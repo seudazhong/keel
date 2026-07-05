@@ -1,0 +1,46 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+htmlcov/
+.coverage
+dist/
+build/
+
+# ---- Node / web ----
+node_modules/
+.pnpm-store/
+web/dist/
+web/.vite/
+*.tsbuildinfo
+
+# ---- Data / runtime ----
+data/
+*.db
+*.sqlite
+*.sqlite3
+logs/
+*.log
+.keel/
+tmp/
+
+# ---- Docker ----
+# keep compose files; ignore local overrides
+docker-compose.override.yml
+
+# ---- Editors / OS ----
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.example.json
+.DS_Store
+Thumbs.db
