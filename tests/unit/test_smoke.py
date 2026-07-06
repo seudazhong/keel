@@ -18,6 +18,8 @@ MODULES = [
     "keel_core.api",
     "keel_core.context",
     "keel_core.scope",
+    "keel_core.state",
+    "keel_core.loop",
     "keel_core.eventbus",
     "keel_core.observability",
     "keel_core.testing",

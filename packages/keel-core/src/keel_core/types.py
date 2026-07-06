@@ -35,6 +35,15 @@ class StopReason(StrEnum):
     error = "error"
 
 
+class FinishReason(StrEnum):
+    """Turn-level provider finish signal (distinct from the run-level StopReason)."""
+
+    end_turn = "end_turn"
+    tool_use = "tool_use"
+    length = "length"
+    error = "error"
+
+
 class PermissionDecision(StrEnum):
     """Permission-engine verdict (deny > ask > allow; default ask)."""
 

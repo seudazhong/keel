@@ -11,9 +11,9 @@ spec frozen here; the enforcement + its acceptance test land in M1.
 
 | # | Invariant | Enforced in | Status | Acceptance test |
 |---|---|---|---|---|
-| I1 | Bounded loop, **named termination** | `keel_core/loop` | M1 | Force `max_iterations`/budget/interrupt/halt; assert `run.ended{reason}` for each. |
-| I2 | **Persist-before-first-model-call** | `keel_core/state` admission | M1 | Kill the worker between admit and first model call; on restart the run resumes with **0 lost turns**. |
-| I3 | **Stop-reason-gated** tool execution | `keel_core/loop` | M1 | Replay a stream with `stop_reason != tool_use` + trailing tool JSON; assert **no tool runs**. |
+| I1 | Bounded loop, **named termination** | `keel_core/loop` | **proven (loop α)** | Force `max_iterations`/budget/interrupt/halt/error/completed; assert `run.ended{reason}` for each. |
+| I2 | **Persist-before-first-model-call** | `keel_core/state` admission | **proven (loop α)** | `admit` appends the user event before `run` ever calls the provider; the first request already carries it. (Crash→resume with the durable store lands in M1 state.) |
+| I3 | **Stop-reason-gated** tool execution | `keel_core/loop` | **proven (loop α)** | A stream with `finish_reason != tool_use` + a trailing tool call runs **no tool**. |
 | I4 | **Byte-stable prompt prefix** | `keel_core/context` | **proven (S1)** | Prefix bytes identical across turns/agents → stable `cache_key`; memory never in prefix. |
 | I5 | Parallel-safe executor, **deterministic order** | `keel_core/tools` | M1 | Mixed read/write calls with overlapping paths; writes serialize, results emit in source order. |
 | I6 | **Two-level sandbox** | `keel_sandbox` + `permissions/` | **proven (S3, policy)** | Egress / `.git` / `.env` / path-escape denied; network off by default. |
@@ -24,9 +24,9 @@ spec frozen here; the enforcement + its acceptance test land in M1.
 
 ## Notes per invariant
 
-- **I1 — bounded loop / named termination.** Every run caps iterations, budgets tokens, and exits for exactly one named `StopReason` (`keel_core.types.StopReason`), emitted as `run.ended{reason}`.
-- **I2 — durable admission.** User input is persisted as an event **before** the first model call, so a crash loses **0 turns**; the run is resumable from the event log.
-- **I3 — stop-reason gate.** Tools execute **only** when the provider's `stop_reason` requests tool use; trailing tool-shaped JSON after any other stop reason must not trigger execution.
+- **I1 — bounded loop / named termination.** *(proven — loop α)* Every run caps iterations, budgets tokens, and exits for exactly one named `StopReason` (`keel_core.types.StopReason`), emitted as `run.ended{reason}`. Test: [`tests/unit/test_loop.py`](../tests/unit/test_loop.py).
+- **I2 — durable admission.** *(proven — loop α, ordering)* `keel_core.loop.admit` persists the user input as an event **before** `run` makes the first model call, so the first provider request already contains it. Full crash→resume with **0 lost turns** lands with the durable Postgres store (M1 state). Test: [`tests/unit/test_loop.py`](../tests/unit/test_loop.py).
+- **I3 — stop-reason gate.** *(proven — loop α)* Tools execute **only** when the provider's `finish_reason == tool_use`; a trailing tool call after any other finish reason must not trigger execution. Test: [`tests/unit/test_loop.py`](../tests/unit/test_loop.py).
 - **I4 — byte-stable prefix.** *(proven — S1)* The cache-friendly prompt prefix depends only on stable inputs; volatile content (history, memory) lives in the suffix and never perturbs `prompt_cache_key`. Test: [`tests/unit/test_spike_s1_prompt_cache.py`](../tests/unit/test_spike_s1_prompt_cache.py).
 - **I5 — deterministic parallel executor.** Independent read-only tools run concurrently; writes/overlapping paths serialize; results always emit in source order.
 - **I6 — two-level sandbox.** *(proven — S3, policy layer)* Network is off by default; egress to loopback/link-local/private/SSRF targets is denied; file access is workspace-only and blocks `.git`/`.env`/path-escape. Container enforcement wraps this in M1. Test: [`tests/unit/test_spike_s3_sandbox_policy.py`](../tests/unit/test_spike_s3_sandbox_policy.py).

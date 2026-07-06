@@ -68,3 +68,25 @@ class ReplayProviderGateway:
         if chunks is None:
             raise KeyError(f"no cassette entry for request {request_key(request)}")
         return _aiter(chunks)
+
+
+class ScriptedProviderGateway:
+    """A ``ProviderGateway`` that yields a pre-scripted chunk list per call.
+
+    Each ``stream`` call returns the next scripted turn; once exhausted, the last
+    turn repeats (useful for forcing e.g. an unbounded tool-use loop). ``calls``
+    counts invocations for assertions.
+    """
+
+    def __init__(self, turns: list[list[ProviderChunk]]) -> None:
+        if not turns:
+            raise ValueError("ScriptedProviderGateway needs at least one turn")
+        self._turns = turns
+        self._index = 0
+        self.calls = 0
+
+    def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
+        self.calls += 1
+        turn = self._turns[min(self._index, len(self._turns) - 1)]
+        self._index += 1
+        return _aiter(turn)

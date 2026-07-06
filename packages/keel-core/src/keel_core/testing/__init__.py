@@ -7,6 +7,11 @@ ProviderGateway in M1; the cassette format and replay are frozen here.
 
 from __future__ import annotations
 
-from keel_core.testing.record_replay import Cassette, ReplayProviderGateway, request_key
+from keel_core.testing.record_replay import (
+    Cassette,
+    ReplayProviderGateway,
+    ScriptedProviderGateway,
+    request_key,
+)
 
-__all__ = ["Cassette", "ReplayProviderGateway", "request_key"]
+__all__ = ["Cassette", "ReplayProviderGateway", "ScriptedProviderGateway", "request_key"]

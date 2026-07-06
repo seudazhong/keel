@@ -22,10 +22,10 @@ from .agents import AgentSpec
 from .events import Event
 from .types import (
     ContentTaint,
+    FinishReason,
     PermissionDecision,
     ScopeId,
     SessionId,
-    StopReason,
     TrustLevel,
 )
 
@@ -63,12 +63,26 @@ class ProviderRequest(BaseModel):
     prompt_cache_key: str | None = None
 
 
+class ToolCall(BaseModel):
+    """A tool invocation requested by the model."""
+
+    id: str
+    name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
 class ProviderChunk(BaseModel):
-    """A streamed provider delta."""
+    """A streamed provider delta.
+
+    ``tool_call`` carries a requested tool invocation; ``finish_reason`` is set on
+    the terminal chunk of a turn. The loop opens the tool gate only when
+    ``finish_reason == tool_use`` (stop-reason-gated invariant).
+    """
 
     delta: str = ""
     thinking: str = ""
-    stop_reason: StopReason | None = None
+    tool_call: ToolCall | None = None
+    finish_reason: FinishReason | None = None
 
 
 class PromptBundle(BaseModel):

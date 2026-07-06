@@ -12,6 +12,7 @@ __version__ = "0.0.0"
 from .agents import AgentSpec, Scope
 from .errors import CrossScopeError, KeelError, PermissionDenied
 from .events import Event, EventType
+from .loop import RunBudget, RunResult, ToolRegistry, admit, run
 from .protocols import (
     EventStore,
     PermissionEngine,
@@ -22,12 +23,15 @@ from .protocols import (
     ProviderRequest,
     ScopeGuard,
     Tool,
+    ToolCall,
     ToolContext,
     ToolResult,
 )
+from .state import InMemoryEventStore
 from .types import (
     AgentId,
     ContentTaint,
+    FinishReason,
     PermissionDecision,
     Role,
     RunId,
@@ -43,6 +47,7 @@ __all__ = [
     # types
     "AgentId",
     "ContentTaint",
+    "FinishReason",
     "PermissionDecision",
     "Role",
     "RunId",
@@ -63,6 +68,7 @@ __all__ = [
     "Scope",
     # protocols + models
     "Tool",
+    "ToolCall",
     "ToolContext",
     "ToolResult",
     "EventStore",
@@ -73,4 +79,11 @@ __all__ = [
     "PromptAssembler",
     "PromptBundle",
     "ScopeGuard",
+    # runtime (loop + state)
+    "run",
+    "admit",
+    "ToolRegistry",
+    "RunBudget",
+    "RunResult",
+    "InMemoryEventStore",
 ]

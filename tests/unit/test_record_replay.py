@@ -8,7 +8,7 @@ import pytest
 
 from keel_core.protocols import ProviderChunk, ProviderGateway, ProviderRequest
 from keel_core.testing.record_replay import Cassette, ReplayProviderGateway, request_key
-from keel_core.types import StopReason
+from keel_core.types import FinishReason
 
 
 def test_request_key_is_stable() -> None:
@@ -23,7 +23,7 @@ async def test_replay_is_deterministic(tmp_path: Path) -> None:
     recorded = [
         ProviderChunk(delta="he"),
         ProviderChunk(delta="llo"),
-        ProviderChunk(stop_reason=StopReason.completed),
+        ProviderChunk(finish_reason=FinishReason.end_turn),
     ]
 
     writer = Cassette(path)
@@ -35,7 +35,7 @@ async def test_replay_is_deterministic(tmp_path: Path) -> None:
     for _ in range(2):
         out = [chunk async for chunk in gateway.stream(request)]
         assert [c.delta for c in out] == ["he", "llo", ""]
-        assert out[-1].stop_reason is StopReason.completed
+        assert out[-1].finish_reason is FinishReason.end_turn
 
 
 def test_replay_missing_entry_raises(tmp_path: Path) -> None:
