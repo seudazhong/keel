@@ -81,7 +81,7 @@ The pivot to a **server-primary connected assistant** ([ADR-0009](./adr/0009-pro
 
 ## 5. Invariant acceptance checklist
 
-The architecture names non-negotiable invariants. Each must have an owner component and an acceptance test *before* the milestone that relies on it ships.
+The architecture names non-negotiable invariants. Each must have an owner component and an acceptance test *before* the milestone that relies on it ships. The executable registry of these gates is [`tests/invariants/test_invariants.py`](../tests/invariants/test_invariants.py) (frozen specs in [`INVARIANTS.md`](./INVARIANTS.md)).
 
 | Invariant | Enforced in | Acceptance test (record/replay where possible) |
 |---|---|---|
