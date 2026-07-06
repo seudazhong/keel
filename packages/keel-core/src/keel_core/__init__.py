@@ -1,6 +1,7 @@
-"""Keel agent runtime core (skeleton).
+"""Keel agent runtime core.
 
-M0 ships seams and shared infrastructure only; behaviour lands in M1
+M0 ships the frozen **contracts** (Protocols, event vocabulary, REST DTOs,
+scope model) and shared infrastructure; behaviour lands in M1
 (see docs/IMPLEMENTATION-PLAN.md).
 """
 
@@ -8,4 +9,68 @@ from __future__ import annotations
 
 __version__ = "0.0.0"
 
-__all__ = ["__version__"]
+from .agents import AgentSpec, Scope
+from .errors import CrossScopeError, KeelError, PermissionDenied
+from .events import Event, EventType
+from .protocols import (
+    EventStore,
+    PermissionEngine,
+    PromptAssembler,
+    PromptBundle,
+    ProviderChunk,
+    ProviderGateway,
+    ProviderRequest,
+    ScopeGuard,
+    Tool,
+    ToolContext,
+    ToolResult,
+)
+from .types import (
+    AgentId,
+    ContentTaint,
+    PermissionDecision,
+    Role,
+    RunId,
+    ScopeId,
+    ScopeKind,
+    SessionId,
+    StopReason,
+    TrustLevel,
+)
+
+__all__ = [
+    "__version__",
+    # types
+    "AgentId",
+    "ContentTaint",
+    "PermissionDecision",
+    "Role",
+    "RunId",
+    "ScopeId",
+    "ScopeKind",
+    "SessionId",
+    "StopReason",
+    "TrustLevel",
+    # errors
+    "KeelError",
+    "PermissionDenied",
+    "CrossScopeError",
+    # events
+    "Event",
+    "EventType",
+    # agents
+    "AgentSpec",
+    "Scope",
+    # protocols + models
+    "Tool",
+    "ToolContext",
+    "ToolResult",
+    "EventStore",
+    "ProviderGateway",
+    "ProviderRequest",
+    "ProviderChunk",
+    "PermissionEngine",
+    "PromptAssembler",
+    "PromptBundle",
+    "ScopeGuard",
+]
