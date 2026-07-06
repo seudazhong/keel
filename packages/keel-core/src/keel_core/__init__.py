@@ -11,6 +11,7 @@ __version__ = "0.0.0"
 
 from .agents import AgentSpec, Scope
 from .connectors import ConfusedDeputyEngine, Connector, ConnectorTool, taint_from_events
+from .embeddings import Embedder, FakeEmbedder, LiteLLMEmbedder, rrf_fuse
 from .errors import CrossScopeError, KeelError, PermissionDenied
 from .events import Event, EventType
 from .loop import RunBudget, RunResult, ToolRegistry, admit, run
@@ -33,6 +34,13 @@ from .protocols import (
     Usage,
 )
 from .providers import LiteLLMGateway
+from .search import (
+    ArchivalSearchTool,
+    ArchivalStore,
+    SearchHit,
+    SessionSearchTool,
+    session_search,
+)
 from .secrets import EnvelopeCipher, SecretsError, cipher_from_settings
 from .state import InMemoryEventStore, PostgresEventStore
 from .tokens import InMemoryTokenStore, PostgresTokenStore
@@ -111,6 +119,16 @@ __all__ = [
     "cipher_from_settings",
     "InMemoryTokenStore",
     "PostgresTokenStore",
+    # search + archival (WS-D)
+    "Embedder",
+    "FakeEmbedder",
+    "LiteLLMEmbedder",
+    "rrf_fuse",
+    "ArchivalStore",
+    "SearchHit",
+    "session_search",
+    "ArchivalSearchTool",
+    "SessionSearchTool",
     # observability (WS-H)
     "Tracer",
     "NoopTracer",

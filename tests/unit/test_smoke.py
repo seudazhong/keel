@@ -23,6 +23,8 @@ MODULES = [
     "keel_core.tokens",
     "keel_core.secrets",
     "keel_core.connectors",
+    "keel_core.embeddings",
+    "keel_core.search",
     "keel_core.projections",
     "keel_core.loop",
     "keel_core.providers",
