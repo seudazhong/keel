@@ -58,7 +58,9 @@ async def stream_events(
         async for event in runtime.tail(session_id, after):
             if await request.is_disconnected():
                 break
-            yield f"id: {event.seq}\ndata: {event.model_dump_json()}\n\n"
+            data = f"data: {event.model_dump_json()}\n\n"
+            # Partial deltas carry no durable seq; only real events advance the cursor.
+            yield f"id: {event.seq}\n{data}" if event.seq else data
 
     return StreamingResponse(
         _events(),

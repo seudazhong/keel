@@ -19,7 +19,7 @@ Load-bearing invariants proven here:
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -172,6 +172,7 @@ async def _call_provider(
     request: ProviderRequest,
     max_retries: int,
     on_delta: DeltaObserver | None = None,
+    emit_delta: Callable[[str], Awaitable[None]] | None = None,
 ) -> _TurnOutput:
     attempt = 0
     while True:
@@ -186,6 +187,11 @@ async def _call_provider(
                         try:
                             on_delta(chunk.delta)
                         except Exception:  # noqa: BLE001 - live delta observer is best-effort
+                            pass
+                    if emit_delta is not None:
+                        try:
+                            await emit_delta(chunk.delta)  # awaited inline -> ordered
+                        except Exception:  # noqa: BLE001 - streaming relay is best-effort
                             pass
                 if chunk.tool_call is not None:
                     tool_calls.append(chunk.tool_call)
@@ -278,6 +284,7 @@ async def run(
     on_event: EventObserver | None = None,
     on_delta: DeltaObserver | None = None,
     run_id: RunId | None = None,
+    stream_deltas: bool = False,
 ) -> RunResult:
     """Execute the agent loop until a named termination and return the result.
 
@@ -285,7 +292,9 @@ async def run(
     for every persisted event (in seq order) and ``on_delta`` for each streamed text
     delta, letting a surface render the run live without polling the store. A caller
     may pass ``run_id`` (e.g. a server that returned it to a client before the run
-    finished); otherwise one is generated.
+    finished); otherwise one is generated. With ``stream_deltas`` the loop also emits
+    partial ``message.token`` events per delta (``payload.partial``) so a store's
+    fan-out can relay token-by-token; the whole message is still emitted at turn end.
     """
     registry = registry or ToolRegistry()
     budget = budget or RunBudget(
@@ -297,6 +306,19 @@ async def run(
     scope_id = agent.scope.id
     trust = agent.scope.trust
     run_id = run_id or uuid.uuid4().hex
+
+    emit_delta: Callable[[str], Awaitable[None]] | None = None
+    if stream_deltas:
+
+        async def emit_delta(text: str) -> None:
+            await _emit(
+                store,
+                EventType.message_token,
+                session_id,
+                scope_id,
+                run_id,
+                {"role": "assistant", "text": text, "partial": True},
+            )
 
     await _emit(store, EventType.run_started, session_id, scope_id, run_id, {"agent": agent.id})
 
@@ -322,7 +344,7 @@ async def run(
         request = await _build_request(agent, store, session_id)
 
         try:
-            turn = await _call_provider(provider, request, budget.max_retries, on_delta)
+            turn = await _call_provider(provider, request, budget.max_retries, on_delta, emit_delta)
         except KeelError as exc:
             reason = StopReason.error
             error = str(exc)

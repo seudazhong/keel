@@ -97,3 +97,48 @@ async def test_web_approval_gates_a_mutating_tool(
     assert approval_id is not None  # the mutating tool asked before running
     assert tool_ok is True
     assert (tmp_path / "out.txt").read_text(encoding="utf-8") == "hi"  # approved -> executed
+
+
+async def test_web_streams_token_deltas_over_redis(
+    migrated_db: AsyncEngine, redis_client: aioredis.Redis, tmp_path: Path
+) -> None:
+    provider = ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(delta="Hel"),
+                ProviderChunk(delta="lo", finish_reason=FinishReason.end_turn),
+            ]
+        ]
+    )
+    runtime = AgentRuntime(
+        redis_client=redis_client,
+        engine=migrated_db,
+        model="test/model",
+        workspace=tmp_path,
+        provider=provider,
+    )
+    session_id = f"web-stream-{uuid.uuid4().hex}"
+    await runtime.admit_and_run(session_id, "hi")
+
+    partials: list[str] = []
+    whole: str | None = None
+    async for event in runtime.tail(session_id, 0):
+        if event.type is EventType.message_token and event.payload.get("role") == "assistant":
+            if event.payload.get("partial"):
+                partials.append(str(event.payload["text"]))
+            else:
+                whole = str(event.payload["text"])
+        if event.type is EventType.run_ended:
+            break
+
+    assert partials == ["Hel", "lo"]  # token-by-token over the Redis fan-out
+    assert whole == "Hello"
+
+    # Partials are fan-out only: the durable log holds just the whole message.
+    durable_assistant = [
+        event
+        async for event in runtime._durable().read(session_id)
+        if event.type is EventType.message_token and event.payload.get("role") == "assistant"
+    ]
+    assert len(durable_assistant) == 1
+    assert not durable_assistant[0].payload.get("partial")

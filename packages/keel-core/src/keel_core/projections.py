@@ -19,6 +19,8 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
     for event in events:
         role = event.payload.get("role")
         if role in ("user", "assistant"):
+            if event.payload.get("partial"):
+                continue  # streaming-only delta; the whole message is emitted at turn end
             messages.append({"role": str(role), "content": str(event.payload.get("text", ""))})
         elif event.type == EventType.tool_result:
             messages.append({"role": "tool", "content": str(event.payload)})

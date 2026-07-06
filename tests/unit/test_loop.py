@@ -439,3 +439,32 @@ async def test_provider_transient_error_retries_then_surfaces_message() -> None:
     assert result.reason is StopReason.error
     assert attempts["n"] == 3  # initial + 2 retries
     assert result.error is not None and "connection reset" in result.error
+
+
+async def test_stream_deltas_emits_partials_but_projection_uses_whole() -> None:
+    from keel_core.projections import project_messages
+
+    store = InMemoryEventStore()
+    provider = ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(delta="Hel"),
+                ProviderChunk(delta="lo", finish_reason=FinishReason.end_turn),
+            ]
+        ]
+    )
+    await admit(store, "s1", "u:1", "hi")
+    await run(agent=_agent(), session_id="s1", store=store, provider=provider, stream_deltas=True)
+
+    tokens = [e for e in store.snapshot("s1") if e.type is EventType.message_token]
+    partials = [e.payload["text"] for e in tokens if e.payload.get("partial")]
+    wholes = [
+        e for e in tokens if not e.payload.get("partial") and e.payload.get("role") == "assistant"
+    ]
+    assert partials == ["Hel", "lo"]  # streamed token-by-token
+    assert len(wholes) == 1 and wholes[0].payload["text"] == "Hello"
+    # The message projection ignores partials -> exactly one assistant message.
+    assert project_messages(store.snapshot("s1")) == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "Hello"},
+    ]

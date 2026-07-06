@@ -94,6 +94,11 @@ class CompositeEventStore:
         self._fanout = fanout
 
     async def append(self, event: Event) -> None:
+        # Streaming-only partial deltas relay to Redis but never touch the durable
+        # log (the whole message.token is emitted at turn end).
+        if event.type is EventType.message_token and event.payload.get("partial"):
+            await self._fanout.append(event)
+            return
         await self._durable.append(event)  # assigns seq
         await self._fanout.append(event)  # same event, now carrying seq
 
@@ -194,6 +199,7 @@ class AgentRuntime:
                 permissions=self._permissions,
                 approve=approve,
                 run_id=run_id,
+                stream_deltas=True,  # relay token-by-token over SSE
             )
         except Exception:  # noqa: BLE001 - a run task must not take the server down
             logger.exception("run %s failed", run_id)

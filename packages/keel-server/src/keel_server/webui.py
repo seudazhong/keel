@@ -56,7 +56,7 @@ document.getElementById("sid").textContent = "session " + sid.slice(0, 8);
 const log = document.getElementById("log");
 const input = document.getElementById("input");
 const sendBtn = document.getElementById("send");
-let lastSeq = 0, es = null;
+let lastSeq = 0, es = null, streamBubble = null;
 
 function el(cls, text) {
   const d = document.createElement("div");
@@ -65,6 +65,17 @@ function el(cls, text) {
   log.appendChild(d);
   window.scrollTo(0, document.body.scrollHeight);
   return d;
+}
+
+function appendDelta(text) {
+  if (!streamBubble) streamBubble = el("msg assistant", "");
+  streamBubble.textContent += text;
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+function finalizeAssistant(text) {
+  if (streamBubble) { streamBubble.textContent = text; streamBubble = null; }
+  else el("msg assistant", text);
 }
 
 function addApproval(p) {
@@ -87,9 +98,12 @@ function addApproval(p) {
 }
 
 function handleEvent(ev) {
-  lastSeq = ev.seq;
+  if (ev.seq) lastSeq = ev.seq;  // partial deltas (seq 0) don't move the cursor
   const t = ev.type, p = ev.payload || {};
-  if (t === "message.token") { if (p.role === "assistant") el("msg assistant", p.text); }
+  if (t === "message.token") {
+    if (p.role !== "assistant") return;
+    if (p.partial) appendDelta(p.text); else finalizeAssistant(p.text);
+  }
   else if (t === "tool.call") el("meta", `→ ${p.tool}(${JSON.stringify(p.args)})`);
   else if (t === "tool.result") el("meta", `← ${p.ok ? "ok" : "err"}: ${p.output || ""}`);
   else if (t === "approval.requested") addApproval(p);
