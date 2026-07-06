@@ -25,7 +25,7 @@ import typer
 
 from keel_cli.runner import ChatSession, _preview, build_session
 from keel_core import InMemoryEventStore, __version__
-from keel_core.config import get_settings
+from keel_core.config import get_settings, load_env_file
 from keel_core.events import EventType
 from keel_core.tools.executor import ApproveFn
 from keel_core.types import StopReason
@@ -326,6 +326,7 @@ def run_cmd(
 def main() -> None:
     """CLI entry point."""
     _configure_console()
+    load_env_file()  # one .env carries KEEL_* settings and provider API keys
     app()
 
 

@@ -8,6 +8,7 @@ A mounted-config-file source (deploy/config/) is a documented M1 extension point
 from __future__ import annotations
 
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -45,3 +46,28 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return a cached :class:`Settings` instance."""
     return Settings()
+
+
+def load_env_file(path: str | Path | None = None) -> str | None:
+    """Load a ``.env`` file into ``os.environ`` and return the path used (or None).
+
+    :class:`Settings` already reads ``.env`` for ``KEEL_``-prefixed values, but
+    third-party libraries (LiteLLM) read provider API keys such as
+    ``OPENAI_API_KEY`` straight from the process environment. This makes one
+    ``.env`` carry both: it injects every key/value into ``os.environ`` with
+    ``override=False`` so a real environment variable always wins.
+
+    Call this from a **process entry point** (CLI ``main``, a service ``startup``)
+    — never at import time, so tests and library importers don't inherit a
+    developer's local secrets. When ``path`` is omitted, the nearest ``.env`` at
+    or above the current working directory is used.
+    """
+    try:
+        from dotenv import find_dotenv, load_dotenv
+    except ImportError:  # pragma: no cover - python-dotenv ships with pydantic-settings
+        return None
+    target = str(path) if path is not None else find_dotenv(usecwd=True)
+    if not target or not Path(target).is_file():
+        return None
+    load_dotenv(target, override=False)
+    return target

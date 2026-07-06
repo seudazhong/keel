@@ -15,7 +15,7 @@ from typing import Any
 from arq.connections import RedisSettings
 
 from keel_core import __version__
-from keel_core.config import get_settings
+from keel_core.config import get_settings, load_env_file
 from keel_core.observability import configure_logging, configure_tracing
 
 logger = logging.getLogger("keel.worker")
@@ -28,6 +28,7 @@ async def noop(ctx: dict[str, Any]) -> str:
 
 
 async def startup(ctx: dict[str, Any]) -> None:
+    load_env_file()  # provider keys visible to LiteLLM before any agent task runs
     configure_logging(get_settings().log_level)
     configure_tracing("keel-worker")
     logger.info("keel-worker %s starting", __version__)
