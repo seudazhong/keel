@@ -7,10 +7,11 @@ from collections.abc import AsyncIterator
 from keel_core.agents import AgentSpec, Scope
 from keel_core.events import EventType
 from keel_core.loop import RunBudget, ToolRegistry, admit, run
+from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.protocols import ProviderChunk, ProviderRequest, ToolCall, ToolContext, ToolResult
 from keel_core.state import InMemoryEventStore
 from keel_core.testing import ScriptedProviderGateway
-from keel_core.types import FinishReason, ScopeKind, StopReason, TrustLevel
+from keel_core.types import FinishReason, PermissionDecision, ScopeKind, StopReason, TrustLevel
 
 
 def _agent() -> AgentSpec:
@@ -228,3 +229,94 @@ async def test_persist_before_first_model_call() -> None:
 
     first_messages = seen["first_messages"]
     assert any(m["role"] == "user" and m["content"] == "hello world" for m in first_messages)
+
+
+async def test_tool_error_still_reaches_named_termination() -> None:
+    store = InMemoryEventStore()
+
+    class _BoomTool:
+        name = "boom"
+        description = "always raises"
+
+        def input_schema(self) -> dict[str, object]:
+            return {}
+
+        async def run(self, args: dict[str, object], ctx: ToolContext) -> ToolResult:
+            raise RuntimeError("kaboom")
+
+    provider = ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(
+                    tool_call=ToolCall(id="c", name="boom", arguments={}),
+                    finish_reason=FinishReason.tool_use,
+                )
+            ],
+            [ProviderChunk(delta="done", finish_reason=FinishReason.end_turn)],
+        ]
+    )
+    await admit(store, "s1", "u:1", "go")
+    result = await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=provider,
+        registry=ToolRegistry([_BoomTool()]),
+    )
+    assert result.reason is StopReason.completed  # the run still terminated, named
+    types = _event_types(store, "s1")
+    assert types[-1] == EventType.run_ended
+    assert EventType.tool_result in types  # the failing tool produced a result, not a crash
+
+
+async def test_agent_budget_is_respected() -> None:
+    store = InMemoryEventStore()
+    provider = ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(
+                    tool_call=ToolCall(id="c", name="x", arguments={}),
+                    finish_reason=FinishReason.tool_use,
+                )
+            ]
+        ]
+    )
+    agent = AgentSpec(
+        id="a",
+        name="A",
+        model="test/model",
+        scope=Scope(id="u:1", kind=ScopeKind.personal),
+        max_iterations=2,
+    )
+    await admit(store, "s1", "u:1", "loop")
+    result = await run(agent=agent, session_id="s1", store=store, provider=provider)
+    assert result.reason is StopReason.max_iterations
+    assert result.iterations == 2  # honored the agent's cap, not RunBudget's default
+
+
+async def test_loop_permission_gate_blocks_tool() -> None:
+    store = InMemoryEventStore()
+    tool = _SpyTool()
+    provider = ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(
+                    tool_call=ToolCall(id="c", name="echo", arguments={}),
+                    finish_reason=FinishReason.tool_use,
+                )
+            ],
+            [ProviderChunk(delta="done", finish_reason=FinishReason.end_turn)],
+        ]
+    )
+    engine = RuleBasedPermissionEngine([Rule("*", PermissionDecision.deny)])
+    await admit(store, "s1", "u:1", "go")
+    result = await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=provider,
+        registry=ToolRegistry([tool]),
+        permissions=engine,
+    )
+    assert result.reason is StopReason.completed
+    assert tool.calls == []  # the permission gate blocked execution inside the loop

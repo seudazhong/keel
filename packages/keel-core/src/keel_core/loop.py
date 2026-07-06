@@ -26,16 +26,20 @@ from datetime import UTC, datetime
 from keel_core.agents import AgentSpec
 from keel_core.errors import KeelError
 from keel_core.events import Event, EventType
+from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.protocols import (
     EventStore,
+    PermissionEngine,
     ProviderGateway,
     ProviderRequest,
     Tool,
     ToolCall,
     ToolContext,
 )
+from keel_core.tools.executor import ApproveFn, ExecRequest, execute
 from keel_core.types import (
     FinishReason,
+    PermissionDecision,
     RunId,
     ScopeId,
     SessionId,
@@ -46,6 +50,10 @@ from keel_core.types import (
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+# Library default: the caller (server/surface) supplies a real policy engine.
+_ALLOW_ALL = RuleBasedPermissionEngine([Rule("*", PermissionDecision.allow)])
 
 
 class ToolRegistry:
@@ -158,44 +166,53 @@ async def _call_provider(
                 raise KeelError("provider call failed after retries") from exc
 
 
-async def _execute_tool(
+async def _run_tools(
     store: EventStore,
     registry: ToolRegistry,
+    permissions: PermissionEngine,
+    approve: ApproveFn | None,
     session_id: SessionId,
     scope_id: ScopeId,
     run_id: RunId,
     trust: TrustLevel,
-    call: ToolCall,
+    calls: list[ToolCall],
 ) -> None:
-    await _emit(
-        store,
-        EventType.tool_call,
-        session_id,
-        scope_id,
-        run_id,
-        {"tool": call.name, "call_id": call.id, "args": call.arguments},
-    )
-    tool = registry.get(call.name)
-    if tool is None:
+    """Emit tool.call events, run the calls through the parallel-safe permission-gated
+    executor, then emit tool.result events — all in source order. A failing tool yields
+    a failed result (never crashes the run)."""
+    ctx = ToolContext(scope_id=scope_id, session_id=session_id, trust=trust)
+    for call in calls:
         await _emit(
             store,
-            EventType.tool_result,
+            EventType.tool_call,
             session_id,
             scope_id,
             run_id,
-            {"call_id": call.id, "ok": False, "error": "unknown tool"},
+            {"tool": call.name, "call_id": call.id, "args": call.arguments},
         )
-        return
-    ctx = ToolContext(scope_id=scope_id, session_id=session_id, trust=trust)
-    result = await tool.run(call.arguments, ctx)
-    await _emit(
-        store,
-        EventType.tool_result,
-        session_id,
-        scope_id,
-        run_id,
-        {"call_id": call.id, "ok": result.ok, "output": result.output},
-    )
+
+    requests: list[ExecRequest] = []
+    known: list[bool] = []
+    for call in calls:
+        tool = registry.get(call.name)
+        known.append(tool is not None)
+        if tool is not None:
+            requests.append(
+                ExecRequest(call=call, tool=tool, write=bool(getattr(tool, "writes", True)))
+            )
+
+    results = iter(await execute(requests, ctx, permissions, approve))
+    for call, is_known in zip(calls, known, strict=True):
+        if is_known:
+            result = next(results)
+            payload: dict[str, object] = {
+                "call_id": call.id,
+                "ok": result.ok,
+                "output": result.output,
+            }
+        else:
+            payload = {"call_id": call.id, "ok": False, "error": "unknown tool"}
+        await _emit(store, EventType.tool_result, session_id, scope_id, run_id, payload)
 
 
 async def run(
@@ -207,10 +224,15 @@ async def run(
     registry: ToolRegistry | None = None,
     budget: RunBudget | None = None,
     interrupt: Callable[[], bool] | None = None,
+    permissions: PermissionEngine | None = None,
+    approve: ApproveFn | None = None,
 ) -> RunResult:
     """Execute the agent loop until a named termination and return the result."""
     registry = registry or ToolRegistry()
-    budget = budget or RunBudget()
+    budget = budget or RunBudget(
+        max_iterations=agent.max_iterations, token_budget=agent.token_budget
+    )
+    permissions = permissions or _ALLOW_ALL
     scope_id = agent.scope.id
     trust = agent.scope.trust
     run_id: RunId = uuid.uuid4().hex
@@ -256,8 +278,17 @@ async def run(
 
         # Stop-reason gate (I3): tools run ONLY on an explicit tool_use finish.
         if turn.finish_reason == FinishReason.tool_use and turn.tool_calls:
-            for call in turn.tool_calls:
-                await _execute_tool(store, registry, session_id, scope_id, run_id, trust, call)
+            await _run_tools(
+                store,
+                registry,
+                permissions,
+                approve,
+                session_id,
+                scope_id,
+                run_id,
+                trust,
+                turn.tool_calls,
+            )
             iterations += 1
             await _emit(
                 store, EventType.turn_ended, session_id, scope_id, run_id, {"turn": iterations}

@@ -18,6 +18,7 @@ from keel_core.tools.bounding import bound_output
 class ShellTool:
     name = "shell"
     description = "Run a shell command in the workspace (timeout-bounded)."
+    writes = True
 
     def __init__(
         self, workspace: Path | str, *, timeout: float = 30.0, spill_dir: Path | None = None

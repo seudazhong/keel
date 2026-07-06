@@ -61,3 +61,22 @@ async def test_ls_glob_grep(tmp_path: Path) -> None:
     grep = await GrepTool(tmp_path).run({"pattern": "import", "glob": "**/*.py"}, ctx)
     assert "x.py" in grep.output
     assert "import os" in grep.output
+
+
+async def test_glob_grep_cannot_escape_workspace(tmp_path: Path) -> None:
+    ctx = _ctx()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (tmp_path / "secret.txt").write_text("TOPSECRET", encoding="utf-8")
+    await WriteTool(workspace).run({"path": "inside.txt", "content": "hello"}, ctx)
+
+    globbed = await GlobTool(workspace).run({"pattern": "../*"}, ctx)
+    assert "secret" not in globbed.output  # escaping matches are dropped
+
+    grep = await GrepTool(workspace).run({"pattern": "TOPSECRET", "glob": "../*"}, ctx)
+    assert "TOPSECRET" not in grep.output  # cannot read files outside the workspace
+
+
+async def test_glob_invalid_pattern_does_not_crash(tmp_path: Path) -> None:
+    result = await GlobTool(tmp_path).run({"pattern": "/etc/*"}, _ctx())
+    assert "etc" not in result.output or result.ok is False

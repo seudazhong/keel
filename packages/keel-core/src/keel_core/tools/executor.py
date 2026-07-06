@@ -45,14 +45,16 @@ async def _run_one(
     permissions: PermissionEngine,
     approve: ApproveFn | None,
 ) -> ToolResult:
-    decision = permissions.evaluate(request.call.name, request.call.arguments, ctx)
-    if decision is PermissionDecision.deny:
-        return ToolResult(ok=False, output="permission denied")
-    if decision is PermissionDecision.ask and (approve is None or not approve(request.call, ctx)):
-        return ToolResult(ok=False, output="approval required")
     try:
+        decision = permissions.evaluate(request.call.name, request.call.arguments, ctx)
+        if decision is PermissionDecision.deny:
+            return ToolResult(ok=False, output="permission denied")
+        if decision is PermissionDecision.ask and (
+            approve is None or not approve(request.call, ctx)
+        ):
+            return ToolResult(ok=False, output="approval required")
         return await request.tool.run(request.call.arguments, ctx)
-    except Exception as exc:  # noqa: BLE001 - a tool failure must not crash the run
+    except Exception as exc:  # noqa: BLE001 - gate/approve/tool failure must not crash the run
         return ToolResult(ok=False, output=f"tool error: {exc.__class__.__name__}")
 
 

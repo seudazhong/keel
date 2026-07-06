@@ -30,6 +30,17 @@ def _safe_path(workspace: Path, rel: str) -> Path | None:
     return candidate
 
 
+def _confine(match: Path, root: Path) -> Path | None:
+    """Return ``match`` as a workspace-relative path if confined, else None."""
+    resolved = match.resolve()
+    if not resolved.is_relative_to(root):
+        return None
+    rel = resolved.relative_to(root)
+    if any(part in _DENY_PARTS for part in rel.parts):
+        return None
+    return rel
+
+
 class _WorkspaceTool:
     def __init__(self, workspace: Path | str, *, spill_dir: Path | None = None) -> None:
         self._workspace = Path(workspace)
@@ -39,6 +50,7 @@ class _WorkspaceTool:
 class ReadTool(_WorkspaceTool):
     name = "read"
     description = "Read a UTF-8 text file within the workspace."
+    writes = False
 
     def input_schema(self) -> dict[str, Any]:
         return {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
@@ -58,6 +70,7 @@ class ReadTool(_WorkspaceTool):
 class WriteTool(_WorkspaceTool):
     name = "write"
     description = "Write UTF-8 text to a file within the workspace (creates parents)."
+    writes = True
 
     def input_schema(self) -> dict[str, Any]:
         return {
@@ -79,6 +92,7 @@ class WriteTool(_WorkspaceTool):
 class EditTool(_WorkspaceTool):
     name = "edit"
     description = "Replace the single exact occurrence of `old` with `new` in a file."
+    writes = True
 
     def input_schema(self) -> dict[str, Any]:
         return {
@@ -110,6 +124,7 @@ class EditTool(_WorkspaceTool):
 class LsTool(_WorkspaceTool):
     name = "ls"
     description = "List entries of a directory within the workspace."
+    writes = False
 
     def input_schema(self) -> dict[str, Any]:
         return {"type": "object", "properties": {"path": {"type": "string"}}}
@@ -126,6 +141,7 @@ class LsTool(_WorkspaceTool):
 class GlobTool(_WorkspaceTool):
     name = "glob"
     description = "Find files in the workspace matching a glob pattern."
+    writes = False
 
     def input_schema(self) -> dict[str, Any]:
         return {
@@ -136,12 +152,16 @@ class GlobTool(_WorkspaceTool):
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         root = self._workspace.resolve()
-        pattern = str(args.get("pattern", "*"))
-        matches = sorted(
-            str(match.relative_to(root))
-            for match in root.glob(pattern)
-            if not any(part in _DENY_PARTS for part in match.relative_to(root).parts)
-        )
+        try:
+            candidates = list(root.glob(str(args.get("pattern", "*"))))
+        except (ValueError, NotImplementedError) as exc:
+            return ToolResult(ok=False, output=f"invalid glob pattern: {exc}")
+        matches: list[str] = []
+        for match in candidates:
+            rel = _confine(match, root)  # drop anything that escapes the workspace
+            if rel is not None:
+                matches.append(str(rel))
+        matches.sort()
         bounded = bound_output("\n".join(matches), spill_dir=self._spill_dir)
         return ToolResult(ok=True, output=bounded.text, spill_path=bounded.spill_path)
 
@@ -149,6 +169,7 @@ class GlobTool(_WorkspaceTool):
 class GrepTool(_WorkspaceTool):
     name = "grep"
     description = "Search workspace files for a regex, returning path:line:text matches."
+    writes = False
 
     def input_schema(self) -> dict[str, Any]:
         return {
@@ -163,14 +184,15 @@ class GrepTool(_WorkspaceTool):
         except re.error as exc:
             return ToolResult(ok=False, output=f"invalid regex: {exc}")
         root = self._workspace.resolve()
-        glob = str(args.get("glob", "**/*"))
+        try:
+            candidates = sorted(root.glob(str(args.get("glob", "**/*"))))
+        except (ValueError, NotImplementedError) as exc:
+            return ToolResult(ok=False, output=f"invalid glob pattern: {exc}")
         hits: list[str] = []
-        for match in sorted(root.glob(glob)):
-            if not match.is_file():
+        for match in candidates:
+            rel = _confine(match, root)  # skip anything that escapes the workspace
+            if rel is None or not match.is_file():
                 continue
-            if any(part in _DENY_PARTS for part in match.relative_to(root).parts):
-                continue
-            rel = match.relative_to(root)
             for lineno, line in enumerate(
                 match.read_text(encoding="utf-8", errors="replace").splitlines(), start=1
             ):
