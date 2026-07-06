@@ -43,3 +43,6 @@ explicit_package_bases = true
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "integration: requires a live Postgres and/or Redis service",
+]

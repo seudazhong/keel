@@ -34,7 +34,7 @@ jobs:
         run: uv run mypy packages
 
       - name: Pytest
-        run: uv run pytest
+        run: uv run pytest -m "not integration"
 
   build-image:
     name: Build app image
@@ -46,3 +46,41 @@ jobs:
       # linux/python3.12 from the committed lockfile.
       - name: Build keel-app image
         run: docker build -f deploy/docker/app.Dockerfile -t keel-app:ci .
+
+  integration:
+    name: Integration (Postgres · Redis)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: keel
+          POSTGRES_PASSWORD: keel
+          POSTGRES_DB: keel
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U keel -d keel"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Sync workspace (frozen)
+        run: uv sync --frozen
+
+      - name: Integration tests (spikes S4, S5-RLS)
+        run: uv run pytest -m integration
+        env:
+          KEEL_TEST_DATABASE_URL: postgresql+psycopg://keel:keel@localhost:5432/keel
+          KEEL_TEST_REDIS_URL: redis://localhost:6379/0
+
