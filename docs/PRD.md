@@ -21,6 +21,13 @@ Teams and individuals increasingly want an autonomous assistant that (a) they **
 
 ## 2. Goals & Non-Goals
 
+### 2.0 Primary use cases & product form [ADR-0009]
+The core is general-purpose, but v1 is anchored on two primary use cases, which fix the product form:
+- **UC-A Team / IM assistant** — a shared assistant in group chats + a team web app (server-side; untrusted input).
+- **UC-B Personal connected assistant** — works with **my** email/calendar/docs/knowledge via cloud **OAuth connectors** (also server-side; only local files need a local executor).
+
+Form: **server-primary**, with tool execution behind a **pluggable execution environment** (sandbox now; a local executor deferred); **an agent is a scoped, persisted entity** (group vs personal = same abstraction, different scope); **Connectors are a first-class capability**; **Web + IM are the primary surfaces**, CLI is admin/power-user. See [ADR-0009](./adr/0009-product-form-and-primary-use-cases.md).
+
 ### 2.1 Goals
 - **G1 — One core, many surfaces.** A single agent runtime serving CLI, web, and IM identically; adding a surface never forks agent logic.
 - **G2 — Capable & safe action.** A strong built-in toolbox with a permission engine and sandboxing so tools can touch the real world without undue risk.
@@ -46,6 +53,7 @@ Teams and individuals increasingly want an autonomous assistant that (a) they **
 | **Dev Dana** | Software engineer automating dev/ops tasks | CLI, web | shell/file tools, sandboxing, sub-agents, MCP, low latency |
 | **Ops Omar** | Platform/SRE running the agent as a service | web (admin), CLI | scheduling, observability, deployment, RBAC, cost control |
 | **Team Tia** | Non-dev team member using it as an assistant | web, IM | conversation, memory, skills, approvals |
+| **Individual Ivy** | Uses a personal assistant over her own email/calendar/docs | web, IM (DM) | connectors (OAuth), private memory, proactivity, data isolation |
 | **Community Chen** | Runs a bot for a QQ/WeChat group | IM gateway | multi-platform adapters, per-chat sessions, rate limits, safety |
 | **Builder Bao** | Extends Keel with custom tools/skills/plugins | CLI, SDK | clean extension APIs, MCP, hot-reload, docs |
 
@@ -53,12 +61,15 @@ Teams and individuals increasingly want an autonomous assistant that (a) they **
 
 ## 4. Key use cases / journeys
 
+*(Primary: #2 team, #3 group bot, #7 personal. Secondary: #1 dev, #5 research, #6 skills.)*
+
 1. **Dev automation (CLI).** Dana runs `keel "find and fix the flaky test in payments"`; the agent reads files, runs the suite in a sandbox, edits code, and reports a diff — asking approval before writing.
 2. **Team assistant (web).** Tia asks the web app to "summarise this week's incidents and draft a postmortem"; the agent recalls prior sessions, pulls linked docs via MCP, and streams a draft.
 3. **Group bot (IM).** In a QQ group, members @-mention the bot; it maintains a per-group session, answers with tools, and respects per-group rate limits and a constrained "safe" toolset because input is untrusted.
 4. **Scheduled digest (autonomy).** Omar schedules "every weekday 09:00, compile overnight alerts and post to the ops channel"; the scheduler runs it at-most-once and the run is fully traced.
 5. **Long-horizon research (multi-agent).** A lead agent decomposes a research task, delegates to isolated sub-agents (shared budget), and synthesises results.
 6. **Skill authoring (extensibility).** Bao drops a `skills/postmortem/SKILL.md`; the agent discovers it, shows its name/description in-context, and loads the body on demand.
+7. **Personal connected assistant (UC-B).** Ivy's personal agent — scoped to her, with her Gmail/Calendar granted — triages overnight mail, drafts replies for approval, and each morning posts a digest; its connectors and memory are invisible to any group agent.
 
 ---
 
@@ -101,6 +112,15 @@ Priorities: **P0** = MVP (must), **P1** = fast-follow (should), **P2** = later (
 | FR-T6 | Tool **schema validation** (Pydantic/JSON-Schema) before execution; separate model-facing vs user-facing output. | P0 |
 | FR-T7 | Additional tools: `todo`, `ask_user`/`question`, `task` (sub-agent), `memory_*`, `skill`, `http_request`, `sql_query` (P1). | P0/P1 |
 | FR-T8 | **Guardrails**: loop/no-progress detection, dedup, per-turn bounded recovery counters. | P0 |
+
+### 6.2.1 Connectors & personal data (FR-N) [ADR-0009]
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-N1 | **Connectors subsystem**: email, calendar, contacts, docs/notes, knowledge, IM — via OAuth (or curated MCP), surfaced to the loop as **agent-scoped tools**. | P0 |
+| FR-N2 | **OAuth token management**: per-user/per-connector auth + refresh; tokens envelope-encrypted; a connector is **granted to a specific agent scope**, never ambient. | P0 |
+| FR-N3 | **Per-scope data isolation**: a personal agent's connectors/memory/tokens are invisible to group/other agents; cross-scope reads are denied and audited. | P0 |
+| FR-N4 | **Outbound-action control**: a personal agent's send/post actions require approval and are audited. | P0 |
+| FR-N5 | **Pluggable execution environment** (sandbox now; **`LocalDaemon`** for local files deferred), with its own fail-closed permission gate. | P1 |
 
 ### 6.3 Agent core & loop (FR-C)
 | ID | Requirement | Priority |
@@ -179,7 +199,7 @@ Priorities: **P0** = MVP (must), **P1** = fast-follow (should), **P2** = later (
 |---|---|---|
 | FR-ADM1 | Authn/authz for web/admin (local users + OAuth/OIDC) and machine API keys. | P0 |
 | FR-ADM2 | RBAC roles (owner/admin/member/viewer) at v1 granularity. | P1 |
-| FR-ADM3 | Agent management: create/configure agents (persona, tools, model, permissions, memory). | P0 |
+| FR-ADM3 | Agent management: create/configure agents (persona, **scope**, tools, **connectors**, model, permissions, memory) as scoped entities. | P0 |
 | FR-ADM4 | Config, secrets, connection (MCP/provider) management UI + API. | P1 |
 
 ---
@@ -215,11 +235,11 @@ Priorities: **P0** = MVP (must), **P1** = fast-follow (should), **P2** = later (
 
 ## 9. Scope
 
-### 9.1 MVP (Milestone 1) — "the core that talks"
-Core agent loop, provider layer (multi-provider), file/shell/web tools with sandbox + permissions, parallel execution, session persistence + search, long-term memory (blocks + hybrid store), CLI + web app, one IM adapter (QQ/OneBot), skills, MCP client, agentic tool discovery, tracing (OTel + Langfuse), docker-compose (`dev`/`full`).
+### 9.1 MVP (Milestone 1) — "the connected assistant that talks"
+Core agent loop, provider layer (multi-provider), **connectors (email/calendar/docs via OAuth) + per-scope data isolation**, file/shell/web tools with sandbox + permissions (behind a pluggable execution environment), parallel execution, session persistence + search, long-term memory (blocks + hybrid store), **web app + one IM adapter (QQ/OneBot) + CLI (admin)**, skills, MCP client, agentic tool discovery, tracing (OTel + Langfuse), docker-compose (`dev`/`full`). **Local files/desktop deferred** behind the `LocalDaemon` backend.
 
 ### 9.2 In scope (later milestones)
-Multi-agent orchestration polish, background jobs, scheduler UI, RAG/KB, memory consolidation, plugins/SDK, more IM adapters (WeChat/Discord/Slack), RBAC, evals, desktop shell.
+Multi-agent orchestration polish, background jobs, scheduler UI, RAG/KB, memory consolidation, plugins/SDK, more IM adapters (WeCom/WeChat/Discord/Slack), more connectors, **local-file execution (`LocalDaemon`)**, RBAC, evals, desktop shell.
 
 ### 9.3 Out of scope (v1)
 Visual no-code workflow builder; hosted multi-tenant SaaS + billing; model training; native mobile apps.

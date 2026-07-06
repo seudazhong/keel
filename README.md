@@ -16,14 +16,16 @@ The design follows the project's own field manual, *How to Develop an AI Agent*:
 |---|---|
 | [`docs/PRD.md`](./docs/PRD.md) | Product Requirements — vision, personas, requirements, scope, milestones, risks |
 | [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | Technology selection & system design — C4 views, components, data model, protocol, deployment |
-| [`docs/adr/`](./docs/adr) | Architecture Decision Records (language, datastore, runtime, frontend, sandbox, scheduler, embeddings, deployment) |
+| [`docs/adr/`](./docs/adr) | Architecture Decision Records (language, datastore, runtime, frontend, sandbox, scheduler, embeddings, deployment, **product form**) |
 | [`docs/DESIGN-REVIEW.md`](./docs/DESIGN-REVIEW.md) | Critical design review — gaps, risks, resolved open questions, invariant acceptance checklist |
 | [`docs/IMPLEMENTATION-PLAN.md`](./docs/IMPLEMENTATION-PLAN.md) | Phased plan (M0–M4) — workstreams, sequencing, exit criteria |
 | [`docs/diagrams/`](./docs/diagrams) | Mermaid architecture diagrams — C4, agent loop, sequences, ER, deployment |
 
 ## What Keel will do (highlights)
-- **One core, many surfaces** — CLI · web app · IM gateway (QQ/Telegram/WeCom…)
-- **Real tools** — file ops, `bash`/`powershell`, web fetch/scrape/search — sandboxed, permissioned, run in parallel
+Primary form (see [ADR-0009](./docs/adr/0009-product-form-and-primary-use-cases.md)): a **server-side, connected conversational assistant** — for teams/IM and for personal use — where an *agent is a scoped entity* (a group agent and your personal agent are the same thing with different scope).
+- **One core, many surfaces** — **web app + IM gateway** (QQ/Telegram/WeCom…) primary · CLI for admin/power-use
+- **Connectors** — email · calendar · docs · knowledge via OAuth, **scoped per agent**, with per-scope data isolation
+- **Real tools** — web fetch/scrape/search, file ops, `bash`/`powershell` — sandboxed, permissioned, parallel (execution environment is pluggable)
 - **Multi-agent** — sub-agents as tools, shared budgets, isolation
 - **Memory** — editable memory blocks + session persistence + hybrid (full-text + semantic) session search
 - **Autonomy** — cron/interval scheduled tasks with at-most-once guarantees

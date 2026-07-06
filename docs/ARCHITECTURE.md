@@ -7,7 +7,7 @@
 
 ## 1. Design goals & guiding principles
 
-Keel is a **general-purpose agent runtime** with a *narrow-waist* core and many surfaces. The architecture is driven by five commitments:
+Keel is a **general-purpose agent runtime** with a *narrow-waist* core and many surfaces. Its **primary product form is a server-side, connected conversational assistant** (team/IM + personal) — see **§1.1** and **[ADR-0009](./adr/0009-product-form-and-primary-use-cases.md)**. The architecture is driven by five commitments:
 
 1. **One core, many surfaces [P2].** `keel-core` is a pure library with no UI/transport dependencies. CLI, web, and IM are clients of one protocol.
 2. **One tool interface [P3].** Built-ins, MCP tools, skills, and sub-agents all present to the loop as "a callable with a JSON schema."
@@ -16,6 +16,18 @@ Keel is a **general-purpose agent runtime** with a *narrow-waist* core and many 
 5. **Fail closed on trust, degrade on ops [P5].** Permission/security errors deny; provider/tool errors recover.
 
 Non-negotiable invariants (acceptance-tested): bounded loops with named termination; persist-before-first-model-call; stop-reason-gated tool execution; byte-stable prompt prefix; two-level sandbox; shared budget across the delegation tree; import ≠ trust.
+
+### 1.1 Product form & primary use cases [ADR-0009]
+The core is general-purpose, but v1 is shaped by two primary use cases:
+- **Team / IM assistant** — a shared assistant in group chats + a team web app (Q&A, look-ups, drafting). *Server-side; untrusted input.*
+- **Personal connected assistant** — works with **my** email/calendar/docs/knowledge. That data lives in **cloud accounts via OAuth**, so it is *also server-side*; only "my local files" needs local execution.
+
+Consequences that shape this whole document:
+1. **Form = server-primary.** Tool execution sits behind a **pluggable `ExecutionEnvironment`** (§6.4); v1 ships the sandbox-container backend, and a **`LocalDaemon`** backend (local files / desktop) is **deferred**. The "server vs personal-machine" question is thus a *backend* choice, not an architecture fork.
+2. **An agent is a scoped, persisted entity** (§10): a *group agent* and a *personal agent* are one abstraction with different scope/memory/connectors/trust.
+3. **Connectors are a first-class subsystem** (§6.5): email/calendar/docs/IM via OAuth, scoped per agent.
+4. **Center of gravity = connectors + memory + retrieval + messaging**; file/shell/code are secondary. **Web + IM are the primary surfaces**; CLI is admin/power-user.
+5. **Data isolation is core**, and the headline threat is **cross-scope data exfiltration / confused deputy** (§13), ranked above sandbox escape.
 
 ---
 
@@ -115,6 +127,7 @@ keel-core
 ├─ agents/        AgentSpec, sub-agent delegation (as tool), shared budget, roles
 ├─ skills/        SKILL.md loader, progressive disclosure (inline/fork)
 ├─ mcp/           MCP client (stdio + HTTP/SSE), tool import, allow-list
+├─ connectors/    email · calendar · contacts · docs · IM — OAuth, per-scope, surfaced as scoped tools
 ├─ discovery/     tool_search (agentic discovery) over registry+MCP+skills
 ├─ permissions/   PermissionEngine (allow/ask/deny), approval bus protocol
 ├─ observability/ tracer (OTel), scores, cost accounting
@@ -192,8 +205,10 @@ emit results in ASSISTANT SOURCE ORDER (deterministic transcript)
 ```
 
 ### 6.3 Built-in toolbox (v1)
+**Emphasis [ADR-0009]:** for the primary use cases the headline tools are **connectors + retrieval + messaging**; file/shell/code are secondary (kept, not the star).
 | Group | Tools |
 |---|---|
+| Connectors | `email_*`, `calendar_*`, `contacts_*`, `docs_*`, `kb_search` — via the Connectors subsystem (§6.5), **scoped per agent** |
 | Files | `read`, `write`, `edit` (str/patch), `ls`, `glob`, `grep` (ripgrep) |
 | Exec | `bash`, `powershell` (sandboxed, timeout, truncation), `background_process` |
 | Web | `web_fetch` (→clean md), `web_scrape` (css/xpath, optional JS render), `web_search` |
@@ -201,6 +216,23 @@ emit results in ASSISTANT SOURCE ORDER (deterministic transcript)
 | Data | `http_request`, `sql_query` (P1) |
 
 - Shell/web-scrape/JS-render tools run in **keel-sandbox** (least privilege). Web tools use an **SSRF-safe** fetcher (block loopback/link-local/private ranges).
+
+### 6.4 Execution environments (pluggable) [ADR-0009]
+Tool execution is behind an **`ExecutionEnvironment`** interface (à la Hermes `BaseEnvironment`), so *where* a `bash`/file tool runs is a swappable backend, not baked into the loop:
+```
+ToolExecutor ──▶ ExecutionEnvironment
+                 ├─ SandboxContainer  → server-side keel-sandbox (v1 default; safest)
+                 ├─ LocalDaemon       → a light executor the user runs on their machine (deferred; unlocks local-files/desktop)
+                 └─ InProcess         → lite mode (reduced isolation)
+```
+This is what demotes the "server vs personal-machine" fork to a backend choice. v1 ships `SandboxContainer` (+ `InProcess` for `lite`); `LocalDaemon` is a later milestone with its **own** fail-closed permission gate (untrusted input must never drive a local executor).
+
+### 6.5 Connectors (`keel-core/connectors`) [ADR-0009]
+The first-class integration subsystem for personal data + messaging — the headline capability for the primary use cases.
+- **Kinds (v1 targets):** email (Gmail / MS Graph), calendar, contacts, docs/notes (Google Drive / OneDrive / Notion), knowledge bases (RAG, §8), and IM (§12.3). Implemented natively or via curated MCP servers, presented to the loop as **scoped tools** (`email_*`, `calendar_*`, …).
+- **OAuth token management:** per-user, per-connector OAuth with refresh; tokens stored via the secrets envelope (§13, G9); a connector is **granted to a specific agent scope** — never ambient.
+- **Per-scope data isolation:** a connector attached to a *personal* agent is invisible to a *group* agent (§10, §13). Retrieval from a connector is logged/auditable.
+- **Safety:** connector content is **untrusted input** (an email can carry injection); it is scanned (§13, G6) and cannot silently trigger destructive tools or cross-scope reads.
 
 ---
 
@@ -272,7 +304,8 @@ memory.updated · turn.ended · run.ended{reason} · error · lifecycle{phase}
 
 ---
 
-## 10. Multi-agent (`keel-core/agents`)
+## 10. Agents, scope & multi-agent (`keel-core/agents`)
+- **An agent is a scoped, persisted entity [ADR-0009]:** persona + memory + toolset + **connectors** + permission boundary + provider + trust level. A **group agent** (chat-scoped, shared memory, safe toolset, no personal connectors, untrusted input) and a **personal agent** (user-scoped, private memory, the user's connectors, trusted) are the *same* abstraction with a different **scope**. **Per-scope data isolation is enforced:** a group agent can never read a personal agent's connectors, memory, or tokens.
 - **Sub-agent = tool** (`task`): parent calls it; child runs an isolated loop (fresh context, reduced toolset, own workspace); parent gets the final summary [pattern].
 - **Shared budget** across the whole delegation tree (Redis-tracked); bounded `max_depth`; **leaf** vs **orchestrator** roles (leaf can't delegate). Foreground (blocking) and background (job) delegation; child cost rolls up.
 - **Topologies:** supervisor + handoff (`transfer_to_<agent>`) v1; round-robin/groups P1. Coordination via shared task lists / optional shared memory blocks (kept small). Handoffs are bounded by a **max-handoff cap** and **A→B→A cycle detection** in the delegation tree, alongside `max_depth` [G13].
@@ -286,6 +319,8 @@ memory.updated · turn.ended · run.ended{reason} · error · lifecycle{phase}
 ---
 
 ## 12. Surfaces
+
+**Priority [ADR-0009]:** **Web + IM are the primary surfaces**; the **CLI** is an admin/power-user surface (and the `lite` embedded mode); a **desktop shell / local-file access** is deferred behind the `LocalDaemon` execution backend (§6.4).
 
 ### 12.1 CLI (`keel-cli`)
 Typer + Rich/Textual. Thin client of the API: interactive TUI (streaming, approvals, `/slash`), one-shot (`keel "…"`), headless (`--json`). An **embedded mode** (import `keel-core` directly, SQLite `lite`) for offline single-user use.
@@ -308,6 +343,7 @@ React + Vite + TS + Tailwind + shadcn/ui + TanStack Query + Zustand. Chat with s
 - **Egress/paths:** SSRF-safe fetch; workspace-only file access; deny `.git`/`.env`/secrets; artifact path-traversal guard.
 - **Secrets [G9]:** app-level **envelope encryption** — a per-record data key encrypts each secret and is wrapped by a **master key** sourced from env/Docker secret (v1), pluggable to Vault/KMS; keys never ship in images and a rotation procedure is documented. `connections`/`config` hold secret *refs*; values are redacted in logs & telemetry; `.env` is secrets-only.
 - **Trust-gating:** untrusted IM/web content confined to a safe toolset; project skills/MCP gated on trust; **import ≠ trust** (MCP allow-list) [P6].
+- **Scope isolation & confused-deputy defense [ADR-0009]:** per-agent/scope data boundaries — a group/untrusted agent can never access a personal agent's connectors, memory, or tokens. **Cross-scope data exfiltration** (injection coercing an agent to leak private data) is the **headline threat** for the primary use cases, ranked *above* sandbox escape. Personal-agent connectors require explicit per-connector grants; a personal agent's outbound actions (send email, post) pass approval and are audited; co-hosting a public group bot with a private personal agent is allowed only under hard scope isolation (separate instances recommended for the most sensitive use).
 - **Injection scanning [G6]:** tool/skill/MCP **descriptions and imported instructions** are scanned for prompt-injection at import/discovery time; a hit **quarantines** the item (excluded from the prompt) pending review.
 - **AuthN/Z:** OAuth2/OIDC + hashed API keys; RBAC roles; audit log of tool actions & approvals.
 - **Data governance [G4]:** per-agent/session **retention** windows; **PII redaction** in traces/telemetry (extends secret redaction); **right-to-erasure** via event **tombstones** + projection rebuild + vector purge; a documented data map (what is stored where) for self-hosted (incl. EU) deployments.
@@ -405,13 +441,14 @@ OneBot → adapter → normalize → InboundEvent(session_key) → wake rules/ra
 | [0006](./adr/0006-scheduler-and-queue.md) | arq queue + custom leader-elected at-most-once scheduler |
 | [0007](./adr/0007-embeddings-and-rerank.md) | Local `bge-m3` embeddings default; hosted via gateway; rerank optional |
 | [0008](./adr/0008-deployment-profiles-and-first-run.md) | `lite`/`dev`/`full`/`demo` profiles; MinIO & Ollama gating; first-run |
+| [0009](./adr/0009-product-form-and-primary-use-cases.md) | Server-primary connected assistant; agent = scoped entity; Connectors first-class; pluggable execution |
 
 ---
 
 ## 19. Phasing (maps to PRD milestones)
 - **M0 Foundations:** monorepo skeleton, `keel-core` interfaces, compose `dev`, CI, migrations.
-- **M1 MVP:** loop + providers + tools(sandbox,permissions) + sessions+search + memory + CLI + web + QQ + skills + MCP + discovery + tracing.
-- **M2 Autonomy & scale:** scheduler + jobs + worker scale-out + failover/routing + admin dashboards + RBAC + more adapters.
+- **M1 MVP:** loop + providers + tools(sandbox,permissions) + **connectors (email/calendar/docs via OAuth)** + **agent scope & per-scope data isolation** + sessions+search + memory + **web + IM (QQ/OneBot)** + CLI (admin) + skills + MCP + discovery + tracing. *(Local files/desktop deferred behind `LocalDaemon`.)*
+- **M2 Autonomy & scale:** scheduler + jobs + worker scale-out + failover/routing + admin dashboards + RBAC + **more connectors + WeCom/Telegram adapters**.
 - **M3 Knowledge & quality:** RAG/KB + consolidation + evals + plugin SDK + desktop shell.
 - **M4 Hardening:** security review, perf, multi-tenant groundwork, docs/examples.
 
