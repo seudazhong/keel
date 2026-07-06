@@ -16,6 +16,8 @@ MODULES = [
     "keel_core.agents",
     "keel_core.protocols",
     "keel_core.api",
+    "keel_core.testing",
+    "keel_core.testing.record_replay",
     "keel_server",
     "keel_server.app",
     "keel_server.api.v1",
