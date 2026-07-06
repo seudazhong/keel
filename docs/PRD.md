@@ -200,6 +200,7 @@ Priorities: **P0** = MVP (must), **P1** = fast-follow (should), **P2** = later (
 | NFR-10 | **Cost control** | Per-agent/session budgets; model routing; cost visible in UI; hard caps. |
 | NFR-11 | **Licensing** | Permissive OSS (Apache-2.0); dependencies vetted for compatible licenses. |
 | NFR-12 | **Testability** | Deterministic record/replay of provider calls; unit + integration + e2e; eval harness. |
+| NFR-13 | **Privacy & retention** | Per-agent/session retention windows; PII redaction in traces/telemetry; right-to-erasure (event tombstone + projection rebuild + vector purge); documented data map. |
 
 ---
 
@@ -269,4 +270,4 @@ Visual no-code workflow builder; hosted multi-tenant SaaS + billing; model train
 4. Should the `lite` single-binary/SQLite mode be a first-class target or dev-only?
 5. Do we ship a default local model (Ollama) container for zero-API-key first-run?
 
-*(These are resolved or tracked in [`ARCHITECTURE.md`](./ARCHITECTURE.md) and the ADRs.)*
+**Resolutions (from the design review):** Q1 → local `bge-m3` default (ADR-0007); Q2 → React + Vite (ADR-0004); Q3 → MinIO profile-gated (ADR-0008); Q4 → `lite` is first-class & CI-tested (ADR-0008); Q5 → Ollama via the `demo` overlay, off by default (ADR-0008). See [`DESIGN-REVIEW.md`](./DESIGN-REVIEW.md) §4 and [`ARCHITECTURE.md`](./ARCHITECTURE.md) §20.

@@ -160,7 +160,9 @@ run(session, input):
 - **Routing:** strategy chain (explicit override → task classifier → default); model *slots* (`main/fast/reasoning/vision/embed/rerank`).
 - **Failover:** classify (`rate_limit/overloaded/auth/context_overflow/server_error/timeout/…`) → bounded recovery; credential pools; process-wide rate-limit guard in Redis; failover reconciles identity.
 - **Caching:** compute a stable `prompt_cache_key`; pass provider cache controls (e.g., Anthropic `cache_control`).
-- Embedding + rerank go through the same gateway for memory/RAG.
+- Embedding + rerank go through the same gateway for memory/RAG; embedding collections are `(model, dim)`-pinned (§8.2, ADR-0007).
+- **Rate limiting [G10]:** token-bucket limiters keyed by `{provider-credential}`, `{session}`, and `{chat}` in Redis; the provider-side guard reconciles with `429`/`Retry-After` headers; IM per-chat limits reuse the same primitive.
+- **Cost control [G7]:** the gateway **reserves** an estimated token/cost budget in Redis *before* a call (hard-cap on reserved) and **reconciles** to authoritative provider usage *after* the run into Postgres/Langfuse; both *reserved* and *settled* cost are surfaced (the shared budget in §10 spends the reservation).
 - **Local models:** an optional `ollama` container gives a zero-API-key first run.
 
 ---
@@ -226,9 +228,12 @@ fuse     = RRF(lexical_rank, semantic_rank) · temporal_decay · optional rerank
 ```
 Session search and archival search share this pipeline. CJK handled via trigram + multilingual embeddings.
 
+**Embedding pinning [G8, ADR-0007]:** every `passage`/`kb_chunk` records its `embedding_model` + `dim`; a collection is pinned to a single `(model, dim)`, and **cross-model KNN is refused**. Switching the embedding model is a **re-embed migration job**, never a silent config change.
+
 ### 8.3 State / event sourcing [pattern]
 - **Append-only `events`** are the source of truth; **projectors** fold them into read models (`messages`, `parts`, `session` rollups, `todos`). Gives resume, replay, live streaming, and audit from one primitive.
 - **Durable prompt admission:** `session_input` row written before execution; a coordinator promotes it; crash → pending & retryable.
+- **Event schema evolution [G3]:** each event carries a `version` per `type`; an **upcaster registry** migrates old payloads to the current shape on read, so **projections rebuild from v0** and replay never breaks on drift. Event shapes are contract-tested old→new; upcasters are append-only.
 
 ---
 
@@ -239,11 +244,11 @@ Session search and archival search share this pipeline. CJK handled via trigram 
 users(id, email, role, ...)                      api_keys(id, hash, scopes, ...)
 agents(id, name, persona, model_slots, tools_policy, memory_config, ...)
 sessions(id, agent_id, key, title, status, token/cost rollups, created_at, ...)
-events(id, session_id, seq, type, payload jsonb, ts)          -- append-only, (session_id,seq) unique
+events(id, session_id, seq, type, version, payload jsonb, ts)          -- append-only, (session_id,seq) unique
 messages(id, session_id, seq, role, ...)  parts(id, message_id, kind, content jsonb, ...)  -- projections
 memory_blocks(id, agent_id, label, value, limit, read_only, version)  block_history(...)
-passages(id, scope, text, embedding vector, tags, ts)         -- pgvector (archival/KB)
-kb_docs(...) kb_chunks(id, doc_id, text, embedding vector, ...)
+passages(id, scope, text, embedding vector, embedding_model, dim, tags, ts)         -- pgvector (archival/KB)
+kb_docs(...) kb_chunks(id, doc_id, text, embedding vector, embedding_model, dim, ...)
 skills(id, name, description, path, frontmatter jsonb)
 mcp_servers(id, name, transport, url/cmd, allow_list, auth_ref)
 tools_cache(agent_id, name, schema jsonb, source)             -- discovery cache
@@ -255,7 +260,7 @@ connections(id, kind=provider, config jsonb, secret_ref)      config(key, value,
 - **Traces/scores** are emitted to **Langfuse** (source of truth for eval); a thin local mirror for admin dashboards is optional.
 
 ### 9.2 API & event protocol
-- **REST** (OpenAPI-generated SDK): CRUD for agents, sessions, messages, memory, skills, mcp, schedules, connections, config, users.
+- **REST** (OpenAPI-generated SDK) under a **`/v1`** prefix; **additive-only** evolution with a documented deprecation window; CI regenerates the SDK and diffs it to catch breaking changes [G14]. CRUD for agents, sessions, messages, memory, skills, mcp, schedules, connections, config, users.
 - **Run stream (SSE)** `GET /sessions/{id}/events?after=` — replayable per-session; **WebSocket** `/sessions/{id}/ws` for bidirectional control (steer/interrupt/approval).
 - **Event vocabulary (typed):**
 ```
@@ -270,7 +275,7 @@ memory.updated · turn.ended · run.ended{reason} · error · lifecycle{phase}
 ## 10. Multi-agent (`keel-core/agents`)
 - **Sub-agent = tool** (`task`): parent calls it; child runs an isolated loop (fresh context, reduced toolset, own workspace); parent gets the final summary [pattern].
 - **Shared budget** across the whole delegation tree (Redis-tracked); bounded `max_depth`; **leaf** vs **orchestrator** roles (leaf can't delegate). Foreground (blocking) and background (job) delegation; child cost rolls up.
-- **Topologies:** supervisor + handoff (`transfer_to_<agent>`) v1; round-robin/groups P1. Coordination via shared task lists / optional shared memory blocks (kept small).
+- **Topologies:** supervisor + handoff (`transfer_to_<agent>`) v1; round-robin/groups P1. Coordination via shared task lists / optional shared memory blocks (kept small). Handoffs are bounded by a **max-handoff cap** and **A→B→A cycle detection** in the delegation tree, alongside `max_depth` [G13].
 
 ---
 
@@ -288,7 +293,8 @@ Typer + Rich/Textual. Thin client of the API: interactive TUI (streaming, approv
 ### 12.2 Web app (`web/`)
 React + Vite + TS + Tailwind + shadcn/ui + TanStack Query + Zustand. Chat with streaming + tool/step timeline; approvals; session list & **search**; memory/skills/mcp/schedule/connection admin; run **traces** (embeds Langfuse or a local view). Served by nginx, proxying `keel-server`. A **Tauri** desktop shell (P2) reuses the same web bundle.
 
-### 12.3 IM gateway (`adapters/`, hosted by `keel-server` or standalone `keel-gateway`)
+### 12.3 IM gateway (`adapters/`)
+- **Topology [G11]:** adapters are **hosted in `keel-server`** by default (all profiles, as the container diagram shows); a standalone **`keel-gateway`** container is an **opt-in scale-out split** for high-volume channels.
 - **Adapter interface** normalizes every platform to a unified `InboundEvent` + `MessageChain` and renders replies back [pattern: normalize-early].
 - v1: **OneBot v11 (QQ)** (connect to NapCat/Lagrange over WS), **Telegram** (aiogram). P1: **WeCom (企业微信)** official API (compliant WeChat family), **Discord/Slack**; personal-WeChat bridges are opt-in/best-effort with ToS warnings.
 - Per-chat **UMO-style session key** (`platform:type:id`) drives config/persona/memory/rate-limit/provider; **wake rules** (@mention/prefix/keyword), whitelist, per-chat rate limits; **untrusted input → constrained safe toolset** [P5/P6].
@@ -297,12 +303,14 @@ React + Vite + TS + Tailwind + shadcn/ui + TanStack Query + Zustand. Chat with s
 
 ## 13. Security architecture
 - **Permission engine [P5]:** rules → `allow/ask/deny`; last-match wins; `deny > ask > allow`; default ask; layered (global → agent → session → sandbox). Denied tools stripped pre-prompt.
-- **Approval protocol:** correlation-ID request/response over the event bus; identical on CLI/web/IM; modes `plan/default/auto` (auto requires sandbox).
+- **Approval protocol [G5]:** approvals are **persisted as `events`** (a durable pending store), not only Redis pub/sub, and carry a correlation ID; identical on CLI/web/IM. If no surface responds within a **TTL**, the request **fails closed (deny)**; on resume, pending approvals are re-surfaced. Modes `plan/default/auto` (auto requires sandbox).
 - **Two-level sandbox [P5]:** process/container isolation (`keel-sandbox`: read-only root, tmpfs, dropped caps, network-deny default, workspace bind, CPU/mem limits) + per-command policy. Advanced: per-session ephemeral containers or gVisor.
 - **Egress/paths:** SSRF-safe fetch; workspace-only file access; deny `.git`/`.env`/secrets; artifact path-traversal guard.
-- **Secrets:** `connections`/`config` secret refs resolved from env/Docker secrets/keystore; encrypted at rest; redacted in logs & telemetry; `.env` is secrets-only.
+- **Secrets [G9]:** app-level **envelope encryption** — a per-record data key encrypts each secret and is wrapped by a **master key** sourced from env/Docker secret (v1), pluggable to Vault/KMS; keys never ship in images and a rotation procedure is documented. `connections`/`config` hold secret *refs*; values are redacted in logs & telemetry; `.env` is secrets-only.
 - **Trust-gating:** untrusted IM/web content confined to a safe toolset; project skills/MCP gated on trust; **import ≠ trust** (MCP allow-list) [P6].
+- **Injection scanning [G6]:** tool/skill/MCP **descriptions and imported instructions** are scanned for prompt-injection at import/discovery time; a hit **quarantines** the item (excluded from the prompt) pending review.
 - **AuthN/Z:** OAuth2/OIDC + hashed API keys; RBAC roles; audit log of tool actions & approvals.
+- **Data governance [G4]:** per-agent/session **retention** windows; **PII redaction** in traces/telemetry (extends secret redaction); **right-to-erasure** via event **tombstones** + projection rebuild + vector purge; a documented data map (what is stored where) for self-hosted (incl. EU) deployments.
 
 ---
 
@@ -382,6 +390,7 @@ OneBot → adapter → normalize → InboundEvent(session_key) → wake rules/ra
 - **i18n:** EN + 简体中文 for UI and system prompts; CJK-safe search (trigram + multilingual embeddings).
 - **Testing [NFR-12]:** provider record/replay for deterministic tests; unit (core), integration (services+DB), e2e (compose), eval harness (task-suite + Langfuse datasets).
 - **Extensibility (footprint ladder [P8]):** capability enters as skill → tool (SDK) → plugin → MCP before touching the core; plugins load with manifest validation + rollback.
+- **Backup / DR [G15]:** the append-only event store is the replay source of truth; `pg_dump` + WAL archiving for Postgres and a mirror for MinIO; an M4 runbook covers restore, exercised by a restore drill in e2e.
 
 ---
 
@@ -405,3 +414,8 @@ OneBot → adapter → normalize → InboundEvent(session_key) → wake rules/ra
 - **M2 Autonomy & scale:** scheduler + jobs + worker scale-out + failover/routing + admin dashboards + RBAC + more adapters.
 - **M3 Knowledge & quality:** RAG/KB + consolidation + evals + plugin SDK + desktop shell.
 - **M4 Hardening:** security review, perf, multi-tenant groundwork, docs/examples.
+
+---
+
+## 20. Design-review convergence
+This spec is reconciled with [`DESIGN-REVIEW.md`](./DESIGN-REVIEW.md). **Folded into the design now** (cheap to decide, expensive to retrofit): **G3** event versioning/upcasters (§8.3, §9.1), **G5** durable fail-closed approvals (§13), **G6** injection scanning (§13), **G7** cost reserve/reconcile (§5), **G8** embedding `(model,dim)` pinning (§5, §8.2, §9.1, ADR-0007), **G9** secret envelope encryption (§13), **G10** rate-limit design (§5), **G11** gateway topology default (§12.3), **G13** handoff cycle cap (§10), **G14** `/v1` + additive API (§9.2), **G4** data governance (§13), **G15** backup/DR (§17). **Scheduled** into the milestone that first needs them per the [implementation plan](./IMPLEMENTATION-PLAN.md): G7/G10 → M2; G4 build-out → M3; G6/G9 hardening & G15 runbook → M4. Open questions **Q1/Q3/Q4/Q5** are resolved by ADR-0007/0008 (Q2 by ADR-0004). The review's §5 invariant checklist is the acceptance backbone for M0/M1.
