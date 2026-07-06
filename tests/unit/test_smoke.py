@@ -19,6 +19,7 @@ MODULES = [
     "keel_core.context",
     "keel_core.scope",
     "keel_core.eventbus",
+    "keel_core.observability",
     "keel_core.testing",
     "keel_core.testing.record_replay",
     "keel_server",
