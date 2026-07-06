@@ -32,7 +32,17 @@ flowchart TB
         m2["seed data"]
     end
 
+    subgraph ext["External — per-scope OAuth"]
+        e1["Gmail · MS Graph<br/>Calendar · Notion"]
+    end
+
+    subgraph future["Deferred — pluggable execution"]
+        fd1["LocalDaemon<br/>user machine · local files"]
+    end
+
     lite -.->|"scale up"| dev
     dev -.->|"add services"| full
     full -.->|"zero-key demo"| demo
+    full -->|"OAuth connectors"| ext
+    full -.->|"local exec (later)"| future
 ```

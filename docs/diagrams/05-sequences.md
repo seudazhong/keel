@@ -99,3 +99,27 @@ sequenceDiagram
     W-->>AD: events to MessageChain
     AD->>OB: reply
 ```
+
+## E. Personal connected assistant (UC-B — proactive digest + send) [ADR-0009]
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SC as keel-scheduler
+    participant W as keel-worker (personal · user:ivy)
+    participant CN as Connector (Gmail, granted to scope)
+    participant DB as Postgres (tokens · audit)
+    participant S as Surface (Web / DM)
+
+    Note over W,CN: scope=user:ivy — group agents cannot see these connectors/tokens
+    SC->>W: 09:00 scheduled run (at-most-once)
+    W->>DB: load scoped connector grant + token (envelope-decrypt)
+    W->>CN: fetch overnight mail (read, scoped)
+    CN-->>W: messages (untrusted content → injection-scanned)
+    W->>W: summarize + draft replies
+    W->>S: approval.requested (send draft?)
+    S-->>W: approve
+    W->>CN: send email (outbound action)
+    W->>DB: audit_log (connector action)
+    W->>S: digest posted
+```

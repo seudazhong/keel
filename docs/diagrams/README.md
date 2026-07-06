@@ -1,6 +1,6 @@
 # Keel — Diagrams
 
-Source diagrams for the architecture, authored in **Mermaid** (renders natively on GitHub). They visualise what `ARCHITECTURE.md` describes in prose/ASCII, and incorporate the accepted refinements from `DESIGN-REVIEW.md` (event `version`, embedding `(model, dim)` pinning, durable + fail-closed approvals).
+Source diagrams for the architecture, authored in **Mermaid** (renders natively on GitHub). They visualise what `ARCHITECTURE.md` describes in prose/ASCII, and incorporate the accepted refinements from `DESIGN-REVIEW.md` (event `version`, embedding `(model, dim)` pinning, durable + fail-closed approvals) and the **ADR-0009 pivot** (scoped agents, first-class connectors, pluggable execution).
 
 | # | Diagram | View |
 |---|---|---|
@@ -8,8 +8,9 @@ Source diagrams for the architecture, authored in **Mermaid** (renders natively 
 | 02 | Containers (C4 L2) | [`02-containers.md`](./02-containers.md) |
 | 03 | `keel-core` components (C4 L3) | [`03-core-components.md`](./03-core-components.md) |
 | 04 | Agent runtime — turn lifecycle | [`04-agent-loop.md`](./04-agent-loop.md) |
-| 05 | Key sequences (run · approval · schedule · IM) | [`05-sequences.md`](./05-sequences.md) |
+| 05 | Key sequences (run · approval · schedule · IM · personal) | [`05-sequences.md`](./05-sequences.md) |
 | 06 | Data model (ER) | [`06-data-model.md`](./06-data-model.md) |
 | 07 | Deployment profiles | [`07-deployment.md`](./07-deployment.md) |
+| 08 | Agent scope, connectors & isolation | [`08-scope-and-connectors.md`](./08-scope-and-connectors.md) |
 
 > Notation: C4 levels are drawn with plain `flowchart` (not the experimental `C4*` syntax) for portable rendering. Cylinders `[( )]` are datastores; dashed edges denote progression/optional paths.

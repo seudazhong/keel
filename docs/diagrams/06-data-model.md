@@ -1,6 +1,6 @@
 # 06 — Data model (core tables)
 
-Abbreviated Postgres schema. `events` is the append-only source of truth; `messages`/`parts` are projections. Additions from `DESIGN-REVIEW.md`: `events.version` (G3, schema evolution) and `passages.embedding_model`/`dim` (G8, model pinning).
+Abbreviated Postgres schema. `events` is the append-only source of truth; `messages`/`parts` are projections. Additions: `events.version` (G3, schema evolution), `passages.embedding_model`/`dim` (G8, model pinning), and the **scope / connector** model (ADR-0009) — agents are scoped entities, connectors are granted per scope, and `audit_log` records connector actions.
 
 ```mermaid
 erDiagram
@@ -9,8 +9,11 @@ erDiagram
     agents ||--o{ sessions : runs
     agents ||--o{ memory_blocks : has
     agents ||--o{ schedules : owns
+    agents ||--o{ connector_grants : grants
+    connectors ||--o{ connector_grants : granted_via
     sessions ||--o{ events : appends
     sessions ||--o{ messages : projects
+    sessions ||--o{ audit_log : records
     messages ||--o{ parts : contains
     memory_blocks ||--o{ block_history : versions
     schedules ||--o{ jobs : enqueues
@@ -30,6 +33,7 @@ erDiagram
     agents {
         uuid id PK
         string name
+        string scope
         jsonb model_slots
         jsonb tools_policy
         jsonb memory_config
@@ -41,6 +45,26 @@ erDiagram
         string status
         bigint tokens
         numeric cost
+    }
+    connectors {
+        uuid id PK
+        string kind
+        string scope
+        string token_ref
+        string status
+    }
+    connector_grants {
+        uuid id PK
+        uuid agent_id FK
+        uuid connector_id FK
+    }
+    audit_log {
+        uuid id PK
+        uuid session_id FK
+        string actor
+        string action
+        string target
+        timestamp ts
     }
     events {
         uuid id PK
