@@ -45,6 +45,7 @@ MODULES = [
     "keel_sandbox.policy",
     "keel_cli",
     "keel_cli.main",
+    "keel_cli.runner",
     "keel_sdk",
 ]
 

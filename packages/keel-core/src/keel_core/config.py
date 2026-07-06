@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     app_env: str = "dev"
     log_level: str = "INFO"
 
+    # Default model surfaces use when none is given (LiteLLM model id).
+    default_model: str = "gpt-4o-mini"
+
     # psycopg3 driver works for both sync (Alembic) and async (app) engines.
     database_url: str = "postgresql+psycopg://keel:keel@localhost:5432/keel"
     redis_url: str = "redis://localhost:6379/0"

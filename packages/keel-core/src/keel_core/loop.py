@@ -19,7 +19,7 @@ Load-bearing invariants proven here:
 from __future__ import annotations
 
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -51,6 +51,36 @@ from keel_core.types import (
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+# Live-observation seams: an in-process surface (CLI now, IM adapter later) renders
+# the canonical event stream without polling. Both are optional and side-effect-only.
+EventObserver = Callable[[Event], None]
+DeltaObserver = Callable[[str], None]
+
+
+class _ObservingStore:
+    """Decorate an :class:`EventStore` to notify an observer after each append.
+
+    Reads delegate unchanged; the observer fires only on a *successful* append, so
+    a surface sees exactly the durable, seq-assigned events (never a lost write).
+    Observation is **best-effort**: the event is already durable when the observer
+    runs, so an observer error is swallowed rather than aborting the run.
+    """
+
+    def __init__(self, inner: EventStore, observer: EventObserver) -> None:
+        self._inner = inner
+        self._observer = observer
+
+    async def append(self, event: Event) -> None:
+        await self._inner.append(event)
+        try:
+            self._observer(event)
+        except Exception:  # noqa: BLE001 - a live observer must never crash a durable run
+            pass
+
+    def read(self, session_id: SessionId, after: int | None = None) -> AsyncIterator[Event]:
+        return self._inner.read(session_id, after)
 
 
 # Library default: the caller (server/surface) supplies a real policy engine.
@@ -136,7 +166,10 @@ async def _build_request(
 
 
 async def _call_provider(
-    provider: ProviderGateway, request: ProviderRequest, max_retries: int
+    provider: ProviderGateway,
+    request: ProviderRequest,
+    max_retries: int,
+    on_delta: DeltaObserver | None = None,
 ) -> _TurnOutput:
     attempt = 0
     while True:
@@ -147,6 +180,11 @@ async def _call_provider(
             async for chunk in provider.stream(request):
                 if chunk.delta:
                     text_parts.append(chunk.delta)
+                    if on_delta is not None:
+                        try:
+                            on_delta(chunk.delta)
+                        except Exception:  # noqa: BLE001 - live delta observer is best-effort
+                            pass
                 if chunk.tool_call is not None:
                     tool_calls.append(chunk.tool_call)
                 if chunk.finish_reason is not None:
@@ -221,13 +259,22 @@ async def run(
     interrupt: Callable[[], bool] | None = None,
     permissions: PermissionEngine | None = None,
     approve: ApproveFn | None = None,
+    on_event: EventObserver | None = None,
+    on_delta: DeltaObserver | None = None,
 ) -> RunResult:
-    """Execute the agent loop until a named termination and return the result."""
+    """Execute the agent loop until a named termination and return the result.
+
+    ``on_event``/``on_delta`` are optional live-observation seams: ``on_event`` fires
+    for every persisted event (in seq order) and ``on_delta`` for each streamed text
+    delta, letting a surface render the run live without polling the store.
+    """
     registry = registry or ToolRegistry()
     budget = budget or RunBudget(
         max_iterations=agent.max_iterations, token_budget=agent.token_budget
     )
     permissions = permissions or _ALLOW_ALL
+    if on_event is not None:
+        store = _ObservingStore(store, on_event)
     scope_id = agent.scope.id
     trust = agent.scope.trust
     run_id: RunId = uuid.uuid4().hex
@@ -255,7 +302,7 @@ async def run(
         request = await _build_request(agent, store, session_id)
 
         try:
-            turn = await _call_provider(provider, request, budget.max_retries)
+            turn = await _call_provider(provider, request, budget.max_retries, on_delta)
         except KeelError:
             reason = StopReason.error
             break

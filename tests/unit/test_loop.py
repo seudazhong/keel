@@ -320,3 +320,74 @@ async def test_loop_permission_gate_blocks_tool() -> None:
     )
     assert result.reason is StopReason.completed
     assert tool.calls == []  # the permission gate blocked execution inside the loop
+
+
+async def test_on_delta_streams_text_deltas() -> None:
+    store = InMemoryEventStore()
+    provider = ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(delta="Hel"),
+                ProviderChunk(delta="lo", finish_reason=FinishReason.end_turn),
+            ]
+        ]
+    )
+    deltas: list[str] = []
+    await admit(store, "s1", "u:1", "hi")
+    await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=provider,
+        on_delta=deltas.append,
+    )
+    assert deltas == ["Hel", "lo"]  # tokens surfaced live, in order
+
+
+async def test_on_event_observes_persisted_events_in_order() -> None:
+    store = InMemoryEventStore()
+    provider = ScriptedProviderGateway(
+        [[ProviderChunk(delta="hi", finish_reason=FinishReason.end_turn)]]
+    )
+    seen: list[EventType] = []
+    await admit(store, "s1", "u:1", "hi")  # before run: observer not yet attached
+    await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=provider,
+        on_event=lambda event: seen.append(event.type),
+    )
+    # The observer sees exactly the run's events (not the pre-run admit), in seq order.
+    assert seen[0] is EventType.run_started
+    assert seen[-1] is EventType.run_ended
+    assert EventType.message_token in seen
+    # Every observed event was durably appended (same set the store holds for the run).
+    stored = [event.type for event in store.snapshot("s1")]
+    assert seen == stored[1:]  # stored[0] is the admitted user message
+
+
+async def test_observer_errors_never_abort_the_run() -> None:
+    store = InMemoryEventStore()
+    provider = ScriptedProviderGateway(
+        [[ProviderChunk(delta="hi", finish_reason=FinishReason.end_turn)]]
+    )
+
+    def boom_event(event: object) -> None:
+        raise RuntimeError("render boom")
+
+    def boom_delta(text: str) -> None:
+        raise RuntimeError("delta boom")
+
+    await admit(store, "s1", "u:1", "hi")
+    result = await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=provider,
+        on_event=boom_event,
+        on_delta=boom_delta,
+    )
+    # Live observation is best-effort: failing observers don't crash or mislabel the run.
+    assert result.reason is StopReason.completed
+    assert _event_types(store, "s1")[-1] == EventType.run_ended  # events still persisted
