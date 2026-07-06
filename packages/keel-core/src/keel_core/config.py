@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     # a Fernet key is derived from it. Empty -> the token store fails closed.
     secret_key: str = ""
 
+    # Langfuse tracing (WS-H). Tracing is enabled only when both keys are set;
+    # otherwise a no-op tracer is used (zero overhead, no network).
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_host: str = "https://cloud.langfuse.com"
+
     # psycopg3 driver works for both sync (Alembic) and async (app) engines.
     database_url: str = "postgresql+psycopg://keel:keel@localhost:5432/keel"
     redis_url: str = "redis://localhost:6379/0"

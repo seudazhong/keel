@@ -74,18 +74,37 @@ class ToolCall(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
 
 
+class Usage(BaseModel):
+    """Token + cost accounting for a provider turn (WS-H)."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    cache_read_tokens: int = 0  # prompt-cache hits (cheaper); ADR-0003 / NFR-8
+    cost_usd: float = 0.0
+
+    def __add__(self, other: Usage) -> Usage:
+        return Usage(
+            prompt_tokens=self.prompt_tokens + other.prompt_tokens,
+            completion_tokens=self.completion_tokens + other.completion_tokens,
+            cache_read_tokens=self.cache_read_tokens + other.cache_read_tokens,
+            cost_usd=self.cost_usd + other.cost_usd,
+        )
+
+
 class ProviderChunk(BaseModel):
     """A streamed provider delta.
 
     ``tool_call`` carries a requested tool invocation; ``finish_reason`` is set on
     the terminal chunk of a turn. The loop opens the tool gate only when
-    ``finish_reason == tool_use`` (stop-reason-gated invariant).
+    ``finish_reason == tool_use`` (stop-reason-gated invariant). ``usage`` is set on
+    a trailing accounting chunk (token + cost totals for the turn).
     """
 
     delta: str = ""
     thinking: str = ""
     tool_call: ToolCall | None = None
     finish_reason: FinishReason | None = None
+    usage: Usage | None = None
 
 
 class PromptBundle(BaseModel):

@@ -30,12 +30,14 @@ from .protocols import (
     ToolCall,
     ToolContext,
     ToolResult,
+    Usage,
 )
 from .providers import LiteLLMGateway
 from .secrets import EnvelopeCipher, SecretsError, cipher_from_settings
 from .state import InMemoryEventStore, PostgresEventStore
 from .tokens import InMemoryTokenStore, PostgresTokenStore
 from .tools import ExecRequest, execute
+from .tracing import LangfuseTracer, NoopTracer, Tracer, make_tracer
 from .types import (
     AgentId,
     ContentTaint,
@@ -83,6 +85,7 @@ __all__ = [
     "ProviderGateway",
     "ProviderRequest",
     "ProviderChunk",
+    "Usage",
     "PermissionEngine",
     "PromptAssembler",
     "PromptBundle",
@@ -108,6 +111,11 @@ __all__ = [
     "cipher_from_settings",
     "InMemoryTokenStore",
     "PostgresTokenStore",
+    # observability (WS-H)
+    "Tracer",
+    "NoopTracer",
+    "LangfuseTracer",
+    "make_tracer",
     # permissions + tool execution
     "Rule",
     "RuleBasedPermissionEngine",

@@ -16,7 +16,7 @@ import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from keel_core.protocols import ProviderChunk, ProviderRequest, ToolCall
+from keel_core.protocols import ProviderChunk, ProviderRequest, ToolCall, Usage
 from keel_core.types import FinishReason
 
 CompletionFn = Callable[..., Awaitable[Any]]
@@ -53,6 +53,32 @@ def _build_tool_call(fragment: dict[str, str]) -> ToolCall:
     return ToolCall(id=fragment["id"] or "call", name=fragment["name"], arguments=arguments)
 
 
+def _compute_cost(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    """Best-effort USD cost for a turn via LiteLLM's price map (0.0 if unknown)."""
+    try:
+        from litellm import cost_per_token
+
+        prompt_cost, completion_cost = cost_per_token(
+            model=model, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
+        )
+        return float(prompt_cost) + float(completion_cost)
+    except Exception:  # noqa: BLE001 - unknown model / offline: accounting is best-effort
+        return 0.0
+
+
+def _extract_usage(model: str, raw: Any) -> Usage:
+    prompt = int(getattr(raw, "prompt_tokens", 0) or 0)
+    completion = int(getattr(raw, "completion_tokens", 0) or 0)
+    details = getattr(raw, "prompt_tokens_details", None)
+    cached = int(getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
+    return Usage(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        cache_read_tokens=cached,
+        cost_usd=_compute_cost(model, prompt, completion),
+    )
+
+
 class LiteLLMGateway:
     """A ``ProviderGateway`` backed by LiteLLM."""
 
@@ -74,6 +100,7 @@ class LiteLLMGateway:
             "model": request.model,
             "messages": request.messages,
             "stream": True,
+            "stream_options": {"include_usage": True},  # token/cost accounting (WS-H)
         }
         if request.tools:
             kwargs["tools"] = request.tools
@@ -82,8 +109,13 @@ class LiteLLMGateway:
 
         response = await self._completion(**kwargs)
         tool_fragments: dict[int, dict[str, str]] = {}
+        usage: Usage | None = None
 
         async for chunk in response:
+            raw_usage = getattr(chunk, "usage", None)
+            if raw_usage is not None:
+                usage = _extract_usage(request.model, raw_usage)
+
             choices = getattr(chunk, "choices", None) or []
             if not choices:
                 continue
@@ -113,3 +145,6 @@ class LiteLLMGateway:
                     yield ProviderChunk(tool_call=_build_tool_call(fragment))
                 tool_fragments.clear()
                 yield ProviderChunk(finish_reason=finish)
+
+        if usage is not None:
+            yield ProviderChunk(usage=usage)

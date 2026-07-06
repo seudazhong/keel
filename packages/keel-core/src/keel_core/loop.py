@@ -37,6 +37,7 @@ from keel_core.protocols import (
     Tool,
     ToolCall,
     ToolContext,
+    Usage,
 )
 from keel_core.tools.executor import ApproveFn, ExecRequest, execute
 from keel_core.types import (
@@ -116,6 +117,7 @@ class RunResult:
     iterations: int = 0
     tokens: int = 0
     error: str | None = None
+    usage: Usage = field(default_factory=Usage)
     events: list[Event] = field(default_factory=list)
 
 
@@ -125,6 +127,7 @@ class _TurnOutput:
     tool_calls: list[ToolCall]
     finish_reason: FinishReason | None
     tokens: int
+    usage: Usage
 
 
 async def _emit(
@@ -180,7 +183,10 @@ async def _call_provider(
             text_parts: list[str] = []
             tool_calls: list[ToolCall] = []
             finish: FinishReason | None = None
+            usage = Usage()
             async for chunk in provider.stream(request):
+                if chunk.usage is not None:
+                    usage = chunk.usage
                 if chunk.delta:
                     text_parts.append(chunk.delta)
                     if on_delta is not None:
@@ -198,8 +204,14 @@ async def _call_provider(
                 if chunk.finish_reason is not None:
                     finish = chunk.finish_reason
             text = "".join(text_parts)
+            # Real completion tokens drive the budget when the provider reports them.
+            tokens = usage.completion_tokens or len(text)
             return _TurnOutput(
-                text=text, tool_calls=tool_calls, finish_reason=finish, tokens=len(text)
+                text=text,
+                tool_calls=tool_calls,
+                finish_reason=finish,
+                tokens=tokens,
+                usage=usage,
             )
         except Exception as exc:  # noqa: BLE001 - bounded retry then fail closed
             status = getattr(exc, "status_code", None)
@@ -324,6 +336,7 @@ async def run(
 
     iterations = 0
     tokens = 0
+    total_usage = Usage()
     error: str | None = None
     reason = StopReason.completed
 
@@ -352,6 +365,7 @@ async def run(
             break
 
         tokens += turn.tokens
+        total_usage = total_usage + turn.usage
         if turn.text:
             await _emit(
                 store,
@@ -359,7 +373,7 @@ async def run(
                 session_id,
                 scope_id,
                 run_id,
-                {"role": "assistant", "text": turn.text},
+                {"role": "assistant", "text": turn.text, "usage": turn.usage.model_dump()},
             )
 
         # Stop-reason gate (I3): tools run ONLY on an explicit tool_use finish.
@@ -391,7 +405,19 @@ async def run(
             reason = StopReason.halted
         break
 
-    await _emit(store, EventType.run_ended, session_id, scope_id, run_id, {"reason": str(reason)})
+    await _emit(
+        store,
+        EventType.run_ended,
+        session_id,
+        scope_id,
+        run_id,
+        {"reason": str(reason), "usage": total_usage.model_dump()},
+    )
     return RunResult(
-        run_id=run_id, reason=reason, iterations=iterations, tokens=tokens, error=error
+        run_id=run_id,
+        reason=reason,
+        iterations=iterations,
+        tokens=tokens,
+        error=error,
+        usage=total_usage,
     )

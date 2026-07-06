@@ -33,6 +33,7 @@ from keel_core import (
     ToolRegistry,
     TrustLevel,
     admit,
+    make_tracer,
     run,
 )
 from keel_core.eventbus import RedisEventStore
@@ -163,6 +164,7 @@ class AgentRuntime:
         self._registry = ToolRegistry(_build_tools(workspace))
         self._permissions = _web_permissions()
         self._approvals = ApprovalRegistry()
+        self._tracer = make_tracer()  # Langfuse if configured, else no-op
         self._runs: dict[RunId, asyncio.Task[None]] = {}
 
     @property
@@ -200,6 +202,7 @@ class AgentRuntime:
                 approve=approve,
                 run_id=run_id,
                 stream_deltas=True,  # relay token-by-token over SSE
+                on_event=self._tracer.record,  # export the run to Langfuse (if configured)
             )
         except Exception:  # noqa: BLE001 - a run task must not take the server down
             logger.exception("run %s failed", run_id)
@@ -207,6 +210,8 @@ class AgentRuntime:
                 store, EventType.error, session_id, run_id, {"message": "internal run error"}
             )
             await self._emit(store, EventType.run_ended, session_id, run_id, {"reason": "error"})
+        finally:
+            self._tracer.flush()
 
     def _approver(
         self, store: CompositeEventStore, session_id: SessionId, run_id: RunId

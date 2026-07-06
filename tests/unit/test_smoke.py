@@ -34,6 +34,7 @@ MODULES = [
     "keel_core.tools.shell",
     "keel_core.eventbus",
     "keel_core.observability",
+    "keel_core.tracing",
     "keel_core.testing",
     "keel_core.testing.record_replay",
     "keel_server",

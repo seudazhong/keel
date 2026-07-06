@@ -33,6 +33,15 @@ def _tool_delta(
     return SimpleNamespace(index=index, id=id, function=SimpleNamespace(name=name, arguments=args))
 
 
+def _usage_chunk(prompt: int, completion: int, cached: int = 0) -> SimpleNamespace:
+    usage = SimpleNamespace(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=cached),
+    )
+    return SimpleNamespace(choices=[], usage=usage)
+
+
 def _completion(chunks: list[Any], capture: dict[str, Any]):
     async def completion(**kwargs: Any) -> AsyncIterator[Any]:
         capture["kwargs"] = kwargs
@@ -58,6 +67,24 @@ async def test_streams_text_and_finish() -> None:
     assert out[-1].finish_reason is FinishReason.end_turn
     assert capture["kwargs"]["model"] == "openai/gpt-x"
     assert capture["kwargs"]["stream"] is True
+
+
+async def test_extracts_usage_chunk() -> None:
+    capture: dict[str, Any] = {}
+    chunks = [_chunk(content="hi"), _chunk(finish_reason="stop"), _usage_chunk(12, 7, cached=3)]
+    gateway = LiteLLMGateway(completion=_completion(chunks, capture))
+
+    request = ProviderRequest(model="test/model", messages=[{"role": "user", "content": "hi"}])
+    out = [chunk async for chunk in gateway.stream(request)]
+
+    usage_chunks = [chunk for chunk in out if chunk.usage is not None]
+    assert len(usage_chunks) == 1
+    usage = usage_chunks[0].usage
+    assert usage is not None
+    assert usage.prompt_tokens == 12
+    assert usage.completion_tokens == 7
+    assert usage.cache_read_tokens == 3  # prompt-cache hits accounted (NFR-8)
+    assert capture["kwargs"]["stream_options"] == {"include_usage": True}
 
 
 async def test_streams_tool_call_across_fragments() -> None:
