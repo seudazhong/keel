@@ -13,6 +13,7 @@ from .agents import AgentSpec, Scope
 from .errors import CrossScopeError, KeelError, PermissionDenied
 from .events import Event, EventType
 from .loop import RunBudget, RunResult, ToolRegistry, admit, run
+from .permissions import Rule, RuleBasedPermissionEngine
 from .protocols import (
     EventStore,
     PermissionEngine,
@@ -29,6 +30,7 @@ from .protocols import (
 )
 from .providers import LiteLLMGateway
 from .state import InMemoryEventStore
+from .tools import ExecRequest, execute
 from .types import (
     AgentId,
     ContentTaint,
@@ -88,4 +90,9 @@ __all__ = [
     "RunResult",
     "InMemoryEventStore",
     "LiteLLMGateway",
+    # permissions + tool execution
+    "Rule",
+    "RuleBasedPermissionEngine",
+    "ExecRequest",
+    "execute",
 ]

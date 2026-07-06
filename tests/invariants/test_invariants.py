@@ -20,11 +20,13 @@ from keel_core.agents import AgentSpec, Scope
 from keel_core.context import StablePromptAssembler
 from keel_core.errors import CrossScopeError
 from keel_core.loop import RunBudget, ToolRegistry, admit, run
+from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.protocols import ProviderChunk, ProviderRequest, ToolCall, ToolContext, ToolResult
 from keel_core.scope import DefaultScopeGuard
 from keel_core.state import InMemoryEventStore
 from keel_core.testing import ScriptedProviderGateway
-from keel_core.types import FinishReason, ScopeKind, StopReason
+from keel_core.tools.executor import ExecRequest, execute
+from keel_core.types import FinishReason, PermissionDecision, ScopeKind, StopReason
 from keel_sandbox.policy import EgressPolicy, PathPolicy
 from keel_scheduler.atmostonce import AtMostOnceScheduler, InMemoryClaimStore, Schedule
 
@@ -146,6 +148,44 @@ def _gate_stop_reason_gated_tools() -> None:
     assert calls == []
 
 
+def _gate_parallel_safe_deterministic_order() -> None:
+    order: list[str] = []
+    active = {"n": 0, "max": 0}
+
+    class _Probe:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.description = name
+
+        def input_schema(self) -> dict[str, object]:
+            return {}
+
+        async def run(self, args: dict[str, object], ctx: ToolContext) -> ToolResult:
+            active["n"] += 1
+            active["max"] = max(active["max"], active["n"])
+            order.append(f"start:{self.name}")
+            await asyncio.sleep(0.01)
+            order.append(f"end:{self.name}")
+            active["n"] -= 1
+            return ToolResult(ok=True, output=self.name)
+
+    async def scenario() -> list[ToolResult]:
+        engine = RuleBasedPermissionEngine([Rule("*", PermissionDecision.allow)])
+        requests = [
+            ExecRequest(
+                ToolCall(id="1", name="w1"), _Probe("w1"), write=True, resources=frozenset({"a"})
+            ),
+            ExecRequest(
+                ToolCall(id="2", name="w2"), _Probe("w2"), write=True, resources=frozenset({"a"})
+            ),
+        ]
+        return await execute(requests, ToolContext(scope_id="s", session_id="x"), engine)
+
+    results = asyncio.run(scenario())
+    assert active["max"] == 1  # writes to the same resource serialized
+    assert [r.output for r in results] == ["w1", "w2"]  # source order
+
+
 # invariant id -> (enforced-in component, gate | None). None => spec pending M1.
 INVARIANTS: dict[str, tuple[str, Callable[[], None] | None]] = {
     "I1-bounded-loop-named-termination": ("keel_core/loop", _gate_bounded_loop_named_termination),
@@ -155,7 +195,10 @@ INVARIANTS: dict[str, tuple[str, Callable[[], None] | None]] = {
     ),
     "I3-stop-reason-gated-tools": ("keel_core/loop", _gate_stop_reason_gated_tools),
     "I4-byte-stable-prompt-prefix": ("keel_core/context", _gate_byte_stable_prefix),
-    "I5-parallel-safe-deterministic-order": ("keel_core/tools", None),
+    "I5-parallel-safe-deterministic-order": (
+        "keel_core/tools",
+        _gate_parallel_safe_deterministic_order,
+    ),
     "I6-two-level-sandbox": ("keel_sandbox+permissions", _gate_two_level_sandbox),
     "I7-shared-budget-delegation-tree": ("keel_core/agents", None),
     "I8-import-not-trust": ("mcp+skills+discovery", None),
