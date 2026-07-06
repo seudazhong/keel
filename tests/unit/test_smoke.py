@@ -19,6 +19,8 @@ MODULES = [
     "keel_core.context",
     "keel_core.scope",
     "keel_core.state",
+    "keel_core.memory",
+    "keel_core.projections",
     "keel_core.loop",
     "keel_core.providers",
     "keel_core.permissions",

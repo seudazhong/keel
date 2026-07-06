@@ -13,7 +13,9 @@ from .agents import AgentSpec, Scope
 from .errors import CrossScopeError, KeelError, PermissionDenied
 from .events import Event, EventType
 from .loop import RunBudget, RunResult, ToolRegistry, admit, run
+from .memory import PostgresMemoryStore
 from .permissions import Rule, RuleBasedPermissionEngine
+from .projections import project_messages
 from .protocols import (
     EventStore,
     PermissionEngine,
@@ -29,7 +31,7 @@ from .protocols import (
     ToolResult,
 )
 from .providers import LiteLLMGateway
-from .state import InMemoryEventStore
+from .state import InMemoryEventStore, PostgresEventStore
 from .tools import ExecRequest, execute
 from .types import (
     AgentId,
@@ -89,6 +91,9 @@ __all__ = [
     "RunBudget",
     "RunResult",
     "InMemoryEventStore",
+    "PostgresEventStore",
+    "PostgresMemoryStore",
+    "project_messages",
     "LiteLLMGateway",
     # permissions + tool execution
     "Rule",

@@ -11,6 +11,7 @@ import asyncio
 import os
 import sys
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -20,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 _DEFAULT_PG = "postgresql+psycopg://keel:keel@localhost:5432/keel"
 _DEFAULT_REDIS = "redis://localhost:6379/0"
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 # psycopg's async mode does not support Windows' ProactorEventLoop. On Windows,
@@ -57,3 +59,24 @@ async def redis_client() -> AsyncIterator[aioredis.Redis]:
         pytest.skip("Redis not available")
     yield client
     await client.aclose()
+
+
+def _upgrade_head(url: str) -> None:
+    """Run Alembic migrations to head against ``url`` (sync; call in a thread)."""
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config(str(_REPO_ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(_REPO_ROOT / "migrations"))
+    cfg.set_main_option("sqlalchemy.url", url)
+    command.upgrade(cfg, "head")
+
+
+@pytest_asyncio.fixture
+async def migrated_db(pg_engine: AsyncEngine) -> AsyncIterator[AsyncEngine]:
+    """A Postgres engine with the schema migrated to head and a clean slate."""
+    url = os.environ.get("KEEL_TEST_DATABASE_URL", _DEFAULT_PG)
+    await asyncio.to_thread(_upgrade_head, url)
+    async with pg_engine.begin() as conn:
+        await conn.execute(text("TRUNCATE events, sessions, memory_blocks, memory_block_versions"))
+    yield pg_engine

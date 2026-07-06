@@ -27,6 +27,7 @@ from keel_core.agents import AgentSpec
 from keel_core.errors import KeelError
 from keel_core.events import Event, EventType
 from keel_core.permissions import Rule, RuleBasedPermissionEngine
+from keel_core.projections import project_messages
 from keel_core.protocols import (
     EventStore,
     PermissionEngine,
@@ -130,14 +131,8 @@ async def admit(store: EventStore, session_id: SessionId, scope_id: ScopeId, con
 async def _build_request(
     agent: AgentSpec, store: EventStore, session_id: SessionId
 ) -> ProviderRequest:
-    messages: list[dict[str, object]] = []
-    async for event in store.read(session_id):
-        role = event.payload.get("role")
-        if role in ("user", "assistant"):
-            messages.append({"role": role, "content": event.payload.get("text", "")})
-        elif event.type == EventType.tool_result:
-            messages.append({"role": "tool", "content": str(event.payload)})
-    return ProviderRequest(model=agent.model, messages=messages)
+    events = [event async for event in store.read(session_id)]
+    return ProviderRequest(model=agent.model, messages=project_messages(events))
 
 
 async def _call_provider(

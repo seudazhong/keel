@@ -12,7 +12,8 @@ from sqlalchemy import engine_from_config, pool
 from keel_core.config import get_settings
 
 config = context.config
-config.set_main_option("sqlalchemy.url", get_settings().sync_database_url)
+if not config.get_main_option("sqlalchemy.url"):
+    config.set_main_option("sqlalchemy.url", get_settings().sync_database_url)
 
 target_metadata = None
 
