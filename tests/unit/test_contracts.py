@@ -98,12 +98,13 @@ def test_openapi_freezes_v1_contract() -> None:
     assert "get" in paths["/v1/sessions/{session_id}/events"]
     assert "post" in paths["/v1/approvals/{approval_id}"]
 
-    # Every non-probe route is namespaced under /v1 (additive-only, G14).
-    non_probe = [p for p in paths if p not in ("/health", "/readiness")]
+    # Every non-probe API route is namespaced under /v1 (additive-only, G14).
+    # "/" is the web UI (excluded from the schema), so it never appears here.
+    non_probe = [p for p in paths if p not in ("/health", "/readiness", "/")]
     assert non_probe and all(p.startswith("/v1") for p in non_probe)
 
 
-def test_http_health_and_v1_stub() -> None:
+def test_http_health_and_v1_requires_runtime() -> None:
     from fastapi.testclient import TestClient
 
     from keel_server.app import create_app
@@ -114,6 +115,6 @@ def test_http_health_and_v1_stub() -> None:
     assert health.status_code == 200
     assert health.json()["service"] == "keel-server"
 
-    # The contract route exists but is a stub until M1.
-    stub = client.post("/v1/sessions/s1/messages", json={"content": "hi"})
-    assert stub.status_code == 501
+    # The contract route is implemented; without a started runtime it fails closed.
+    resp = client.post("/v1/sessions/s1/messages", json={"content": "hi"})
+    assert resp.status_code == 503

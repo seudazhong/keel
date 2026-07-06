@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # Default model surfaces use when none is given (LiteLLM model id).
     default_model: str = "gpt-4o-mini"
 
+    # Durable event store backend: "postgres" (default) or "memory". The in-memory
+    # store is a single-process "lite" profile — and the way to run the server on a
+    # Windows host, where uvicorn's Proactor loop can't drive psycopg's async driver.
+    event_store: str = "postgres"
+
     # psycopg3 driver works for both sync (Alembic) and async (app) engines.
     database_url: str = "postgresql+psycopg://keel:keel@localhost:5432/keel"
     redis_url: str = "redis://localhost:6379/0"

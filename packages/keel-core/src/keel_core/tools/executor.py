@@ -12,13 +12,13 @@ approver, else fail closed).
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 
 from keel_core.protocols import PermissionEngine, Tool, ToolCall, ToolContext, ToolResult
 from keel_core.types import PermissionDecision
 
-ApproveFn = Callable[[ToolCall, ToolContext], bool]
+ApproveFn = Callable[[ToolCall, ToolContext], bool | Awaitable[bool]]
 
 
 @dataclass
@@ -49,10 +49,13 @@ async def _run_one(
         decision = permissions.evaluate(request.call.name, request.call.arguments, ctx)
         if decision is PermissionDecision.deny:
             return ToolResult(ok=False, output="permission denied")
-        if decision is PermissionDecision.ask and (
-            approve is None or not approve(request.call, ctx)
-        ):
-            return ToolResult(ok=False, output="approval required")
+        if decision is PermissionDecision.ask:
+            approved = False
+            if approve is not None:
+                verdict = approve(request.call, ctx)
+                approved = verdict if isinstance(verdict, bool) else await verdict
+            if not approved:
+                return ToolResult(ok=False, output="approval required")
         return await request.tool.run(request.call.arguments, ctx)
     except Exception as exc:  # noqa: BLE001 - gate/approve/tool failure must not crash the run
         return ToolResult(ok=False, output=f"tool error: {exc.__class__.__name__}")

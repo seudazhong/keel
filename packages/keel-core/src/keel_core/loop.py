@@ -267,12 +267,15 @@ async def run(
     approve: ApproveFn | None = None,
     on_event: EventObserver | None = None,
     on_delta: DeltaObserver | None = None,
+    run_id: RunId | None = None,
 ) -> RunResult:
     """Execute the agent loop until a named termination and return the result.
 
     ``on_event``/``on_delta`` are optional live-observation seams: ``on_event`` fires
     for every persisted event (in seq order) and ``on_delta`` for each streamed text
-    delta, letting a surface render the run live without polling the store.
+    delta, letting a surface render the run live without polling the store. A caller
+    may pass ``run_id`` (e.g. a server that returned it to a client before the run
+    finished); otherwise one is generated.
     """
     registry = registry or ToolRegistry()
     budget = budget or RunBudget(
@@ -283,7 +286,7 @@ async def run(
         store = _ObservingStore(store, on_event)
     scope_id = agent.scope.id
     trust = agent.scope.trust
-    run_id: RunId = uuid.uuid4().hex
+    run_id = run_id or uuid.uuid4().hex
 
     await _emit(store, EventType.run_started, session_id, scope_id, run_id, {"agent": agent.id})
 

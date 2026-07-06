@@ -36,6 +36,8 @@ MODULES = [
     "keel_server",
     "keel_server.app",
     "keel_server.api.v1",
+    "keel_server.runtime",
+    "keel_server.webui",
     "keel_worker",
     "keel_worker.main",
     "keel_scheduler",

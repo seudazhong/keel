@@ -9,7 +9,12 @@ from keel_core.observability import configure_logging, configure_tracing
 
 
 def main() -> None:
-    """Run the Keel server."""
+    """Run the Keel server.
+
+    On a Windows host use ``KEEL_EVENT_STORE=memory``: uvicorn runs the Proactor
+    event loop, which psycopg's async driver can't use. Postgres durability is a
+    Docker/Linux concern (see docs) where the selector loop is the default.
+    """
     load_env_file()  # provider keys + KEEL_* from one .env
     settings = get_settings()
     configure_logging(settings.log_level)

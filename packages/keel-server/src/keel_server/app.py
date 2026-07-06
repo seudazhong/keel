@@ -1,33 +1,65 @@
-"""FastAPI application factory with liveness and readiness probes.
+"""FastAPI application factory: probes, the agent runtime, and the web UI.
 
-M0 exposes only health/readiness so ``compose --profile dev`` can report a
-healthy stack. Engine/Redis clients are created lazily (no connection at
-import), so importing this module never requires a live datastore.
+Liveness/readiness let ``compose --profile dev`` report a healthy stack. A
+``lifespan`` builds the :class:`~keel_server.runtime.AgentRuntime` (Redis fan-out +
+durable store + provider) and stores it on ``app.state`` for the ``/v1`` routes.
+Datastore clients connect lazily, so importing this module never needs a live
+datastore; the runtime is only built when the app actually starts.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import text
 
 from keel_core import __version__
 from keel_core.api import HealthResponse, ReadinessResponse
-from keel_core.config import get_settings
+from keel_core.config import get_settings, load_env_file
 from keel_core.db import make_async_engine, make_redis
 from keel_server.api import v1
+from keel_server.runtime import AgentRuntime
+from keel_server.webui import INDEX_HTML
 
 logger = logging.getLogger("keel.server")
 
 
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Build datastore clients + the agent runtime on startup; dispose on shutdown."""
+    settings = get_settings()
+    load_env_file()  # provider keys (OPENAI/ANTHROPIC/...) for LiteLLM
+    redis_client = make_redis(settings)
+    engine = make_async_engine(settings) if settings.event_store == "postgres" else None
+    app.state.redis = redis_client
+    app.state.engine = engine
+    app.state.runtime = AgentRuntime(
+        redis_client=redis_client,
+        engine=engine,
+        model=settings.default_model,
+        workspace=Path.cwd(),
+    )
+    try:
+        yield
+    finally:
+        await redis_client.aclose()
+        if engine is not None:
+            await engine.dispose()
+
+
 def create_app() -> FastAPI:
     """Build the Keel FastAPI application."""
-    settings = get_settings()
-    app = FastAPI(title="Keel", version=__version__)
-    engine = make_async_engine(settings)
-    redis_client = make_redis(settings)
+    app = FastAPI(title="Keel", version=__version__, lifespan=_lifespan)
+
+    @app.get("/", response_class=HTMLResponse, include_in_schema=False)
+    async def index() -> str:
+        """Serve the minimal web chat UI."""
+        return INDEX_HTML
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
@@ -37,16 +69,26 @@ def create_app() -> FastAPI:
     @app.get("/readiness", response_model=ReadinessResponse)
     async def readiness() -> JSONResponse:
         """Readiness: dependencies (Postgres, Redis) are reachable."""
+        settings = get_settings()
         checks: dict[str, str] = {}
         ready = True
+        engine = getattr(app.state, "engine", None)
+        redis_client = getattr(app.state, "redis", None)
 
-        try:
-            async with engine.connect() as conn:
-                await conn.execute(text("SELECT 1"))
-            checks["postgres"] = "ok"
-        except Exception as exc:  # noqa: BLE001 - report, never crash the probe
-            checks["postgres"] = f"error: {exc.__class__.__name__}"
-            ready = False
+        if redis_client is None:
+            body = ReadinessResponse(ready=False, checks={"runtime": "not initialized"})
+            return JSONResponse(body.model_dump(), status_code=503)
+
+        if settings.event_store == "postgres":
+            try:
+                async with engine.connect() as conn:  # type: ignore[union-attr]
+                    await conn.execute(text("SELECT 1"))
+                checks["postgres"] = "ok"
+            except Exception as exc:  # noqa: BLE001 - report, never crash the probe
+                checks["postgres"] = f"error: {exc.__class__.__name__}"
+                ready = False
+        else:
+            checks["event_store"] = "memory"
 
         try:
             await redis_client.ping()
