@@ -394,6 +394,8 @@ OneBot → adapter → normalize → InboundEvent(session_key) → wake rules/ra
 | [0004](./adr/0004-frontend.md) | React + Vite + Tailwind + shadcn/ui |
 | [0005](./adr/0005-sandbox.md) | Dedicated least-privilege sandbox container + per-command policy |
 | [0006](./adr/0006-scheduler-and-queue.md) | arq queue + custom leader-elected at-most-once scheduler |
+| [0007](./adr/0007-embeddings-and-rerank.md) | Local `bge-m3` embeddings default; hosted via gateway; rerank optional |
+| [0008](./adr/0008-deployment-profiles-and-first-run.md) | `lite`/`dev`/`full`/`demo` profiles; MinIO & Ollama gating; first-run |
 
 ---
 

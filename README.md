@@ -16,7 +16,10 @@ The design follows the project's own field manual, *How to Develop an AI Agent*:
 |---|---|
 | [`docs/PRD.md`](./docs/PRD.md) | Product Requirements — vision, personas, requirements, scope, milestones, risks |
 | [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | Technology selection & system design — C4 views, components, data model, protocol, deployment |
-| [`docs/adr/`](./docs/adr) | Architecture Decision Records (language, datastore, runtime, frontend, sandbox, scheduler) |
+| [`docs/adr/`](./docs/adr) | Architecture Decision Records (language, datastore, runtime, frontend, sandbox, scheduler, embeddings, deployment) |
+| [`docs/DESIGN-REVIEW.md`](./docs/DESIGN-REVIEW.md) | Critical design review — gaps, risks, resolved open questions, invariant acceptance checklist |
+| [`docs/IMPLEMENTATION-PLAN.md`](./docs/IMPLEMENTATION-PLAN.md) | Phased plan (M0–M4) — workstreams, sequencing, exit criteria |
+| [`docs/diagrams/`](./docs/diagrams) | Mermaid architecture diagrams — C4, agent loop, sequences, ER, deployment |
 
 ## What Keel will do (highlights)
 - **One core, many surfaces** — CLI · web app · IM gateway (QQ/Telegram/WeCom…)
