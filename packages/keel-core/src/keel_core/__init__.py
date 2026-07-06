@@ -27,6 +27,7 @@ from .protocols import (
     ToolContext,
     ToolResult,
 )
+from .providers import LiteLLMGateway
 from .state import InMemoryEventStore
 from .types import (
     AgentId,
@@ -86,4 +87,5 @@ __all__ = [
     "RunBudget",
     "RunResult",
     "InMemoryEventStore",
+    "LiteLLMGateway",
 ]

@@ -20,6 +20,7 @@ MODULES = [
     "keel_core.scope",
     "keel_core.state",
     "keel_core.loop",
+    "keel_core.providers",
     "keel_core.eventbus",
     "keel_core.observability",
     "keel_core.testing",
