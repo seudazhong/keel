@@ -1,0 +1,111 @@
+# Keel — Docker Compose (ADR-0008 profiles).
+#
+#   docker compose --profile dev up -d      # server + worker + web + postgres + redis
+#
+# Compose lives at the repo root so the build context is the workspace root
+# (packages/ must be reachable). Dockerfiles are under deploy/docker/.
+name: keel
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: deploy/docker/app.Dockerfile
+  image: keel-app:dev
+
+x-app-env: &app-env
+  KEEL_DATABASE_URL: postgresql+psycopg://keel:keel@postgres:5432/keel
+  KEEL_REDIS_URL: redis://redis:6379/0
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: keel
+      POSTGRES_PASSWORD: keel
+      POSTGRES_DB: keel
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keel -d keel"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    profiles: ["dev", "full"]
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    profiles: ["dev", "full"]
+
+  # First-run bootstrap: idempotent schema migrate (DR-4). Runs once and exits.
+  keel-migrate:
+    <<: *app
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      <<: *app-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    profiles: ["dev", "full"]
+
+  keel-server:
+    <<: *app
+    command: ["keel-server"]
+    environment:
+      <<: *app-env
+      KEEL_SERVER_HOST: 0.0.0.0
+      KEEL_SERVER_PORT: 8000
+    ports: ["8000:8000"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      keel-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    profiles: ["dev", "full"]
+
+  keel-worker:
+    <<: *app
+    command: ["arq", "keel_worker.main.WorkerSettings"]
+    environment:
+      <<: *app-env
+    depends_on:
+      redis:
+        condition: service_healthy
+      keel-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "arq", "keel_worker.main.WorkerSettings", "--check"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    profiles: ["dev", "full"]
+
+  keel-web:
+    image: nginx:alpine
+    ports: ["3000:80"]
+    volumes:
+      - ./web/stub:/usr/share/nginx/html:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost/"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    profiles: ["dev", "full"]
+
+volumes:
+  pgdata:

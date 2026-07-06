@@ -1,0 +1,18 @@
+[project]
+name = "keel-scheduler"
+version = "0.0.0"
+description = "Keel leader-elected cron scheduler (stub; lands in M2)."
+requires-python = ">=3.12"
+dependencies = [
+    "keel-core",
+]
+
+[project.scripts]
+keel-scheduler = "keel_scheduler.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/keel_scheduler"]

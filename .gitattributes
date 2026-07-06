@@ -1,0 +1,14 @@
+# Keel ships Linux container images, shell scripts and a uv lockfile, so text
+# files use LF in the repo and working tree (overrides core.autocrlf on Windows).
+* text=auto eol=lf
+
+# Binary assets — never touch line endings.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.pdf binary
