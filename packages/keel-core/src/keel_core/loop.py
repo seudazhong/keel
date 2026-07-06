@@ -114,6 +114,7 @@ class RunResult:
     reason: StopReason
     iterations: int = 0
     tokens: int = 0
+    error: str | None = None
     events: list[Event] = field(default_factory=list)
 
 
@@ -194,9 +195,14 @@ async def _call_provider(
                 text=text, tool_calls=tool_calls, finish_reason=finish, tokens=len(text)
             )
         except Exception as exc:  # noqa: BLE001 - bounded retry then fail closed
+            status = getattr(exc, "status_code", None)
+            # Non-transient client errors (bad model, auth, invalid request) won't
+            # succeed on retry — fail fast, carrying the provider's own message.
+            if isinstance(status, int) and 400 <= status < 500 and status != 429:
+                raise KeelError(str(exc)) from exc
             attempt += 1
             if attempt > max_retries:
-                raise KeelError("provider call failed after retries") from exc
+                raise KeelError(f"provider call failed after retries: {exc}") from exc
 
 
 async def _run_tools(
@@ -283,6 +289,7 @@ async def run(
 
     iterations = 0
     tokens = 0
+    error: str | None = None
     reason = StopReason.completed
 
     while True:
@@ -303,8 +310,10 @@ async def run(
 
         try:
             turn = await _call_provider(provider, request, budget.max_retries, on_delta)
-        except KeelError:
+        except KeelError as exc:
             reason = StopReason.error
+            error = str(exc)
+            await _emit(store, EventType.error, session_id, scope_id, run_id, {"message": error})
             break
 
         tokens += turn.tokens
@@ -348,4 +357,6 @@ async def run(
         break
 
     await _emit(store, EventType.run_ended, session_id, scope_id, run_id, {"reason": str(reason)})
-    return RunResult(run_id=run_id, reason=reason, iterations=iterations, tokens=tokens)
+    return RunResult(
+        run_id=run_id, reason=reason, iterations=iterations, tokens=tokens, error=error
+    )

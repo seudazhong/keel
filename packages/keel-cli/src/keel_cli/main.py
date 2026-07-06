@@ -312,6 +312,7 @@ def run_cmd(
                 {
                     "reason": str(result.reason),
                     "output": holder["output"],
+                    "error": result.error,
                     "iterations": result.iterations,
                     "tokens": result.tokens,
                 }

@@ -136,3 +136,39 @@ def test_run_command_nonzero_on_noncompletion(monkeypatch) -> None:  # type: ign
     result = CliRunner().invoke(app, ["run", "hi", "--json"])
     assert result.exit_code == 1
     assert json.loads(result.stdout)["reason"] == "halted"
+
+
+async def test_chat_session_renders_provider_error(tmp_path: Path) -> None:
+    class _Gateway:
+        def stream(self, request: object):  # type: ignore[no-untyped-def]
+            raise type("BadRequestError", (Exception,), {"status_code": 400})(
+                'model "gpt-5.5" is not accessible via the /chat/completions endpoint'
+            )
+
+    out, meta = _Capture(), _Capture()
+    session = build_session(
+        model="github_copilot/gpt-5.5",
+        workspace=tmp_path,
+        provider=_Gateway(),
+        write_out=out,
+        write_meta=meta,
+    )
+    result = await session.send("hi")
+    assert result.reason is StopReason.error
+    assert result.error is not None
+    assert "error:" in meta.text and "not accessible" in meta.text  # real message shown
+
+
+def test_run_command_surfaces_provider_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    class _Gateway:
+        def stream(self, request: object):  # type: ignore[no-untyped-def]
+            raise type("BadRequestError", (Exception,), {"status_code": 400})(
+                'model "nope" is not accessible'
+            )
+
+    monkeypatch.setattr(runner_mod, "build_provider", lambda: _Gateway())
+    result = CliRunner().invoke(app, ["run", "hi", "--json"])
+    assert result.exit_code == 1
+    data = json.loads(result.stdout)
+    assert data["reason"] == "error"
+    assert data["error"] is not None and "not accessible" in data["error"]

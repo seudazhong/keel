@@ -58,9 +58,12 @@ class LiteLLMGateway:
 
     def __init__(self, *, completion: CompletionFn | None = None) -> None:
         if completion is None:
-            from litellm import acompletion
+            import litellm
 
-            completion = acompletion
+            # We surface provider errors ourselves; drop LiteLLM's "Give Feedback"
+            # footer so a failed call isn't buried under boilerplate.
+            litellm.suppress_debug_info = True
+            completion = litellm.acompletion
         self._completion = completion
 
     def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:

@@ -391,3 +391,51 @@ async def test_observer_errors_never_abort_the_run() -> None:
     # Live observation is best-effort: failing observers don't crash or mislabel the run.
     assert result.reason is StopReason.completed
     assert _event_types(store, "s1")[-1] == EventType.run_ended  # events still persisted
+
+
+async def test_provider_client_error_fails_fast_with_message() -> None:
+    store = InMemoryEventStore()
+    attempts = {"n": 0}
+
+    class _ClientError(Exception):
+        status_code = 400
+
+    class _Gateway:
+        def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
+            attempts["n"] += 1
+            raise _ClientError('model "gpt-5.5" is not accessible via /chat/completions')
+
+    await admit(store, "s1", "u:1", "hi")
+    result = await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=_Gateway(),
+        budget=RunBudget(max_retries=2),
+    )
+    assert result.reason is StopReason.error
+    assert attempts["n"] == 1  # a 4xx won't succeed on retry -> fail fast, no retries
+    assert result.error is not None and "not accessible" in result.error
+    assert EventType.error in _event_types(store, "s1")  # surfaced as an event too
+
+
+async def test_provider_transient_error_retries_then_surfaces_message() -> None:
+    store = InMemoryEventStore()
+    attempts = {"n": 0}
+
+    class _Gateway:
+        def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
+            attempts["n"] += 1
+            raise RuntimeError("connection reset")  # no status_code -> treated as transient
+
+    await admit(store, "s1", "u:1", "hi")
+    result = await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=_Gateway(),
+        budget=RunBudget(max_retries=2),
+    )
+    assert result.reason is StopReason.error
+    assert attempts["n"] == 3  # initial + 2 retries
+    assert result.error is not None and "connection reset" in result.error

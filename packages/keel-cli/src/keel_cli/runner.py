@@ -140,6 +140,8 @@ class StreamRenderer:
             ok = bool(event.payload.get("ok"))
             mark = "ok" if ok else "err"
             self.write_meta(f"  <- {mark}: {_preview(event.payload.get('output', ''))}\n")
+        elif event.type is EventType.error:
+            self.write_meta(f"  ! error: {_preview(event.payload.get('message', ''), 300)}\n")
 
     @property
     def output(self) -> str:
