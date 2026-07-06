@@ -11,6 +11,8 @@ The design is **coherent, buildable, and faithful to the field manual**. The nar
 
 **Recommendation:** proceed to **M0** after closing three open questions (below) and folding the medium-severity gaps in §3 into the backlog. None of the gaps invalidate the architecture; they are refinements that are cheaper to decide now than to retrofit (event-schema versioning and privacy/retention especially).
 
+> **Addendum (post-pivot).** §1–§3 were written **before** [ADR-0009](./adr/0009-product-form-and-primary-use-cases.md) (server-primary connected assistant). That pivot added the largest capability and security surface in the design — the **Connectors** subsystem, **OAuth token** management, **per-scope data isolation**, and a new *headline* threat (**cross-scope exfiltration / confused-deputy**, ranked above sandbox escape) — none of which this review had critiqued. **§3A** reviews them and adds one invariant to **§5**. The verdict is unchanged (proceed to M0), but **G16 (scope-isolation enforcement) and G17 (confused-deputy) join G3/G8 as must-do-in-M1 design tasks.**
+
 ---
 
 ## 2. Strengths (kept, do not re-litigate)
@@ -49,6 +51,22 @@ Severity: **H** = decide before M1 code, **M** = design now / build in the miles
 
 ---
 
+## 3A. Addendum — ADR-0009 pivot review (connectors · scope · confused-deputy)
+
+The pivot to a **server-primary connected assistant** ([ADR-0009](./adr/0009-product-form-and-primary-use-cases.md)) landed after §1–§3 were written. It elevates personal-data **Connectors** over **OAuth**, makes **an agent a scoped entity**, and declares a new *headline* threat — **cross-scope data exfiltration / confused-deputy**, ranked *above* sandbox escape. None of that was in the original review. This addendum critiques it in the §3 format and on the same severity scale (**H** = decide before M1 code · **M** = design now / build when first needed · **L** = track).
+
+| # | Area | Gap | Recommendation | Sev |
+|---|---|---|---|---|
+| G16 | **Scope-isolation enforcement point** | ADR-0009 makes per-scope isolation a headline goal but the architecture never names *where* it is enforced; ad-hoc `WHERE scope_id = ?` in each query is one forgotten filter away from a cross-scope leak. | Make `scope_id` a **mandatory column** on every scoped row (sessions, events, memory, connectors, tokens, passages) and route **all** data access through one **`ScopeGuard`** repository layer that injects the filter; add **Postgres RLS** as defense-in-depth; **deny-by-default** and **audit** every cross-scope access attempt. This is the enforcement home for the new §5 invariant. | **H** |
+| G17 | **Confused-deputy: content-trust ≠ scope-trust** | The safe-toolset control (FR-X6 / G6) gates *untrusted surfaces* (group input). But a **trusted personal agent** holding connectors routinely ingests **untrusted content** — an email body, a fetched web page, a shared doc — the classic injection→exfiltration path the current model does not stop. | Separate **trust of the scope** from **trust of the content**: **taint-tag** tool/connector outputs (email, web, external docs) as untrusted and propagate the taint through context; **gate outbound & cross-connector actions** whose plan is influenced by tainted content (require approval / drop to the safe toolset). Ties to G6 injection scanning and G5 approvals. | **H** |
+| G18 | **OAuth token lifecycle & scope binding** | Tokens are said to be envelope-encrypted and granted to a scope, but refresh failure, revocation, least-scope grants, and token fate on **scope deletion** are unspecified. | Store tokens encrypted (extends **G9**) keyed by `(scope_id, connector_id)`; request **least OAuth scopes**; **fail-closed** on refresh/revoke; on scope deletion **revoke + purge** tokens (ties to G4 erasure); audit every token use. | **M** |
+| G19 | **Connector ↔ one-tool-interface (P3)** | A first-class Connectors subsystem risks a **parallel path** into the loop, violating P3 (one tool interface). | Keep connectors surfaced to the loop **as scoped tools** (as FR-N1 already states); the subsystem owns only **auth / lifecycle / scoping / provenance**, never a second tool contract. Connector tools carry **scope + taint** metadata. | **L** |
+| G20 | **Outbound-action idempotency & audit** | FR-N4 requires approval + audit for outbound actions (email send, calendar invite, IM post), but **retry-safety** is unspecified — a worker retry could double-send. | Outbound connector actions carry an **idempotency key** (at-most-once send), are **always audited**, and are approval-gated by scoped policy; reconcile against provider message IDs. Mirrors the scheduler's at-most-once discipline. | **M** |
+
+**Co-hosting caveat (ADR-0009 §6).** Hard per-scope isolation is precisely what lets a public group bot and a private personal agent share one instance. The **acceptance test for that claim** is the new §5 invariant below; until it is green, **recommend separate instances** for the most sensitive personal use (as ADR-0009 already advises).
+
+---
+
 ## 4. Open questions — resolution
 
 | PRD Q | Question | Resolution | Where |
@@ -76,6 +94,7 @@ The architecture names non-negotiable invariants. Each must have an owner compon
 | **Shared budget** across delegation tree | `agents/` + Redis | Fan-out sub-agents; assert tree cost ≤ cap and children can't exceed the parent's remaining. |
 | **Import ≠ trust** | `mcp/`, `skills/`, `discovery/` | Register a malicious MCP tool description; assert allow-list gate + injection scan (G6) quarantine. |
 | **At-most-once** schedule | `keel-scheduler` | Crash mid-tick after cursor advance; assert the job runs **0 or 1** times, never twice. |
+| **Per-scope data isolation** [ADR-0009] | `state/` + `connectors/` via `ScopeGuard` (+ Postgres RLS) | Co-host a group agent and a personal agent in one instance/DB; assert the group agent **cannot** read the personal agent's connectors, tokens, memory, or sessions; every cross-scope attempt is **denied *and* audited**. Extends to the **confused-deputy** case: tainted content (email/web) cannot drive an unapproved outbound/cross-connector action (G17). |
 
 ---
 
@@ -84,9 +103,10 @@ The architecture names non-negotiable invariants. Each must have an owner compon
 - Add **ADR-0007** and **ADR-0008**; extend the ADR index in `ARCHITECTURE.md §18` and the README ADR line. *(Done.)*
 - Populate **`docs/diagrams/`**. *(Done.)*
 - In a future pass, fold G3/G5/G8 into `ARCHITECTURE.md` (§8/§9/§13) once agreed, so the spec and this review converge.
+- Fold the **§3A pivot gaps** — G16 (scope-guard), G17 (taint / confused-deputy), G18 (token lifecycle), G20 (outbound idempotency) — into `ARCHITECTURE.md` (§6.5 connectors, §8/§9 data model, §13 security), and thread the new invariant into `IMPLEMENTATION-PLAN.md`. *(Threaded into the plan — M0 seam + spike S5, M1 scope/connectors steps; the ARCHITECTURE fold-in is tracked for the next spec pass.)*
 
 ---
 
 ## 7. Summary
 
-Green-light the architecture. Close Q1/Q4/Q5 (ADR-0007/0008), treat **G3, G5, G8** as must-do-in-M1 design tasks (they are expensive to retrofit), and schedule **G4, G6, G7, G9** into the milestone that first needs them. The invariant checklist in §5 is the acceptance backbone for M0/M1.
+Green-light the architecture. Close Q1/Q4/Q5 (ADR-0007/0008), treat **G3, G5, G8** — and, from the **§3A pivot addendum, G16 (scope-isolation enforcement) and G17 (confused-deputy)** — as must-do-in-M1 design tasks (all expensive to retrofit), and schedule **G4, G6, G7, G9, G18, G20** into the milestone that first needs them. The §5 invariant checklist — now including **per-scope data isolation** — is the acceptance backbone for M0/M1.
