@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from keel_core.agents import AgentSpec
+from keel_core.connectors import taint_from_events
 from keel_core.errors import KeelError
 from keel_core.events import Event, EventType
 from keel_core.permissions import Rule, RuleBasedPermissionEngine
@@ -219,7 +220,15 @@ async def _run_tools(
     """Emit tool.call events, run the calls through the parallel-safe permission-gated
     executor, then emit tool.result events — all in source order. A failing tool yields
     a failed result (never crashes the run)."""
-    ctx = ToolContext(scope_id=scope_id, session_id=session_id, trust=trust)
+    # Content taint accumulated by prior tool results this run (G17): outbound
+    # actions gate on it via a ConfusedDeputyEngine.
+    prior = [event async for event in store.read(session_id)]
+    ctx = ToolContext(
+        scope_id=scope_id,
+        session_id=session_id,
+        trust=trust,
+        content_taint=taint_from_events(prior),
+    )
     for call in calls:
         await _emit(
             store,
@@ -248,6 +257,7 @@ async def _run_tools(
                 "call_id": call.id,
                 "ok": result.ok,
                 "output": result.output,
+                "taint": str(result.taint),
             }
         else:
             payload = {"call_id": call.id, "ok": False, "error": "unknown tool"}

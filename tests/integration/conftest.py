@@ -78,5 +78,10 @@ async def migrated_db(pg_engine: AsyncEngine) -> AsyncIterator[AsyncEngine]:
     url = os.environ.get("KEEL_TEST_DATABASE_URL", _DEFAULT_PG)
     await asyncio.to_thread(_upgrade_head, url)
     async with pg_engine.begin() as conn:
-        await conn.execute(text("TRUNCATE events, sessions, memory_blocks, memory_block_versions"))
+        await conn.execute(
+            text(
+                "TRUNCATE events, sessions, memory_blocks, memory_block_versions, "
+                "connector_tokens"
+            )
+        )
     yield pg_engine

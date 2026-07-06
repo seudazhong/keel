@@ -10,6 +10,7 @@ from __future__ import annotations
 __version__ = "0.0.0"
 
 from .agents import AgentSpec, Scope
+from .connectors import ConfusedDeputyEngine, Connector, ConnectorTool, taint_from_events
 from .errors import CrossScopeError, KeelError, PermissionDenied
 from .events import Event, EventType
 from .loop import RunBudget, RunResult, ToolRegistry, admit, run
@@ -31,7 +32,9 @@ from .protocols import (
     ToolResult,
 )
 from .providers import LiteLLMGateway
+from .secrets import EnvelopeCipher, SecretsError, cipher_from_settings
 from .state import InMemoryEventStore, PostgresEventStore
+from .tokens import InMemoryTokenStore, PostgresTokenStore
 from .tools import ExecRequest, execute
 from .types import (
     AgentId,
@@ -95,6 +98,16 @@ __all__ = [
     "PostgresMemoryStore",
     "project_messages",
     "LiteLLMGateway",
+    # connectors + secrets (WS-G)
+    "Connector",
+    "ConnectorTool",
+    "ConfusedDeputyEngine",
+    "taint_from_events",
+    "EnvelopeCipher",
+    "SecretsError",
+    "cipher_from_settings",
+    "InMemoryTokenStore",
+    "PostgresTokenStore",
     # permissions + tool execution
     "Rule",
     "RuleBasedPermissionEngine",

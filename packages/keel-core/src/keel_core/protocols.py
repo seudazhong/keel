@@ -38,6 +38,9 @@ class ToolContext(BaseModel):
     scope_id: ScopeId
     session_id: SessionId
     trust: TrustLevel = TrustLevel.untrusted
+    # Trust of the *content* seen so far this run (G17). A trusted scope may still
+    # ingest tainted content (an email body, a web page); outbound actions gate on it.
+    content_taint: ContentTaint = ContentTaint.clean
 
 
 class ToolResult(BaseModel):

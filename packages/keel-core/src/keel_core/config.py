@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     # Windows host, where uvicorn's Proactor loop can't drive psycopg's async driver.
     event_store: str = "postgres"
 
+    # Envelope-encryption key for connector OAuth tokens at rest (G18). Any string;
+    # a Fernet key is derived from it. Empty -> the token store fails closed.
+    secret_key: str = ""
+
     # psycopg3 driver works for both sync (Alembic) and async (app) engines.
     database_url: str = "postgresql+psycopg://keel:keel@localhost:5432/keel"
     redis_url: str = "redis://localhost:6379/0"
