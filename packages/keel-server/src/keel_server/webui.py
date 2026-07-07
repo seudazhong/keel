@@ -7,6 +7,13 @@ Kept inline so the server needs no static-asset packaging or Node build.
 
 from __future__ import annotations
 
+from html import escape as _esc
+
+from fastapi import APIRouter, Request
+from fastapi.responses import HTMLResponse
+
+from keel_core.approvals import ApprovalRecord
+
 INDEX_HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -142,3 +149,79 @@ input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
 </body>
 </html>
 """
+
+
+# --- Approvals page (server-rendered; realizes docs/mockups/slice-preview.html) -------
+
+pages_router = APIRouter()
+
+_APPROVALS_HTML = """<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Keel — Approvals</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.5 system-ui, sans-serif; background: #0f1115; color: #e6e6e6; }
+  header { padding: 12px 16px; border-bottom: 1px solid #222; }
+  header b { color: #7aa2f7; }
+  main { max-width: 820px; margin: 0 auto; padding: 16px; }
+  .approval { background: #2b2411; border: 1px solid #5a4a15; border-radius: 10px;
+              padding: 14px; margin-bottom: 14px; }
+  .approval .hd { font-size: 16px; }
+  .approval .target { color: #f7768e; font-family: ui-monospace, monospace; }
+  .badge { font-size: 12px; color: #e0af68; border: 1px solid #5a4a15; border-radius: 20px;
+           padding: 1px 8px; margin-left: 6px; }
+  .cd { color: #c0caf5; font-size: 13px; margin: 8px 0; }
+  .btns button { margin-right: 8px; padding: 5px 14px; border-radius: 6px; border: 0;
+                 cursor: pointer; font: inherit; }
+  .allow { background: #2e7d32; color: #fff; } .deny { background: #7a2222; color: #fff; }
+  .meta { color: #9aa; }
+</style>
+</head>
+<body>
+<header><b>Keel</b> · Approvals — 无人值守运行的挂起审批（G5，超时 fail-closed）</header>
+<main>{{ROWS}}</main>
+<script>
+async function resolve(id, action) {
+  await fetch(`/v1/approvals/${id}/${action}`, { method: "POST" });
+  location.reload();
+}
+</script>
+</body>
+</html>
+"""
+
+
+def _render_row(record: ApprovalRecord) -> str:
+    target = str(record.args.get("to", "")) if isinstance(record.args, dict) else ""
+    return (
+        '<div class="approval">'
+        f'<div class="hd">✉️ <b>{_esc(record.tool)}</b> → '
+        f'<span class="target">{_esc(target)}</span>'
+        f'<span class="badge">⏸ 已挂起 · run {_esc(record.run_id)}</span></div>'
+        f'<div class="cd">🛡️ confused-deputy：本次运行读入了 <b>tainted</b> 内容'
+        f"（reason={_esc(record.reason)}），外发需你批准。</div>"
+        '<div class="btns">'
+        f"<button class=\"allow\" onclick=\"resolve('{_esc(record.id)}','approve')\">批准</button>"
+        f"<button class=\"deny\" onclick=\"resolve('{_esc(record.id)}','reject')\">拒绝</button>"
+        "</div></div>"
+    )
+
+
+def render_approvals_page(records: list[ApprovalRecord]) -> str:
+    rows = "\n".join(_render_row(r) for r in records)
+    if not rows:
+        rows = '<p class="meta">没有待处理的审批。</p>'
+    return _APPROVALS_HTML.replace("{{ROWS}}", rows)
+
+
+@pages_router.get("/approvals", response_class=HTMLResponse, include_in_schema=False)
+async def approvals_page(request: Request) -> str:
+    """Server-rendered pending durable approvals for the slice scope."""
+    store = getattr(request.app.state, "durable_approvals", None)
+    scope = getattr(request.app.state, "durable_scope", "web:local")
+    records = await store.list_pending(scope) if store is not None else []
+    return render_approvals_page(records)

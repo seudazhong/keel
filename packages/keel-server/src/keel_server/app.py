@@ -20,6 +20,7 @@ from sqlalchemy import text
 
 from keel_core import __version__
 from keel_core.api import HealthResponse, ReadinessResponse
+from keel_core.approvals import InMemoryApprovalStore, PostgresApprovalStore
 from keel_core.config import get_settings, load_env_file
 from keel_core.db import make_async_engine, make_redis
 from keel_core.providers import LiteLLMGateway
@@ -27,7 +28,7 @@ from keel_server.api import gateway as gateway_api
 from keel_server.api import v1
 from keel_server.gateway import OneBotGateway, RateLimiter
 from keel_server.runtime import AgentRuntime
-from keel_server.webui import INDEX_HTML
+from keel_server.webui import INDEX_HTML, pages_router
 
 logger = logging.getLogger("keel.server")
 
@@ -47,6 +48,29 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         model=settings.default_model,
         workspace=Path.cwd(),
     )
+    # Durable approvals raised by unattended (scheduled) runs — the Approvals page +
+    # API read this; approving enqueues a resume_run onto the worker's arq queue (G5).
+    app.state.durable_scope = "web:local"
+    app.state.durable_approvals = (
+        PostgresApprovalStore(engine, "web:local")
+        if engine is not None
+        else InMemoryApprovalStore()
+    )
+    app.state.arq = None
+    app.state.enqueue = None
+    try:
+        from arq import create_pool
+        from arq.connections import RedisSettings
+
+        arq_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+        app.state.arq = arq_pool
+
+        async def _enqueue(name: str, *args: object) -> None:
+            await arq_pool.enqueue_job(name, *args)
+
+        app.state.enqueue = _enqueue
+    except Exception:  # noqa: BLE001 - resume enqueue is best-effort; the page still renders
+        logger.warning("arq queue unavailable; durable-approval resume enqueue disabled")
     # OneBot IM gateway (optional): only wired when an API base is configured.
     if settings.onebot_api_base:
         app.state.onebot_gateway = OneBotGateway(
@@ -63,6 +87,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         await redis_client.aclose()
+        arq = getattr(app.state, "arq", None)
+        if arq is not None:
+            await arq.aclose()
         if engine is not None:
             await engine.dispose()
 
@@ -117,6 +144,7 @@ def create_app() -> FastAPI:
 
     app.include_router(v1.router)
     app.include_router(gateway_api.router)
+    app.include_router(pages_router)
 
     return app
 

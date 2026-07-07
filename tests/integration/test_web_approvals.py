@@ -78,3 +78,30 @@ async def test_reject_resolves_and_enqueues_resume(approvals_client: _Fixture) -
     assert enqueued == [("resume_run", "digest:web:local", "r1", "web:local")]
     rec = await approvals.get(aid)
     assert rec is not None and rec.status == "denied"
+
+
+async def test_approvals_page_renders_pending() -> None:
+    from keel_server.webui import pages_router
+
+    approvals = InMemoryApprovalStore()
+    await approvals.create_pending(
+        scope_id="web:local",
+        run_id="r1",
+        session_id="digest:web:local",
+        tool="email.send",
+        args={"to": "finance@external.example"},
+        call_id="c1",
+        idempotency_key="k1",
+        reason="tainted",
+        expires_at=datetime.now(UTC) + timedelta(hours=24),
+    )
+    app = FastAPI()
+    app.include_router(pages_router)
+    app.state.durable_approvals = approvals
+    app.state.durable_scope = "web:local"
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        html = (await client.get("/approvals")).text
+    assert "email.send" in html
+    assert "finance@external.example" in html
+    assert "已挂起" in html
