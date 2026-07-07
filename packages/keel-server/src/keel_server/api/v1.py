@@ -12,10 +12,11 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from keel_core.api import ApprovalResolution, CreateMessageRequest, CreateMessageResponse
+from keel_core.approvals import ApprovalStore
 from keel_core.types import PermissionDecision
 from keel_server.runtime import AgentRuntime
 
@@ -27,6 +28,14 @@ def _runtime(request: Request) -> AgentRuntime:
     if runtime is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "runtime unavailable")
     return runtime
+
+
+def _durable_approvals(request: Request) -> tuple[ApprovalStore, str]:
+    store: ApprovalStore | None = getattr(request.app.state, "durable_approvals", None)
+    if store is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "durable approvals unavailable")
+    scope: str = getattr(request.app.state, "durable_scope", "web:local")
+    return store, scope
 
 
 @router.post(
@@ -83,3 +92,49 @@ async def resolve_approval(
     if not resolved:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown or already-resolved approval")
     return {"resolved": True, "approved": approved}
+
+
+@router.get("/approvals", summary="List durable approvals for the current scope")
+async def list_approvals(
+    request: Request, status_filter: str = Query("pending", alias="status")
+) -> list[dict[str, object]]:
+    """Durable approvals raised by unattended runs (pending queue by default)."""
+    store, scope = _durable_approvals(request)
+    rows = await store.list_pending(scope) if status_filter == "pending" else []
+    return [
+        {
+            "id": r.id,
+            "run_id": r.run_id,
+            "session_id": r.session_id,
+            "tool": r.tool,
+            "args": r.args,
+            "call_id": r.call_id,
+            "reason": r.reason,
+            "status": r.status,
+            "created_at": r.created_at.isoformat(),
+            "expires_at": r.expires_at.isoformat(),
+        }
+        for r in rows
+    ]
+
+
+async def _resolve_durable(request: Request, approval_id: str, decision: str) -> dict[str, bool]:
+    store, _ = _durable_approvals(request)
+    ok = await store.resolve(approval_id, decision, "web")
+    if ok:
+        record = await store.get(approval_id)
+        enqueue = getattr(request.app.state, "enqueue", None)
+        if record is not None and enqueue is not None:
+            # Continue the suspended run: resume executes-or-denies the gated call (G5).
+            await enqueue("resume_run", record.session_id, record.run_id, record.scope_id)
+    return {"ok": ok}
+
+
+@router.post("/approvals/{approval_id}/approve", summary="Approve a durable approval")
+async def approve_durable(approval_id: str, request: Request) -> dict[str, bool]:
+    return await _resolve_durable(request, approval_id, "granted")
+
+
+@router.post("/approvals/{approval_id}/reject", summary="Reject a durable approval")
+async def reject_durable(approval_id: str, request: Request) -> dict[str, bool]:
+    return await _resolve_durable(request, approval_id, "denied")
