@@ -58,14 +58,14 @@ def digest_registry(sent: list[dict[str, Any]] | None = None) -> ToolRegistry:
     return ToolRegistry(
         [
             ConnectorTool(
-                name="inbox.list",
+                name="inbox_list",
                 description="List recent inbox messages.",
                 action=inbox_list,
                 outbound=False,
                 input_schema={"type": "object", "properties": {}},
             ),
             ConnectorTool(
-                name="email.send",
+                name="email_send",
                 description="Send an email.",
                 action=email_send,
                 outbound=True,
@@ -87,12 +87,12 @@ def digest_permissions() -> ConfusedDeputyEngine:
     """Allow inbox read + email send; escalate the send to ``ask`` once content is tainted."""
     base = RuleBasedPermissionEngine(
         [
-            Rule("inbox.list", PermissionDecision.allow),
-            Rule("email.send", PermissionDecision.allow),
+            Rule("inbox_list", PermissionDecision.allow),
+            Rule("email_send", PermissionDecision.allow),
         ],
         default=PermissionDecision.deny,
     )
-    return ConfusedDeputyEngine(base, outbound_tools={"email.send"})
+    return ConfusedDeputyEngine(base, outbound_tools={"email_send"})
 
 
 def digest_session_id(scope_id: str) -> str:
@@ -107,5 +107,5 @@ def build_digest_agent(scope_id: str) -> AgentSpec:
         model="",
         scope=Scope(id=scope_id, kind=ScopeKind.personal, trust=TrustLevel.trusted),
         persona="You are a concise personal assistant that triages the inbox each morning.",
-        toolset=["inbox.list", "email.send"],
+        toolset=["inbox_list", "email_send"],
     )

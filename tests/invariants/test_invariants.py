@@ -277,7 +277,7 @@ async def test_g5_durable_approval_survives_a_fresh_process() -> None:
         [
             [
                 ProviderChunk(
-                    tool_call=ToolCall(id="c1", name="inbox.list", arguments={}),
+                    tool_call=ToolCall(id="c1", name="inbox_list", arguments={}),
                     finish_reason=FinishReason.tool_use,
                 )
             ],
@@ -285,7 +285,7 @@ async def test_g5_durable_approval_survives_a_fresh_process() -> None:
                 ProviderChunk(
                     tool_call=ToolCall(
                         id="c2",
-                        name="email.send",
+                        name="email_send",
                         arguments={"to": "finance@external.example", "idempotency_key": "k"},
                     ),
                     finish_reason=FinishReason.tool_use,

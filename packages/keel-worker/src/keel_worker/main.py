@@ -26,7 +26,7 @@ from keel_core.digest import (
     digest_permissions,
     digest_registry,
 )
-from keel_core.loop import admit_system, resume, run
+from keel_core.loop import admit, resume, run
 from keel_core.observability import configure_logging, configure_tracing
 from keel_scheduler.store import due_tick
 
@@ -45,7 +45,9 @@ async def run_agent(ctx: dict[str, Any], schedule_id: str) -> str:
         return "missing"
     store, approvals, provider = ctx["store"], ctx["approvals"], ctx["provider"]
     agent = build_digest_agent(row.scope_id).model_copy(update={"model": settings.default_model})
-    await admit_system(store, row.session_id, row.scope_id, DIGEST_INSTRUCTION)
+    # The scheduled trigger is a *user* turn (the agent's standing behavior is its
+    # persona/system prompt); a system-only message list is rejected by chat providers.
+    await admit(store, row.session_id, row.scope_id, DIGEST_INSTRUCTION)
     result = await run(
         agent=agent,
         session_id=row.session_id,

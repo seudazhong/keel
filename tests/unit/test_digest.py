@@ -22,9 +22,19 @@ from keel_core.types import FinishReason, StopReason
 def test_agent_and_session_shape() -> None:
     agent = build_digest_agent("u:1")
     assert agent.scope.id == "u:1"
-    assert set(agent.toolset) == {"inbox.list", "email.send"}
+    assert set(agent.toolset) == {"inbox_list", "email_send"}
     assert digest_session_id("u:1") == "digest:u:1"
     assert "triage" in DIGEST_INSTRUCTION.lower()
+
+
+def test_tool_names_are_provider_valid() -> None:
+    import re
+
+    # OpenAI/Anthropic function names: ^[a-zA-Z0-9_-]{1,64}$ (no dots) — else 400 Bad Request.
+    names = [str(s["function"]["name"]) for s in digest_registry().schemas()]
+    assert names
+    for name in names:
+        assert re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", name), name
 
 
 async def test_digest_run_suspends_on_send() -> None:
@@ -33,7 +43,7 @@ async def test_digest_run_suspends_on_send() -> None:
         [
             [
                 ProviderChunk(
-                    tool_call=ToolCall(id="c1", name="inbox.list", arguments={}),
+                    tool_call=ToolCall(id="c1", name="inbox_list", arguments={}),
                     finish_reason=FinishReason.tool_use,
                 )
             ],
@@ -41,7 +51,7 @@ async def test_digest_run_suspends_on_send() -> None:
                 ProviderChunk(
                     tool_call=ToolCall(
                         id="c2",
-                        name="email.send",
+                        name="email_send",
                         arguments={"to": "finance@external.example", "idempotency_key": "k"},
                     ),
                     finish_reason=FinishReason.tool_use,
