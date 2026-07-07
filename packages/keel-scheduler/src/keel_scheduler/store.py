@@ -37,6 +37,8 @@ class ScheduleRow:
 class ScheduleStore(Protocol):
     async def due(self, now: datetime) -> list[ScheduleRow]: ...
 
+    async def get(self, schedule_id: str) -> ScheduleRow | None: ...
+
     async def mark_run(self, schedule_id: str, when: datetime, status: str) -> None: ...
 
 
@@ -56,6 +58,9 @@ class InMemoryScheduleStore:
 
     async def due(self, now: datetime) -> list[ScheduleRow]:
         return [r for r in self.rows if r.enabled and r.next_run_at <= now]
+
+    async def get(self, schedule_id: str) -> ScheduleRow | None:
+        return next((r for r in self.rows if r.id == schedule_id), None)
 
     async def mark_run(self, schedule_id: str, when: datetime, status: str) -> None:
         for r in self.rows:
@@ -128,6 +133,21 @@ class PostgresScheduleStore:
                 .all()
             )
         return [_to_schedule_row(r) for r in rows]
+
+    async def get(self, schedule_id: str) -> ScheduleRow | None:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            row = (
+                (
+                    await conn.execute(
+                        text("SELECT * FROM schedules WHERE scope_id = :scope AND id = :id"),
+                        {"scope": self._scope_id, "id": schedule_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return _to_schedule_row(row) if row is not None else None
 
     async def mark_run(self, schedule_id: str, when: datetime, status: str) -> None:
         async with self._engine.begin() as conn:
