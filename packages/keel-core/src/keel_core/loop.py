@@ -22,6 +22,7 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Any
 
 from keel_core.agents import AgentSpec
 from keel_core.connectors import taint_from_events
@@ -98,6 +99,24 @@ class ToolRegistry:
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
 
+    def schemas(self) -> list[dict[str, Any]]:
+        """Advertise the tools to the provider (OpenAI/LiteLLM function-call format).
+
+        Without this the model never learns the toolset exists and will refuse to
+        call anything; the loop then only ever executes tools a caller forces.
+        """
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema(),
+                },
+            }
+            for tool in self._tools.values()
+        ]
+
 
 @dataclass
 class RunBudget:
@@ -164,10 +183,14 @@ async def admit(store: EventStore, session_id: SessionId, scope_id: ScopeId, con
 
 
 async def _build_request(
-    agent: AgentSpec, store: EventStore, session_id: SessionId
+    agent: AgentSpec, store: EventStore, session_id: SessionId, registry: ToolRegistry
 ) -> ProviderRequest:
     events = [event async for event in store.read(session_id)]
-    return ProviderRequest(model=agent.model, messages=project_messages(events))
+    return ProviderRequest(
+        model=agent.model,
+        messages=project_messages(events),
+        tools=registry.schemas(),
+    )
 
 
 async def _call_provider(
@@ -354,7 +377,7 @@ async def run(
         await _emit(
             store, EventType.turn_started, session_id, scope_id, run_id, {"turn": iterations}
         )
-        request = await _build_request(agent, store, session_id)
+        request = await _build_request(agent, store, session_id, registry)
 
         try:
             turn = await _call_provider(provider, request, budget.max_retries, on_delta, emit_delta)

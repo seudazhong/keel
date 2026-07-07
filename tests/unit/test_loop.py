@@ -468,3 +468,35 @@ async def test_stream_deltas_emits_partials_but_projection_uses_whole() -> None:
         {"role": "user", "content": "hi"},
         {"role": "assistant", "content": "Hello"},
     ]
+
+
+async def test_tools_are_advertised_to_the_provider() -> None:
+    store = InMemoryEventStore()
+    seen: dict[str, list[dict[str, object]]] = {}
+
+    class _ProbeGateway:
+        def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
+            seen["tools"] = request.tools
+            return _one_end_turn()
+
+    await admit(store, "s1", "u:1", "list files")
+    await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=_ProbeGateway(),
+        registry=ToolRegistry([_SpyTool()]),
+    )
+    # The model must be told the toolset exists (OpenAI/LiteLLM function-call format),
+    # otherwise a real provider never emits a tool_use and tools are dead code.
+    tools = seen["tools"]
+    assert tools and tools[0]["type"] == "function"
+    assert tools[0]["function"]["name"] == "echo"  # type: ignore[index]
+
+
+def test_tool_registry_schemas_shape() -> None:
+    registry = ToolRegistry([_SpyTool()])
+    schemas = registry.schemas()
+    assert len(schemas) == 1
+    fn = schemas[0]["function"]
+    assert set(fn) == {"name", "description", "parameters"}  # type: ignore[arg-type]
