@@ -14,6 +14,19 @@ from .connectors import ConfusedDeputyEngine, Connector, ConnectorTool, taint_fr
 from .embeddings import Embedder, FakeEmbedder, LiteLLMEmbedder, rrf_fuse
 from .errors import CrossScopeError, KeelError, PermissionDenied
 from .events import Event, EventType
+from .extensibility import (
+    CatalogEntry,
+    ImportGuard,
+    ImportVerdict,
+    MCPClient,
+    MCPTool,
+    MCPToolSpec,
+    Skill,
+    SkillCatalog,
+    ToolSearchTool,
+    scan_for_injection,
+    tool_search,
+)
 from .loop import RunBudget, RunResult, ToolRegistry, admit, run
 from .memory import PostgresMemoryStore
 from .permissions import Rule, RuleBasedPermissionEngine
@@ -129,6 +142,18 @@ __all__ = [
     "session_search",
     "ArchivalSearchTool",
     "SessionSearchTool",
+    # extensibility (WS-G, I8)
+    "ImportGuard",
+    "ImportVerdict",
+    "scan_for_injection",
+    "Skill",
+    "SkillCatalog",
+    "MCPClient",
+    "MCPTool",
+    "MCPToolSpec",
+    "CatalogEntry",
+    "tool_search",
+    "ToolSearchTool",
     # observability (WS-H)
     "Tracer",
     "NoopTracer",

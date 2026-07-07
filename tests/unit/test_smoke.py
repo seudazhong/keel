@@ -25,6 +25,7 @@ MODULES = [
     "keel_core.connectors",
     "keel_core.embeddings",
     "keel_core.search",
+    "keel_core.extensibility",
     "keel_core.projections",
     "keel_core.loop",
     "keel_core.providers",
