@@ -52,3 +52,11 @@ def test_load_env_file_missing_returns_none(tmp_path: Path) -> None:
     from keel_core.config import load_env_file
 
     assert load_env_file(tmp_path / "nope.env") is None
+
+
+def test_scheduler_and_approval_defaults() -> None:
+    from keel_core.config import Settings
+
+    settings = Settings()
+    assert settings.approval_timeout_hours == 24
+    assert settings.scheduler_tick_seconds == 30

@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     server_host: str = "0.0.0.0"
     server_port: int = 8000
 
+    # Autonomy (M2 slice): scheduler tick cadence + how long an unattended approval
+    # stays open before it fails closed (invariant: fail-closed on timeout).
+    scheduler_tick_seconds: int = 30
+    approval_timeout_hours: int = 24
+
     @property
     def sync_database_url(self) -> str:
         """SQLAlchemy URL for the synchronous engine (Alembic uses this)."""
