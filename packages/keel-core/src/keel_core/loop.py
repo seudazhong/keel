@@ -25,6 +25,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from keel_core.agents import AgentSpec
+from keel_core.approvals import ApprovalStore
 from keel_core.connectors import taint_from_events
 from keel_core.errors import KeelError
 from keel_core.events import Event, EventType
@@ -42,6 +43,7 @@ from keel_core.protocols import (
 )
 from keel_core.tools.executor import ApproveFn, ExecRequest, execute
 from keel_core.types import (
+    ContentTaint,
     FinishReason,
     PermissionDecision,
     RunId,
@@ -138,6 +140,7 @@ class RunResult:
     error: str | None = None
     usage: Usage = field(default_factory=Usage)
     events: list[Event] = field(default_factory=list)
+    pending_approvals: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -285,10 +288,17 @@ async def _run_tools(
     run_id: RunId,
     trust: TrustLevel,
     calls: list[ToolCall],
-) -> None:
+    approvals: ApprovalStore | None = None,
+    expires_at: datetime | None = None,
+) -> list[str]:
     """Emit tool.call events, run the calls through the parallel-safe permission-gated
     executor, then emit tool.result events — all in source order. A failing tool yields
-    a failed result (never crashes the run)."""
+    a failed result (never crashes the run).
+
+    Durable mode: when ``approvals`` is provided and any call is gated to ``ask``, the
+    batch is **suspended** instead of executed — a pending approval is created per ask
+    call and the created approval ids are returned (no tool.result yet). The run then
+    resumes via :func:`resume` once the approvals resolve. Returns ``[]`` otherwise."""
     # Content taint accumulated by prior tool results this run (G17): outbound
     # actions gate on it via a ConfusedDeputyEngine.
     prior = [event async for event in store.read(session_id)]
@@ -307,6 +317,44 @@ async def _run_tools(
             run_id,
             {"tool": call.name, "call_id": call.id, "args": call.arguments},
         )
+
+    if approvals is not None:
+        asks = [
+            call
+            for call in calls
+            if permissions.evaluate(call.name, call.arguments, ctx) is PermissionDecision.ask
+        ]
+        if asks:
+            reason = "tainted" if ctx.content_taint is ContentTaint.tainted else "first_use"
+            created: list[str] = []
+            for call in asks:
+                key = str(call.arguments.get("idempotency_key") or uuid.uuid4().hex)
+                approval_id = await approvals.create_pending(
+                    scope_id=scope_id,
+                    run_id=run_id,
+                    session_id=session_id,
+                    tool=call.name,
+                    args=call.arguments,
+                    call_id=call.id,
+                    idempotency_key=key,
+                    reason=reason,
+                    expires_at=expires_at or _now(),
+                )
+                await _emit(
+                    store,
+                    EventType.approval_requested,
+                    session_id,
+                    scope_id,
+                    run_id,
+                    {
+                        "approval_id": approval_id,
+                        "tool": call.name,
+                        "args": call.arguments,
+                        "call_id": call.id,
+                    },
+                )
+                created.append(approval_id)
+            return created  # SUSPEND: no execute(), no tool.result
 
     requests: list[ExecRequest] = []
     known: list[bool] = []
@@ -331,6 +379,7 @@ async def _run_tools(
         else:
             payload = {"call_id": call.id, "ok": False, "error": "unknown tool"}
         await _emit(store, EventType.tool_result, session_id, scope_id, run_id, payload)
+    return []
 
 
 async def _agent_loop(
@@ -347,6 +396,8 @@ async def _agent_loop(
     run_id: RunId,
     emit_delta: Callable[[str], Awaitable[None]] | None,
     on_delta: DeltaObserver | None,
+    approvals: ApprovalStore | None = None,
+    expires_at: datetime | None = None,
     start_iteration: int = 0,
 ) -> _LoopOutcome:
     """The turn loop: build request -> call provider -> (gate) run tools -> repeat.
@@ -361,6 +412,7 @@ async def _agent_loop(
     total_usage = Usage()
     error: str | None = None
     reason = StopReason.completed
+    pending: list[str] = []
 
     while True:
         if interrupt is not None and interrupt():
@@ -400,7 +452,7 @@ async def _agent_loop(
 
         # Stop-reason gate (I3): tools run ONLY on an explicit tool_use finish.
         if turn.finish_reason == FinishReason.tool_use and turn.tool_calls:
-            await _run_tools(
+            suspended = await _run_tools(
                 store,
                 registry,
                 permissions,
@@ -410,7 +462,13 @@ async def _agent_loop(
                 run_id,
                 trust,
                 turn.tool_calls,
+                approvals,
+                expires_at,
             )
+            if suspended:
+                pending = suspended
+                reason = StopReason.suspended
+                break
             iterations += 1
             await _emit(
                 store, EventType.turn_ended, session_id, scope_id, run_id, {"turn": iterations}
@@ -427,7 +485,7 @@ async def _agent_loop(
             reason = StopReason.halted
         break
 
-    return _LoopOutcome(reason, error, iterations, tokens, total_usage)
+    return _LoopOutcome(reason, error, iterations, tokens, total_usage, pending)
 
 
 async def run(
@@ -445,6 +503,8 @@ async def run(
     on_delta: DeltaObserver | None = None,
     run_id: RunId | None = None,
     stream_deltas: bool = False,
+    approvals: ApprovalStore | None = None,
+    expires_at: datetime | None = None,
 ) -> RunResult:
     """Execute the agent loop until a named termination and return the result.
 
@@ -494,16 +554,28 @@ async def run(
         run_id=run_id,
         emit_delta=emit_delta,
         on_delta=on_delta,
+        approvals=approvals,
+        expires_at=expires_at,
     )
 
-    await _emit(
-        store,
-        EventType.run_ended,
-        session_id,
-        scope_id,
-        run_id,
-        {"reason": str(outcome.reason), "usage": outcome.usage.model_dump()},
-    )
+    if outcome.reason is StopReason.suspended:
+        await _emit(
+            store,
+            EventType.run_suspended,
+            session_id,
+            scope_id,
+            run_id,
+            {"approval_ids": outcome.pending_approvals},
+        )
+    else:
+        await _emit(
+            store,
+            EventType.run_ended,
+            session_id,
+            scope_id,
+            run_id,
+            {"reason": str(outcome.reason), "usage": outcome.usage.model_dump()},
+        )
     return RunResult(
         run_id=run_id,
         reason=outcome.reason,
@@ -511,4 +583,5 @@ async def run(
         tokens=outcome.tokens,
         error=outcome.error,
         usage=outcome.usage,
+        pending_approvals=outcome.pending_approvals,
     )
