@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Keel — Sessions</title>
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="logo">K</div><b>Keel</b><span class="env">standard</span></div>
+    <div class="scope-switch"><span class="dot"></span>
+      <div class="who"><b>个人助理</b><span>personal · dazhongguo</span></div><span class="chev">▾</span></div>
+    <nav class="nav">
+      <span class="label">工作区</span>
+      <a href="chat.html"><span class="ico">💬</span> Chat</a>
+      <a class="active" href="sessions.html"><span class="ico">🗂️</span> Sessions</a>
+      <a href="memory.html"><span class="ico">🧠</span> Memory</a>
+      <span class="label">配置</span>
+      <a href="agents.html"><span class="ico">🤖</span> Agents</a>
+      <a href="connectors.html"><span class="ico">🔌</span> Connectors</a>
+      <a href="approvals.html"><span class="ico">✅</span> Approvals <span class="count">3</span></a>
+      <span class="label">运维</span>
+      <a href="observability.html"><span class="ico">📊</span> Observability</a>
+      <a href="admin.html"><span class="ico">⚙️</span> Admin</a>
+    </nav>
+    <div class="foot"><span class="avatar">D</span> dazhongguo <span style="margin-left:auto"><a href="index.html">← 全景</a></span></div>
+  </aside>
+
+  <div class="main">
+    <div class="topbar"><h1>Sessions</h1><span class="sub">· 跨 Web / IM 的历史会话</span></div>
+
+    <div class="content">
+      <div class="card" style="margin-bottom:16px;"><div class="bd" style="display:flex;gap:10px;align-items:center;">
+        <div class="search" style="width:100%;"><span>🔍</span> 混合检索（全文 + 语义）："发票 报销"…</div>
+        <div class="chip">场景：全部 ▾</div><div class="chip">Agent：全部 ▾</div><div class="chip">时间：30 天 ▾</div>
+      </div></div>
+
+      <div class="banner info" style="margin-bottom:16px;"><span class="ic">🔎</span>
+        <div>混合检索：<b>pg_trgm + tsvector</b>（CJK 友好的词法）⊕ <b>pgvector KNN</b>（语义），RRF 融合排序。</div></div>
+
+      <div class="card"><div class="bd tight"><table>
+        <thead><tr><th>会话</th><th>场景</th><th>Agent</th><th>消息</th><th>成本</th><th>最近</th></tr></thead>
+        <tbody>
+          <tr><td><b>报销发票怎么整理</b><div class="muted" style="font-size:12px;">…把这些<mark style="background:#fff3bf;">发票</mark>按月份归类，生成<mark style="background:#fff3bf;">报销</mark>单…</div></td>
+            <td><span class="badge sky">web</span></td><td>个人助理</td><td>14</td><td>$0.08</td><td class="muted">今天</td></tr>
+          <tr><td><b>安排明天的行程</b><div class="muted" style="font-size:12px;">查日历 → 约张伟 3 点开会</div></td>
+            <td><span class="badge sky">web</span></td><td>个人助理</td><td>6</td><td>$0.01</td><td class="muted">刚刚</td></tr>
+          <tr><td><b>群里问 Keel 怎么部署</b><div class="muted" style="font-size:12px;">@机器人 keel 支持哪些数据库？</div></td>
+            <td><span class="badge green">QQ 群</span></td><td>团队 Q&A 机器人</td><td>3</td><td>$0.00</td><td class="muted">昨天</td></tr>
+          <tr><td><b>周报草稿 w28</b><div class="muted" style="font-size:12px;">汇总本周提交 + 生成周报</div></td>
+            <td><span class="badge sky">web</span></td><td>周报助手</td><td>9</td><td>$0.03</td><td class="muted">2 天前</td></tr>
+          <tr><td><b>Q3 OKR 复盘</b><div class="muted" style="font-size:12px;">检索历史会话 + 归档记忆</div></td>
+            <td><span class="badge sky">web</span></td><td>个人助理</td><td>22</td><td>$0.15</td><td class="muted">3 天前</td></tr>
+        </tbody>
+      </table></div></div>
+
+      <div class="note">设计待定：搜索范围是否受 scope 隔离约束（个人不能搜到 group 的会话）？IM 会话的「打开」体验——跳回 Web 只读回放，还是能继续对话？归档/保留策略（G4 erasure）入口放哪？</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

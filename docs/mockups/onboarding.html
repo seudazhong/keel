@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Keel — 首次运行</title>
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+<div style="min-height:100vh; display:flex; flex-direction:column;">
+  <div class="topbar"><div class="logo" style="width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#4f46e5,#8b5cf6);color:#fff;font-weight:800;display:grid;place-items:center;">K</div>
+    <h1 style="margin-left:8px;">欢迎使用 Keel</h1><span class="sub">首次运行向导</span>
+    <div class="spacer"></div><a class="muted" href="index.html" style="font-size:12px;">← 全景</a></div>
+
+  <div style="flex:1; padding:40px 22px;">
+    <div class="wizard">
+      <div class="steps">
+        <div class="s done">1 · 部署 profile</div>
+        <div class="s active">2 · 模型 / 提供方</div>
+        <div class="s">3 · 创建首个 Agent</div>
+        <div class="s">4 · 完成</div>
+      </div>
+
+      <div class="card">
+        <div class="hd"><h3>连接一个模型提供方</h3><span class="sub">· 决定 agent 用什么大模型</span></div>
+        <div class="bd stack">
+          <div class="banner info"><span class="ic">◆</span>
+            <div>你已用 GitHub Copilot 订阅登录。也可切换为 OpenAI / Anthropic / Gemini / DeepSeek / 本地 Ollama（填 API Key），或指向本地 litellm 代理。</div></div>
+
+          <div class="grid c2">
+            <div class="card" style="border-color:var(--accent-border);box-shadow:none;">
+              <div class="bd">
+                <div style="display:flex;align-items:center;gap:10px;">
+                  <span style="font-size:22px;">🐙</span><b>GitHub Copilot</b>
+                  <span class="badge green" style="margin-left:auto;"><span class="d"></span>已登录</span>
+                </div>
+                <div class="muted" style="font-size:12px;margin:8px 0;">设备码登录已完成，token 已缓存。</div>
+                <div class="section-title">默认模型</div>
+                <div class="chip" style="width:100%;justify-content:space-between;">claude-sonnet-4.5 <span>▾</span></div>
+                <div class="note">设计待定：Copilot 模型里 gpt-5.x / codex 走 Responses API，当前 chat 路径不可用——选择器要不要灰掉并提示原因？</div>
+              </div>
+            </div>
+            <div class="card" style="box-shadow:none;">
+              <div class="bd">
+                <div style="display:flex;align-items:center;gap:10px;"><span style="font-size:22px;">🔑</span><b>其他提供方</b></div>
+                <div class="stack" style="gap:8px;margin-top:10px;">
+                  <div class="chip" style="justify-content:space-between;">OpenAI <span class="muted">未配置</span></div>
+                  <div class="chip" style="justify-content:space-between;">Anthropic <span class="muted">未配置</span></div>
+                  <div class="chip" style="justify-content:space-between;">本地 Ollama <span class="muted">未配置</span></div>
+                  <div class="chip" style="justify-content:space-between;">litellm 代理 <span class="muted">未配置</span></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style="display:flex;gap:10px;">
+            <button class="btn">← 上一步</button>
+            <button class="btn primary" style="margin-left:auto;">下一步：创建 Agent →</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="note" style="margin-top:14px;">设计待定：部署 profile（lite / standard / full，见 ADR-0008）三选一分别开启哪些服务？首次运行是否强制创建管理员账号 + 设置 KEEL_SECRET_KEY（连接器加密所需）？</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

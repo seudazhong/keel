@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Keel — Agents</title>
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="logo">K</div><b>Keel</b><span class="env">standard</span></div>
+    <div class="scope-switch"><span class="dot"></span>
+      <div class="who"><b>个人助理</b><span>personal · dazhongguo</span></div><span class="chev">▾</span></div>
+    <nav class="nav">
+      <span class="label">工作区</span>
+      <a href="chat.html"><span class="ico">💬</span> Chat</a>
+      <a href="sessions.html"><span class="ico">🗂️</span> Sessions</a>
+      <a href="memory.html"><span class="ico">🧠</span> Memory</a>
+      <span class="label">配置</span>
+      <a class="active" href="agents.html"><span class="ico">🤖</span> Agents</a>
+      <a href="connectors.html"><span class="ico">🔌</span> Connectors</a>
+      <a href="approvals.html"><span class="ico">✅</span> Approvals <span class="count">3</span></a>
+      <span class="label">运维</span>
+      <a href="observability.html"><span class="ico">📊</span> Observability</a>
+      <a href="admin.html"><span class="ico">⚙️</span> Admin</a>
+    </nav>
+    <div class="foot"><span class="avatar">D</span> dazhongguo <span style="margin-left:auto"><a href="index.html">← 全景</a></span></div>
+  </aside>
+
+  <div class="main">
+    <div class="topbar"><h1>Agents</h1><span class="sub">· 每个 agent = 一个 scoped 实体</span>
+      <div class="spacer"></div><button class="btn primary sm">＋ 新建 Agent</button></div>
+
+    <div class="content wide">
+      <div class="row" style="align-items:flex-start;">
+        <!-- Agent list -->
+        <div class="card" style="width:340px;flex:none;">
+          <div class="hd"><h3>全部 Agent</h3><span class="sub">3</span></div>
+          <div class="bd tight">
+            <div style="padding:12px 16px;background:var(--accent-soft);border-left:2px solid var(--accent);cursor:pointer;">
+              <div style="display:flex;align-items:center;gap:8px;"><b>个人助理</b>
+                <span class="badge violet">personal</span><span class="badge green"><span class="d"></span>trusted</span></div>
+              <div class="muted" style="font-size:12px;margin-top:4px;">claude-sonnet-4.5 · 6 工具 · 3 连接器</div>
+            </div>
+            <div style="padding:12px 16px;border-top:1px solid var(--border);cursor:pointer;">
+              <div style="display:flex;align-items:center;gap:8px;"><b>团队 Q&A 机器人</b>
+                <span class="badge sky">group</span><span class="badge amber">untrusted</span></div>
+              <div class="muted" style="font-size:12px;margin-top:4px;">gpt-4o · 安全工具集 · 0 连接器</div>
+            </div>
+            <div style="padding:12px 16px;border-top:1px solid var(--border);cursor:pointer;">
+              <div style="display:flex;align-items:center;gap:8px;"><b>周报助手</b>
+                <span class="badge violet">personal</span><span class="badge green"><span class="d"></span>trusted</span></div>
+              <div class="muted" style="font-size:12px;margin-top:4px;">claude-sonnet-4.5 · 4 工具 · 2 连接器</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Agent detail -->
+        <div class="stack" style="flex:1;">
+          <div class="card">
+            <div class="hd"><h3>个人助理</h3><span class="badge violet">personal · u:dazhongguo</span>
+              <div class="spacer" style="flex:1"></div><button class="btn sm">复制</button><button class="btn primary sm">保存</button></div>
+            <div class="bd stack">
+              <div>
+                <div class="section-title">人格 / System persona</div>
+                <div class="card" style="box-shadow:none;background:var(--surface-2);"><div class="bd" style="font-size:13px;color:var(--text-soft);">
+                  你是我的私人助理，熟悉我的日程与联系人。回答简洁、主动提醒，涉及外发动作先征求我同意。</div></div>
+              </div>
+              <div class="grid c2">
+                <div><div class="section-title">模型</div><div class="chip" style="width:100%;justify-content:space-between;">github_copilot / claude-sonnet-4.5 <span>▾</span></div></div>
+                <div><div class="section-title">信任级别</div><div class="chip" style="width:100%;justify-content:space-between;">trusted（可用完整工具 + 连接器）<span>▾</span></div></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="hd"><h3>工具集 & 权限</h3><span class="sub">· 每个工具：allow / ask / deny</span></div>
+            <div class="bd tight">
+              <table><tbody>
+                <tr><td><b>read / ls / glob / grep</b><div class="muted" style="font-size:12px;">只读文件工具</div></td>
+                  <td style="text-align:right;"><span class="badge green">allow</span></td><td style="width:44px;"><span class="toggle on"></span></td></tr>
+                <tr><td><b>write / edit</b><div class="muted" style="font-size:12px;">写文件</div></td>
+                  <td style="text-align:right;"><span class="badge amber">ask</span></td><td><span class="toggle on"></span></td></tr>
+                <tr><td><b>shell</b><div class="muted" style="font-size:12px;">执行命令（沙箱内）</div></td>
+                  <td style="text-align:right;"><span class="badge amber">ask</span></td><td><span class="toggle"></span></td></tr>
+                <tr><td><b>archival_search / session_search</b><div class="muted" style="font-size:12px;">检索记忆与历史</div></td>
+                  <td style="text-align:right;"><span class="badge green">allow</span></td><td><span class="toggle on"></span></td></tr>
+              </tbody></table>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="hd"><h3>已授予的连接器</h3><span class="sub">· 仅本 agent scope 可用</span>
+              <div class="spacer" style="flex:1"></div><a class="muted" href="connectors.html" style="font-size:12px;">管理 →</a></div>
+            <div class="bd row" style="flex-wrap:wrap;">
+              <div class="chip">✉️ Gmail · 读+发送</div>
+              <div class="chip">📅 Google Calendar · 读+写</div>
+              <div class="chip">📄 Notion · 读</div>
+            </div>
+          </div>
+          <div class="note">设计待定：agent 与连接器是「多对多授予」——授权入口放在 agent 里还是 connector 里？group agent 应被硬性禁止授予任何个人连接器（ADR-0009 隔离），UI 如何表达这条铁律？</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

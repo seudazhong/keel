@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Keel — Observability</title>
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="logo">K</div><b>Keel</b><span class="env">standard</span></div>
+    <div class="scope-switch"><span class="dot"></span>
+      <div class="who"><b>个人助理</b><span>personal · dazhongguo</span></div><span class="chev">▾</span></div>
+    <nav class="nav">
+      <span class="label">工作区</span>
+      <a href="chat.html"><span class="ico">💬</span> Chat</a>
+      <a href="sessions.html"><span class="ico">🗂️</span> Sessions</a>
+      <a href="memory.html"><span class="ico">🧠</span> Memory</a>
+      <span class="label">配置</span>
+      <a href="agents.html"><span class="ico">🤖</span> Agents</a>
+      <a href="connectors.html"><span class="ico">🔌</span> Connectors</a>
+      <a href="approvals.html"><span class="ico">✅</span> Approvals <span class="count">3</span></a>
+      <span class="label">运维</span>
+      <a class="active" href="observability.html"><span class="ico">📊</span> Observability</a>
+      <a href="admin.html"><span class="ico">⚙️</span> Admin</a>
+    </nav>
+    <div class="foot"><span class="avatar">D</span> dazhongguo <span style="margin-left:auto"><a href="index.html">← 全景</a></span></div>
+  </aside>
+
+  <div class="main">
+    <div class="topbar"><h1>Observability</h1><span class="sub">· 运行轨迹 + token/成本核算（Langfuse）</span>
+      <div class="spacer"></div><div class="chip">近 7 天 ▾</div></div>
+
+    <div class="content wide">
+      <div class="grid c4" style="margin-bottom:16px;">
+        <div class="card stat"><div class="k">运行数</div><div class="n">1,284</div><div class="delta up">▲ 12%</div></div>
+        <div class="card stat"><div class="k">Tokens</div><div class="n">4.8M</div><div class="delta up">▲ 8%</div></div>
+        <div class="card stat"><div class="k">成本（USD）</div><div class="n">$14.20</div><div class="delta down">▼ 5%</div></div>
+        <div class="card stat"><div class="k">缓存命中省下</div><div class="n">$6.10</div><div class="delta up">43%</div></div>
+      </div>
+
+      <div class="row" style="align-items:flex-start;">
+        <div class="card" style="flex:1;">
+          <div class="hd"><h3>最近运行</h3><span class="sub">· 点开看轨迹</span></div>
+          <div class="bd tight"><table>
+            <thead><tr><th>会话 / Agent</th><th>结果</th><th>迭代</th><th>Tokens</th><th>成本</th><th>耗时</th></tr></thead>
+            <tbody>
+              <tr style="background:var(--accent-soft);"><td><b>安排明天的行程</b><div class="muted" style="font-size:12px;">个人助理</div></td>
+                <td><span class="badge green">completed</span></td><td>2</td><td>3,412</td><td>$0.011</td><td class="muted">4.2s</td></tr>
+              <tr><td><b>整理收件箱</b><div class="muted" style="font-size:12px;">个人助理</div></td>
+                <td><span class="badge green">completed</span></td><td>5</td><td>9,180</td><td>$0.031</td><td class="muted">11s</td></tr>
+              <tr><td><b>群问部署</b><div class="muted" style="font-size:12px;">团队 Q&A 机器人</div></td>
+                <td><span class="badge green">completed</span></td><td>1</td><td>1,050</td><td>$0.002</td><td class="muted">1.8s</td></tr>
+              <tr><td><b>周报草稿</b><div class="muted" style="font-size:12px;">周报助手</div></td>
+                <td><span class="badge red">error</span> <span class="muted" style="font-size:11px;">model not accessible</span></td><td>0</td><td>0</td><td>$0.00</td><td class="muted">0.3s</td></tr>
+            </tbody>
+          </table></div>
+        </div>
+
+        <!-- Run trace -->
+        <div class="card" style="width:380px;flex:none;">
+          <div class="hd"><h3>运行轨迹</h3><span class="sub mono" style="font-size:11px;">run 5aa2…081d</span></div>
+          <div class="bd">
+            <div class="timeline">
+              <div class="tl-item"><b style="font-size:13px;">run.started</b><div class="muted" style="font-size:12px;">个人助理 · claude-sonnet-4.5</div></div>
+              <div class="tl-item"><b style="font-size:13px;">turn 0 · 生成</b><div class="muted" style="font-size:12px;">1,200 tok · $0.004</div></div>
+              <div class="tl-item tool"><b style="font-size:13px;">🔌 calendar.list_events</b><div class="muted" style="font-size:12px;">→ 3 事件 · 220ms</div></div>
+              <div class="tl-item"><b style="font-size:13px;">turn 1 · 生成</b><div class="muted" style="font-size:12px;">2,212 tok · $0.007（缓存读 1,900）</div></div>
+              <div class="tl-item"><b style="font-size:13px;">approval.requested</b><div class="muted" style="font-size:12px;">gmail.send · 等待用户</div></div>
+              <div class="tl-item ok"><b style="font-size:13px;">run.ended · completed</b><div class="muted" style="font-size:12px;">合计 3,412 tok · $0.011</div></div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="note">设计待定：成本按 scope/agent/用户 归集用于配额与计费（G7）——阈值告警放这里还是 Admin？错误（如 model not accessible）要不要聚合成「健康问题」推给管理员？</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Keel — Admin</title>
+<link rel="stylesheet" href="assets/app.css" />
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="logo">K</div><b>Keel</b><span class="env">standard</span></div>
+    <div class="scope-switch"><span class="dot"></span>
+      <div class="who"><b>系统管理</b><span>system · admin</span></div><span class="chev">▾</span></div>
+    <nav class="nav">
+      <span class="label">工作区</span>
+      <a href="chat.html"><span class="ico">💬</span> Chat</a>
+      <a href="sessions.html"><span class="ico">🗂️</span> Sessions</a>
+      <a href="memory.html"><span class="ico">🧠</span> Memory</a>
+      <span class="label">配置</span>
+      <a href="agents.html"><span class="ico">🤖</span> Agents</a>
+      <a href="connectors.html"><span class="ico">🔌</span> Connectors</a>
+      <a href="approvals.html"><span class="ico">✅</span> Approvals <span class="count">3</span></a>
+      <span class="label">运维</span>
+      <a href="observability.html"><span class="ico">📊</span> Observability</a>
+      <a class="active" href="admin.html"><span class="ico">⚙️</span> Admin</a>
+    </nav>
+    <div class="foot"><span class="avatar">D</span> dazhongguo <span style="margin-left:auto"><a href="index.html">← 全景</a></span></div>
+  </aside>
+
+  <div class="main">
+    <div class="topbar"><h1>Admin</h1><span class="sub">· 用户 / scopes / IM 渠道 / 健康</span>
+      <div class="spacer"></div><span class="badge green"><span class="d"></span>全部服务正常</span></div>
+
+    <div class="content">
+      <!-- Health -->
+      <div class="grid c4" style="margin-bottom:20px;">
+        <div class="card stat"><div class="k">Postgres</div><div class="n" style="font-size:18px;color:var(--green);">● 正常</div><div class="muted" style="font-size:12px;">RLS 生效</div></div>
+        <div class="card stat"><div class="k">Redis</div><div class="n" style="font-size:18px;color:var(--green);">● 正常</div><div class="muted" style="font-size:12px;">事件流 + 队列</div></div>
+        <div class="card stat"><div class="k">Worker</div><div class="n" style="font-size:18px;color:var(--green);">● 2 在线</div><div class="muted" style="font-size:12px;">at-most-once</div></div>
+        <div class="card stat"><div class="k">部署 profile</div><div class="n" style="font-size:18px;">standard</div><div class="muted" style="font-size:12px;">web+worker+db</div></div>
+      </div>
+
+      <div class="grid c2">
+        <!-- Users & RBAC -->
+        <div class="card">
+          <div class="hd"><h3>用户 & 角色（RBAC）</h3><div class="spacer" style="flex:1"></div><button class="btn primary sm">＋ 邀请</button></div>
+          <div class="bd tight"><table>
+            <thead><tr><th>用户</th><th>角色</th><th>可见 scope</th></tr></thead>
+            <tbody>
+              <tr><td><b>dazhongguo</b><div class="muted" style="font-size:12px;">me@gmail.com</div></td><td><span class="badge violet">owner</span></td><td class="muted">全部</td></tr>
+              <tr><td><b>lily</b><div class="muted" style="font-size:12px;">lily@team.com</div></td><td><span class="badge sky">admin</span></td><td class="muted">group:*</td></tr>
+              <tr><td><b>bot-svc</b><div class="muted" style="font-size:12px;">service account</div></td><td><span class="badge">member</span></td><td class="muted">group:88</td></tr>
+            </tbody>
+          </table></div>
+        </div>
+
+        <!-- Scopes -->
+        <div class="card">
+          <div class="hd"><h3>Scopes（隔离边界）</h3></div>
+          <div class="bd tight"><table>
+            <thead><tr><th>Scope</th><th>类型</th><th>Agent</th><th>连接器</th></tr></thead>
+            <tbody>
+              <tr><td class="mono">personal:dazhongguo</td><td><span class="badge violet">personal</span></td><td>2</td><td>3</td></tr>
+              <tr><td class="mono">group:88</td><td><span class="badge sky">group</span></td><td>1</td><td>0</td></tr>
+              <tr><td class="mono">system</td><td><span class="badge">system</span></td><td>—</td><td>—</td></tr>
+            </tbody>
+          </table></div>
+        </div>
+      </div>
+
+      <!-- IM channels -->
+      <div class="card" style="margin-top:16px;">
+        <div class="hd"><h3>IM 渠道</h3><span class="sub">· 唤醒规则 + 限流 · 不可信输入 → 安全工具集</span>
+          <div class="spacer" style="flex:1"></div><button class="btn sm">＋ 添加渠道</button></div>
+        <div class="bd tight"><table>
+          <thead><tr><th>渠道</th><th>状态</th><th>唤醒规则</th><th>限流</th><th>绑定 Agent</th></tr></thead>
+          <tbody>
+            <tr><td><b>🐧 QQ (OneBot)</b></td><td><span class="badge green"><span class="d"></span>已连</span></td>
+              <td class="soft">群内 @机器人 或 /keel；私聊常应</td><td>5 / 分钟 / 会话</td><td>团队 Q&A 机器人</td></tr>
+            <tr><td><b>✈️ Telegram</b></td><td><span class="badge">未连</span></td><td class="muted">—</td><td class="muted">—</td><td class="muted">—</td></tr>
+            <tr><td><b>🏢 WeCom</b></td><td><span class="badge">未连</span></td><td class="muted">—</td><td class="muted">—</td><td class="muted">—</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+
+      <div class="note">设计待定：RBAC 角色粒度（owner/admin/member 够吗，是否需要 per-scope 角色）？secret_key/加密密钥轮换在此管理？多租户（M4）时 scope 之上是否需要「组织」层？审计日志的查看入口。</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
