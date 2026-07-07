@@ -6,10 +6,16 @@ suspends (loop.py) and resumes when the row is granted/denied/expired (G5)."""
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
+
+_SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 
 
 @dataclass
@@ -99,9 +105,7 @@ class InMemoryApprovalStore:
         return self._rows.get(approval_id)
 
     async def list_pending(self, scope_id: str) -> list[ApprovalRecord]:
-        return [
-            r for r in self._rows.values() if r.scope_id == scope_id and r.status == "pending"
-        ]
+        return [r for r in self._rows.values() if r.scope_id == scope_id and r.status == "pending"]
 
     async def pending_for_run(self, run_id: str) -> list[ApprovalRecord]:
         return [r for r in self._rows.values() if r.run_id == run_id and r.status == "pending"]
@@ -123,3 +127,150 @@ class InMemoryApprovalStore:
                 row.resolved_at = now
                 expired.append(row.id)
         return expired
+
+
+def _to_record(row: Any) -> ApprovalRecord:
+    return ApprovalRecord(
+        id=row["id"],
+        scope_id=row["scope_id"],
+        run_id=row["run_id"],
+        session_id=row["session_id"],
+        tool=row["tool"],
+        args=row["args"],
+        call_id=row["call_id"],
+        idempotency_key=row["idempotency_key"],
+        reason=row["reason"],
+        status=row["status"],
+        created_at=row["created_at"],
+        expires_at=row["expires_at"],
+        resolved_at=row["resolved_at"],
+        resolved_by=row["resolved_by"],
+    )
+
+
+class PostgresApprovalStore:
+    """Durable, scope-bound ApprovalStore over Postgres (RLS as defense-in-depth)."""
+
+    def __init__(self, engine: AsyncEngine, scope_id: str) -> None:
+        self._engine = engine
+        self._scope_id = scope_id
+
+    async def create_pending(
+        self,
+        *,
+        scope_id: str,
+        run_id: str,
+        session_id: str,
+        tool: str,
+        args: dict[str, Any],
+        call_id: str,
+        idempotency_key: str,
+        reason: str,
+        expires_at: datetime,
+    ) -> str:
+        approval_id = uuid.uuid4().hex
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": scope_id})
+            await conn.execute(
+                text(
+                    "INSERT INTO approvals (id, scope_id, run_id, session_id, tool, args, "
+                    "call_id, idempotency_key, reason, status, created_at, expires_at) VALUES "
+                    "(:id, :scope, :run_id, :session_id, :tool, CAST(:args AS jsonb), :call_id, "
+                    ":key, :reason, 'pending', now(), :expires_at)"
+                ),
+                {
+                    "id": approval_id,
+                    "scope": scope_id,
+                    "run_id": run_id,
+                    "session_id": session_id,
+                    "tool": tool,
+                    "args": json.dumps(args),
+                    "call_id": call_id,
+                    "key": idempotency_key,
+                    "reason": reason,
+                    "expires_at": expires_at,
+                },
+            )
+        return approval_id
+
+    async def get(self, approval_id: str) -> ApprovalRecord | None:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            row = (
+                (
+                    await conn.execute(
+                        text("SELECT * FROM approvals WHERE scope_id = :scope AND id = :id"),
+                        {"scope": self._scope_id, "id": approval_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return _to_record(row) if row is not None else None
+
+    async def list_pending(self, scope_id: str) -> list[ApprovalRecord]:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": scope_id})
+            rows = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT * FROM approvals WHERE scope_id = :scope AND status = 'pending' "
+                            "ORDER BY created_at"
+                        ),
+                        {"scope": scope_id},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [_to_record(r) for r in rows]
+
+    async def pending_for_run(self, run_id: str) -> list[ApprovalRecord]:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            rows = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT * FROM approvals WHERE scope_id = :scope AND run_id = :run_id "
+                            "AND status = 'pending'"
+                        ),
+                        {"scope": self._scope_id, "run_id": run_id},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [_to_record(r) for r in rows]
+
+    async def resolve(self, approval_id: str, status: str, resolved_by: str) -> bool:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    "UPDATE approvals SET status = :status, resolved_at = now(), "
+                    "resolved_by = :by WHERE scope_id = :scope AND id = :id AND status = 'pending'"
+                ),
+                {"status": status, "by": resolved_by, "scope": self._scope_id, "id": approval_id},
+            )
+        return result.rowcount == 1
+
+    async def expire_due(self, now: datetime) -> list[str]:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            rows = (
+                (
+                    await conn.execute(
+                        text(
+                            "UPDATE approvals SET status = 'expired', resolved_at = :now "
+                            "WHERE scope_id = :scope AND status = 'pending' AND expires_at <= :now "
+                            "RETURNING id"
+                        ),
+                        {"scope": self._scope_id, "now": now},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [str(r) for r in rows]

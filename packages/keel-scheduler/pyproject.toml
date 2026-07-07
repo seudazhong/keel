@@ -5,6 +5,7 @@ description = "Keel leader-elected cron scheduler (stub; lands in M2)."
 requires-python = ">=3.12"
 dependencies = [
     "keel-core",
+    "sqlalchemy>=2",
 ]
 
 [project.scripts]
