@@ -1084,10 +1084,14 @@ version = "0.0.0"
 source = { editable = "packages/keel-scheduler" }
 dependencies = [
     { name = "keel-core" },
+    { name = "sqlalchemy" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "keel-core", editable = "packages/keel-core" }]
+requires-dist = [
+    { name = "keel-core", editable = "packages/keel-core" },
+    { name = "sqlalchemy", specifier = ">=2" },
+]
 
 [[package]]
 name = "keel-sdk"
