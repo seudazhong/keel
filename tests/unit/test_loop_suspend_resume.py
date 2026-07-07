@@ -101,3 +101,102 @@ async def test_tainted_outbound_suspends_when_durable_approvals_present() -> Non
         if e.type is EventType.tool_result and e.payload.get("call_id") == "c2"
     ]
     assert sends == []  # the escalated send has no result yet
+
+
+def _done() -> ScriptedProviderGateway:
+    """What the model does AFTER the send is resolved: just wrap up."""
+    return ScriptedProviderGateway(
+        [[ProviderChunk(delta="Sent. Here's your digest.", finish_reason=FinishReason.end_turn)]]
+    )
+
+
+async def _suspend_once(
+    store: InMemoryEventStore, approvals: InMemoryApprovalStore, sent: list[dict[str, object]]
+) -> str:
+    await admit_system(store, "s1", "u:1", "triage the inbox and reply if needed")
+    result = await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=_read_then_send(),
+        registry=_mail_tools(sent),
+        permissions=_engine(),
+        approvals=approvals,
+        expires_at=_EXPIRES,
+    )
+    return result.run_id
+
+
+async def test_resume_after_grant_sends_once_and_completes() -> None:
+    from keel_core.loop import resume
+
+    store, approvals, sent = InMemoryEventStore(), InMemoryApprovalStore(), []
+    run_id = await _suspend_once(store, approvals, sent)
+    aid = (await approvals.list_pending("u:1"))[0].id
+    assert await approvals.resolve(aid, "granted", "dazhongguo") is True
+
+    result = await resume(
+        agent=_agent(),
+        session_id="s1",
+        run_id=run_id,
+        store=store,
+        provider=_done(),
+        registry=_mail_tools(sent),
+        permissions=_engine(),
+        approvals=approvals,
+    )
+    assert result.reason is StopReason.completed
+    assert sent == [{"to": "z@x", "idempotency_key": "k1"}]  # sent exactly once
+    types = [e.type for e in store.snapshot("s1")]
+    assert EventType.run_resumed in types and EventType.run_ended in types
+
+
+async def test_resume_after_reject_does_not_send() -> None:
+    from keel_core.loop import resume
+
+    store, approvals, sent = InMemoryEventStore(), InMemoryApprovalStore(), []
+    run_id = await _suspend_once(store, approvals, sent)
+    aid = (await approvals.list_pending("u:1"))[0].id
+    await approvals.resolve(aid, "denied", "dazhongguo")
+
+    result = await resume(
+        agent=_agent(),
+        session_id="s1",
+        run_id=run_id,
+        store=store,
+        provider=_done(),
+        registry=_mail_tools(sent),
+        permissions=_engine(),
+        approvals=approvals,
+    )
+    assert result.reason is StopReason.completed
+    assert sent == []
+    denied = [
+        e
+        for e in store.snapshot("s1")
+        if e.type is EventType.tool_result and e.payload.get("call_id") == "c2"
+    ]
+    assert denied and denied[0].payload["ok"] is False
+
+
+async def test_double_resume_sends_once() -> None:
+    from keel_core.loop import resume
+
+    store, approvals, sent = InMemoryEventStore(), InMemoryApprovalStore(), []
+    run_id = await _suspend_once(store, approvals, sent)
+    aid = (await approvals.list_pending("u:1"))[0].id
+    await approvals.resolve(aid, "granted", "dazhongguo")
+    registry = _mail_tools(sent)  # one registry instance across both resumes
+
+    for _ in range(2):  # a redelivered resume job must not double-send
+        await resume(
+            agent=_agent(),
+            session_id="s1",
+            run_id=run_id,
+            store=store,
+            provider=_done(),
+            registry=registry,
+            permissions=_engine(),
+            approvals=approvals,
+        )
+    assert sent == [{"to": "z@x", "idempotency_key": "k1"}]  # idempotent: one send

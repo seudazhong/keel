@@ -39,6 +39,7 @@ from keel_core.protocols import (
     Tool,
     ToolCall,
     ToolContext,
+    ToolResult,
     Usage,
 )
 from keel_core.tools.executor import ApproveFn, ExecRequest, execute
@@ -551,6 +552,152 @@ async def run(
         interrupt=interrupt,
         permissions=permissions,
         approve=approve,
+        run_id=run_id,
+        emit_delta=emit_delta,
+        on_delta=on_delta,
+        approvals=approvals,
+        expires_at=expires_at,
+    )
+
+    if outcome.reason is StopReason.suspended:
+        await _emit(
+            store,
+            EventType.run_suspended,
+            session_id,
+            scope_id,
+            run_id,
+            {"approval_ids": outcome.pending_approvals},
+        )
+    else:
+        await _emit(
+            store,
+            EventType.run_ended,
+            session_id,
+            scope_id,
+            run_id,
+            {"reason": str(outcome.reason), "usage": outcome.usage.model_dump()},
+        )
+    return RunResult(
+        run_id=run_id,
+        reason=outcome.reason,
+        iterations=outcome.iterations,
+        tokens=outcome.tokens,
+        error=outcome.error,
+        usage=outcome.usage,
+        pending_approvals=outcome.pending_approvals,
+    )
+
+
+async def _suspended_calls(store: EventStore, session_id: SessionId) -> list[ToolCall]:
+    """The tool.call events in the log that have no matching tool.result (the batch a
+    suspended run stopped at)."""
+    calls: dict[str, ToolCall] = {}
+    resulted: set[str] = set()
+    async for event in store.read(session_id):
+        if event.type is EventType.tool_call:
+            cid = str(event.payload["call_id"])
+            calls[cid] = ToolCall(
+                id=cid,
+                name=str(event.payload["tool"]),
+                arguments=dict(event.payload.get("args", {})),
+            )
+        elif event.type is EventType.tool_result:
+            resulted.add(str(event.payload.get("call_id")))
+    return [call for cid, call in calls.items() if cid not in resulted]
+
+
+async def resume(
+    *,
+    agent: AgentSpec,
+    session_id: SessionId,
+    run_id: RunId,
+    store: EventStore,
+    provider: ProviderGateway,
+    registry: ToolRegistry,
+    permissions: PermissionEngine,
+    approvals: ApprovalStore,
+    budget: RunBudget | None = None,
+    on_event: EventObserver | None = None,
+    on_delta: DeltaObserver | None = None,
+    stream_deltas: bool = False,
+    expires_at: datetime | None = None,
+) -> RunResult:
+    """Resume a suspended run: resolve its pending tool batch, then continue the loop.
+
+    The event log is the checkpoint (no separate store). The suspended calls are the
+    tool.call events with no matching tool.result; each granted (or auto-allowed) call
+    executes idempotently, each denied/expired call gets a failed result. Only after the
+    thread is complete does :func:`_agent_loop` call the provider again — so the model's
+    continuation never depends on non-deterministically reproducing the same tool call."""
+    budget = budget or RunBudget(
+        max_iterations=agent.max_iterations, token_budget=agent.token_budget
+    )
+    if on_event is not None:
+        store = _ObservingStore(store, on_event)
+    scope_id = agent.scope.id
+    trust = agent.scope.trust
+
+    await _emit(store, EventType.run_resumed, session_id, scope_id, run_id, {})
+
+    prior = [event async for event in store.read(session_id)]
+    ctx = ToolContext(
+        scope_id=scope_id,
+        session_id=session_id,
+        trust=trust,
+        content_taint=taint_from_events(prior),
+    )
+    approval_of: dict[str, str] = {
+        str(event.payload["call_id"]): str(event.payload["approval_id"])
+        for event in prior
+        if event.type is EventType.approval_requested
+    }
+
+    for call in await _suspended_calls(store, session_id):
+        decision = permissions.evaluate(call.name, call.arguments, ctx)
+        granted = decision is PermissionDecision.allow
+        if decision is PermissionDecision.ask and call.id in approval_of:
+            record = await approvals.get(approval_of[call.id])
+            granted = record is not None and record.status == "granted"
+        if granted:
+            tool = registry.get(call.name)
+            result = (
+                await tool.run(call.arguments, ctx)
+                if tool is not None
+                else ToolResult(ok=False, output="unknown tool")
+            )
+            payload: dict[str, object] = {
+                "call_id": call.id,
+                "ok": result.ok,
+                "output": result.output,
+                "taint": str(result.taint),
+            }
+        else:
+            payload = {"call_id": call.id, "ok": False, "output": "approval denied"}
+        await _emit(store, EventType.tool_result, session_id, scope_id, run_id, payload)
+
+    emit_delta: Callable[[str], Awaitable[None]] | None = None
+    if stream_deltas:
+
+        async def emit_delta(text: str) -> None:
+            await _emit(
+                store,
+                EventType.message_token,
+                session_id,
+                scope_id,
+                run_id,
+                {"role": "assistant", "text": text, "partial": True},
+            )
+
+    outcome = await _agent_loop(
+        agent=agent,
+        session_id=session_id,
+        store=store,
+        provider=provider,
+        registry=registry,
+        budget=budget,
+        interrupt=None,
+        permissions=permissions,
+        approve=None,
         run_id=run_id,
         emit_delta=emit_delta,
         on_delta=on_delta,
