@@ -37,12 +37,12 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
 
     for event in events:
         role = event.payload.get("role")
-        if event.type is EventType.message_token and role in ("user", "assistant"):
+        if event.type is EventType.message_token and role in ("user", "assistant", "system"):
             if event.payload.get("partial"):
                 continue  # streaming-only delta; the whole message lands at turn end
-            if role == "user":
+            if role in ("user", "system"):
                 flush()
-                messages.append({"role": "user", "content": str(event.payload.get("text", ""))})
+                messages.append({"role": role, "content": str(event.payload.get("text", ""))})
             else:  # assistant text — may be joined by tool calls in the same turn
                 flush()
                 pending_assistant = {

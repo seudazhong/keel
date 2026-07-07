@@ -500,3 +500,17 @@ def test_tool_registry_schemas_shape() -> None:
     assert len(schemas) == 1
     fn = schemas[0]["function"]
     assert set(fn) == {"name", "description", "parameters"}  # type: ignore[arg-type]
+
+
+async def test_admit_system_seeds_a_system_message() -> None:
+    from keel_core.loop import admit_system
+    from keel_core.projections import project_messages
+
+    store = InMemoryEventStore()
+    await admit_system(store, "s1", "u:1", "morning triage: summarize the inbox")
+    events = store.snapshot("s1")
+    assert events[0].payload["role"] == "system"
+
+    messages = project_messages(events)
+    assert messages[0]["role"] == "system"
+    assert "morning triage" in messages[0]["content"]

@@ -182,6 +182,24 @@ async def admit(store: EventStore, session_id: SessionId, scope_id: ScopeId, con
     )
 
 
+async def admit_system(
+    store: EventStore, session_id: SessionId, scope_id: ScopeId, content: str
+) -> None:
+    """Durably persist a system/standing instruction that starts an unattended run.
+
+    Unlike :func:`admit` (a user turn), this seeds the run with a developer-authored
+    instruction — the scheduled digest's "morning triage" prompt — with no human
+    present. Persisted before any model call (invariant I2)."""
+    await _emit(
+        store,
+        EventType.message_token,
+        session_id,
+        scope_id,
+        None,
+        {"role": "system", "text": content},
+    )
+
+
 async def _build_request(
     agent: AgentSpec, store: EventStore, session_id: SessionId, registry: ToolRegistry
 ) -> ProviderRequest:
