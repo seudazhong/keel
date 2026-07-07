@@ -1,7 +1,7 @@
 # Keel — UX design & product-shape review (mockups)
 
 **Date:** 2026-07-07 · **Status:** Draft for review · **Owner:** @dazhongguo
-**Artifacts:** `docs/mockups/` (10 static HTML screens, open `index.html`)
+**Artifacts:** `docs/mockups/` (13 static HTML screens, open `index.html`)
 **Grounded in:** ADR-0009 (product form & use cases), ADR-0004 (frontend stack)
 
 ## 1. Why this exists
@@ -53,6 +53,11 @@ with a **scope switcher** (the scope switch is the UX embodiment of ADR-0009).
 | **sessions** | Cross-surface history | Hybrid search (FTS⊕vector, RRF) · filters (surface/agent/date) |
 | **observability** | Runs + cost | Stat tiles · runs table · **run trace timeline** (per-step tokens/cost, cache-read) |
 | **admin** | Operate the instance | Health · users/**RBAC** · scopes · **IM channels** (wake rules, rate limits) |
+| **schedules** | Automation (FR-A) | Scheduled tasks (cron/interval/once, **at-most-once** I9) · background jobs (progress/cancel/inject) |
+| **delegation** | Multi-agent (FR-M) | Delegation tree · **shared budget** (I7) · sub-agents as tools (leaf/orchestrator) · supervisor/handoff |
+| **extensions** | Skills & MCP (FR-E) | Installed skills (progressive disclosure) · MCP servers (allow-list) · **quarantine** (import guard, I8) · tool_search |
+
+(chat also carries **interrupt / steer / follow-up** — FR-C3 queue modes.)
 
 Primary journeys the mockups tell:
 - **UC-B personal:** onboarding → connect Gmail/Calendar → chat "arrange tomorrow" →
@@ -60,6 +65,42 @@ Primary journeys the mockups tell:
   remembers "张伟 = project lead".
 - **UC-A team/IM:** admin connects QQ (OneBot) → group agent (untrusted → safe
   toolset) answers @-mentions under a rate limit → sessions/observability show it.
+
+## 4A. Coverage check vs PRD (mockups ↔ FR-*)
+
+Cross-checked the mockups against the PRD functional requirements (§6, FR-*).
+
+**Alignment (no drift outward).** Every element drawn maps to a real FR — no invented
+scope, no contradictions: chat=FR-S2/C2, agents=FR-ADM3/X1, connectors=FR-N1/N2/N3,
+approvals=FR-X2/N4, memory=FR-D3/D4, sessions=FR-D1/D2, observability=FR-O1/O2/O5,
+admin=FR-ADM1–4/S6, onboarding=ADR-0008/FR-P1, schedules=FR-A1/A2/A3, delegation=
+FR-M1/M2/M3, extensions=FR-E1/E2/E3. FR-S2's 7 sub-elements are fully covered across
+screens.
+
+**Gap: P0 features the first pass under-covered — now added (this revision).** The
+original 9 screens covered the two hero use-cases but omitted P0 surface beyond them:
+
+| Was missing (P0) | FR | Resolution |
+|---|---|---|
+| Multi-agent / delegation / **shared budget** | FR-M1/M2 (I7) | added `delegation.html` |
+| Scheduled tasks + background jobs | FR-A1/A2/A3 | added `schedules.html` |
+| Chat **interrupt / steer** | FR-C3 | added run-bar to `chat.html` |
+| Skills / MCP / tool_search management | FR-E1/E2/E3 (I8) | added `extensions.html` |
+| **Web tools** (web_fetch/scrape/search) in toolset | FR-T3 | to add to agents tool list (not yet built in core) |
+
+**Gap: still deferred (P1/P2 or later milestones) — tracked, not drawn.**
+RAG / knowledge bases (FR-D5, M3) · budgets & hard caps config (NFR-10, FR-M2) ·
+provider failover/routing (FR-P3, M2) · evaluation/datasets (FR-O4, M3) · login/authn
+flow (FR-ADM1) · **i18n language toggle** (NFR-9 — mockups are zh-only; product is
+English + 简体中文) · privacy/retention/erasure surface (NFR-13) · output-spill file
+(FR-T5) · desktop shell (FR-S7, P2). Also **CLI** (FR-S1) is a real surface not drawn
+(intentional — it's not a web screen).
+
+**Doc-vs-code inconsistency found.** FR-X1 says permissions are "last-match wins", but
+the **implemented** engine (`keel_core/permissions`) is "most-restrictive wins
+(deny>ask>allow)". The mockups follow the code; **PRD FR-X1 wording should be updated**
+to match (a genuine doc gap surfaced by this pass).
+
 
 ## 5. Open design decisions & risks (the point of this pass)
 

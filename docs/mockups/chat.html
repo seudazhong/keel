@@ -25,6 +25,10 @@
       <a href="agents.html"><span class="ico">🤖</span> Agents</a>
       <a href="connectors.html"><span class="ico">🔌</span> Connectors</a>
       <a href="approvals.html"><span class="ico">✅</span> Approvals <span class="count">3</span></a>
+      <a href="extensions.html"><span class="ico">🧩</span> Extensions</a>
+      <span class="label">自动化</span>
+      <a href="schedules.html"><span class="ico">⏰</span> Schedules</a>
+      <a href="delegation.html"><span class="ico">🕸️</span> Multi-agent</a>
       <span class="label">运维</span>
       <a href="observability.html"><span class="ico">📊</span> Observability</a>
       <a href="admin.html"><span class="ico">⚙️</span> Admin</a>
@@ -89,6 +93,14 @@
           </div>
           <div class="note">设计待定：审批卡该展示哪些「为什么问你」的理由？外发动作的默认策略（总是问 / 首次问 / 按收件人域名）在哪里配置？</div>
         </div>
+      </div>
+      <div class="runbar">
+        <span class="pulse"></span> 运行中 · 第 2 轮 · 正在调用 <b>calendar.list_events</b>…
+        <span style="margin-left:auto; display:flex; gap:8px;">
+          <button class="btn sm">↪ 插话 steer</button>
+          <button class="btn sm">⏭ 追问 follow-up</button>
+          <button class="btn sm danger">⏸ 打断 interrupt</button>
+        </span>
       </div>
       <div class="composer">
         <input placeholder="给个人助理发消息…（连接器、记忆、工具都可用）" />

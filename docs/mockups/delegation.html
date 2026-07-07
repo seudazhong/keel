@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Keel — Multi-agent</title>
+<link rel="stylesheet" href="assets/app.css" />
+<style>
+  .tree { display:flex; flex-direction:column; gap:0; }
+  .node { display:flex; align-items:center; gap:12px; padding:12px 14px; border:1px solid var(--border);
+    border-radius:var(--radius-sm); background:var(--surface); box-shadow:var(--shadow); }
+  .node .ava { width:30px; height:30px; border-radius:8px; display:grid; place-items:center; font-size:15px;
+    background:var(--accent-soft); }
+  .node .meta b { font-size:13px; } .node .meta span { font-size:12px; color:var(--text-muted); }
+  .child { margin-left:34px; padding-left:22px; border-left:2px solid var(--border); margin-top:10px;
+    display:flex; flex-direction:column; gap:10px; }
+  .budget { height:14px; border-radius:8px; background:var(--border); overflow:hidden; display:flex; }
+  .budget i { display:block; height:100%; }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand"><div class="logo">K</div><b>Keel</b><span class="env">standard</span></div>
+    <div class="scope-switch"><span class="dot"></span>
+      <div class="who"><b>个人助理</b><span>personal · dazhongguo</span></div><span class="chev">▾</span></div>
+    <nav class="nav">
+      <span class="label">工作区</span>
+      <a href="chat.html"><span class="ico">💬</span> Chat</a>
+      <a href="sessions.html"><span class="ico">🗂️</span> Sessions</a>
+      <a href="memory.html"><span class="ico">🧠</span> Memory</a>
+      <span class="label">配置</span>
+      <a href="agents.html"><span class="ico">🤖</span> Agents</a>
+      <a href="connectors.html"><span class="ico">🔌</span> Connectors</a>
+      <a href="approvals.html"><span class="ico">✅</span> Approvals <span class="count">3</span></a>
+      <a href="extensions.html"><span class="ico">🧩</span> Extensions</a>
+      <span class="label">自动化</span>
+      <a href="schedules.html"><span class="ico">⏰</span> Schedules</a>
+      <a class="active" href="delegation.html"><span class="ico">🕸️</span> Multi-agent</a>
+      <span class="label">运维</span>
+      <a href="observability.html"><span class="ico">📊</span> Observability</a>
+      <a href="admin.html"><span class="ico">⚙️</span> Admin</a>
+    </nav>
+    <div class="foot"><span class="avatar">D</span> dazhongguo <span style="margin-left:auto"><a href="index.html">← 全景</a></span></div>
+  </aside>
+
+  <div class="main">
+    <div class="topbar"><h1>Multi-agent</h1><span class="sub">· 子 agent 作为工具 · 委派树 · 共享预算（FR-M · M2）</span>
+      <div class="spacer"></div><span class="badge violet">supervisor 拓扑</span></div>
+
+    <div class="content">
+      <!-- Shared budget (I7) -->
+      <div class="card" style="margin-bottom:16px;">
+        <div class="hd"><h3>共享预算</h3><span class="sub">· 整棵委派树共用一个预算（invariant I7）</span>
+          <div class="spacer" style="flex:1"></div><span class="badge amber">I7 · 待实现（M2）</span></div>
+        <div class="bd">
+          <div class="budget">
+            <i style="width:22%;background:#4f46e5;" title="orchestrator"></i>
+            <i style="width:26%;background:#7c73f0;" title="研究员"></i>
+            <i style="width:18%;background:#a78bfa;" title="核对员"></i>
+            <i style="width:9%;background:#c4b5fd;" title="写作"></i>
+          </div>
+          <div style="display:flex;justify-content:space-between;margin-top:8px;font-size:12px;">
+            <span class="soft">已用 <b>75%</b> · 60,500 / 80,000 tok · $0.42</span>
+            <span class="muted">剩余 19,500 tok — 子 agent 不能超过父级剩余额度</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Delegation tree -->
+      <div class="card">
+        <div class="hd"><h3>委派树</h3><span class="sub mono" style="font-size:11px;">run 9f2c…7ab1 · “调研 3 个竞品并对比”</span></div>
+        <div class="bd">
+          <div class="tree">
+            <div class="node">
+              <div class="ava">🧭</div>
+              <div class="meta"><b>个人助理（orchestrator）</b><br><span>分解任务 · 汇总结果 · 完整工具集</span></div>
+              <span class="badge violet" style="margin-left:auto;">运行中</span>
+              <span class="chip" style="margin-left:8px;">12,000 tok · $0.08</span>
+            </div>
+            <div class="child">
+              <div class="node">
+                <div class="ava">🔬</div>
+                <div class="meta"><b>子 agent · 研究员 A</b><br><span>leaf · 隔离上下文 · 缩减工具集（web_fetch/search）· 独立 workspace</span></div>
+                <span class="badge green" style="margin-left:auto;"><span class="d"></span>完成</span>
+                <span class="chip" style="margin-left:8px;">21,000 tok · $0.15</span>
+              </div>
+              <div class="node">
+                <div class="ava">🔬</div>
+                <div class="meta"><b>子 agent · 研究员 B</b><br><span>leaf · 隔离上下文 · web 工具</span></div>
+                <span class="badge violet" style="margin-left:auto;">运行中</span>
+                <span class="chip" style="margin-left:8px;">14,500 tok · $0.10</span>
+              </div>
+              <div class="node">
+                <div class="ava">✅</div>
+                <div class="meta"><b>子 agent · 事实核对员</b><br><span>leaf · 只读检索工具</span></div>
+                <span class="badge" style="margin-left:auto;">排队</span>
+                <span class="chip" style="margin-left:8px;">— </span>
+              </div>
+            </div>
+          </div>
+          <div class="banner info" style="margin-top:14px;"><span class="ic">🔗</span>
+            <div>子 agent 通过 <b>一套工具接口</b>（P3）呈现给循环——和内置工具、MCP 工具一模一样（<span class="mono">task / delegate</span>）。
+              成本向上<b>汇总到父级</b>；支持 supervisor 与 handoff（<span class="mono">transfer_to_&lt;agent&gt;</span>）拓扑。</div></div>
+        </div>
+      </div>
+
+      <div class="note">设计待定：委派树该<b>实时流式</b>（每个子 agent 一路事件）还是折叠为一个工具调用？深度/扇出上限与「握手环」防护（G13）在哪配置？子 agent 触发的<b>审批</b>归谁？I7 共享预算尚未实现——这屏也是它落地时的验收视图。</div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
