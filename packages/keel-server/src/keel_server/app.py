@@ -22,7 +22,10 @@ from keel_core import __version__
 from keel_core.api import HealthResponse, ReadinessResponse
 from keel_core.config import get_settings, load_env_file
 from keel_core.db import make_async_engine, make_redis
+from keel_core.providers import LiteLLMGateway
+from keel_server.api import gateway as gateway_api
 from keel_server.api import v1
+from keel_server.gateway import OneBotGateway, RateLimiter
 from keel_server.runtime import AgentRuntime
 from keel_server.webui import INDEX_HTML
 
@@ -44,6 +47,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         model=settings.default_model,
         workspace=Path.cwd(),
     )
+    # OneBot IM gateway (optional): only wired when an API base is configured.
+    if settings.onebot_api_base:
+        app.state.onebot_gateway = OneBotGateway(
+            provider=LiteLLMGateway(),
+            send=gateway_api.make_onebot_sender(
+                settings.onebot_api_base, settings.onebot_access_token
+            ),
+            workspace=Path.cwd(),
+            self_id=settings.onebot_self_id or None,
+            model=settings.default_model,
+            rate_limiter=RateLimiter(limit=settings.im_rate_limit),
+        )
     try:
         yield
     finally:
@@ -101,6 +116,7 @@ def create_app() -> FastAPI:
         return JSONResponse(body.model_dump(), status_code=200 if ready else 503)
 
     app.include_router(v1.router)
+    app.include_router(gateway_api.router)
 
     return app
 

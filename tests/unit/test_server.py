@@ -98,3 +98,28 @@ def test_index_serves_web_ui() -> None:
     assert resp.status_code == 200
     assert "text/html" in resp.headers["content-type"]
     assert "EventSource" in resp.text  # the SSE client is wired in the page
+
+
+def test_onebot_webhook_accepts_and_dispatches() -> None:
+    handled: list[dict[str, object]] = []
+
+    class _FakeGateway:
+        async def handle(self, payload: dict[str, object]) -> None:
+            handled.append(payload)
+
+    app = create_app()
+    app.state.onebot_gateway = _FakeGateway()
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/gateway/onebot",
+        json={"post_type": "message", "message_type": "private", "user_id": 1, "raw_message": "hi"},
+    )
+    assert resp.status_code == 202
+    # BackgroundTasks run after the response; TestClient waits for them.
+    assert handled and handled[0]["raw_message"] == "hi"
+
+
+def test_onebot_webhook_503_without_gateway() -> None:
+    client = TestClient(create_app())  # lifespan not run -> no gateway configured
+    resp = client.post("/v1/gateway/onebot", json={"post_type": "message"})
+    assert resp.status_code == 503

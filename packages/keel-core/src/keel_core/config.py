@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = ""
     langfuse_host: str = "https://cloud.langfuse.com"
 
+    # OneBot (QQ) IM gateway (WS-E/J). Empty api_base -> the gateway is disabled.
+    onebot_api_base: str = ""
+    onebot_access_token: str = ""
+    onebot_self_id: int = 0
+    im_rate_limit: int = 5  # max messages per chat per minute
+
     # psycopg3 driver works for both sync (Alembic) and async (app) engines.
     database_url: str = "postgresql+psycopg://keel:keel@localhost:5432/keel"
     redis_url: str = "redis://localhost:6379/0"
