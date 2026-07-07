@@ -32,6 +32,8 @@ class EventType(StrEnum):
     tool_result = "tool.result"
     approval_requested = "approval.requested"
     approval_resolved = "approval.resolved"
+    run_suspended = "run.suspended"
+    run_resumed = "run.resumed"
     error = "error"
 
 

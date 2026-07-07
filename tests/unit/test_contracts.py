@@ -23,12 +23,20 @@ EVENT_VOCABULARY_V0 = {
     "tool.result",
     "approval.requested",
     "approval.resolved",
+    "run.suspended",
+    "run.resumed",
     "error",
 }
 
 
 def test_event_vocabulary_is_frozen() -> None:
     assert {member.value for member in EventType} == EVENT_VOCABULARY_V0
+
+
+def test_suspend_resume_vocabulary_exists() -> None:
+    assert StopReason.suspended.value == "suspended"
+    assert EventType.run_suspended.value == "run.suspended"
+    assert EventType.run_resumed.value == "run.resumed"
 
 
 def test_event_roundtrip_and_version_default() -> None:

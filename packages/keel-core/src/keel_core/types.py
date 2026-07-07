@@ -33,6 +33,7 @@ class StopReason(StrEnum):
     interrupted = "interrupted"
     halted = "halted"
     error = "error"
+    suspended = "suspended"
 
 
 class FinishReason(StrEnum):
