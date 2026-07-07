@@ -252,3 +252,74 @@ def test_invariant_gate(invariant: str) -> None:
 
 def test_all_ten_invariants_registered() -> None:
     assert len(INVARIANTS) == 10
+
+
+async def test_g5_durable_approval_survives_a_fresh_process() -> None:
+    """G5 gate (M2 slice): an unattended run that suspends at a tainted outbound resumes
+    from a **fresh** agent/registry/provider — proving its state lives entirely in the
+    durable event log + approvals store — and sends exactly once."""
+    from datetime import UTC
+
+    from keel_core.approvals import InMemoryApprovalStore
+    from keel_core.digest import (
+        DIGEST_INSTRUCTION,
+        build_digest_agent,
+        digest_permissions,
+        digest_registry,
+        digest_session_id,
+    )
+    from keel_core.loop import admit_system, resume, run
+
+    store, approvals = InMemoryEventStore(), InMemoryApprovalStore()
+    sent: list[dict[str, object]] = []
+    sid = digest_session_id("u:1")
+    provider = ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(
+                    tool_call=ToolCall(id="c1", name="inbox.list", arguments={}),
+                    finish_reason=FinishReason.tool_use,
+                )
+            ],
+            [
+                ProviderChunk(
+                    tool_call=ToolCall(
+                        id="c2",
+                        name="email.send",
+                        arguments={"to": "finance@external.example", "idempotency_key": "k"},
+                    ),
+                    finish_reason=FinishReason.tool_use,
+                )
+            ],
+        ]
+    )
+    await admit_system(store, sid, "u:1", DIGEST_INSTRUCTION)
+    suspended = await run(
+        agent=build_digest_agent("u:1"),
+        session_id=sid,
+        store=store,
+        provider=provider,
+        registry=digest_registry(sent),
+        permissions=digest_permissions(),
+        approvals=approvals,
+        expires_at=datetime.now(UTC) + timedelta(hours=24),
+    )
+    assert suspended.reason is StopReason.suspended and sent == []
+
+    aid = (await approvals.list_pending("u:1"))[0].id
+    await approvals.resolve(aid, "granted", "u:1")  # a human approves out-of-band
+
+    done = await resume(  # a fresh process resumes from the durable log
+        agent=build_digest_agent("u:1"),
+        session_id=sid,
+        run_id=suspended.run_id,
+        store=store,
+        provider=ScriptedProviderGateway(
+            [[ProviderChunk(delta="sent", finish_reason=FinishReason.end_turn)]]
+        ),
+        registry=digest_registry(sent),
+        permissions=digest_permissions(),
+        approvals=approvals,
+    )
+    assert done.reason is StopReason.completed
+    assert sent == [{"to": "finance@external.example", "idempotency_key": "k"}]  # exactly once

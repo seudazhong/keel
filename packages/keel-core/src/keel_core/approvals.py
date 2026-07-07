@@ -215,8 +215,8 @@ class PostgresApprovalStore:
                 (
                     await conn.execute(
                         text(
-                            "SELECT * FROM approvals WHERE scope_id = :scope AND status = 'pending' "
-                            "ORDER BY created_at"
+                            "SELECT * FROM approvals WHERE scope_id = :scope "
+                            "AND status = 'pending' ORDER BY created_at"
                         ),
                         {"scope": scope_id},
                     )
