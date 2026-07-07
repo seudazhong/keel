@@ -149,6 +149,16 @@ class _TurnOutput:
     usage: Usage
 
 
+@dataclass
+class _LoopOutcome:
+    reason: StopReason
+    error: str | None
+    iterations: int
+    tokens: int
+    usage: Usage
+    pending_approvals: list[str] = field(default_factory=list)
+
+
 async def _emit(
     store: EventStore,
     event_type: EventType,
@@ -323,59 +333,30 @@ async def _run_tools(
         await _emit(store, EventType.tool_result, session_id, scope_id, run_id, payload)
 
 
-async def run(
+async def _agent_loop(
     *,
     agent: AgentSpec,
     session_id: SessionId,
     store: EventStore,
     provider: ProviderGateway,
-    registry: ToolRegistry | None = None,
-    budget: RunBudget | None = None,
-    interrupt: Callable[[], bool] | None = None,
-    permissions: PermissionEngine | None = None,
-    approve: ApproveFn | None = None,
-    on_event: EventObserver | None = None,
-    on_delta: DeltaObserver | None = None,
-    run_id: RunId | None = None,
-    stream_deltas: bool = False,
-) -> RunResult:
-    """Execute the agent loop until a named termination and return the result.
+    registry: ToolRegistry,
+    budget: RunBudget,
+    interrupt: Callable[[], bool] | None,
+    permissions: PermissionEngine,
+    approve: ApproveFn | None,
+    run_id: RunId,
+    emit_delta: Callable[[str], Awaitable[None]] | None,
+    on_delta: DeltaObserver | None,
+    start_iteration: int = 0,
+) -> _LoopOutcome:
+    """The turn loop: build request -> call provider -> (gate) run tools -> repeat.
 
-    ``on_event``/``on_delta`` are optional live-observation seams: ``on_event`` fires
-    for every persisted event (in seq order) and ``on_delta`` for each streamed text
-    delta, letting a surface render the run live without polling the store. A caller
-    may pass ``run_id`` (e.g. a server that returned it to a client before the run
-    finished); otherwise one is generated. With ``stream_deltas`` the loop also emits
-    partial ``message.token`` events per delta (``payload.partial``) so a store's
-    fan-out can relay token-by-token; the whole message is still emitted at turn end.
+    Extracted from :func:`run` so :func:`resume` can re-enter it after resolving a
+    suspended tool batch. Returns the outcome; the caller emits run.started / run.ended.
     """
-    registry = registry or ToolRegistry()
-    budget = budget or RunBudget(
-        max_iterations=agent.max_iterations, token_budget=agent.token_budget
-    )
-    permissions = permissions or _ALLOW_ALL
-    if on_event is not None:
-        store = _ObservingStore(store, on_event)
     scope_id = agent.scope.id
     trust = agent.scope.trust
-    run_id = run_id or uuid.uuid4().hex
-
-    emit_delta: Callable[[str], Awaitable[None]] | None = None
-    if stream_deltas:
-
-        async def emit_delta(text: str) -> None:
-            await _emit(
-                store,
-                EventType.message_token,
-                session_id,
-                scope_id,
-                run_id,
-                {"role": "assistant", "text": text, "partial": True},
-            )
-
-    await _emit(store, EventType.run_started, session_id, scope_id, run_id, {"agent": agent.id})
-
-    iterations = 0
+    iterations = start_iteration
     tokens = 0
     total_usage = Usage()
     error: str | None = None
@@ -446,19 +427,88 @@ async def run(
             reason = StopReason.halted
         break
 
+    return _LoopOutcome(reason, error, iterations, tokens, total_usage)
+
+
+async def run(
+    *,
+    agent: AgentSpec,
+    session_id: SessionId,
+    store: EventStore,
+    provider: ProviderGateway,
+    registry: ToolRegistry | None = None,
+    budget: RunBudget | None = None,
+    interrupt: Callable[[], bool] | None = None,
+    permissions: PermissionEngine | None = None,
+    approve: ApproveFn | None = None,
+    on_event: EventObserver | None = None,
+    on_delta: DeltaObserver | None = None,
+    run_id: RunId | None = None,
+    stream_deltas: bool = False,
+) -> RunResult:
+    """Execute the agent loop until a named termination and return the result.
+
+    ``on_event``/``on_delta`` are optional live-observation seams: ``on_event`` fires
+    for every persisted event (in seq order) and ``on_delta`` for each streamed text
+    delta, letting a surface render the run live without polling the store. A caller
+    may pass ``run_id`` (e.g. a server that returned it to a client before the run
+    finished); otherwise one is generated. With ``stream_deltas`` the loop also emits
+    partial ``message.token`` events per delta (``payload.partial``) so a store's
+    fan-out can relay token-by-token; the whole message is still emitted at turn end.
+    """
+    registry = registry or ToolRegistry()
+    budget = budget or RunBudget(
+        max_iterations=agent.max_iterations, token_budget=agent.token_budget
+    )
+    permissions = permissions or _ALLOW_ALL
+    if on_event is not None:
+        store = _ObservingStore(store, on_event)
+    scope_id = agent.scope.id
+    run_id = run_id or uuid.uuid4().hex
+
+    emit_delta: Callable[[str], Awaitable[None]] | None = None
+    if stream_deltas:
+
+        async def emit_delta(text: str) -> None:
+            await _emit(
+                store,
+                EventType.message_token,
+                session_id,
+                scope_id,
+                run_id,
+                {"role": "assistant", "text": text, "partial": True},
+            )
+
+    await _emit(store, EventType.run_started, session_id, scope_id, run_id, {"agent": agent.id})
+
+    outcome = await _agent_loop(
+        agent=agent,
+        session_id=session_id,
+        store=store,
+        provider=provider,
+        registry=registry,
+        budget=budget,
+        interrupt=interrupt,
+        permissions=permissions,
+        approve=approve,
+        run_id=run_id,
+        emit_delta=emit_delta,
+        on_delta=on_delta,
+    )
+
     await _emit(
         store,
         EventType.run_ended,
         session_id,
         scope_id,
         run_id,
-        {"reason": str(reason), "usage": total_usage.model_dump()},
+        {"reason": str(outcome.reason), "usage": outcome.usage.model_dump()},
     )
     return RunResult(
         run_id=run_id,
-        reason=reason,
-        iterations=iterations,
-        tokens=tokens,
-        error=error,
-        usage=total_usage,
+        reason=outcome.reason,
+        iterations=outcome.iterations,
+        tokens=outcome.tokens,
+        error=outcome.error,
+        usage=outcome.usage,
     )
