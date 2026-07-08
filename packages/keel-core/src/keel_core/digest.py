@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any
 
 from keel_core.agents import AgentSpec, Scope
-from keel_core.connectors import ConfusedDeputyEngine, ConnectorTool
+from keel_core.connectors import ActionFn, ConfusedDeputyEngine, ConnectorTool
 from keel_core.loop import ToolRegistry
 from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.protocols import ToolContext
@@ -44,11 +44,21 @@ def _inbox_text() -> str:
     )
 
 
-def digest_registry(sent: list[dict[str, Any]] | None = None) -> ToolRegistry:
-    """The digest toolset. ``sent`` (if given) records outbound sends for tests."""
+def digest_registry(
+    sent: list[dict[str, Any]] | None = None,
+    *,
+    inbox_action: ActionFn | None = None,
+) -> ToolRegistry:
+    """The digest toolset. ``sent`` (if given) records outbound sends for tests.
+
+    ``inbox_action`` overrides the fake in-memory inbox with a real connector (e.g.
+    Gmail); when omitted the deterministic :data:`SAMPLE_INBOX` is used. Either way the
+    inbound ``ConnectorTool`` taints the output (G17), so the confused-deputy guard
+    behaves identically.
+    """
     outbox = sent if sent is not None else []
 
-    async def inbox_list(args: dict[str, Any], ctx: ToolContext) -> str:
+    async def fake_inbox_list(args: dict[str, Any], ctx: ToolContext) -> str:
         return _inbox_text()
 
     async def email_send(args: dict[str, Any], ctx: ToolContext) -> str:
@@ -60,7 +70,7 @@ def digest_registry(sent: list[dict[str, Any]] | None = None) -> ToolRegistry:
             ConnectorTool(
                 name="inbox_list",
                 description="List recent inbox messages.",
-                action=inbox_list,
+                action=inbox_action or fake_inbox_list,
                 outbound=False,
                 input_schema={"type": "object", "properties": {}},
             ),

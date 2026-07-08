@@ -13,10 +13,10 @@ from keel_core.digest import (
     digest_session_id,
 )
 from keel_core.loop import admit_system, run
-from keel_core.protocols import ProviderChunk, ToolCall
+from keel_core.protocols import ProviderChunk, ToolCall, ToolContext
 from keel_core.state import InMemoryEventStore
 from keel_core.testing import ScriptedProviderGateway
-from keel_core.types import FinishReason, StopReason
+from keel_core.types import ContentTaint, FinishReason, StopReason
 
 
 def test_agent_and_session_shape() -> None:
@@ -35,6 +35,25 @@ def test_tool_names_are_provider_valid() -> None:
     assert names
     for name in names:
         assert re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", name), name
+
+
+async def test_default_registry_uses_fake_inbox() -> None:
+    tool = digest_registry().get("inbox_list")
+    assert tool is not None
+    result = await tool.run({}, ToolContext(scope_id="u:1", session_id="digest:u:1"))
+    assert "zhangwei@example.com" in result.output
+    assert result.taint is ContentTaint.tainted
+
+
+async def test_registry_honors_injected_inbox_action() -> None:
+    async def real_inbox(args: dict[str, object], ctx: ToolContext) -> str:
+        return "REAL INBOX"
+
+    tool = digest_registry(inbox_action=real_inbox).get("inbox_list")
+    assert tool is not None
+    result = await tool.run({}, ToolContext(scope_id="u:1", session_id="digest:u:1"))
+    assert result.output == "REAL INBOX"
+    assert result.taint is ContentTaint.tainted  # inbound is always tainted (G17)
 
 
 async def test_digest_run_suspends_on_send() -> None:
