@@ -1,9 +1,11 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
+import { ChatThread } from "./ChatThread";
 import { Composer } from "./Composer";
 import { InlineApproval } from "./InlineApproval";
 import { MessageBubble } from "./MessageBubble";
 import { ToolStep } from "./ToolStep";
+import type { ChatItem } from "./types";
 
 describe("chat components", () => {
   it("MessageBubble renders its text", () => {
@@ -47,5 +49,22 @@ describe("chat components", () => {
     fireEvent.change(disabledInput, { target: { value: "x" } });
     fireEvent.keyDown(disabledInput, { key: "Enter" }); // disabled -> no-op
     expect(onSend).toHaveBeenCalledTimes(1);
+  });
+
+  it("ChatThread renders every item kind", () => {
+    const items: ChatItem[] = [
+      { kind: "user", id: "1", text: "hello" },
+      { kind: "assistant", id: "2", text: "hi there", streaming: false },
+      { kind: "tool", id: "3", callId: "c", tool: "read", args: {}, result: { ok: true, output: "res" } },
+      { kind: "approval", id: "4", approvalId: "a", tool: "write", args: { path: "x" } },
+      { kind: "meta", id: "5", text: "! oops", tone: "error" },
+    ];
+    render(<ChatThread items={items} onResolve={vi.fn()} />);
+    expect(screen.getByText("hello")).toBeInTheDocument();
+    expect(screen.getByText("hi there")).toBeInTheDocument();
+    expect(screen.getByText("read")).toBeInTheDocument();
+    expect(screen.getByText("res")).toBeInTheDocument();
+    expect(screen.getByText(/需要你批准/)).toBeInTheDocument();
+    expect(screen.getByText("! oops")).toBeInTheDocument();
   });
 });
