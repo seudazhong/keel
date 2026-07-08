@@ -40,6 +40,11 @@ async def _store(scope_id: str, creds_json: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Authorize the Gmail read connector.")
     parser.add_argument("--scope", default="web:local")
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="print the consent URL instead of opening a browser (drive it yourself)",
+    )
     args = parser.parse_args()
 
     load_env_file()  # KEEL_SECRET_KEY / KEEL_DATABASE_URL from .env
@@ -58,7 +63,12 @@ def main() -> None:
 
     flow = InstalledAppFlow.from_client_secrets_file(str(client_path), list(GMAIL_SCOPES))
     # offline + forced consent guarantees a refresh_token even on re-authorization.
-    creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+    creds = flow.run_local_server(
+        port=0,
+        open_browser=not args.no_browser,
+        access_type="offline",
+        prompt="consent",
+    )
 
     if sys.platform == "win32":  # psycopg async needs a selector loop on Windows
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
