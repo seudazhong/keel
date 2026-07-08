@@ -55,6 +55,30 @@ def _completion(chunks: list[Any], capture: dict[str, Any]):
     return completion
 
 
+def _responses(events: list[Any], capture: dict[str, Any]):
+    async def responses(**kwargs: Any) -> AsyncIterator[Any]:
+        capture["kwargs"] = kwargs
+
+        async def gen() -> AsyncIterator[Any]:
+            for event in events:
+                yield event
+
+        return gen()
+
+    return responses
+
+
+def _rev(type_: str, **attrs: Any) -> SimpleNamespace:
+    """A Responses API stream event double."""
+    return SimpleNamespace(type=type_, **attrs)
+
+
+def _fn_item(call_id: str, name: str, item_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        type="function_call", call_id=call_id, name=name, id=item_id, arguments=""
+    )
+
+
 async def test_streams_text_and_finish() -> None:
     capture: dict[str, Any] = {}
     chunks = [_chunk(content="he"), _chunk(content="llo"), _chunk(finish_reason="stop")]
@@ -144,6 +168,83 @@ async def test_gateway_drives_the_loop() -> None:
 
 
 def test_default_gateway_binds_litellm() -> None:
-    # No injected completion -> lazily binds litellm.acompletion (proves wiring).
+    # No injected callables -> lazily binds litellm.acompletion + aresponses (wiring).
     gateway = LiteLLMGateway()
     assert callable(gateway._completion)
+    assert callable(gateway._responses)
+
+
+async def test_responses_streams_text_and_usage() -> None:
+    capture: dict[str, Any] = {}
+    usage = SimpleNamespace(
+        input_tokens=13, output_tokens=28, input_tokens_details=SimpleNamespace(cached_tokens=5)
+    )
+    events = [
+        _rev("response.output_text.delta", delta="Hello "),
+        _rev("response.output_text.delta", delta="there"),
+        _rev("response.completed", response=SimpleNamespace(usage=usage)),
+    ]
+    gateway = LiteLLMGateway(completion=_completion([], {}), responses=_responses(events, capture))
+    request = ProviderRequest(
+        model="github_copilot/gpt-5.3-codex", messages=[{"role": "user", "content": "hi"}]
+    )
+    out = [chunk async for chunk in gateway._stream_responses(request)]
+
+    assert [c.delta for c in out if c.delta] == ["Hello ", "there"]
+    finish = next(c.finish_reason for c in out if c.finish_reason is not None)
+    assert finish is FinishReason.end_turn
+    usage_chunks = [c for c in out if c.usage is not None]
+    assert usage_chunks and usage_chunks[0].usage is not None
+    assert usage_chunks[0].usage.prompt_tokens == 13
+    assert usage_chunks[0].usage.completion_tokens == 28
+    assert usage_chunks[0].usage.cache_read_tokens == 5
+    assert capture["kwargs"]["input"] == request.messages  # messages passed as Responses input
+
+
+async def test_responses_streams_tool_call() -> None:
+    capture: dict[str, Any] = {}
+    events = [
+        _rev("response.output_item.added", item=SimpleNamespace(type="reasoning", id="r1")),
+        _rev("response.output_item.added", item=_fn_item("call_9", "get_weather", "enc1")),
+        _rev("response.function_call_arguments.delta", item_id="enc1", delta='{"city":'),
+        _rev("response.function_call_arguments.done", item_id="enc1", arguments='{"city":"Paris"}'),
+        _rev("response.completed", response=SimpleNamespace(usage=None)),
+    ]
+    gateway = LiteLLMGateway(completion=_completion([], {}), responses=_responses(events, capture))
+    request = ProviderRequest(
+        model="github_copilot/gpt-5.3-codex",
+        messages=[],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "d",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+    )
+    out = [chunk async for chunk in gateway._stream_responses(request)]
+
+    tool_chunks = [c for c in out if c.tool_call is not None]
+    assert len(tool_chunks) == 1
+    call = tool_chunks[0].tool_call
+    assert call is not None
+    assert call.id == "call_9"
+    assert call.name == "get_weather"
+    assert call.arguments == {"city": "Paris"}
+    finish = next(c.finish_reason for c in out if c.finish_reason is not None)
+    assert finish is FinishReason.tool_use
+    assert capture["kwargs"]["tools"][0] == {
+        "type": "function",
+        "name": "get_weather",
+        "description": "d",
+        "parameters": {"type": "object"},
+    }
+
+
+def test_use_responses_routing() -> None:
+    gateway = LiteLLMGateway(completion=_completion([], {}), responses=_responses([], {}))
+    assert gateway._use_responses("openai/gpt-4o") is False  # non-copilot -> chat
+    assert gateway._use_responses("github_copilot/gpt-5.3-codex") is True  # responses-only model

@@ -79,21 +79,140 @@ def _extract_usage(model: str, raw: Any) -> Usage:
     )
 
 
-class LiteLLMGateway:
-    """A ``ProviderGateway`` backed by LiteLLM."""
+def _extract_responses_usage(model: str, raw: Any) -> Usage:
+    """Usage from a Responses API ``response.completed`` event (input/output tokens)."""
+    prompt = int(getattr(raw, "input_tokens", 0) or 0)
+    completion = int(getattr(raw, "output_tokens", 0) or 0)
+    details = getattr(raw, "input_tokens_details", None)
+    cached = int(getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
+    return Usage(
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        cache_read_tokens=cached,
+        cost_usd=_compute_cost(model, prompt, completion),
+    )
 
-    def __init__(self, *, completion: CompletionFn | None = None) -> None:
-        if completion is None:
+
+def _to_responses_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert chat function tools (``{type, function:{...}}``) to the flat Responses
+    API shape (``{type:"function", name, description, parameters}``)."""
+    out: list[dict[str, Any]] = []
+    for tool in tools:
+        fn = tool["function"] if isinstance(tool, dict) and "function" in tool else tool
+        out.append(
+            {
+                "type": "function",
+                "name": fn.get("name"),
+                "description": fn.get("description", ""),
+                "parameters": fn.get("parameters") or {"type": "object", "properties": {}},
+            }
+        )
+    return out
+
+
+def _event_type(event: Any) -> str | None:
+    """The Responses stream event type as a plain string (enum or str)."""
+    raw = getattr(event, "type", None)
+    return getattr(raw, "value", raw)
+
+
+class LiteLLMGateway:
+    """A ``ProviderGateway`` backed by LiteLLM.
+
+    Routes each request to the right endpoint: models that only speak the
+    **Responses API** (e.g. ``github_copilot/gpt-5.3-codex``) go through
+    ``litellm.aresponses``; everything else uses ``/chat/completions``. Both paths
+    normalize to the same ``ProviderChunk`` stream.
+    """
+
+    def __init__(
+        self, *, completion: CompletionFn | None = None, responses: CompletionFn | None = None
+    ) -> None:
+        if completion is None or responses is None:
             import litellm
 
             # We surface provider errors ourselves; drop LiteLLM's "Give Feedback"
             # footer so a failed call isn't buried under boilerplate.
             litellm.suppress_debug_info = True
-            completion = litellm.acompletion
+            if completion is None:
+                completion = litellm.acompletion
+            if responses is None:
+                responses = litellm.aresponses
         self._completion = completion
+        self._responses = responses
+
+    def _use_responses(self, model: str) -> bool:
+        """True when ``model`` is a github_copilot model that requires /responses."""
+        if not model.startswith("github_copilot/"):
+            return False
+        bare = model.split("/", 1)[1]
+        try:
+            from litellm.llms.github_copilot.responses.transformation import (
+                github_copilot_supports_responses_api,
+            )
+
+            return bool(github_copilot_supports_responses_api(bare))
+        except Exception:  # noqa: BLE001 - unknown/uninstalled -> fall back to chat
+            return False
 
     def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
+        if self._use_responses(request.model):
+            return self._stream_responses(request)
         return self._stream(request)
+
+    async def _stream_responses(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
+        """Normalize a ``litellm.aresponses`` (Responses API) stream to ProviderChunks."""
+        kwargs: dict[str, Any] = {
+            "model": request.model,
+            "input": request.messages,
+            "stream": True,
+        }
+        if request.tools:
+            kwargs["tools"] = _to_responses_tools(request.tools)
+
+        response = await self._responses(**kwargs)
+        # item_id -> accumulating {call_id, name, arguments}; order preserves call order.
+        pending: dict[str, dict[str, str]] = {}
+        order: list[str] = []
+        usage: Usage | None = None
+
+        async for event in response:
+            etype = _event_type(event)
+            if etype == "response.output_text.delta":
+                delta = getattr(event, "delta", None)
+                if delta:
+                    yield ProviderChunk(delta=delta)
+            elif etype == "response.output_item.added":
+                item = getattr(event, "item", None)
+                if item is not None and getattr(item, "type", None) == "function_call":
+                    item_id = str(getattr(item, "id", "") or "")
+                    pending[item_id] = {
+                        "id": str(getattr(item, "call_id", "") or "call"),
+                        "name": str(getattr(item, "name", "") or ""),
+                        "arguments": str(getattr(item, "arguments", "") or ""),
+                    }
+                    order.append(item_id)
+            elif etype == "response.function_call_arguments.delta":
+                item_id = str(getattr(event, "item_id", "") or "")
+                if item_id in pending:
+                    pending[item_id]["arguments"] += getattr(event, "delta", "") or ""
+            elif etype == "response.function_call_arguments.done":
+                item_id = str(getattr(event, "item_id", "") or "")
+                if item_id in pending:
+                    pending[item_id]["arguments"] = (
+                        getattr(event, "arguments", None) or pending[item_id]["arguments"]
+                    )
+            elif etype == "response.completed":
+                result = getattr(event, "response", None)
+                raw_usage = getattr(result, "usage", None) if result is not None else None
+                if raw_usage is not None:
+                    usage = _extract_responses_usage(request.model, raw_usage)
+
+        for item_id in order:
+            yield ProviderChunk(tool_call=_build_tool_call(pending[item_id]))
+        yield ProviderChunk(finish_reason=FinishReason.tool_use if order else FinishReason.end_turn)
+        if usage is not None:
+            yield ProviderChunk(usage=usage)
 
     async def _stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
         kwargs: dict[str, Any] = {
