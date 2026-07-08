@@ -9,7 +9,12 @@ from __future__ import annotations
 import pytest
 
 from keel_core import gmail
-from keel_core.gmail import GmailError, format_inbox, make_gmail_inbox_action
+from keel_core.gmail import (
+    GmailError,
+    format_inbox,
+    make_gmail_inbox_action,
+    make_gmail_send_action,
+)
 from keel_core.protocols import ToolContext
 
 
@@ -82,3 +87,37 @@ async def test_action_skips_persist_when_unchanged(monkeypatch: pytest.MonkeyPat
 
     assert result == "INBOX"
     assert store.puts == []  # nothing to persist
+
+
+async def test_send_action_sends_and_persists_rotation(monkeypatch: pytest.MonkeyPatch) -> None:
+    store = FakeTokenStore("ORIG")
+    seen: dict[str, str] = {}
+
+    def fake_send(creds_json: str, to: str, subject: str, body: str) -> tuple[str, str]:
+        seen.update(creds=creds_json, to=to, subject=subject, body=body)
+        return "msgid123", "ROTATED"
+
+    monkeypatch.setattr(gmail, "_send_sync", fake_send)
+    action = make_gmail_send_action(store)
+
+    result = await action({"to": " me@example.com ", "subject": "Hi", "body": "hello"}, _ctx())
+
+    assert result == "sent (id=msgid123)"
+    assert seen == {"creds": "ORIG", "to": "me@example.com", "subject": "Hi", "body": "hello"}
+    assert store.puts == ["ROTATED"]  # rotated creds persisted
+
+
+async def test_send_action_requires_to(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_send(creds_json: str, to: str, subject: str, body: str) -> tuple[str, str]:
+        raise AssertionError("_send_sync must not be called without a recipient")
+
+    monkeypatch.setattr(gmail, "_send_sync", fake_send)
+    action = make_gmail_send_action(FakeTokenStore("ORIG"))
+    with pytest.raises(GmailError, match="requires a 'to'"):
+        await action({"subject": "x", "body": "y"}, _ctx())
+
+
+async def test_send_action_raises_when_unauthorized() -> None:
+    action = make_gmail_send_action(FakeTokenStore(None))
+    with pytest.raises(GmailError, match="not authorized"):
+        await action({"to": "me@example.com"}, _ctx())
