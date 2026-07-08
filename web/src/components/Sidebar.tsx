@@ -14,7 +14,7 @@ const groups = [
     label: "配置",
     items: [
       { icon: "🤖", label: "Agents" },
-      { icon: "🔌", label: "Connectors" },
+      { icon: "🔌", label: "Connectors", to: "/connectors" },
       { icon: "✅", label: "Approvals", to: "/approvals" },
       { icon: "🧩", label: "Extensions" },
     ],
