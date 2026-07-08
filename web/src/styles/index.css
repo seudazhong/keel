@@ -1,0 +1,27 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #fbfcfd;
+  --border: #e6e8ec;
+  --text: #10151f;
+  --text-soft: #4a5568;
+  --text-muted: #8a94a6;
+  --accent: #4f46e5;
+  --green: #16a34a;
+  --amber: #b45309;
+  --red: #dc2626;
+  --sky: #0369a1;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei",
+    sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
