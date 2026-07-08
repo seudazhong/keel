@@ -9,6 +9,9 @@ RLS as defense-in-depth. On scope deletion, :meth:`purge` revokes every token
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
@@ -16,6 +19,30 @@ from keel_core.secrets import EnvelopeCipher
 from keel_core.types import ScopeId
 
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
+
+
+@dataclass(frozen=True)
+class ConnectorTokenInfo:
+    """A connector that has a stored token for a scope (status, not the secret)."""
+
+    connector_id: str
+    updated_at: datetime | None
+
+
+async def list_connected(engine: AsyncEngine, scope_id: ScopeId) -> list[ConnectorTokenInfo]:
+    """Connectors with a stored token for ``scope_id`` (no decryption — status only)."""
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT connector_id, updated_at FROM connector_tokens "
+                    "WHERE scope_id = :scope ORDER BY connector_id"
+                ),
+                {"scope": scope_id},
+            )
+        ).all()
+    return [ConnectorTokenInfo(connector_id=r.connector_id, updated_at=r.updated_at) for r in rows]
 
 
 class InMemoryTokenStore:

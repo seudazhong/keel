@@ -17,6 +17,7 @@ from fastapi.responses import StreamingResponse
 
 from keel_core.api import ApprovalResolution, CreateMessageRequest, CreateMessageResponse
 from keel_core.approvals import ApprovalStore
+from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
 from keel_core.types import PermissionDecision
 from keel_server.runtime import AgentRuntime
 
@@ -138,3 +139,36 @@ async def approve_durable(approval_id: str, request: Request) -> dict[str, bool]
 @router.post("/approvals/{approval_id}/reject", summary="Reject a durable approval")
 async def reject_durable(approval_id: str, request: Request) -> dict[str, bool]:
     return await _resolve_durable(request, approval_id, "denied")
+
+
+def _short_scope(scope: str) -> str:
+    return scope.rsplit("/", 1)[-1]
+
+
+# Static catalog of known connectors; connection status is joined per-scope at request time.
+CONNECTOR_CATALOG: list[dict[str, object]] = [
+    {
+        "id": GMAIL_CONNECTOR_ID,
+        "name": "Gmail",
+        "icon": "✉️",
+        "kind": "oauth",
+        "scopes": [_short_scope(s) for s in GMAIL_SCOPES],
+    },
+]
+
+
+@router.get("/connectors", summary="List connectors and connection status for the scope")
+async def list_connectors(request: Request) -> list[dict[str, object]]:
+    """Known connectors joined with per-scope connection status (no token decryption)."""
+    engine = getattr(request.app.state, "engine", None)
+    scope = getattr(request.app.state, "durable_scope", "web:local")
+    connected: dict[str, str | None] = {}
+    if engine is not None:
+        from keel_core.tokens import list_connected
+
+        for info in await list_connected(engine, scope):
+            connected[info.connector_id] = info.updated_at.isoformat() if info.updated_at else None
+    return [
+        {**c, "connected": str(c["id"]) in connected, "updated_at": connected.get(str(c["id"]))}
+        for c in CONNECTOR_CATALOG
+    ]
