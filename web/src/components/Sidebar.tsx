@@ -6,7 +6,7 @@ const groups = [
     label: "工作区",
     items: [
       { icon: "💬", label: "Chat", to: "/chat" },
-      { icon: "🗂️", label: "Sessions" },
+      { icon: "🗂️", label: "Sessions", to: "/sessions" },
       { icon: "🧠", label: "Memory" },
     ],
   },
