@@ -44,3 +44,9 @@ docker-compose.override.yml
 !.vscode/settings.example.json
 .DS_Store
 Thumbs.db
+
+# Local OAuth client secrets (never commit)
+.secrets/
+
+# Transient Playwright MCP artifacts (console logs, page snapshots, screenshots)
+.playwright-mcp/
