@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyEvent, initialChatState, userSent, type SseEvent } from "./chatReducer";
+import { applyEvent, foldHistory, initialChatState, userSent, type SseEvent } from "./chatReducer";
 
 const ev = (type: string, payload: Record<string, unknown>, seq = 0): SseEvent => ({
   type,
@@ -72,5 +72,14 @@ describe("chatReducer", () => {
       tone: "error",
       text: expect.stringContaining("boom"),
     });
+  });
+
+  it("foldHistory renders user messages for replay", () => {
+    const s = foldHistory([
+      ev("message.token", { role: "user", text: "hi" }, 1),
+      ev("message.token", { role: "assistant", text: "hello" }, 2),
+    ]);
+    expect(s.items.map((i) => i.kind)).toEqual(["user", "assistant"]);
+    expect(s.items[0]).toMatchObject({ kind: "user", text: "hi" });
   });
 });

@@ -13,6 +13,6 @@ export function useSessions() {
 export function useSessionHistory(id: string) {
   return useQuery({
     queryKey: ["sessions", id, "history"],
-    queryFn: () => api.get<SseEvent[]>(`/v1/sessions/${id}/history`),
+    queryFn: () => api.get<SseEvent[]>(`/v1/sessions/${encodeURIComponent(id)}/history`),
   });
 }

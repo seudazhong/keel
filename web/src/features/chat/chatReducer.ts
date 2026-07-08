@@ -35,16 +35,23 @@ function applyAssistantToken(items: ChatItem[], text: string, partial: boolean):
 /**
  * Reduce one SSE event into the chat state (ports keel_server/webui.py handleEvent).
  * Only events with a truthy ``seq`` advance the replay cursor; partial deltas (seq 0)
- * accumulate but never move it.
+ * accumulate but never move it. ``includeUser`` renders user ``message.token`` events as
+ * user bubbles — off for live chat (``userSent`` already added them + the SSE echoes
+ * them), on for durable replay (:func:`foldHistory`).
  */
-export function applyEvent(state: ChatState, ev: SseEvent): ChatState {
+export function applyEvent(state: ChatState, ev: SseEvent, includeUser = false): ChatState {
   const lastSeq = ev.seq ? ev.seq : state.lastSeq;
   const p = ev.payload ?? {};
   switch (ev.type) {
     case "message.token": {
-      if (p.role !== "assistant") return { ...state, lastSeq };
       const text = typeof p.text === "string" ? p.text : "";
-      return { ...state, lastSeq, items: applyAssistantToken(state.items, text, p.partial === true) };
+      if (p.role === "assistant") {
+        return { ...state, lastSeq, items: applyAssistantToken(state.items, text, p.partial === true) };
+      }
+      if (p.role === "user" && includeUser) {
+        return { ...state, lastSeq, items: [...state.items, { kind: "user", id: nextId(), text }] };
+      }
+      return { ...state, lastSeq };
     }
     case "tool.call": {
       const item: ChatItem = {
@@ -105,4 +112,10 @@ export function applyEvent(state: ChatState, ev: SseEvent): ChatState {
       // turn.*, message.thinking, run.suspended/resumed: no visible item in this slice.
       return { ...state, lastSeq };
   }
+}
+
+/** Fold a session's durable event log into a thread for read-only replay (renders user
+ * messages too, unlike live chat where the composer already shows them). */
+export function foldHistory(events: SseEvent[]): ChatState {
+  return events.reduce((state, ev) => applyEvent(state, ev, true), initialChatState);
 }
