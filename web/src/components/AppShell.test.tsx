@@ -7,20 +7,28 @@ import { AppShell } from "./AppShell";
 
 function shellAt(path: string) {
   return createMemoryRouter(
-    [{ element: <AppShell />, children: [{ path: "approvals", element: <ApprovalsPage /> }] }],
+    [
+      {
+        element: <AppShell />,
+        children: [
+          { path: "chat", element: <div>chat</div> },
+          { path: "approvals", element: <ApprovalsPage /> },
+        ],
+      },
+    ],
     { initialEntries: [path] },
   );
 }
 
-test("the shell exposes exactly one real nav link (Approvals)", () => {
+test("the shell exposes real nav links (Chat, Approvals)", () => {
   renderWithClient(<RouterProvider router={shellAt("/approvals")} />);
-  const links = screen.getAllByRole("link");
-  expect(links).toHaveLength(1);
-  expect(links[0]).toHaveTextContent("Approvals");
+  const labels = screen.getAllByRole("link").map((l) => l.textContent ?? "");
+  expect(labels.some((l) => l.includes("Chat"))).toBe(true);
+  expect(labels.some((l) => l.includes("Approvals"))).toBe(true);
 });
 
 test("other nav items render as disabled placeholders", () => {
   renderWithClient(<RouterProvider router={shellAt("/approvals")} />);
   const disabled = Array.from(document.querySelectorAll("[aria-disabled='true']"));
-  expect(disabled.some((el) => el.textContent?.includes("Chat"))).toBe(true);
+  expect(disabled.some((el) => el.textContent?.includes("Sessions"))).toBe(true);
 });
