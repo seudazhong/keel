@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from keel_core.api import ApprovalResolution, CreateMessageRequest, CreateMessageResponse
 from keel_core.approvals import ApprovalStore
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
+from keel_core.state import PostgresEventStore, list_sessions
 from keel_core.types import PermissionDecision
 from keel_server.runtime import AgentRuntime
 
@@ -172,3 +173,33 @@ async def list_connectors(request: Request) -> list[dict[str, object]]:
         {**c, "connected": str(c["id"]) in connected, "updated_at": connected.get(str(c["id"]))}
         for c in CONNECTOR_CATALOG
     ]
+
+
+@router.get("/sessions", summary="List the scope's sessions (newest first)")
+async def list_sessions_endpoint(request: Request) -> list[dict[str, object]]:
+    """Session summaries for the Sessions list (title preview + message count)."""
+    engine = getattr(request.app.state, "engine", None)
+    scope = getattr(request.app.state, "durable_scope", "web:local")
+    if engine is None:
+        return []
+    return [
+        {
+            "id": s.id,
+            "title": s.title,
+            "messages": s.messages,
+            "created_at": s.created_at.isoformat(),
+            "updated_at": s.updated_at.isoformat(),
+        }
+        for s in await list_sessions(engine, scope)
+    ]
+
+
+@router.get("/sessions/{session_id}/history", summary="Durable event history for a session")
+async def session_history(session_id: str, request: Request) -> list[dict[str, object]]:
+    """The session's durable event log (oldest first) for a read-only replay."""
+    engine = getattr(request.app.state, "engine", None)
+    scope = getattr(request.app.state, "durable_scope", "web:local")
+    if engine is None:
+        return []
+    store = PostgresEventStore(engine, scope)
+    return [event.model_dump(mode="json") async for event in store.read(session_id)]
