@@ -62,6 +62,13 @@ class Settings(BaseSettings):
     scheduler_tick_seconds: int = 30
     approval_timeout_hours: int = 24
 
+    # Gmail read connector (WS-G, real inbox). Disabled -> the digest uses the fake
+    # in-memory inbox (default/test path). When enabled the worker loads the OAuth
+    # refresh token from the connector token store (scope-bound, encrypted).
+    gmail_enabled: bool = False
+    gmail_client_secrets_path: str = ".secrets/gmail_client.json"
+    gmail_max_messages: int = 5
+
     @property
     def sync_database_url(self) -> str:
         """SQLAlchemy URL for the synchronous engine (Alembic uses this)."""
