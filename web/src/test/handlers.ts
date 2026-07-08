@@ -14,8 +14,21 @@ export const sampleApproval: Approval = {
   expires_at: "2026-07-09T00:00:00Z",
 };
 
+// Stateful like the real backend: approve/reject removes the row so a refetch reconciles.
+let pending: Approval[] = [sampleApproval];
+
+export function resetApprovals(): void {
+  pending = [sampleApproval];
+}
+
 export const handlers = [
-  http.get("/v1/approvals", () => HttpResponse.json([sampleApproval])),
-  http.post("/v1/approvals/:id/approve", () => HttpResponse.json({ ok: true })),
-  http.post("/v1/approvals/:id/reject", () => HttpResponse.json({ ok: true })),
+  http.get("/v1/approvals", () => HttpResponse.json(pending)),
+  http.post("/v1/approvals/:id/approve", ({ params }) => {
+    pending = pending.filter((r) => r.id !== String(params.id));
+    return HttpResponse.json({ ok: true });
+  }),
+  http.post("/v1/approvals/:id/reject", ({ params }) => {
+    pending = pending.filter((r) => r.id !== String(params.id));
+    return HttpResponse.json({ ok: true });
+  }),
 ];
