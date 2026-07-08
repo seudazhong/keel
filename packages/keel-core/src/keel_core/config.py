@@ -68,6 +68,10 @@ class Settings(BaseSettings):
     gmail_enabled: bool = False
     gmail_client_secrets_path: str = ".secrets/gmail_client.json"
     gmail_max_messages: int = 5
+    # Real outbound send (gmail.send). Off by default even when reading is enabled, so
+    # the safe posture is "read real mail, send is mocked + approval-gated". Turning
+    # this on requires re-authorizing (the send scope) via scripts/gmail_authorize.py.
+    gmail_send_enabled: bool = False
 
     @property
     def sync_database_url(self) -> str:
