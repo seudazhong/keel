@@ -56,6 +56,25 @@ async def test_registry_honors_injected_inbox_action() -> None:
     assert result.taint is ContentTaint.tainted  # inbound is always tainted (G17)
 
 
+async def test_registry_honors_injected_send_action() -> None:
+    calls: list[dict[str, object]] = []
+
+    async def real_send(args: dict[str, object], ctx: ToolContext) -> str:
+        calls.append(args)
+        return "sent (id=abc)"
+
+    sent: list[dict[str, object]] = []
+    tool = digest_registry(sent, send_action=real_send).get("email_send")
+    assert tool is not None
+    result = await tool.run(
+        {"to": "me@example.com", "idempotency_key": "k"},
+        ToolContext(scope_id="u:1", session_id="digest:u:1"),
+    )
+    assert result.output == "sent (id=abc)"
+    assert calls == [{"to": "me@example.com", "idempotency_key": "k"}]
+    assert sent == []  # the fake in-memory outbox is bypassed
+
+
 async def test_digest_run_suspends_on_send() -> None:
     store, approvals, sent = InMemoryEventStore(), InMemoryApprovalStore(), []
     provider = ScriptedProviderGateway(

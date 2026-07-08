@@ -48,20 +48,22 @@ def digest_registry(
     sent: list[dict[str, Any]] | None = None,
     *,
     inbox_action: ActionFn | None = None,
+    send_action: ActionFn | None = None,
 ) -> ToolRegistry:
     """The digest toolset. ``sent`` (if given) records outbound sends for tests.
 
-    ``inbox_action`` overrides the fake in-memory inbox with a real connector (e.g.
-    Gmail); when omitted the deterministic :data:`SAMPLE_INBOX` is used. Either way the
-    inbound ``ConnectorTool`` taints the output (G17), so the confused-deputy guard
-    behaves identically.
+    ``inbox_action`` / ``send_action`` override the fake in-memory inbox / send with a
+    real connector (e.g. Gmail); when omitted the deterministic :data:`SAMPLE_INBOX` and
+    an in-memory outbox are used. Either way ``inbox_list`` taints its output (G17) and
+    ``email_send`` stays ``outbound=True``, so the confused-deputy guard behaves
+    identically — a real send still requires approval once tainted content is ingested.
     """
     outbox = sent if sent is not None else []
 
     async def fake_inbox_list(args: dict[str, Any], ctx: ToolContext) -> str:
         return _inbox_text()
 
-    async def email_send(args: dict[str, Any], ctx: ToolContext) -> str:
+    async def fake_email_send(args: dict[str, Any], ctx: ToolContext) -> str:
         outbox.append(args)
         return "sent"
 
@@ -77,7 +79,7 @@ def digest_registry(
             ConnectorTool(
                 name="email_send",
                 description="Send an email.",
-                action=email_send,
+                action=send_action or fake_email_send,
                 outbound=True,
                 input_schema={
                     "type": "object",
