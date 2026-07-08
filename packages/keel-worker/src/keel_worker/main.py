@@ -19,14 +19,14 @@ from arq import cron
 from arq.connections import RedisSettings
 
 from keel_core import __version__
-from keel_core.config import get_settings, load_env_file
+from keel_core.config import Settings, get_settings, load_env_file
 from keel_core.digest import (
     DIGEST_INSTRUCTION,
     build_digest_agent,
     digest_permissions,
     digest_registry,
 )
-from keel_core.loop import admit, resume, run
+from keel_core.loop import ToolRegistry, admit, resume, run
 from keel_core.observability import configure_logging, configure_tracing
 from keel_scheduler.store import due_tick
 
@@ -34,6 +34,24 @@ logger = logging.getLogger("keel.worker")
 
 # The autonomy slice operates on a single scope (matches the web server's default).
 _SLICE_SCOPE = "web:local"
+
+
+def _digest_registry(ctx: dict[str, Any], settings: Settings, scope_id: str) -> ToolRegistry:
+    """Digest toolset for a run: the real Gmail inbox when enabled, else the fake.
+
+    Enabling Gmail swaps only the inbound ``inbox_list`` action for one backed by the
+    scope-bound, encrypted connector token store (``ctx["engine"]`` is wired in
+    ``startup``); ``email_send`` stays mocked + approval-gated regardless.
+    """
+    inbox_action = None
+    if settings.gmail_enabled:
+        from keel_core.gmail import make_gmail_inbox_action
+        from keel_core.secrets import cipher_from_settings
+        from keel_core.tokens import PostgresTokenStore
+
+        store = PostgresTokenStore(ctx["engine"], scope_id, cipher_from_settings(settings))
+        inbox_action = make_gmail_inbox_action(store, settings.gmail_max_messages)
+    return digest_registry(ctx.get("sent"), inbox_action=inbox_action)
 
 
 async def run_agent(ctx: dict[str, Any], schedule_id: str) -> str:
@@ -53,7 +71,7 @@ async def run_agent(ctx: dict[str, Any], schedule_id: str) -> str:
         session_id=row.session_id,
         store=store,
         provider=provider,
-        registry=digest_registry(ctx.get("sent")),
+        registry=_digest_registry(ctx, settings, row.scope_id),
         permissions=digest_permissions(),
         approvals=approvals,
         expires_at=datetime.now(UTC) + timedelta(hours=settings.approval_timeout_hours),
@@ -73,7 +91,7 @@ async def resume_run(ctx: dict[str, Any], session_id: str, run_id: str, scope_id
         run_id=run_id,
         store=store,
         provider=provider,
-        registry=digest_registry(ctx.get("sent")),
+        registry=_digest_registry(ctx, settings, scope_id),
         permissions=digest_permissions(),
         approvals=approvals,
     )
