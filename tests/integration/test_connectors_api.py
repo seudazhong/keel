@@ -49,3 +49,20 @@ async def test_connectors_endpoint_lists_catalog(connectors_client: httpx.AsyncC
     assert gmail["connected"] is False
     assert gmail["scopes"] == ["gmail.readonly", "gmail.send"]
     assert gmail["name"] == "Gmail"
+
+
+async def test_revoke_connector_endpoint(migrated_db: AsyncEngine) -> None:
+    scope = f"u:{uuid.uuid4().hex}"
+    await PostgresTokenStore(migrated_db, scope, EnvelopeCipher("k")).put("gmail", "t")
+    assert [i.connector_id for i in await list_connected(migrated_db, scope)] == ["gmail"]
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.engine = migrated_db
+    app.state.durable_scope = scope
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.delete("/v1/connectors/gmail")).json() == {"ok": True}
+        assert (await client.delete("/v1/connectors/gmail")).json() == {"ok": False}  # already gone
+
+    assert await list_connected(migrated_db, scope) == []

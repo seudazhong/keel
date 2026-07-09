@@ -19,6 +19,7 @@ from keel_core.api import ApprovalResolution, CreateMessageRequest, CreateMessag
 from keel_core.approvals import ApprovalStore
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
 from keel_core.state import PostgresEventStore, list_sessions
+from keel_core.tokens import delete_token, list_connected
 from keel_core.types import PermissionDecision
 from keel_server.runtime import AgentRuntime
 
@@ -165,14 +166,21 @@ async def list_connectors(request: Request) -> list[dict[str, object]]:
     scope = getattr(request.app.state, "durable_scope", "web:local")
     connected: dict[str, str | None] = {}
     if engine is not None:
-        from keel_core.tokens import list_connected
-
         for info in await list_connected(engine, scope):
             connected[info.connector_id] = info.updated_at.isoformat() if info.updated_at else None
     return [
         {**c, "connected": str(c["id"]) in connected, "updated_at": connected.get(str(c["id"]))}
         for c in CONNECTOR_CATALOG
     ]
+
+
+@router.delete("/connectors/{connector_id}", summary="Revoke a connector's stored token")
+async def revoke_connector(connector_id: str, request: Request) -> dict[str, bool]:
+    """Delete the scope's stored token for a connector (revoke access)."""
+    engine = getattr(request.app.state, "engine", None)
+    scope = getattr(request.app.state, "durable_scope", "web:local")
+    revoked = engine is not None and await delete_token(engine, scope, connector_id)
+    return {"ok": bool(revoked)}
 
 
 @router.get("/sessions", summary="List the scope's sessions (newest first)")

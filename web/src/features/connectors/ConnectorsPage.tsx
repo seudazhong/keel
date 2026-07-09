@@ -5,7 +5,7 @@ import { Button } from "../../components/ui/button";
 import { Card } from "../../components/ui/card";
 import { Chip } from "../../components/ui/chip";
 import { Skeleton } from "../../components/ui/skeleton";
-import { useConnectors } from "./useConnectors";
+import { useConnectors, useRevokeConnector } from "./useConnectors";
 
 function fmtDate(iso: string | null): string {
   if (!iso) return "—";
@@ -15,6 +15,7 @@ function fmtDate(iso: string | null): string {
 
 export function ConnectorsPage() {
   const { data, isLoading, isError, refetch } = useConnectors();
+  const revoke = useRevokeConnector();
   const connected = data?.filter((c) => c.connected) ?? [];
   const addable = data?.filter((c) => !c.connected) ?? [];
 
@@ -58,6 +59,7 @@ export function ConnectorsPage() {
                       <th className="px-4 py-2.5 font-medium">授予范围（最小）</th>
                       <th className="px-4 py-2.5 font-medium">状态</th>
                       <th className="px-4 py-2.5 font-medium">最近更新</th>
+                      <th className="px-4 py-2.5 font-medium" />
                     </tr>
                   </thead>
                   <tbody>
@@ -77,6 +79,16 @@ export function ConnectorsPage() {
                           <Badge tone="green">● 正常</Badge>
                         </td>
                         <td className="px-4 py-3 text-text-muted">{fmtDate(c.updated_at)}</td>
+                        <td className="px-4 py-3 text-right">
+                          <Button
+                            variant="danger"
+                            className="px-2.5 py-1 text-xs"
+                            disabled={revoke.isPending}
+                            onClick={() => revoke.mutate(c.id)}
+                          >
+                            撤销
+                          </Button>
+                        </td>
                       </tr>
                     ))}
                   </tbody>

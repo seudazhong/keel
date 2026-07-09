@@ -24,7 +24,7 @@ export function resetApprovals(): void {
   pending = [sampleApproval];
 }
 
-export const sampleConnectors: Connector[] = [
+const defaultConnectors: Connector[] = [
   {
     id: "gmail",
     name: "Gmail",
@@ -44,6 +44,14 @@ export const sampleConnectors: Connector[] = [
     updated_at: null,
   },
 ];
+
+let connectors: Connector[] = defaultConnectors.map((c) => ({ ...c }));
+
+export function resetConnectors(): void {
+  connectors = defaultConnectors.map((c) => ({ ...c }));
+}
+
+export const sampleConnectors = defaultConnectors;
 
 export const sampleSessions: SessionSummary[] = [
   {
@@ -72,7 +80,13 @@ const sampleHistory: SseEvent[] = [
 
 export const handlers = [
   http.get("/v1/approvals", () => HttpResponse.json(pending)),
-  http.get("/v1/connectors", () => HttpResponse.json(sampleConnectors)),
+  http.get("/v1/connectors", () => HttpResponse.json(connectors)),
+  http.delete("/v1/connectors/:id", ({ params }) => {
+    connectors = connectors.map((c) =>
+      c.id === String(params.id) ? { ...c, connected: false, updated_at: null } : c,
+    );
+    return HttpResponse.json({ ok: true });
+  }),
   http.get("/v1/sessions", () => HttpResponse.json(sampleSessions)),
   http.get("/v1/sessions/:id/history", () => HttpResponse.json(sampleHistory)),
   http.post("/v1/approvals/:id/approve", ({ params }) => {

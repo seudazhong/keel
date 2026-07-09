@@ -45,6 +45,17 @@ async def list_connected(engine: AsyncEngine, scope_id: ScopeId) -> list[Connect
     return [ConnectorTokenInfo(connector_id=r.connector_id, updated_at=r.updated_at) for r in rows]
 
 
+async def delete_token(engine: AsyncEngine, scope_id: ScopeId, connector_id: str) -> bool:
+    """Revoke (delete) a connector's stored token for a scope. Returns True if a row went."""
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        result = await conn.execute(
+            text("DELETE FROM connector_tokens WHERE scope_id = :scope AND connector_id = :cid"),
+            {"scope": scope_id, "cid": connector_id},
+        )
+    return bool(result.rowcount)
+
+
 class InMemoryTokenStore:
     """Non-durable, scope-bound encrypted token store (tests / lite profile)."""
 
