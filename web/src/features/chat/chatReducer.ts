@@ -1,8 +1,13 @@
-import type { ChatItem, ChatState, SseEvent } from "./types";
+import type { ChatItem, ChatState, ChatUsage, SseEvent } from "./types";
 
-export type { ChatItem, ChatState, SseEvent } from "./types";
+export type { ChatItem, ChatState, ChatUsage, SseEvent } from "./types";
 
-export const initialChatState: ChatState = { items: [], running: false, lastSeq: 0 };
+export const initialChatState: ChatState = {
+  items: [],
+  running: false,
+  lastSeq: 0,
+  usage: { promptTokens: 0, completionTokens: 0, cacheReadTokens: 0, costUsd: 0 },
+};
 
 let _idCounter = 0;
 function nextId(): string {
@@ -32,6 +37,18 @@ function applyAssistantToken(items: ChatItem[], text: string, partial: boolean):
   return [...items, { kind: "assistant", id: nextId(), text, streaming: partial }];
 }
 
+function addUsage(base: ChatUsage, raw: unknown): ChatUsage {
+  if (!raw || typeof raw !== "object") return base;
+  const u = raw as Record<string, unknown>;
+  const n = (v: unknown) => (typeof v === "number" ? v : 0);
+  return {
+    promptTokens: base.promptTokens + n(u.prompt_tokens),
+    completionTokens: base.completionTokens + n(u.completion_tokens),
+    cacheReadTokens: base.cacheReadTokens + n(u.cache_read_tokens),
+    costUsd: base.costUsd + n(u.cost_usd),
+  };
+}
+
 /**
  * Reduce one SSE event into the chat state (ports keel_server/webui.py handleEvent).
  * Only events with a truthy ``seq`` advance the replay cursor; partial deltas (seq 0)
@@ -45,13 +62,24 @@ export function applyEvent(state: ChatState, ev: SseEvent, includeUser = false):
   switch (ev.type) {
     case "message.token": {
       const text = typeof p.text === "string" ? p.text : "";
+      const usage = addUsage(state.usage, p.usage);
       if (p.role === "assistant") {
-        return { ...state, lastSeq, items: applyAssistantToken(state.items, text, p.partial === true) };
+        return {
+          ...state,
+          lastSeq,
+          usage,
+          items: applyAssistantToken(state.items, text, p.partial === true),
+        };
       }
       if (p.role === "user" && includeUser) {
-        return { ...state, lastSeq, items: [...state.items, { kind: "user", id: nextId(), text }] };
+        return {
+          ...state,
+          lastSeq,
+          usage,
+          items: [...state.items, { kind: "user", id: nextId(), text }],
+        };
       }
-      return { ...state, lastSeq };
+      return { ...state, lastSeq, usage };
     }
     case "tool.call": {
       const item: ChatItem = {

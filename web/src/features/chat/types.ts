@@ -28,9 +28,17 @@ export type ChatItem =
     }
   | { kind: "meta"; id: string; text: string; tone?: "error" };
 
+export interface ChatUsage {
+  promptTokens: number;
+  completionTokens: number;
+  cacheReadTokens: number;
+  costUsd: number;
+}
+
 export interface ChatState {
   items: ChatItem[];
   running: boolean;
   lastSeq: number;
   reason?: string;
+  usage: ChatUsage;
 }

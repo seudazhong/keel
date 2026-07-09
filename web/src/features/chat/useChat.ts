@@ -35,6 +35,7 @@ export function useChat(): {
   items: ChatItem[];
   running: boolean;
   reason?: string;
+  usage: ChatState["usage"];
   send: (text: string) => void;
   resolve: (approvalId: string, decision: "allow" | "deny") => void;
 } {
@@ -86,5 +87,12 @@ export function useChat(): {
 
   useEffect(() => () => closeStream(), [closeStream]);
 
-  return { items: state.items, running: state.running, reason: state.reason, send, resolve };
+  return {
+    items: state.items,
+    running: state.running,
+    reason: state.reason,
+    usage: state.usage,
+    send,
+    resolve,
+  };
 }

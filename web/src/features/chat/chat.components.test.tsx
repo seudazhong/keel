@@ -1,6 +1,7 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { ChatThread } from "./ChatThread";
+import { ChatContext } from "./ChatContext";
 import { Composer } from "./Composer";
 import { InlineApproval } from "./InlineApproval";
 import { MessageBubble } from "./MessageBubble";
@@ -66,5 +67,21 @@ describe("chat components", () => {
     expect(screen.getByText("res")).toBeInTheDocument();
     expect(screen.getByText(/需要你批准/)).toBeInTheDocument();
     expect(screen.getByText("! oops")).toBeInTheDocument();
+  });
+
+  it("ChatContext shows total tokens, cost, and tool count", () => {
+    const items: ChatItem[] = [
+      { kind: "tool", id: "1", callId: "c", tool: "read", args: {} },
+      { kind: "user", id: "2", text: "hi" },
+    ];
+    render(
+      <ChatContext
+        items={items}
+        usage={{ promptTokens: 100, completionTokens: 20, cacheReadTokens: 50, costUsd: 0.012 }}
+      />,
+    );
+    expect(screen.getByText("120")).toBeInTheDocument(); // total tokens
+    expect(screen.getByText("$0.0120")).toBeInTheDocument();
+    expect(screen.getByText("50 (50%)")).toBeInTheDocument(); // cache hit
   });
 });

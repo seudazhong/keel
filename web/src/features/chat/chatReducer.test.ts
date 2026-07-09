@@ -82,4 +82,27 @@ describe("chatReducer", () => {
     expect(s.items.map((i) => i.kind)).toEqual(["user", "assistant"]);
     expect(s.items[0]).toMatchObject({ kind: "user", text: "hi" });
   });
+
+  it("accumulates usage across message.token payloads", () => {
+    let s = applyEvent(
+      initialChatState,
+      ev("message.token", {
+        role: "assistant",
+        text: "hi",
+        usage: { prompt_tokens: 100, completion_tokens: 20, cache_read_tokens: 40, cost_usd: 0.01 },
+      }, 3),
+    );
+    s = applyEvent(
+      s,
+      ev("message.token", {
+        role: "assistant",
+        text: "more",
+        usage: { prompt_tokens: 50, completion_tokens: 10, cache_read_tokens: 0, cost_usd: 0.005 },
+      }, 4),
+    );
+    expect(s.usage.promptTokens).toBe(150);
+    expect(s.usage.completionTokens).toBe(30);
+    expect(s.usage.cacheReadTokens).toBe(40);
+    expect(s.usage.costUsd).toBeCloseTo(0.015);
+  });
 });
