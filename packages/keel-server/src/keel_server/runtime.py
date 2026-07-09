@@ -172,6 +172,14 @@ class AgentRuntime:
     def scope_id(self) -> ScopeId:
         return self._scope.id
 
+    @property
+    def model(self) -> str:
+        return self._agent.model
+
+    def set_model(self, model: str) -> None:
+        """Switch the model used by subsequent runs (applies immediately)."""
+        self._agent = self._agent.model_copy(update={"model": model})
+
     def _durable(self) -> EventStore:
         if self._engine is not None:
             return PostgresEventStore(self._engine, self._scope.id)

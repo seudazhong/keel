@@ -11,6 +11,7 @@ Evolution policy (DESIGN-REVIEW G14): ``/v1`` is additive-only.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
@@ -62,6 +63,35 @@ async def interrupt_run(run_id: str, request: Request) -> dict[str, bool]:
     """Ask an in-flight run to stop at its next iteration (StopReason.interrupted)."""
     runtime = _runtime(request)
     return {"ok": runtime.interrupt_run(run_id)}
+
+
+# Suggested Copilot models; gpt-5.3-codex works via the Responses API path (A1).
+_AVAILABLE_MODELS = [
+    "github_copilot/claude-sonnet-4.5",
+    "github_copilot/claude-opus-4.5",
+    "github_copilot/gpt-4o",
+    "github_copilot/gpt-4.1",
+    "github_copilot/gemini-2.5-pro",
+    "github_copilot/gpt-5.3-codex",
+]
+
+
+@router.get("/settings/model", summary="Current model + suggested choices")
+async def get_model(request: Request) -> dict[str, object]:
+    runtime = _runtime(request)
+    current = runtime.model
+    available = _AVAILABLE_MODELS if current in _AVAILABLE_MODELS else [current, *_AVAILABLE_MODELS]
+    return {"current": current, "available": available}
+
+
+@router.put("/settings/model", summary="Switch the model for subsequent runs")
+async def set_model(request: Request, body: dict[str, Any]) -> dict[str, object]:
+    model = str(body.get("model", "")).strip()
+    if not model:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "model is required")
+    runtime = _runtime(request)
+    runtime.set_model(model)
+    return {"ok": True, "current": model}
 
 
 @router.get(

@@ -27,11 +27,28 @@ def test_interrupt_run_marks_known_runs() -> None:
     assert "r1" not in runtime._runs and "r1" not in runtime._interrupted
 
 
+def test_set_model_switches_the_model() -> None:
+    runtime = AgentRuntime(redis_client=MagicMock(), model="m1", workspace=Path("."))
+    assert runtime.model == "m1"
+    runtime.set_model("m2")
+    assert runtime.model == "m2"
+
+
 @pytest_asyncio.fixture
 async def interrupt_client() -> AsyncIterator[httpx.AsyncClient]:
     class FakeRuntime:
+        def __init__(self) -> None:
+            self._m = "github_copilot/claude-sonnet-4.5"
+
         def interrupt_run(self, run_id: str) -> bool:
             return run_id == "known"
+
+        @property
+        def model(self) -> str:
+            return self._m
+
+        def set_model(self, model: str) -> None:
+            self._m = model
 
     app = FastAPI()
     app.include_router(router)
@@ -44,3 +61,15 @@ async def interrupt_client() -> AsyncIterator[httpx.AsyncClient]:
 async def test_interrupt_endpoint(interrupt_client: httpx.AsyncClient) -> None:
     assert (await interrupt_client.post("/v1/runs/known/interrupt")).json() == {"ok": True}
     assert (await interrupt_client.post("/v1/runs/other/interrupt")).json() == {"ok": False}
+
+
+async def test_model_endpoints(interrupt_client: httpx.AsyncClient) -> None:
+    got = (await interrupt_client.get("/v1/settings/model")).json()
+    assert got["current"] == "github_copilot/claude-sonnet-4.5"
+    assert "github_copilot/gpt-5.3-codex" in got["available"]
+
+    put = await interrupt_client.put("/v1/settings/model", json={"model": "github_copilot/gpt-4o"})
+    assert put.json() == {"ok": True, "current": "github_copilot/gpt-4o"}
+    assert (await interrupt_client.get("/v1/settings/model")).json()["current"] == (
+        "github_copilot/gpt-4o"
+    )

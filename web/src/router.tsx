@@ -5,6 +5,7 @@ import { ChatPage } from "./features/chat/ChatPage";
 import { ConnectorsPage } from "./features/connectors/ConnectorsPage";
 import { SessionDetailPage } from "./features/sessions/SessionDetailPage";
 import { SessionsPage } from "./features/sessions/SessionsPage";
+import { SettingsPage } from "./features/settings/SettingsPage";
 
 export const router = createBrowserRouter([
   {
@@ -16,6 +17,7 @@ export const router = createBrowserRouter([
       { path: "sessions/:id", element: <SessionDetailPage /> },
       { path: "connectors", element: <ConnectorsPage /> },
       { path: "approvals", element: <ApprovalsPage /> },
+      { path: "settings", element: <SettingsPage /> },
     ],
   },
 ]);

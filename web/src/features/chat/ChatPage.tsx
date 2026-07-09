@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { Link } from "react-router-dom";
 import { Topbar } from "../../components/Topbar";
 import { Badge } from "../../components/ui/badge";
 import { ChatContext } from "./ChatContext";
@@ -20,7 +21,15 @@ export function ChatPage() {
   return (
     <div className="flex h-screen">
       <div className="flex min-w-0 flex-1 flex-col">
-        <Topbar title="Chat" sub="· 个人助理" right={<Badge tone="violet">{MODEL}</Badge>} />
+        <Topbar
+          title="Chat"
+          sub="· 个人助理"
+          right={
+            <Link to="/settings" title="切换模型">
+              <Badge tone="violet">{MODEL}</Badge>
+            </Link>
+          }
+        />
 
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto flex w-full max-w-[820px] flex-col gap-2.5 p-[22px]">

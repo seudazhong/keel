@@ -78,6 +78,12 @@ const sampleHistory: SseEvent[] = [
   { type: "run.ended", seq: 5, session_id: "s1", run_id: "r1", ts: "", payload: { reason: "completed" } },
 ];
 
+let currentModel = "github_copilot/claude-sonnet-4.5";
+
+export function resetModel(): void {
+  currentModel = "github_copilot/claude-sonnet-4.5";
+}
+
 export const handlers = [
   http.get("/v1/approvals", () => HttpResponse.json(pending)),
   http.get("/v1/connectors", () => HttpResponse.json(connectors)),
@@ -103,6 +109,21 @@ export const handlers = [
     return HttpResponse.json(hits);
   }),
   http.get("/v1/sessions/:id/history", () => HttpResponse.json(sampleHistory)),
+  http.get("/v1/settings/model", () =>
+    HttpResponse.json({
+      current: currentModel,
+      available: [
+        "github_copilot/claude-sonnet-4.5",
+        "github_copilot/gpt-4o",
+        "github_copilot/gpt-5.3-codex",
+      ],
+    }),
+  ),
+  http.put("/v1/settings/model", async ({ request }) => {
+    const body = (await request.json()) as { model: string };
+    currentModel = body.model;
+    return HttpResponse.json({ ok: true, current: currentModel });
+  }),
   http.post("/v1/approvals/:id/approve", ({ params }) => {
     pending = pending.filter((r) => r.id !== String(params.id));
     return HttpResponse.json({ ok: true });
