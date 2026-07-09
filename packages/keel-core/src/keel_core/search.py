@@ -30,6 +30,17 @@ class SearchHit:
     source: str = ""
 
 
+@dataclass
+class SessionSearchHit:
+    """A session matched by :func:`search_sessions` (ranked, with a snippet)."""
+
+    id: str
+    title: str | None
+    snippet: str
+    messages: int
+    updated_at: Any
+
+
 def _vector_literal(vec: list[float]) -> str:
     return "[" + ",".join(repr(float(x)) for x in vec) + "]"
 
@@ -138,6 +149,52 @@ async def session_search(
             {"scope": scope_id, "q": query, "k": k},
         )
         return [SearchHit(content=r.body, source=f"session:{r.session_id}") for r in rows]
+
+
+async def search_sessions(
+    engine: AsyncEngine, scope_id: ScopeId, query: str, *, k: int = 20
+) -> list[SessionSearchHit]:
+    """Rank a scope's sessions by a lexical-hybrid match over their messages.
+
+    Lexical arm only (M1): ``pg_trgm`` similarity ⊕ ``tsvector`` FTS rank, blended by
+    ``GREATEST`` and filtered by (trigram OR FTS) match. The best-matching message per
+    session provides the snippet. The semantic (pgvector) arm is deferred to M3.
+    """
+    if not query.strip():
+        return []
+    sql = text(
+        "WITH hits AS ("
+        "  SELECT DISTINCT ON (e.session_id) e.session_id, e.payload->>'text' AS snippet, "
+        "    GREATEST("
+        "      similarity(e.payload->>'text', :q), "
+        "      ts_rank(to_tsvector('simple', e.payload->>'text'), plainto_tsquery('simple', :q))"
+        "    ) AS score "
+        "  FROM events e "
+        "  WHERE e.scope_id = :scope AND e.type = 'message.token' "
+        "    AND e.payload->>'text' IS NOT NULL "
+        "    AND (similarity(e.payload->>'text', :q) > 0.1 "
+        "         OR to_tsvector('simple', e.payload->>'text') @@ plainto_tsquery('simple', :q)) "
+        "  ORDER BY e.session_id, score DESC"
+        ") "
+        "SELECT h.session_id AS id, h.snippet, h.score, s.title, s.updated_at, "
+        "  (SELECT count(*) FROM events e2 WHERE e2.session_id = s.id "
+        "     AND e2.scope_id = s.scope_id AND e2.type = 'message.token') AS messages "
+        "FROM hits h JOIN sessions s ON s.id = h.session_id AND s.scope_id = :scope "
+        "ORDER BY h.score DESC LIMIT :k"
+    )
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        rows = (await conn.execute(sql, {"scope": scope_id, "q": query, "k": k})).all()
+    return [
+        SessionSearchHit(
+            id=r.id,
+            title=r.title,
+            snippet=r.snippet,
+            messages=int(r.messages),
+            updated_at=r.updated_at,
+        )
+        for r in rows
+    ]
 
 
 class ArchivalSearchTool:

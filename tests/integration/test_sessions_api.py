@@ -62,3 +62,31 @@ async def test_sessions_endpoints(
 
     history = (await client.get(f"/v1/sessions/{sid}/history")).json()
     assert any(e["type"] == "message.token" for e in history)
+
+
+async def test_search_sessions(migrated_db: AsyncEngine) -> None:
+    from keel_core.search import search_sessions
+
+    scope = f"u:{uuid.uuid4().hex}"
+    s1, s2 = f"s:{uuid.uuid4().hex}", f"s:{uuid.uuid4().hex}"
+    await admit(
+        PostgresEventStore(migrated_db, scope), s1, scope, "how do I organize invoices and expenses"
+    )
+    await admit(
+        PostgresEventStore(migrated_db, scope), s2, scope, "schedule a meeting tomorrow afternoon"
+    )
+
+    hits = await search_sessions(migrated_db, scope, "invoices")
+    assert hits and hits[0].id == s1
+    assert "invoice" in hits[0].snippet.lower()
+    assert all(h.id != s2 for h in hits)  # unrelated session not matched
+    assert await search_sessions(migrated_db, scope, "") == []
+
+
+async def test_search_endpoint(sessions_client: tuple[httpx.AsyncClient, str, AsyncEngine]) -> None:
+    client, scope, engine = sessions_client
+    sid = f"s:{uuid.uuid4().hex}"
+    await admit(PostgresEventStore(engine, scope), sid, scope, "quarterly OKR review notes")
+    rows = (await client.get("/v1/sessions/search", params={"q": "OKR"})).json()
+    assert any(r["id"] == sid for r in rows)
+    assert (await client.get("/v1/sessions/search", params={"q": ""})).json() == []

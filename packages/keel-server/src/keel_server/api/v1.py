@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from keel_core.api import ApprovalResolution, CreateMessageRequest, CreateMessageResponse
 from keel_core.approvals import ApprovalStore
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
+from keel_core.search import search_sessions
 from keel_core.state import PostgresEventStore, list_sessions
 from keel_core.tokens import delete_token, list_connected
 from keel_core.types import PermissionDecision
@@ -199,6 +200,25 @@ async def list_sessions_endpoint(request: Request) -> list[dict[str, object]]:
             "updated_at": s.updated_at.isoformat(),
         }
         for s in await list_sessions(engine, scope)
+    ]
+
+
+@router.get("/sessions/search", summary="Search the scope's sessions (lexical hybrid)")
+async def search_sessions_endpoint(request: Request, q: str = Query("")) -> list[dict[str, object]]:
+    """Rank sessions by a trigram ⊕ FTS match over their messages, with a snippet."""
+    engine = getattr(request.app.state, "engine", None)
+    scope = getattr(request.app.state, "durable_scope", "web:local")
+    if engine is None or not q.strip():
+        return []
+    return [
+        {
+            "id": h.id,
+            "title": h.title,
+            "snippet": h.snippet,
+            "messages": h.messages,
+            "updated_at": h.updated_at.isoformat() if h.updated_at else None,
+        }
+        for h in await search_sessions(engine, scope, q)
     ]
 
 

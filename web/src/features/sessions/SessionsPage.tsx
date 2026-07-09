@@ -1,23 +1,39 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Topbar } from "../../components/Topbar";
 import { Banner } from "../../components/ui/banner";
 import { Card } from "../../components/ui/card";
 import { Skeleton } from "../../components/ui/skeleton";
-import { useSessions } from "./useSessions";
+import { useSessions, useSessionSearch } from "./useSessions";
 
-function fmtDate(iso: string): string {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+function fmtDate(iso: string | null): string {
+  const d = new Date(iso ?? "");
+  return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
+}
+
+interface Row {
+  id: string;
+  title: string | null;
+  messages: number;
+  updated_at: string | null;
+  snippet?: string;
 }
 
 export function SessionsPage() {
-  const { data, isLoading, isError, refetch } = useSessions();
   const [q, setQ] = useState("");
-  const needle = q.trim().toLowerCase();
-  const filtered = (data ?? []).filter((s) =>
-    `${s.title ?? ""} ${s.id}`.toLowerCase().includes(needle),
-  );
+  const [dq, setDq] = useState(""); // debounced query
+  useEffect(() => {
+    const t = setTimeout(() => setDq(q.trim()), 250);
+    return () => clearTimeout(t);
+  }, [q]);
+
+  const list = useSessions();
+  const search = useSessionSearch(dq);
+  const searching = dq.length > 0;
+
+  const rows: Row[] = searching ? (search.data ?? []) : (list.data ?? []);
+  const isLoading = searching ? search.isLoading : list.isLoading;
+  const isError = searching ? search.isError : list.isError;
 
   return (
     <>
@@ -25,14 +41,15 @@ export function SessionsPage() {
       <div className="w-full max-w-[900px] p-[22px]">
         <input
           className="mb-4 w-full rounded-sm border border-border bg-surface-2 px-3 py-2 text-sm outline-none focus:border-accent"
-          placeholder="🔍 过滤会话（标题 / id）…"
+          placeholder="🔍 混合检索（trigram + FTS）：会话消息内容…"
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
         <Banner tone="info" className="mb-4">
           <span>🔎</span>
           <div>
-            当前为客户端过滤；服务端混合检索（pg_trgm + tsvector ⊕ pgvector KNN，RRF）即将接入。
+            服务端词法混合检索（<b>pg_trgm + tsvector</b>，取较高分）。语义臂（pgvector
+            KNN）在 M3 接入。
           </div>
         </Banner>
 
@@ -41,18 +58,15 @@ export function SessionsPage() {
         {isError && (
           <Banner tone="danger">
             <span>⚠️</span>
-            <div>
-              加载会话失败。
-              <button className="ml-2 underline" onClick={() => void refetch()}>
-                重试
-              </button>
-            </div>
+            <div>加载会话失败。</div>
           </Banner>
         )}
 
-        {data && filtered.length === 0 && <p className="text-text-muted">没有匹配的会话。</p>}
+        {!isLoading && !isError && rows.length === 0 && (
+          <p className="text-text-muted">{searching ? "没有匹配的会话。" : "还没有会话。"}</p>
+        )}
 
-        {data && filtered.length > 0 && (
+        {rows.length > 0 && (
           <Card className="overflow-hidden">
             <table className="w-full text-sm">
               <thead>
@@ -63,7 +77,7 @@ export function SessionsPage() {
                 </tr>
               </thead>
               <tbody>
-                {filtered.map((s) => (
+                {rows.map((s) => (
                   <tr key={s.id} className="border-b border-border last:border-0 hover:bg-surface-2">
                     <td className="px-4 py-3">
                       <Link
@@ -72,7 +86,11 @@ export function SessionsPage() {
                       >
                         {s.title || s.id}
                       </Link>
-                      <div className="truncate text-xs text-text-muted">{s.id}</div>
+                      {s.snippet ? (
+                        <div className="truncate text-xs text-text-muted">…{s.snippet}…</div>
+                      ) : (
+                        <div className="truncate text-xs text-text-muted">{s.id}</div>
+                      )}
                     </td>
                     <td className="px-4 py-3 text-text-soft">{s.messages}</td>
                     <td className="px-4 py-3 text-text-muted">{fmtDate(s.updated_at)}</td>

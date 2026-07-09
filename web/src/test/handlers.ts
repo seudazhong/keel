@@ -88,6 +88,20 @@ export const handlers = [
     return HttpResponse.json({ ok: true });
   }),
   http.get("/v1/sessions", () => HttpResponse.json(sampleSessions)),
+  http.get("/v1/sessions/search", ({ request }) => {
+    const q = new URL(request.url).searchParams.get("q") ?? "";
+    if (!q.trim()) return HttpResponse.json([]);
+    const hits = sampleSessions
+      .filter((s) => (s.title ?? "").includes(q))
+      .map((s) => ({
+        id: s.id,
+        title: s.title,
+        snippet: s.title ?? "",
+        messages: s.messages,
+        updated_at: s.updated_at,
+      }));
+    return HttpResponse.json(hits);
+  }),
   http.get("/v1/sessions/:id/history", () => HttpResponse.json(sampleHistory)),
   http.post("/v1/approvals/:id/approve", ({ params }) => {
     pending = pending.filter((r) => r.id !== String(params.id));
