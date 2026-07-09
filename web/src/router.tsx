@@ -3,6 +3,7 @@ import { AppShell } from "./components/AppShell";
 import { ApprovalsPage } from "./features/approvals/ApprovalsPage";
 import { ChatPage } from "./features/chat/ChatPage";
 import { ConnectorsPage } from "./features/connectors/ConnectorsPage";
+import { ObservabilityPage } from "./features/observability/ObservabilityPage";
 import { SchedulesPage } from "./features/schedules/SchedulesPage";
 import { SessionDetailPage } from "./features/sessions/SessionDetailPage";
 import { SessionsPage } from "./features/sessions/SessionsPage";
@@ -19,6 +20,7 @@ export const router = createBrowserRouter([
       { path: "connectors", element: <ConnectorsPage /> },
       { path: "schedules", element: <SchedulesPage /> },
       { path: "approvals", element: <ApprovalsPage /> },
+      { path: "observability", element: <ObservabilityPage /> },
       { path: "settings", element: <SettingsPage /> },
     ],
   },

@@ -114,6 +114,29 @@ async def run_schedule(schedule_id: str, request: Request) -> dict[str, bool]:
     return {"ok": True}
 
 
+@router.get("/admin/overview", summary="Scope-wide counts + token/cost totals (admin dashboard)")
+async def admin_overview(request: Request) -> dict[str, object]:
+    engine = getattr(request.app.state, "engine", None)
+    scope = getattr(request.app.state, "durable_scope", "web:local")
+    if engine is None:
+        return {
+            "sessions": 0,
+            "schedules": {"total": 0, "enabled": 0},
+            "approvals": {"pending": 0, "granted": 0, "denied": 0, "expired": 0},
+            "connectors": 0,
+            "usage": {
+                "runs": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cache_read_tokens": 0,
+                "cost_usd": 0.0,
+            },
+        }
+    from keel_core.admin import compute_overview
+
+    return await compute_overview(engine, scope)
+
+
 # Suggested Copilot models; gpt-5.3-codex works via the Responses API path (A1).
 _AVAILABLE_MODELS = [
     "github_copilot/claude-sonnet-4.5",

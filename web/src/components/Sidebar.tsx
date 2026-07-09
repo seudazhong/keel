@@ -29,7 +29,7 @@ const groups = [
   {
     label: "运维",
     items: [
-      { icon: "📊", label: "Observability" },
+      { icon: "📊", label: "Observability", to: "/observability" },
       { icon: "⚙️", label: "Admin" },
     ],
   },

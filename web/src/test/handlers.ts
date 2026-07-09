@@ -162,4 +162,19 @@ export const handlers = [
     return HttpResponse.json({ ok: true, enabled: body.enabled });
   }),
   http.post("/v1/schedules/:id/run", () => HttpResponse.json({ ok: true })),
+  http.get("/v1/admin/overview", () =>
+    HttpResponse.json({
+      sessions: 7,
+      schedules: { total: 3, enabled: 2 },
+      approvals: { pending: 1, granted: 4, denied: 0, expired: 1 },
+      connectors: 2,
+      usage: {
+        runs: 12,
+        prompt_tokens: 100,
+        completion_tokens: 20,
+        cache_read_tokens: 50,
+        cost_usd: 0.012,
+      },
+    }),
+  ),
 ];
