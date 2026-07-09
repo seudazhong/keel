@@ -65,6 +65,55 @@ async def interrupt_run(run_id: str, request: Request) -> dict[str, bool]:
     return {"ok": runtime.interrupt_run(run_id)}
 
 
+@router.get("/schedules", summary="List the scope's schedules (management view)")
+async def list_schedules(request: Request) -> list[dict[str, object]]:
+    engine = getattr(request.app.state, "engine", None)
+    scope = getattr(request.app.state, "durable_scope", "web:local")
+    if engine is None:
+        return []
+    from keel_scheduler.store import PostgresScheduleStore
+
+    store = PostgresScheduleStore(engine, scope)
+    return [
+        {
+            "id": r.id,
+            "agent_id": r.agent_id,
+            "trigger_kind": r.trigger_kind,
+            "spec": r.spec,
+            "interval_s": r.interval_s,
+            "enabled": r.enabled,
+            "next_run_at": r.next_run_at.isoformat(),
+            "last_run_at": r.last_run_at.isoformat() if r.last_run_at else None,
+            "last_status": r.last_status,
+        }
+        for r in await store.list_all()
+    ]
+
+
+@router.post("/schedules/{schedule_id}/toggle", summary="Pause/resume a schedule")
+async def toggle_schedule(
+    schedule_id: str, request: Request, body: dict[str, Any]
+) -> dict[str, object]:
+    engine = getattr(request.app.state, "engine", None)
+    scope = getattr(request.app.state, "durable_scope", "web:local")
+    if engine is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "datastore unavailable")
+    from keel_scheduler.store import PostgresScheduleStore
+
+    enabled = bool(body.get("enabled", True))
+    ok = await PostgresScheduleStore(engine, scope).set_enabled(schedule_id, enabled)
+    return {"ok": ok, "enabled": enabled}
+
+
+@router.post("/schedules/{schedule_id}/run", summary="Trigger a schedule's run now")
+async def run_schedule(schedule_id: str, request: Request) -> dict[str, bool]:
+    enqueue = getattr(request.app.state, "enqueue", None)
+    if enqueue is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "job queue unavailable")
+    await enqueue("run_agent", schedule_id)
+    return {"ok": True}
+
+
 # Suggested Copilot models; gpt-5.3-codex works via the Responses API path (A1).
 _AVAILABLE_MODELS = [
     "github_copilot/claude-sonnet-4.5",

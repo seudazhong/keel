@@ -22,10 +22,10 @@ function shellAt(path: string) {
   );
 }
 
-test("the shell exposes real nav links (Chat, Sessions, Connectors, Approvals)", () => {
+test("the shell exposes real nav links (Chat, Sessions, Connectors, Schedules, Approvals)", () => {
   renderWithClient(<RouterProvider router={shellAt("/approvals")} />);
   const labels = screen.getAllByRole("link").map((l) => l.textContent ?? "");
-  for (const name of ["Chat", "Sessions", "Connectors", "Approvals"]) {
+  for (const name of ["Chat", "Sessions", "Connectors", "Schedules", "Approvals"]) {
     expect(labels.some((l) => l.includes(name))).toBe(true);
   }
 });

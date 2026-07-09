@@ -22,7 +22,7 @@ const groups = [
   {
     label: "自动化",
     items: [
-      { icon: "⏰", label: "Schedules" },
+      { icon: "⏰", label: "Schedules", to: "/schedules" },
       { icon: "🕸️", label: "Multi-agent" },
     ],
   },

@@ -160,6 +160,34 @@ class PostgresScheduleStore:
                 {"status": status, "scope": self._scope_id, "id": schedule_id},
             )
 
+    async def list_all(self) -> list[ScheduleRow]:
+        """All schedules for the scope (management view), soonest next-run first."""
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            rows = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT * FROM schedules WHERE scope_id = :scope ORDER BY next_run_at"
+                        ),
+                        {"scope": self._scope_id},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [_to_schedule_row(r) for r in rows]
+
+    async def set_enabled(self, schedule_id: str, enabled: bool) -> bool:
+        """Pause/resume a schedule. Returns True if a row was updated."""
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text("UPDATE schedules SET enabled = :e WHERE scope_id = :scope AND id = :id"),
+                {"e": enabled, "scope": self._scope_id, "id": schedule_id},
+            )
+        return bool(result.rowcount)
+
 
 class PostgresClaimStore:
     """Atomic compare-and-set on ``schedules.next_run_at`` (the at-most-once cursor)."""

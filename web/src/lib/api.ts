@@ -6,7 +6,16 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   get: <T>(path: string) => req<T>(path),
-  post: <T>(path: string) => req<T>(path, { method: "POST" }),
+  post: <T>(path: string, body?: unknown) =>
+    req<T>(path, {
+      method: "POST",
+      ...(body === undefined
+        ? {}
+        : {
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          }),
+    }),
   put: <T>(path: string, body: unknown) =>
     req<T>(path, {
       method: "PUT",

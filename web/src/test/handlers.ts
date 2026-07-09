@@ -2,6 +2,7 @@ import { http, HttpResponse } from "msw";
 import type { Approval } from "../features/approvals/types";
 import type { SseEvent } from "../features/chat/types";
 import type { Connector } from "../features/connectors/types";
+import type { Schedule } from "../features/schedules/types";
 import type { SessionSummary } from "../features/sessions/types";
 
 export const sampleApproval: Approval = {
@@ -84,6 +85,26 @@ export function resetModel(): void {
   currentModel = "github_copilot/claude-sonnet-4.5";
 }
 
+const defaultSchedules: Schedule[] = [
+  {
+    id: "digest:web:local",
+    agent_id: "digest",
+    trigger_kind: "interval",
+    spec: "86400",
+    interval_s: 86400,
+    enabled: true,
+    next_run_at: "2026-07-09T06:00:00Z",
+    last_run_at: "2026-07-08T06:00:00Z",
+    last_status: "completed",
+  },
+];
+
+let schedules: Schedule[] = defaultSchedules.map((s) => ({ ...s }));
+
+export function resetSchedules(): void {
+  schedules = defaultSchedules.map((s) => ({ ...s }));
+}
+
 export const handlers = [
   http.get("/v1/approvals", () => HttpResponse.json(pending)),
   http.get("/v1/connectors", () => HttpResponse.json(connectors)),
@@ -132,4 +153,13 @@ export const handlers = [
     pending = pending.filter((r) => r.id !== String(params.id));
     return HttpResponse.json({ ok: true });
   }),
+  http.get("/v1/schedules", () => HttpResponse.json(schedules)),
+  http.post("/v1/schedules/:id/toggle", async ({ params, request }) => {
+    const body = (await request.json()) as { enabled: boolean };
+    schedules = schedules.map((s) =>
+      s.id === String(params.id) ? { ...s, enabled: body.enabled } : s,
+    );
+    return HttpResponse.json({ ok: true, enabled: body.enabled });
+  }),
+  http.post("/v1/schedules/:id/run", () => HttpResponse.json({ ok: true })),
 ];

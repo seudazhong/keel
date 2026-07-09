@@ -2,7 +2,7 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup } from "@testing-library/react";
 import { setupServer } from "msw/node";
 import { afterAll, afterEach, beforeAll } from "vitest";
-import { handlers, resetApprovals, resetConnectors, resetModel } from "./handlers";
+import { handlers, resetApprovals, resetConnectors, resetModel, resetSchedules } from "./handlers";
 
 export const server = setupServer(...handlers);
 
@@ -13,5 +13,6 @@ afterEach(() => {
   resetApprovals();
   resetConnectors();
   resetModel();
+  resetSchedules();
 });
 afterAll(() => server.close());
