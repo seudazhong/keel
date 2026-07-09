@@ -13,6 +13,7 @@ a network call (record/replay-style, NFR-12); the default lazily binds
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
@@ -20,6 +21,8 @@ from keel_core.protocols import ProviderChunk, ProviderRequest, ToolCall, Usage
 from keel_core.types import FinishReason
 
 CompletionFn = Callable[..., Awaitable[Any]]
+
+logger = logging.getLogger(__name__)
 
 # Provider finish reasons (OpenAI/Anthropic/LiteLLM) -> our turn-level FinishReason.
 _FINISH_REASONS: dict[str, FinishReason] = {
@@ -126,7 +129,11 @@ class LiteLLMGateway:
     """
 
     def __init__(
-        self, *, completion: CompletionFn | None = None, responses: CompletionFn | None = None
+        self,
+        *,
+        completion: CompletionFn | None = None,
+        responses: CompletionFn | None = None,
+        fallbacks: list[str] | None = None,
     ) -> None:
         if completion is None or responses is None:
             import litellm
@@ -140,6 +147,11 @@ class LiteLLMGateway:
                 responses = litellm.aresponses
         self._completion = completion
         self._responses = responses
+        if fallbacks is None:
+            from keel_core.config import get_settings
+
+            fallbacks = get_settings().fallback_model_list
+        self._fallbacks = fallbacks
 
     def _use_responses(self, model: str) -> bool:
         """True when ``model`` is a github_copilot model that requires /responses."""
@@ -156,9 +168,41 @@ class LiteLLMGateway:
             return False
 
     def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
+        return self._stream_with_failover(request)
+
+    def _dispatch(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
+        """Route one request to the right endpoint (Responses vs chat completions)."""
         if self._use_responses(request.model):
             return self._stream_responses(request)
         return self._stream(request)
+
+    async def _stream_with_failover(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
+        """Try ``request.model``, then each fallback, on a pre-output failure (B2).
+
+        Failover only applies while no chunk has been emitted yet: once we've
+        streamed output, an error propagates (retrying would duplicate the turn).
+        """
+        candidates = [request.model]
+        for model in self._fallbacks:
+            if model not in candidates:
+                candidates.append(model)
+
+        last_exc: Exception | None = None
+        for model in candidates:
+            req = request if model == request.model else request.model_copy(update={"model": model})
+            emitted = False
+            try:
+                async for chunk in self._dispatch(req):
+                    emitted = True
+                    yield chunk
+                return
+            except Exception as exc:  # noqa: BLE001 - provider errors drive failover
+                if emitted:
+                    raise  # partial output already streamed: cannot safely fail over
+                last_exc = exc
+                logger.warning("provider %s failed; falling over: %s", model, exc)
+        if last_exc is not None:
+            raise last_exc
 
     async def _stream_responses(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
         """Normalize a ``litellm.aresponses`` (Responses API) stream to ProviderChunks."""

@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     # Default model surfaces use when none is given (LiteLLM model id).
     default_model: str = "gpt-4o-mini"
 
+    # Ordered fallback models (comma-separated LiteLLM ids) tried when a provider call
+    # fails before emitting any output (B2 failover/routing). Empty -> no failover.
+    fallback_models: str = ""
+
     # Durable event store backend: "postgres" (default) or "memory". The in-memory
     # store is a single-process "lite" profile — and the way to run the server on a
     # Windows host, where uvicorn's Proactor loop can't drive psycopg's async driver.
@@ -77,6 +81,11 @@ class Settings(BaseSettings):
     def sync_database_url(self) -> str:
         """SQLAlchemy URL for the synchronous engine (Alembic uses this)."""
         return self.database_url
+
+    @property
+    def fallback_model_list(self) -> list[str]:
+        """Parsed, de-blanked ``fallback_models`` (order preserved)."""
+        return [m.strip() for m in self.fallback_models.split(",") if m.strip()]
 
 
 @lru_cache

@@ -9,6 +9,8 @@ from collections.abc import AsyncIterator
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from keel_core.agents import AgentSpec, Scope
 from keel_core.loop import admit, run
 from keel_core.protocols import ProviderRequest
@@ -248,3 +250,76 @@ def test_use_responses_routing() -> None:
     gateway = LiteLLMGateway(completion=_completion([], {}), responses=_responses([], {}))
     assert gateway._use_responses("openai/gpt-4o") is False  # non-copilot -> chat
     assert gateway._use_responses("github_copilot/gpt-5.3-codex") is True  # responses-only model
+
+
+def _router_completion(behaviors: dict[str, Any], seen: list[str]):
+    """A chat-completion double that dispatches per requested model.
+
+    ``behaviors[model]`` is either an ``Exception`` (raised at call time) or a list
+    of chunk doubles to stream.
+    """
+
+    async def completion(**kwargs: Any) -> AsyncIterator[Any]:
+        model = kwargs["model"]
+        seen.append(model)
+        behavior = behaviors[model]
+        if isinstance(behavior, Exception):
+            raise behavior
+
+        async def gen() -> AsyncIterator[Any]:
+            for chunk in behavior:
+                yield chunk
+
+        return gen()
+
+    return completion
+
+
+async def test_failover_switches_model_on_error() -> None:
+    seen: list[str] = []
+    behaviors: dict[str, Any] = {
+        "primary/m": RuntimeError("boom"),
+        "backup/m": [_chunk(content="ok"), _chunk(finish_reason="stop")],
+    }
+    gateway = LiteLLMGateway(
+        completion=_router_completion(behaviors, seen),
+        responses=_responses([], {}),
+        fallbacks=["backup/m"],
+    )
+    out = [c async for c in gateway.stream(ProviderRequest(model="primary/m", messages=[]))]
+
+    assert [c.delta for c in out if c.delta] == ["ok"]  # served by the fallback
+    assert seen == ["primary/m", "backup/m"]  # tried primary first, then fell over
+
+
+async def test_no_failover_after_partial_output() -> None:
+    async def completion(**kwargs: Any) -> AsyncIterator[Any]:
+        async def gen() -> AsyncIterator[Any]:
+            yield _chunk(content="par")
+            raise RuntimeError("mid-stream")
+
+        return gen()
+
+    gateway = LiteLLMGateway(
+        completion=completion, responses=_responses([], {}), fallbacks=["backup/m"]
+    )
+    with pytest.raises(RuntimeError, match="mid-stream"):
+        _ = [c async for c in gateway.stream(ProviderRequest(model="primary/m", messages=[]))]
+
+
+async def test_failover_exhausted_raises_last_error() -> None:
+    async def completion(**kwargs: Any) -> AsyncIterator[Any]:
+        raise RuntimeError(f"fail-{kwargs['model']}")
+
+    gateway = LiteLLMGateway(completion=completion, responses=_responses([], {}), fallbacks=["b/m"])
+    with pytest.raises(RuntimeError, match="fail-b/m"):  # last candidate's error surfaces
+        _ = [c async for c in gateway.stream(ProviderRequest(model="a/m", messages=[]))]
+
+
+async def test_no_fallbacks_propagates_error() -> None:
+    async def completion(**kwargs: Any) -> AsyncIterator[Any]:
+        raise RuntimeError("boom")
+
+    gateway = LiteLLMGateway(completion=completion, responses=_responses([], {}), fallbacks=[])
+    with pytest.raises(RuntimeError, match="boom"):
+        _ = [c async for c in gateway.stream(ProviderRequest(model="a/m", messages=[]))]

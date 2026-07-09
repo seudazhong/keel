@@ -83,3 +83,32 @@ async def test_postgres_claim_is_compare_and_set(migrated_db: AsyncEngine) -> No
     assert await claim.claim("d", t0, t0 + timedelta(days=1)) is True
     assert await claim.claim("d", t0, t0 + timedelta(days=1)) is False  # stale expected
     assert await PostgresScheduleStore(migrated_db, "u:1").due(t0) == []  # advanced past t0
+
+
+async def test_concurrent_claims_yield_exactly_one_winner(migrated_db: AsyncEngine) -> None:
+    """N simultaneous ticks (worker replicas) claim a due schedule at most once (I9).
+
+    The scale-out safety property: with the scheduler_tick cron firing on every worker
+    replica, only one replica's compare-and-set on ``next_run_at`` may win, so a due
+    schedule is enqueued exactly once regardless of the number of workers.
+    """
+    import asyncio
+
+    from keel_scheduler.store import PostgresClaimStore
+
+    t0 = datetime(2026, 7, 7, 9, 0, tzinfo=UTC)
+    async with migrated_db.begin() as conn:
+        await conn.execute(text("select set_config('app.scope_id','u:1',true)"))
+        await conn.execute(
+            text(
+                "insert into schedules(id,scope_id,agent_id,session_id,trigger_kind,spec,"
+                "next_run_at,interval_s,enabled) values "
+                "('d','u:1','digest','digest:u:1','interval','86400',:t,86400,true)"
+            ),
+            {"t": t0},
+        )
+    claim = PostgresClaimStore(migrated_db, "u:1")
+    new = t0 + timedelta(days=1)
+    results = await asyncio.gather(*(claim.claim("d", t0, new) for _ in range(8)))
+    assert results.count(True) == 1  # exactly one replica wins the race
+    assert results.count(False) == 7

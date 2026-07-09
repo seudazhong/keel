@@ -77,9 +77,18 @@ services:
       start_period: 10s
     profiles: ["dev", "full"]
 
+  # Stateless & horizontally scalable: run N replicas with
+  #   docker compose up -d --scale keel-worker=3
+  # arq gives each agent job to exactly one worker, and coordinates the scheduler_tick
+  # cron across replicas (Redis lock) so it runs once per tick. As defense-in-depth the
+  # tick's enqueue is idempotent regardless: an atomic compare-and-set on
+  # schedules.next_run_at (+ a RETURNING update for approval expiry) enqueues a due
+  # schedule at most once at any replica count (invariant I9).
   keel-worker:
     <<: *app
     command: ["arq", "keel_worker.main.WorkerSettings"]
+    deploy:
+      replicas: 1  # override with `--scale keel-worker=N`; scale-out is CAS-safe
     environment:
       <<: *app-env
     depends_on:

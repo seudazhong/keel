@@ -60,3 +60,11 @@ def test_scheduler_and_approval_defaults() -> None:
     settings = Settings()
     assert settings.approval_timeout_hours == 24
     assert settings.scheduler_tick_seconds == 30
+
+
+def test_fallback_model_list_parses_and_trims(monkeypatch: pytest.MonkeyPatch) -> None:
+    from keel_core.config import Settings
+
+    assert Settings().fallback_model_list == []  # empty by default -> no failover
+    monkeypatch.setenv("KEEL_FALLBACK_MODELS", "openai/gpt-4o , github_copilot/claude-sonnet-4.5,")
+    assert Settings().fallback_model_list == ["openai/gpt-4o", "github_copilot/claude-sonnet-4.5"]
