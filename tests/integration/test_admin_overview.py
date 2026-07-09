@@ -51,7 +51,8 @@ async def _seed(engine: AsyncEngine, scope: str) -> None:
         for seq, usage in runs:
             await conn.execute(
                 text(
-                    "INSERT INTO events (session_id, scope_id, seq, type, version, run_id, ts, payload) "
+                    "INSERT INTO events (session_id, scope_id, seq, type, version, run_id, "
+                    "ts, payload) "
                     "VALUES (:sid, :s, :seq, 'run.ended', 1, :rid, :ts, CAST(:p AS jsonb))"
                 ),
                 {
@@ -84,7 +85,8 @@ async def _seed(engine: AsyncEngine, scope: str) -> None:
             )
         await conn.execute(
             text(
-                "INSERT INTO connector_tokens (scope_id, connector_id, ciphertext) VALUES (:s, 'gmail', 'x')"
+                "INSERT INTO connector_tokens (scope_id, connector_id, ciphertext) "
+                "VALUES (:s, 'gmail', 'x')"
             ),
             {"s": scope},
         )
@@ -131,3 +133,21 @@ async def test_admin_overview_endpoint(
     assert ov["usage"]["prompt_tokens"] == 150
     assert ov["connectors"] == 1
     assert ov["schedules"] == {"total": 2, "enabled": 1}
+
+
+async def test_admin_overview_is_admin_gated(migrated_db: AsyncEngine) -> None:
+    from keel_server.auth import parse_api_keys
+
+    scope = f"u:{uuid.uuid4().hex}"
+    app = FastAPI()
+    app.include_router(router)
+    app.state.engine = migrated_db
+    app.state.durable_scope = scope
+    app.state.api_keys = parse_api_keys("adm:admin,vw:viewer")  # keyed mode -> enforced
+    transport = ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        assert (await client.get("/v1/admin/overview")).status_code == 401  # no key
+        viewer = await client.get("/v1/admin/overview", headers={"X-API-Key": "vw"})
+        assert viewer.status_code == 403  # viewer < admin
+        admin = await client.get("/v1/admin/overview", headers={"X-API-Key": "adm"})
+        assert admin.status_code == 200 and admin.json()["sessions"] == 0

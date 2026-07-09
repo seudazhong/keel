@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from keel_core.api import ApprovalResolution, CreateMessageRequest, CreateMessageResponse
@@ -23,9 +23,13 @@ from keel_core.search import search_sessions
 from keel_core.state import PostgresEventStore, list_sessions
 from keel_core.tokens import delete_token, list_connected
 from keel_core.types import PermissionDecision
+from keel_server.auth import Role, require_role
 from keel_server.runtime import AgentRuntime
 
-router = APIRouter(prefix="/v1", tags=["v1"])
+# Baseline authorization: every /v1 route needs at least `viewer`. In open mode (no
+# KEEL_API_KEYS) that resolves to an implicit admin, so single-user stays unauthenticated;
+# with keys configured, reads need viewer while mutations/admin raise the bar per-route.
+router = APIRouter(prefix="/v1", tags=["v1"], dependencies=[Depends(require_role(Role.viewer))])
 
 
 def _runtime(request: Request) -> AgentRuntime:
@@ -48,6 +52,7 @@ def _durable_approvals(request: Request) -> tuple[ApprovalStore, str]:
     response_model=CreateMessageResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Admit a user message and schedule a run",
+    dependencies=[Depends(require_role(Role.operator))],
 )
 async def create_message(
     session_id: str, body: CreateMessageRequest, request: Request
@@ -58,7 +63,11 @@ async def create_message(
     return CreateMessageResponse(session_id=session_id, run_id=run_id)
 
 
-@router.post("/runs/{run_id}/interrupt", summary="Interrupt a running agent run")
+@router.post(
+    "/runs/{run_id}/interrupt",
+    summary="Interrupt a running agent run",
+    dependencies=[Depends(require_role(Role.operator))],
+)
 async def interrupt_run(run_id: str, request: Request) -> dict[str, bool]:
     """Ask an in-flight run to stop at its next iteration (StopReason.interrupted)."""
     runtime = _runtime(request)
@@ -90,7 +99,11 @@ async def list_schedules(request: Request) -> list[dict[str, object]]:
     ]
 
 
-@router.post("/schedules/{schedule_id}/toggle", summary="Pause/resume a schedule")
+@router.post(
+    "/schedules/{schedule_id}/toggle",
+    summary="Pause/resume a schedule",
+    dependencies=[Depends(require_role(Role.operator))],
+)
 async def toggle_schedule(
     schedule_id: str, request: Request, body: dict[str, Any]
 ) -> dict[str, object]:
@@ -105,7 +118,11 @@ async def toggle_schedule(
     return {"ok": ok, "enabled": enabled}
 
 
-@router.post("/schedules/{schedule_id}/run", summary="Trigger a schedule's run now")
+@router.post(
+    "/schedules/{schedule_id}/run",
+    summary="Trigger a schedule's run now",
+    dependencies=[Depends(require_role(Role.operator))],
+)
 async def run_schedule(schedule_id: str, request: Request) -> dict[str, bool]:
     enqueue = getattr(request.app.state, "enqueue", None)
     if enqueue is None:
@@ -114,7 +131,11 @@ async def run_schedule(schedule_id: str, request: Request) -> dict[str, bool]:
     return {"ok": True}
 
 
-@router.get("/admin/overview", summary="Scope-wide counts + token/cost totals (admin dashboard)")
+@router.get(
+    "/admin/overview",
+    summary="Scope-wide counts + token/cost totals (admin dashboard)",
+    dependencies=[Depends(require_role(Role.admin))],
+)
 async def admin_overview(request: Request) -> dict[str, object]:
     engine = getattr(request.app.state, "engine", None)
     scope = getattr(request.app.state, "durable_scope", "web:local")
@@ -156,7 +177,11 @@ async def get_model(request: Request) -> dict[str, object]:
     return {"current": current, "available": available}
 
 
-@router.put("/settings/model", summary="Switch the model for subsequent runs")
+@router.put(
+    "/settings/model",
+    summary="Switch the model for subsequent runs",
+    dependencies=[Depends(require_role(Role.operator))],
+)
 async def set_model(request: Request, body: dict[str, Any]) -> dict[str, object]:
     model = str(body.get("model", "")).strip()
     if not model:
@@ -194,6 +219,7 @@ async def stream_events(
 @router.post(
     "/approvals/{approval_id}",
     summary="Resolve a pending approval",
+    dependencies=[Depends(require_role(Role.operator))],
 )
 async def resolve_approval(
     approval_id: str, body: ApprovalResolution, request: Request
@@ -243,12 +269,20 @@ async def _resolve_durable(request: Request, approval_id: str, decision: str) ->
     return {"ok": ok}
 
 
-@router.post("/approvals/{approval_id}/approve", summary="Approve a durable approval")
+@router.post(
+    "/approvals/{approval_id}/approve",
+    summary="Approve a durable approval",
+    dependencies=[Depends(require_role(Role.operator))],
+)
 async def approve_durable(approval_id: str, request: Request) -> dict[str, bool]:
     return await _resolve_durable(request, approval_id, "granted")
 
 
-@router.post("/approvals/{approval_id}/reject", summary="Reject a durable approval")
+@router.post(
+    "/approvals/{approval_id}/reject",
+    summary="Reject a durable approval",
+    dependencies=[Depends(require_role(Role.operator))],
+)
 async def reject_durable(approval_id: str, request: Request) -> dict[str, bool]:
     return await _resolve_durable(request, approval_id, "denied")
 
@@ -284,7 +318,11 @@ async def list_connectors(request: Request) -> list[dict[str, object]]:
     ]
 
 
-@router.delete("/connectors/{connector_id}", summary="Revoke a connector's stored token")
+@router.delete(
+    "/connectors/{connector_id}",
+    summary="Revoke a connector's stored token",
+    dependencies=[Depends(require_role(Role.operator))],
+)
 async def revoke_connector(connector_id: str, request: Request) -> dict[str, bool]:
     """Delete the scope's stored token for a connector (revoke access)."""
     engine = getattr(request.app.state, "engine", None)

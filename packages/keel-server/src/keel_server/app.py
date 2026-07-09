@@ -27,6 +27,7 @@ from keel_core.providers import LiteLLMGateway
 from keel_server.api import gateway as gateway_api
 from keel_server.api import oauth as oauth_api
 from keel_server.api import v1
+from keel_server.auth import parse_api_keys
 from keel_server.gateway import OneBotGateway, RateLimiter
 from keel_server.runtime import AgentRuntime
 from keel_server.webui import INDEX_HTML, pages_router
@@ -52,6 +53,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Durable approvals raised by unattended (scheduled) runs — the Approvals page +
     # API read this; approving enqueues a resume_run onto the worker's arq queue (G5).
     app.state.durable_scope = "web:local"
+    app.state.api_keys = parse_api_keys(settings.api_keys)  # RBAC: empty -> open mode
     app.state.durable_approvals = (
         PostgresApprovalStore(engine, "web:local")
         if engine is not None

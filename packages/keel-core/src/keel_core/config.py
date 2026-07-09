@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     # fails before emitting any output (B2 failover/routing). Empty -> no failover.
     fallback_models: str = ""
 
+    # RBAC (B3): comma-separated ``key:role`` pairs (roles: viewer|operator|admin).
+    # Empty -> open single-user mode (every request is an implicit admin).
+    api_keys: str = ""
+
     # Durable event store backend: "postgres" (default) or "memory". The in-memory
     # store is a single-process "lite" profile — and the way to run the server on a
     # Windows host, where uvicorn's Proactor loop can't drive psycopg's async driver.
