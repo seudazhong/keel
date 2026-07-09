@@ -29,6 +29,11 @@ export async function resolveApproval(
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
 }
 
+export async function interruptRun(runId: string): Promise<void> {
+  const res = await fetch(`/v1/runs/${runId}/interrupt`, { method: "POST" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
 /** Open the SSE stream for a session; caller closes it (on run.ended or unmount). */
 export function openEvents(
   sessionId: string,

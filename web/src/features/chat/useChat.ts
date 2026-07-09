@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
-import { openEvents, postMessage, resolveApproval } from "./chatApi";
+import { interruptRun, openEvents, postMessage, resolveApproval } from "./chatApi";
 import { applyEvent, initialChatState, userSent } from "./chatReducer";
 import type { ChatItem, ChatState, SseEvent } from "./types";
 
@@ -38,12 +38,14 @@ export function useChat(): {
   usage: ChatState["usage"];
   send: (text: string) => void;
   resolve: (approvalId: string, decision: "allow" | "deny") => void;
+  interrupt: () => void;
 } {
   const [state, dispatch] = useReducer(reduce, initialChatState);
 
   const sessionRef = useRef<string>("");
   if (!sessionRef.current) sessionRef.current = crypto.randomUUID();
   const esRef = useRef<EventSource | null>(null);
+  const runIdRef = useRef<string | null>(null);
   const lastSeqRef = useRef(0);
   useEffect(() => {
     lastSeqRef.current = state.lastSeq;
@@ -59,7 +61,8 @@ export function useChat(): {
       dispatch({ kind: "user", text });
       void (async () => {
         try {
-          await postMessage(sessionRef.current, text);
+          const { run_id } = await postMessage(sessionRef.current, text);
+          runIdRef.current = run_id;
         } catch {
           dispatch({ kind: "event", ev: synthetic("error", { message: "发送失败" }) });
           dispatch({ kind: "event", ev: synthetic("run.ended", { reason: "error" }) });
@@ -85,6 +88,11 @@ export function useChat(): {
     void resolveApproval(approvalId, decision).catch(() => undefined);
   }, []);
 
+  const interrupt = useCallback(() => {
+    const runId = runIdRef.current;
+    if (runId) void interruptRun(runId).catch(() => undefined);
+  }, []);
+
   useEffect(() => () => closeStream(), [closeStream]);
 
   return {
@@ -94,5 +102,6 @@ export function useChat(): {
     usage: state.usage,
     send,
     resolve,
+    interrupt,
   };
 }

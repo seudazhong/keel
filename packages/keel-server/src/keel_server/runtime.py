@@ -166,6 +166,7 @@ class AgentRuntime:
         self._approvals = ApprovalRegistry()
         self._tracer = make_tracer()  # Langfuse if configured, else no-op
         self._runs: dict[RunId, asyncio.Task[None]] = {}
+        self._interrupted: set[RunId] = set()
 
     @property
     def scope_id(self) -> ScopeId:
@@ -186,8 +187,19 @@ class AgentRuntime:
         run_id = uuid.uuid4().hex
         task = asyncio.create_task(self._run(store, session_id, run_id))
         self._runs[run_id] = task
-        task.add_done_callback(lambda _t: self._runs.pop(run_id, None))
+        task.add_done_callback(lambda _t: self._forget(run_id))
         return run_id
+
+    def _forget(self, run_id: RunId) -> None:
+        self._runs.pop(run_id, None)
+        self._interrupted.discard(run_id)
+
+    def interrupt_run(self, run_id: RunId) -> bool:
+        """Request an in-flight run to stop at its next iteration. False if unknown."""
+        if run_id not in self._runs:
+            return False
+        self._interrupted.add(run_id)
+        return True
 
     async def _run(self, store: CompositeEventStore, session_id: SessionId, run_id: RunId) -> None:
         approve = self._approver(store, session_id, run_id)
@@ -201,6 +213,7 @@ class AgentRuntime:
                 permissions=self._permissions,
                 approve=approve,
                 run_id=run_id,
+                interrupt=lambda: run_id in self._interrupted,
                 stream_deltas=True,  # relay token-by-token over SSE
                 on_event=self._tracer.record,  # export the run to Langfuse (if configured)
             )

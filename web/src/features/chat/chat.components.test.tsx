@@ -5,6 +5,7 @@ import { ChatContext } from "./ChatContext";
 import { Composer } from "./Composer";
 import { InlineApproval } from "./InlineApproval";
 import { MessageBubble } from "./MessageBubble";
+import { RunBar } from "./RunBar";
 import { ToolStep } from "./ToolStep";
 import type { ChatItem } from "./types";
 
@@ -83,5 +84,12 @@ describe("chat components", () => {
     expect(screen.getByText("120")).toBeInTheDocument(); // total tokens
     expect(screen.getByText("$0.0120")).toBeInTheDocument();
     expect(screen.getByText("50 (50%)")).toBeInTheDocument(); // cache hit
+  });
+
+  it("RunBar shows an interrupt button while running", () => {
+    const onInterrupt = vi.fn();
+    render(<RunBar running reason={undefined} onInterrupt={onInterrupt} />);
+    fireEvent.click(screen.getByText("⏸ 打断"));
+    expect(onInterrupt).toHaveBeenCalled();
   });
 });

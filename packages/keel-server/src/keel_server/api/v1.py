@@ -57,6 +57,13 @@ async def create_message(
     return CreateMessageResponse(session_id=session_id, run_id=run_id)
 
 
+@router.post("/runs/{run_id}/interrupt", summary="Interrupt a running agent run")
+async def interrupt_run(run_id: str, request: Request) -> dict[str, bool]:
+    """Ask an in-flight run to stop at its next iteration (StopReason.interrupted)."""
+    runtime = _runtime(request)
+    return {"ok": runtime.interrupt_run(run_id)}
+
+
 @router.get(
     "/sessions/{session_id}/events",
     summary="Stream session events (SSE, replayable via after=)",

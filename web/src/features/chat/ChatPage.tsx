@@ -10,7 +10,7 @@ import { useChat } from "./useChat";
 const MODEL = "github_copilot / claude-sonnet-4.5";
 
 export function ChatPage() {
-  const { items, running, reason, usage, send, resolve } = useChat();
+  const { items, running, reason, usage, send, resolve, interrupt } = useChat();
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -36,7 +36,7 @@ export function ChatPage() {
 
         <div className="shrink-0">
           <div className="mx-auto w-full max-w-[820px]">
-            <RunBar running={running} reason={reason} />
+            <RunBar running={running} reason={reason} onInterrupt={interrupt} />
             <Composer disabled={running} onSend={send} />
           </div>
         </div>
