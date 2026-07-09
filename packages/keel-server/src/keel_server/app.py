@@ -28,7 +28,7 @@ from keel_server.api import gateway as gateway_api
 from keel_server.api import oauth as oauth_api
 from keel_server.api import v1
 from keel_server.auth import parse_api_keys
-from keel_server.gateway import OneBotGateway, RateLimiter
+from keel_server.gateway import OneBotGateway, RateLimiter, TelegramGateway
 from keel_server.runtime import AgentRuntime
 from keel_server.webui import INDEX_HTML, pages_router
 
@@ -83,6 +83,16 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             ),
             workspace=Path.cwd(),
             self_id=settings.onebot_self_id or None,
+            model=settings.default_model,
+            rate_limiter=RateLimiter(limit=settings.im_rate_limit),
+        )
+    # Telegram IM gateway (optional): only wired when a bot token is configured.
+    if settings.telegram_bot_token:
+        app.state.telegram_gateway = TelegramGateway(
+            provider=LiteLLMGateway(),
+            send=gateway_api.make_telegram_sender(settings.telegram_bot_token),
+            workspace=Path.cwd(),
+            bot_username=settings.telegram_bot_username or None,
             model=settings.default_model,
             rate_limiter=RateLimiter(limit=settings.im_rate_limit),
         )

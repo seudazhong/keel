@@ -123,3 +123,27 @@ def test_onebot_webhook_503_without_gateway() -> None:
     client = TestClient(create_app())  # lifespan not run -> no gateway configured
     resp = client.post("/v1/gateway/onebot", json={"post_type": "message"})
     assert resp.status_code == 503
+
+
+def test_telegram_webhook_accepts_and_dispatches() -> None:
+    handled: list[dict[str, object]] = []
+
+    class _FakeGateway:
+        async def handle(self, payload: dict[str, object]) -> None:
+            handled.append(payload)
+
+    app = create_app()
+    app.state.telegram_gateway = _FakeGateway()
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/gateway/telegram",
+        json={"message": {"text": "hi", "chat": {"id": 7, "type": "private"}}},
+    )
+    assert resp.status_code == 202
+    assert handled and handled[0]["message"]["text"] == "hi"  # type: ignore[index]
+
+
+def test_telegram_webhook_503_without_gateway() -> None:
+    client = TestClient(create_app())  # lifespan not run -> no gateway configured
+    resp = client.post("/v1/gateway/telegram", json={"message": {}})
+    assert resp.status_code == 503

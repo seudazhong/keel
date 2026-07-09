@@ -12,38 +12,29 @@ OneBot HTTP API).
 from __future__ import annotations
 
 import re
-import time
-from collections import defaultdict, deque
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 
-from keel_core import (
-    AgentSpec,
-    Event,
-    EventType,
-    InMemoryEventStore,
-    ProviderGateway,
-    Rule,
-    RuleBasedPermissionEngine,
-    Scope,
-    ScopeKind,
-    ToolRegistry,
-    TrustLevel,
-    admit,
-    run,
+from keel_core import ProviderGateway
+from keel_server.gateway.base import (
+    ImRunner,
+    InboundMessage,
+    RateLimiter,
+    SendFn,
+    WakeDecision,
 )
-from keel_core.protocols import Tool
-from keel_core.tools import GlobTool, GrepTool, LsTool, ReadTool
-from keel_core.types import PermissionDecision
 
-# The safe toolset for untrusted surfaces (FR-X6): read-only, no write/edit/shell.
-_SAFE_TOOLS = ("read", "ls", "glob", "grep")
-
-SendFn = Callable[[str, str], Awaitable[None]]  # (session_key, text) -> None
+__all__ = [
+    "OneBotEvent",
+    "OneBotGateway",
+    "RateLimiter",
+    "WakeDecision",
+    "session_key",
+    "wake_rule",
+]
 
 
 class OneBotEvent(BaseModel):
@@ -72,12 +63,6 @@ def session_key(event: OneBotEvent) -> str:
     return f"qq:private:{event.user_id}"
 
 
-@dataclass
-class WakeDecision:
-    woke: bool
-    text: str = ""
-
-
 _CQ_AT = re.compile(r"\[CQ:at,qq=(\d+)\]")
 
 
@@ -101,41 +86,6 @@ def wake_rule(
     return WakeDecision(False)
 
 
-class RateLimiter:
-    """Per-key sliding-window limiter (G10): at most ``limit`` events per ``window`` s."""
-
-    def __init__(self, limit: int = 5, window: float = 60.0) -> None:
-        self._limit = limit
-        self._window = window
-        self._hits: dict[str, deque[float]] = defaultdict(deque)
-
-    def allow(self, key: str, *, now: float | None = None) -> bool:
-        now = time.monotonic() if now is None else now
-        hits = self._hits[key]
-        while hits and now - hits[0] > self._window:
-            hits.popleft()
-        if len(hits) >= self._limit:
-            return False
-        hits.append(now)
-        return True
-
-
-def _safe_tools(workspace: Path) -> list[Tool]:
-    tools: list[Tool] = [
-        ReadTool(workspace),
-        LsTool(workspace),
-        GlobTool(workspace),
-        GrepTool(workspace),
-    ]
-    return tools
-
-
-def _safe_permissions() -> RuleBasedPermissionEngine:
-    """Allow only the safe read-only tools; everything else is denied (fail-closed)."""
-    rules = [Rule(name, PermissionDecision.allow) for name in _SAFE_TOOLS]
-    return RuleBasedPermissionEngine(rules, default=PermissionDecision.deny)
-
-
 @dataclass
 class OneBotGateway:
     """Route OneBot messages through wake rules + rate limiting to the safe agent."""
@@ -147,14 +97,15 @@ class OneBotGateway:
     prefixes: tuple[str, ...] = ("/keel",)
     model: str = "gpt-4o-mini"
     rate_limiter: RateLimiter = field(default_factory=RateLimiter)
-    _store: InMemoryEventStore = field(default_factory=InMemoryEventStore, init=False)
+    _runner: ImRunner = field(init=False)
 
-    def _agent(self, key: str) -> AgentSpec:
-        kind = ScopeKind.group if key.startswith("qq:group:") else ScopeKind.personal
-        # Untrusted surface: the scope is untrusted and carries only the safe toolset.
-        scope = Scope(id=key, kind=kind, trust=TrustLevel.untrusted)
-        return AgentSpec(
-            id="im", name="Keel IM", model=self.model, scope=scope, toolset=list(_SAFE_TOOLS)
+    def __post_init__(self) -> None:
+        self._runner = ImRunner(
+            provider=self.provider,
+            send=self.send,
+            workspace=self.workspace,
+            model=self.model,
+            rate_limiter=self.rate_limiter,
         )
 
     async def handle(self, payload: dict[str, Any]) -> None:
@@ -162,36 +113,13 @@ class OneBotGateway:
         event = OneBotEvent.model_validate(payload)
         if event.post_type != "message":
             return
-        key = session_key(event)
         decision = wake_rule(event, self_id=self.self_id, prefixes=self.prefixes)
         if not decision.woke or not decision.text:
             return
-        if not self.rate_limiter.allow(key):
-            return  # drop silently to avoid amplifying spam
-        reply = await self._run(key, decision.text)
-        if reply:
-            await self.send(key, reply)
-
-    async def _run(self, key: str, text: str) -> str:
-        agent = self._agent(key)
-        await admit(self._store, key, agent.scope.id, text)
-        parts: list[str] = []
-
-        def collect(event: Event) -> None:
-            if (
-                event.type is EventType.message_token
-                and event.payload.get("role") == "assistant"
-                and not event.payload.get("partial")
-            ):
-                parts.append(str(event.payload.get("text", "")))
-
-        await run(
-            agent=agent,
-            session_id=key,
-            store=self._store,
-            provider=self.provider,
-            registry=ToolRegistry(_safe_tools(self.workspace)),
-            permissions=_safe_permissions(),
-            on_event=collect,
+        await self._runner.dispatch(
+            InboundMessage(
+                session_key=session_key(event),
+                text=decision.text,
+                is_group=event.message_type == "group",
+            )
         )
-        return "\n".join(p for p in parts if p)

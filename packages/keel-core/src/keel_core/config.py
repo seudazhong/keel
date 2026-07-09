@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     onebot_self_id: int = 0
     im_rate_limit: int = 5  # max messages per chat per minute
 
+    # Telegram IM gateway (WS-E/J). Empty bot token -> the gateway is disabled. The
+    # username (without '@') is used for group @-mention wake detection.
+    telegram_bot_token: str = ""
+    telegram_bot_username: str = ""
+
     # psycopg3 driver works for both sync (Alembic) and async (app) engines.
     database_url: str = "postgresql+psycopg://keel:keel@localhost:5432/keel"
     redis_url: str = "redis://localhost:6379/0"
