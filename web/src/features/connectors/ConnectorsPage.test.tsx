@@ -1,5 +1,5 @@
 import { fireEvent, screen, waitFor } from "@testing-library/react";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { renderWithClient } from "../../test/utils";
 import { ConnectorsPage } from "./ConnectorsPage";
 
@@ -12,11 +12,16 @@ test("renders the connected Gmail row with scope chips + the taint banner", asyn
   expect(screen.getByText("正常", { exact: false })).toBeInTheDocument();
 });
 
-test("shows a not-connected catalog entry with a disabled connect button", async () => {
+test("a not-connected oauth connector offers an in-browser connect", async () => {
+  const open = vi.spyOn(window, "open").mockImplementation(() => null);
   renderWithClient(<ConnectorsPage />);
   await screen.findByText("gmail.readonly");
   expect(screen.getByText("Google Calendar")).toBeInTheDocument();
-  expect(screen.getByRole("button", { name: "连接" })).toBeDisabled();
+  const btn = screen.getByRole("button", { name: "连接" });
+  expect(btn).not.toBeDisabled();
+  fireEvent.click(btn);
+  expect(open).toHaveBeenCalledWith("/v1/connectors/calendar/connect", "_blank");
+  open.mockRestore();
 });
 
 test("revoking a connector removes it from the connected list", async () => {

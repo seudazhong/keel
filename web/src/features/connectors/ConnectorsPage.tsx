@@ -115,8 +115,13 @@ export function ConnectorsPage() {
                       <b className="text-sm">{c.name}</b>
                       <Button
                         className="w-full"
-                        disabled
-                        title="通过 CLI 授权（scripts/gmail_authorize.py）"
+                        disabled={c.kind !== "oauth"}
+                        title={
+                          c.kind === "oauth"
+                            ? "在浏览器中授权（新标签页）"
+                            : "暂未支持浏览器内连接"
+                        }
+                        onClick={() => window.open(`/v1/connectors/${c.id}/connect`, "_blank")}
                       >
                         连接
                       </Button>
@@ -124,7 +129,7 @@ export function ConnectorsPage() {
                   ))}
                 </div>
                 <p className="mt-3 text-xs text-text-muted">
-                  浏览器内连接流程即将上线；当前通过 CLI 授权（scripts/gmail_authorize.py）。
+                  点击「连接」在新标签页完成 Google 授权；授权后回到本页刷新即可看到已连接。
                 </p>
               </>
             )}

@@ -25,6 +25,7 @@ from keel_core.config import get_settings, load_env_file
 from keel_core.db import make_async_engine, make_redis
 from keel_core.providers import LiteLLMGateway
 from keel_server.api import gateway as gateway_api
+from keel_server.api import oauth as oauth_api
 from keel_server.api import v1
 from keel_server.gateway import OneBotGateway, RateLimiter
 from keel_server.runtime import AgentRuntime
@@ -143,6 +144,7 @@ def create_app() -> FastAPI:
         return JSONResponse(body.model_dump(), status_code=200 if ready else 503)
 
     app.include_router(v1.router)
+    app.include_router(oauth_api.router)
     app.include_router(gateway_api.router)
     app.include_router(pages_router)
 
