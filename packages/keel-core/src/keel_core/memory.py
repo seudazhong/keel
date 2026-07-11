@@ -8,9 +8,12 @@ value to a history table (undo-able).
 
 from __future__ import annotations
 
+from typing import Any
+
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from keel_core.protocols import ToolContext, ToolResult
 from keel_core.types import ScopeId
 
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
@@ -107,3 +110,93 @@ class PostgresMemoryStore:
                 )
             ).all()
         return {str(row.key): str(row.value) for row in rows}
+
+
+class _MemoryTool:
+    writes = True
+
+    def __init__(self, engine: AsyncEngine, *, max_chars: int = 2000) -> None:
+        self._engine = engine
+        self._max_chars = max_chars
+
+    def _store(self, ctx: ToolContext) -> PostgresMemoryStore:
+        return PostgresMemoryStore(self._engine, ctx.scope_id)
+
+
+class MemoryAppendTool(_MemoryTool):
+    name = "memory_append"
+    description = "Append a line to one of your core memory blocks (creates it if absent)."
+
+    def input_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"block": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["block", "content"],
+        }
+
+    async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        store = self._store(ctx)
+        block, content = str(args.get("block", "")), str(args.get("content", ""))
+        current = await store.get(block) or ""
+        updated = f"{current}\n{content}".strip() if current else content
+        if len(updated) > self._max_chars:
+            return ToolResult(
+                ok=False,
+                output=f"block '{block}' would exceed {self._max_chars} chars; "
+                "use memory_rethink to summarize.",
+            )
+        version = await store.set(block, updated)
+        return ToolResult(ok=True, output=f"appended to '{block}' (v{version})")
+
+
+class MemoryReplaceTool(_MemoryTool):
+    name = "memory_replace"
+    description = "Replace the first occurrence of old with new in a core memory block."
+
+    def input_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {
+                "block": {"type": "string"},
+                "old": {"type": "string"},
+                "new": {"type": "string"},
+            },
+            "required": ["block", "old", "new"],
+        }
+
+    async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        store = self._store(ctx)
+        block, old, new = (
+            str(args.get("block", "")),
+            str(args.get("old", "")),
+            str(args.get("new", "")),
+        )
+        current = await store.get(block)
+        if current is None or old not in current:
+            return ToolResult(ok=False, output=f"'{old}' not found in block '{block}'")
+        updated = current.replace(old, new, 1)
+        if len(updated) > self._max_chars:
+            return ToolResult(
+                ok=False, output=f"block '{block}' would exceed {self._max_chars} chars"
+            )
+        version = await store.set(block, updated)
+        return ToolResult(ok=True, output=f"replaced in '{block}' (v{version})")
+
+
+class MemoryRethinkTool(_MemoryTool):
+    name = "memory_rethink"
+    description = "Overwrite a core memory block entirely (for compaction or correction)."
+
+    def input_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"block": {"type": "string"}, "content": {"type": "string"}},
+            "required": ["block", "content"],
+        }
+
+    async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        block, content = str(args.get("block", "")), str(args.get("content", ""))
+        if len(content) > self._max_chars:
+            return ToolResult(ok=False, output=f"content exceeds {self._max_chars} chars")
+        version = await self._store(ctx).set(block, content)
+        return ToolResult(ok=True, output=f"rewrote '{block}' (v{version})")
