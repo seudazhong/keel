@@ -83,3 +83,20 @@ async def test_session_search_finds_past_messages(migrated_db: AsyncEngine) -> N
     hits = await session_search(migrated_db, scope, "Tokyo flight", k=5)
     assert any("Tokyo" in h.content for h in hits)
     assert hits[0].source.startswith("session:")
+
+
+async def test_archival_insert_then_search(migrated_db: AsyncEngine) -> None:
+    from keel_core.embeddings import FakeEmbedder
+    from keel_core.protocols import ToolContext
+    from keel_core.search import ArchivalInsertTool, ArchivalSearchTool
+
+    embedder = FakeEmbedder(dim=16)
+    ctx = ToolContext(scope_id="u:arch", session_id="s")
+    inserted = await ArchivalInsertTool(migrated_db, embedder).run(
+        {"content": "the capital of France is Paris"}, ctx
+    )
+    assert inserted.ok
+    found = await ArchivalSearchTool(migrated_db, embedder).run(
+        {"query": "France capital", "k": 3}, ctx
+    )
+    assert found.ok and "Paris" in found.output

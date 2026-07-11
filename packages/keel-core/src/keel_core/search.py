@@ -197,6 +197,30 @@ async def search_sessions(
     ]
 
 
+class ArchivalInsertTool:
+    """``archival_insert`` (P3): save a passage to scope-bound archival memory."""
+
+    name = "archival_insert"
+    description = "Save a passage to your archival memory for later semantic recall."
+    writes = True
+
+    def __init__(self, engine: AsyncEngine, embedder: Embedder) -> None:
+        self._engine = engine
+        self._embedder = embedder
+
+    def input_schema(self) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": {"content": {"type": "string"}},
+            "required": ["content"],
+        }
+
+    async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        store = ArchivalStore(self._engine, ctx.scope_id, self._embedder)
+        row_id = await store.add(str(args.get("content", "")))
+        return ToolResult(ok=True, output=f"saved to archival memory (id={row_id})")
+
+
 class ArchivalSearchTool:
     """``archival_search`` tool (P3): scope-bound hybrid retrieval."""
 
