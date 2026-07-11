@@ -63,6 +63,7 @@ def _now() -> datetime:
 # the canonical event stream without polling. Both are optional and side-effect-only.
 EventObserver = Callable[[Event], None]
 DeltaObserver = Callable[[str], None]
+SystemContextFn = Callable[[], Awaitable[str]]
 
 
 class _ObservingStore:
@@ -215,14 +216,19 @@ async def admit_system(
 
 
 async def _build_request(
-    agent: AgentSpec, store: EventStore, session_id: SessionId, registry: ToolRegistry
+    agent: AgentSpec,
+    store: EventStore,
+    session_id: SessionId,
+    registry: ToolRegistry,
+    system_context: SystemContextFn | None = None,
 ) -> ProviderRequest:
     events = [event async for event in store.read(session_id)]
-    return ProviderRequest(
-        model=agent.model,
-        messages=project_messages(events),
-        tools=registry.schemas(),
-    )
+    messages = project_messages(events)
+    if system_context is not None:
+        text = await system_context()
+        if text:
+            messages.insert(0, {"role": "system", "content": text})
+    return ProviderRequest(model=agent.model, messages=messages, tools=registry.schemas())
 
 
 async def _call_provider(
@@ -400,6 +406,7 @@ async def _agent_loop(
     approvals: ApprovalStore | None = None,
     expires_at: datetime | None = None,
     start_iteration: int = 0,
+    system_context: SystemContextFn | None = None,
 ) -> _LoopOutcome:
     """The turn loop: build request -> call provider -> (gate) run tools -> repeat.
 
@@ -429,7 +436,7 @@ async def _agent_loop(
         await _emit(
             store, EventType.turn_started, session_id, scope_id, run_id, {"turn": iterations}
         )
-        request = await _build_request(agent, store, session_id, registry)
+        request = await _build_request(agent, store, session_id, registry, system_context)
 
         try:
             turn = await _call_provider(provider, request, budget.max_retries, on_delta, emit_delta)
@@ -506,6 +513,7 @@ async def run(
     stream_deltas: bool = False,
     approvals: ApprovalStore | None = None,
     expires_at: datetime | None = None,
+    system_context: SystemContextFn | None = None,
 ) -> RunResult:
     """Execute the agent loop until a named termination and return the result.
 
@@ -557,6 +565,7 @@ async def run(
         on_delta=on_delta,
         approvals=approvals,
         expires_at=expires_at,
+        system_context=system_context,
     )
 
     if outcome.reason is StopReason.suspended:
@@ -621,6 +630,7 @@ async def resume(
     on_delta: DeltaObserver | None = None,
     stream_deltas: bool = False,
     expires_at: datetime | None = None,
+    system_context: SystemContextFn | None = None,
 ) -> RunResult:
     """Resume a suspended run: resolve its pending tool batch, then continue the loop.
 
@@ -703,6 +713,7 @@ async def resume(
         on_delta=on_delta,
         approvals=approvals,
         expires_at=expires_at,
+        system_context=system_context,
     )
 
     if outcome.reason is StopReason.suspended:
