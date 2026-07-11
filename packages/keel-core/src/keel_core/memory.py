@@ -16,6 +16,25 @@ from keel_core.types import ScopeId
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 
 
+def format_core_memory(
+    blocks: dict[str, str], *, defaults: tuple[str, ...] = ("persona", "human")
+) -> str:
+    """Render core-memory blocks as an always-visible system message.
+
+    Default blocks render even when absent (empty tags) so the model knows they
+    exist; any extra blocks follow, in insertion order.
+    """
+    keys = list(defaults) + [key for key in blocks if key not in defaults]
+    lines = [
+        "<core_memory>",
+        "Editable long-term memory, always visible. Keep it accurate with the "
+        "memory_* tools; it persists across all your sessions.",
+    ]
+    lines += [f"<{key}>{blocks.get(key, '')}</{key}>" for key in keys]
+    lines.append("</core_memory>")
+    return "\n".join(lines)
+
+
 class PostgresMemoryStore:
     """Scope-bound store for editable memory blocks."""
 
