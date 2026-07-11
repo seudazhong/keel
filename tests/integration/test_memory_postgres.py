@@ -33,3 +33,11 @@ async def test_memory_scope_isolation(migrated_db: AsyncEngine) -> None:
 
     assert await a.get("shared") == "a-value"
     assert await b.get("shared") == "b-value"  # same key, different scopes -> independent
+
+
+async def test_blocks_returns_all_scope_blocks(migrated_db: AsyncEngine) -> None:
+    store = PostgresMemoryStore(migrated_db, "u:blk1")
+    await store.set("persona", "concise")
+    await store.set("human", "name X")
+    assert await store.blocks() == {"persona": "concise", "human": "name X"}
+    assert await PostgresMemoryStore(migrated_db, "u:blk2").blocks() == {}  # scope-isolated

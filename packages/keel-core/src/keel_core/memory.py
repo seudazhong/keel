@@ -95,3 +95,15 @@ class PostgresMemoryStore:
                 )
             ).all()
         return [(int(row.version), str(row.value)) for row in rows]
+
+    async def blocks(self) -> dict[str, str]:
+        """Return all of the scope's memory blocks as ``{key: value}``."""
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            rows = (
+                await conn.execute(
+                    text("SELECT key, value FROM memory_blocks WHERE scope_id = :scope"),
+                    {"scope": self._scope_id},
+                )
+            ).all()
+        return {str(row.key): str(row.value) for row in rows}
