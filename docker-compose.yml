@@ -61,6 +61,7 @@ services:
       <<: *app-env
       KEEL_SERVER_HOST: 0.0.0.0
       KEEL_SERVER_PORT: 8000
+      OLLAMA_API_BASE: "http://ollama:11434"
     ports: ["8000:8000"]
     depends_on:
       postgres:
@@ -68,6 +69,8 @@ services:
       redis:
         condition: service_healthy
       keel-migrate:
+        condition: service_completed_successfully
+      ollama-pull:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
@@ -91,10 +94,13 @@ services:
       replicas: 1  # override with `--scale keel-worker=N`; scale-out is CAS-safe
     environment:
       <<: *app-env
+      OLLAMA_API_BASE: "http://ollama:11434"
     depends_on:
       redis:
         condition: service_healthy
       keel-migrate:
+        condition: service_completed_successfully
+      ollama-pull:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "arq", "keel_worker.main.WorkerSettings", "--check"]
@@ -116,5 +122,27 @@ services:
       retries: 20
     profiles: ["dev", "full"]
 
+  ollama:
+    image: ollama/ollama:latest
+    volumes: ["ollama:/root/.ollama"]
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list >/dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    profiles: ["dev", "full"]
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    environment: { OLLAMA_HOST: "http://ollama:11434" }
+    entrypoint: ["/bin/sh", "-c", "ollama pull bge-m3"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+    profiles: ["dev", "full"]
+
 volumes:
   pgdata:
+  ollama:
