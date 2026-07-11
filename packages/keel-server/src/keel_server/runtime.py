@@ -64,9 +64,6 @@ logger = logging.getLogger("keel.server.runtime")
 
 _READ_ONLY = ("read", "ls", "glob", "grep")
 _MUTATING = ("write", "edit", "shell")
-_MEMORY = ("memory_append", "memory_replace", "memory_rethink")
-_RECALL = ("session_search",)
-_ARCHIVAL = ("archival_insert", "archival_search")
 
 
 def _now() -> datetime:
