@@ -68,3 +68,13 @@ def test_fallback_model_list_parses_and_trims(monkeypatch: pytest.MonkeyPatch) -
     assert Settings().fallback_model_list == []  # empty by default -> no failover
     monkeypatch.setenv("KEEL_FALLBACK_MODELS", "openai/gpt-4o , github_copilot/claude-sonnet-4.5,")
     assert Settings().fallback_model_list == ["openai/gpt-4o", "github_copilot/claude-sonnet-4.5"]
+
+
+def test_memory_embedding_defaults() -> None:
+    from keel_core.config import Settings
+
+    settings = Settings()
+    assert settings.embedding_model == "ollama/bge-m3"
+    assert settings.embedding_dim == 1024
+    assert settings.embedding_send_dimensions is False
+    assert settings.memory_block_max_chars == 2000

@@ -28,7 +28,13 @@ from .extensibility import (
     tool_search,
 )
 from .loop import RunBudget, RunResult, ToolRegistry, admit, run
-from .memory import PostgresMemoryStore
+from .memory import (
+    MemoryAppendTool,
+    MemoryReplaceTool,
+    MemoryRethinkTool,
+    PostgresMemoryStore,
+    format_core_memory,
+)
 from .permissions import Rule, RuleBasedPermissionEngine
 from .projections import project_messages
 from .protocols import (
@@ -48,6 +54,7 @@ from .protocols import (
 )
 from .providers import LiteLLMGateway
 from .search import (
+    ArchivalInsertTool,
     ArchivalSearchTool,
     ArchivalStore,
     SearchHit,
@@ -120,6 +127,10 @@ __all__ = [
     "InMemoryEventStore",
     "PostgresEventStore",
     "PostgresMemoryStore",
+    "MemoryAppendTool",
+    "MemoryReplaceTool",
+    "MemoryRethinkTool",
+    "format_core_memory",
     "project_messages",
     "LiteLLMGateway",
     # connectors + secrets (WS-G)
@@ -141,6 +152,7 @@ __all__ = [
     "SearchHit",
     "session_search",
     "ArchivalSearchTool",
+    "ArchivalInsertTool",
     "SessionSearchTool",
     # extensibility (WS-G, I8)
     "ImportGuard",

@@ -33,6 +33,13 @@ class Settings(BaseSettings):
     # fails before emitting any output (B2 failover/routing). Empty -> no failover.
     fallback_models: str = ""
 
+    # Embeddings for archival memory / RAG (ADR-0007). Empty embedding_model -> archival off
+    # (core memory still works, it is embedding-free).
+    embedding_model: str = "ollama/bge-m3"
+    embedding_dim: int = 1024
+    embedding_send_dimensions: bool = False  # OpenAI text-embedding-3 needs it; Ollama rejects it
+    memory_block_max_chars: int = 2000
+
     # RBAC (B3): comma-separated ``key:role`` pairs (roles: viewer|operator|admin).
     # Empty -> open single-user mode (every request is an implicit admin).
     api_keys: str = ""
