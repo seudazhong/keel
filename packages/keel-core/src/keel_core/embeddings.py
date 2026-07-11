@@ -52,16 +52,26 @@ class FakeEmbedder:
 class LiteLLMEmbedder:
     """A ``(model, dim)``-pinned embedder over LiteLLM (any provider)."""
 
-    def __init__(self, model: str, dim: int) -> None:
+    def __init__(self, model: str, dim: int, *, send_dimensions: bool = False) -> None:
         self.model = model
         self.dim = dim
+        self.send_dimensions = send_dimensions
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         from litellm import aembedding
 
-        response = await aembedding(model=self.model, input=list(texts), dimensions=self.dim)
+        kwargs: dict[str, Any] = {"model": self.model, "input": list(texts)}
+        if self.send_dimensions:  # OpenAI text-embedding-3 accepts it; Ollama rejects it
+            kwargs["dimensions"] = self.dim
+        response = await aembedding(**kwargs)
         data: list[dict[str, Any]] = response.data
-        return [list(item["embedding"]) for item in data]
+        vectors = [list(item["embedding"]) for item in data]
+        for vec in vectors:
+            if len(vec) != self.dim:
+                raise ValueError(
+                    f"embedding dim {len(vec)} != expected {self.dim} for model {self.model}"
+                )
+        return vectors
 
 
 def rrf_fuse(ranked_lists: Iterable[Sequence[int]], *, k: int = 60) -> list[int]:
