@@ -49,6 +49,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine=engine,
         model=settings.default_model,
         workspace=Path.cwd(),
+        embedding_model=settings.embedding_model,
+        embedding_dim=settings.embedding_dim,
+        embedding_send_dimensions=settings.embedding_send_dimensions,
+        memory_block_max_chars=settings.memory_block_max_chars,
     )
     # Durable approvals raised by unattended (scheduled) runs — the Approvals page +
     # API read this; approving enqueues a resume_run onto the worker's arq queue (G5).

@@ -21,9 +21,13 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core import (
     AgentSpec,
+    ArchivalInsertTool,
     EventStore,
     InMemoryEventStore,
     LiteLLMGateway,
+    MemoryAppendTool,
+    MemoryReplaceTool,
+    MemoryRethinkTool,
     PostgresEventStore,
     ProviderGateway,
     Rule,
@@ -33,13 +37,17 @@ from keel_core import (
     ToolRegistry,
     TrustLevel,
     admit,
+    format_core_memory,
     make_tracer,
     run,
 )
+from keel_core.embeddings import Embedder, LiteLLMEmbedder
 from keel_core.eventbus import RedisEventStore
 from keel_core.events import Event, EventType
+from keel_core.memory import PostgresMemoryStore
 from keel_core.protocols import Tool as ToolProto
 from keel_core.protocols import ToolCall, ToolContext
+from keel_core.search import ArchivalSearchTool, SessionSearchTool
 from keel_core.tools import (
     EditTool,
     GlobTool,
@@ -56,6 +64,9 @@ logger = logging.getLogger("keel.server.runtime")
 
 _READ_ONLY = ("read", "ls", "glob", "grep")
 _MUTATING = ("write", "edit", "shell")
+_MEMORY = ("memory_append", "memory_replace", "memory_rethink")
+_RECALL = ("session_search",)
+_ARCHIVAL = ("archival_insert", "archival_search")
 
 
 def _now() -> datetime:
@@ -75,9 +86,25 @@ def _build_tools(workspace: Path) -> list[ToolProto]:
     return tools
 
 
-def _web_permissions() -> RuleBasedPermissionEngine:
-    """Read-only tools allowed; mutating tools require an approval over HTTP."""
+def _build_memory_tools(
+    engine: AsyncEngine, embedder: Embedder | None, *, cap: int
+) -> list[ToolProto]:
+    """Core-memory self-edit + lexical recall (always) + archival (only with an embedder)."""
+    tools: list[ToolProto] = [
+        MemoryAppendTool(engine, max_chars=cap),
+        MemoryReplaceTool(engine, max_chars=cap),
+        MemoryRethinkTool(engine, max_chars=cap),
+        SessionSearchTool(engine),
+    ]
+    if embedder is not None:
+        tools += [ArchivalInsertTool(engine, embedder), ArchivalSearchTool(engine, embedder)]
+    return tools
+
+
+def _web_permissions(memory_allow: tuple[str, ...] = ()) -> RuleBasedPermissionEngine:
+    """Read-only + own-scope memory tools allowed; mutating tools require an approval."""
     rules = [Rule(name, PermissionDecision.allow) for name in _READ_ONLY]
+    rules += [Rule(name, PermissionDecision.allow) for name in memory_allow]
     rules += [Rule(name, PermissionDecision.ask) for name in _MUTATING]
     return RuleBasedPermissionEngine(rules, default=PermissionDecision.ask)
 
@@ -148,21 +175,37 @@ class AgentRuntime:
         engine: AsyncEngine | None = None,
         scope_id: ScopeId = "web:local",
         provider: ProviderGateway | None = None,
+        embedder: Embedder | None = None,
+        embedding_model: str = "ollama/bge-m3",
+        embedding_dim: int = 1024,
+        embedding_send_dimensions: bool = False,
+        memory_block_max_chars: int = 2000,
     ) -> None:
         self._engine = engine
         self._fanout = RedisEventStore(redis_client)
         self._memory = InMemoryEventStore()  # shared durable fallback when no engine
         self._scope = Scope(id=scope_id, kind=ScopeKind.personal, trust=TrustLevel.trusted)
+        if embedder is None and engine is not None and embedding_model:
+            embedder = LiteLLMEmbedder(
+                embedding_model, embedding_dim, send_dimensions=embedding_send_dimensions
+            )
+        self._embedder = embedder
+        memory_tools: list[ToolProto] = (
+            _build_memory_tools(engine, embedder, cap=memory_block_max_chars)
+            if engine is not None
+            else []
+        )
+        memory_names = tuple(tool.name for tool in memory_tools)
         self._agent = AgentSpec(
             id="web",
             name="Keel Web",
             model=model,
             scope=self._scope,
-            toolset=list(_READ_ONLY + _MUTATING),
+            toolset=list(_READ_ONLY + _MUTATING) + list(memory_names),
         )
         self._provider = provider or LiteLLMGateway()
-        self._registry = ToolRegistry(_build_tools(workspace))
-        self._permissions = _web_permissions()
+        self._registry = ToolRegistry(_build_tools(workspace) + memory_tools)
+        self._permissions = _web_permissions(memory_names)
         self._approvals = ApprovalRegistry()
         self._tracer = make_tracer()  # Langfuse if configured, else no-op
         self._runs: dict[RunId, asyncio.Task[None]] = {}
@@ -187,6 +230,12 @@ class AgentRuntime:
 
     def _store(self) -> CompositeEventStore:
         return CompositeEventStore(self._durable(), self._fanout)
+
+    async def _core_memory_context(self) -> str:
+        if self._engine is None:
+            return ""
+        blocks = await PostgresMemoryStore(self._engine, self._scope.id).blocks()
+        return format_core_memory(blocks)
 
     async def admit_and_run(self, session_id: SessionId, content: str) -> RunId:
         """Durably admit input (I2), then launch the run as a background task."""
@@ -224,6 +273,7 @@ class AgentRuntime:
                 interrupt=lambda: run_id in self._interrupted,
                 stream_deltas=True,  # relay token-by-token over SSE
                 on_event=self._tracer.record,  # export the run to Langfuse (if configured)
+                system_context=self._core_memory_context,
             )
         except Exception:  # noqa: BLE001 - a run task must not take the server down
             logger.exception("run %s failed", run_id)
