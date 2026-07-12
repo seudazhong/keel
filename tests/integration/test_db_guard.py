@@ -30,6 +30,13 @@ def test_explicit_keel_test_url_is_accepted(monkeypatch: pytest.MonkeyPatch) -> 
     assert _require_test_database_url() == url
 
 
+def test_malformed_url_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KEEL_TEST_DATABASE_URL", "not-a-valid-url")
+
+    with pytest.raises(pytest.UsageError, match="not a valid SQLAlchemy URL"):
+        _require_test_database_url()
+
+
 def test_destructive_boundary_rechecks_actual_database_name() -> None:
     _assert_test_database_name("keel_test")
 
