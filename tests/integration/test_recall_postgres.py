@@ -335,12 +335,12 @@ async def test_cross_scope_isolation_no_projection_or_message_leak(
     await _seed_event(
         migrated_db, scope_a, session_a, 2, role="assistant", content="unprojected secret"
     )
-    
+
     # Index only the first message via backfill, leaving the second unprojected.
     indexer_a = MessageEmbeddingIndexer(migrated_db, scope_a, embedder)
     backfill_result = await indexer_a.backfill_scope(limit=1)
     assert backfill_result.indexed == 1, "should index exactly one message in scope A"
-    
+
     # Verify scope A has at least one unprojected message before scope B ranking.
     rows_a_before = await _projection_rows(migrated_db, scope_a)
     assert len(rows_a_before) == 1, "scope A must have exactly one indexed row"
