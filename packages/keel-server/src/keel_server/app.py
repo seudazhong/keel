@@ -53,6 +53,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         embedding_dim=settings.embedding_dim,
         embedding_send_dimensions=settings.embedding_send_dimensions,
         memory_block_max_chars=settings.memory_block_max_chars,
+        session_embedding_batch_size=settings.session_embedding_batch_size,
+        session_embedding_catchup_limit=settings.session_embedding_catchup_limit,
     )
     # Durable approvals raised by unattended (scheduled) runs — the Approvals page +
     # API read this; approving enqueues a resume_run onto the worker's arq queue (G5).
@@ -103,6 +105,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        await app.state.runtime.aclose()
         await redis_client.aclose()
         arq = getattr(app.state, "arq", None)
         if arq is not None:

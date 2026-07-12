@@ -14,7 +14,16 @@ _ENGINE = create_async_engine("postgresql+psycopg://keel:keel@localhost:5432/kee
 
 
 def test_build_memory_tools_includes_archival_with_embedder() -> None:
-    names = {t.name for t in _build_memory_tools(_ENGINE, FakeEmbedder(dim=16), cap=2000)}
+    names = {
+        t.name
+        for t in _build_memory_tools(
+            _ENGINE,
+            FakeEmbedder(dim=16),
+            cap=2000,
+            batch_size=64,
+            catchup_limit=500,
+        )
+    }
     assert names == {
         "memory_append",
         "memory_replace",
@@ -26,7 +35,16 @@ def test_build_memory_tools_includes_archival_with_embedder() -> None:
 
 
 def test_build_memory_tools_omits_archival_without_embedder() -> None:
-    names = {t.name for t in _build_memory_tools(_ENGINE, None, cap=2000)}
+    names = {
+        t.name
+        for t in _build_memory_tools(
+            _ENGINE,
+            None,
+            cap=2000,
+            batch_size=64,
+            catchup_limit=500,
+        )
+    }
     assert "archival_insert" not in names and "archival_search" not in names
     assert {"memory_append", "session_search"} <= names  # memory + lexical recall still there
 

@@ -47,6 +47,7 @@ from keel_core.events import Event, EventType
 from keel_core.memory import PostgresMemoryStore
 from keel_core.protocols import Tool as ToolProto
 from keel_core.protocols import ToolCall, ToolContext
+from keel_core.recall import MessageEmbeddingIndexer
 from keel_core.search import ArchivalSearchTool, SessionSearchTool
 from keel_core.tools import (
     EditTool,
@@ -84,14 +85,24 @@ def _build_tools(workspace: Path) -> list[ToolProto]:
 
 
 def _build_memory_tools(
-    engine: AsyncEngine, embedder: Embedder | None, *, cap: int
+    engine: AsyncEngine,
+    embedder: Embedder | None,
+    *,
+    cap: int,
+    batch_size: int,
+    catchup_limit: int,
 ) -> list[ToolProto]:
-    """Core-memory self-edit + lexical recall (always) + archival (only with an embedder)."""
+    """Core-memory editing, hybrid recall, and optional archival memory."""
     tools: list[ToolProto] = [
         MemoryAppendTool(engine, max_chars=cap),
         MemoryReplaceTool(engine, max_chars=cap),
         MemoryRethinkTool(engine, max_chars=cap),
-        SessionSearchTool(engine),
+        SessionSearchTool(
+            engine,
+            embedder,
+            batch_size=batch_size,
+            catchup_limit=catchup_limit,
+        ),
     ]
     if embedder is not None:
         tools += [ArchivalInsertTool(engine, embedder), ArchivalSearchTool(engine, embedder)]
@@ -177,6 +188,9 @@ class AgentRuntime:
         embedding_dim: int = 1024,
         embedding_send_dimensions: bool = False,
         memory_block_max_chars: int = 2000,
+        session_embedding_batch_size: int = 64,
+        session_embedding_catchup_limit: int = 500,
+        session_indexer: MessageEmbeddingIndexer | None = None,
     ) -> None:
         self._engine = engine
         self._fanout = RedisEventStore(redis_client)
@@ -187,8 +201,24 @@ class AgentRuntime:
                 embedding_model, embedding_dim, send_dimensions=embedding_send_dimensions
             )
         self._embedder = embedder
+        self._session_embedding_batch_size = session_embedding_batch_size
+        self._session_embedding_catchup_limit = session_embedding_catchup_limit
+        if session_indexer is None and engine is not None and embedder is not None:
+            session_indexer = MessageEmbeddingIndexer(
+                engine,
+                self._scope.id,
+                embedder,
+                batch_size=session_embedding_batch_size,
+            )
+        self._session_indexer = session_indexer
         memory_tools: list[ToolProto] = (
-            _build_memory_tools(engine, embedder, cap=memory_block_max_chars)
+            _build_memory_tools(
+                engine,
+                embedder,
+                cap=memory_block_max_chars,
+                batch_size=session_embedding_batch_size,
+                catchup_limit=session_embedding_catchup_limit,
+            )
             if engine is not None
             else []
         )
@@ -207,6 +237,7 @@ class AgentRuntime:
         self._tracer = make_tracer()  # Langfuse if configured, else no-op
         self._runs: dict[RunId, asyncio.Task[None]] = {}
         self._interrupted: set[RunId] = set()
+        self._index_tasks: set[asyncio.Task[None]] = set()
 
     @property
     def scope_id(self) -> ScopeId:
@@ -215,6 +246,18 @@ class AgentRuntime:
     @property
     def model(self) -> str:
         return self._agent.model
+
+    @property
+    def embedder(self) -> Embedder | None:
+        return self._embedder
+
+    @property
+    def session_embedding_batch_size(self) -> int:
+        return self._session_embedding_batch_size
+
+    @property
+    def session_embedding_catchup_limit(self) -> int:
+        return self._session_embedding_catchup_limit
 
     def set_model(self, model: str) -> None:
         """Switch the model used by subsequent runs (applies immediately)."""
@@ -280,6 +323,43 @@ class AgentRuntime:
             await self._emit(store, EventType.run_ended, session_id, run_id, {"reason": "error"})
         finally:
             self._tracer.flush()
+            self._schedule_session_index(session_id)
+
+    def _schedule_session_index(self, session_id: SessionId) -> None:
+        if self._session_indexer is None:
+            return
+        task = asyncio.create_task(self._index_session(session_id))
+        self._index_tasks.add(task)
+        task.add_done_callback(self._index_tasks.discard)
+
+    async def _index_session(self, session_id: SessionId) -> None:
+        assert self._session_indexer is not None
+        try:
+            indexed = await self._session_indexer.index_session(session_id)
+            logger.info(
+                "session embedding index complete scope=%s session=%s model=%s dim=%s indexed=%d",
+                self._scope.id,
+                session_id,
+                self._embedder.model if self._embedder is not None else "none",
+                self._embedder.dim if self._embedder is not None else 0,
+                indexed,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - background indexing is explicitly best-effort
+            logger.exception(
+                "session embedding index failed scope=%s session=%s",
+                self._scope.id,
+                session_id,
+            )
+
+    async def aclose(self) -> None:
+        tasks = list(self._index_tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._index_tasks.clear()
 
     def _approver(
         self, store: CompositeEventStore, session_id: SessionId, run_id: RunId
