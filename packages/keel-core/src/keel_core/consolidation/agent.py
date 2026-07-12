@@ -90,7 +90,9 @@ def consolidation_registry(
     """The consolidation toolset bound to a run's shared context."""
     return ToolRegistry(
         [
-            ProposeRewriteTool(engine, run_context),
+            ProposeRewriteTool(
+                engine, run_context, block_max_chars=settings.memory_block_max_chars
+            ),
             ArchivalConsolidateInsertTool(
                 engine,
                 embedder,

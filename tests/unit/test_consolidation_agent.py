@@ -62,6 +62,35 @@ def test_registry_advertises_exactly_two_tools() -> None:
             pass
 
 
+async def test_registry_honors_settings_block_max_chars() -> None:
+    """block_max_chars is threaded from Settings.memory_block_max_chars through the registry."""
+    engine = create_async_engine(_DUMMY_URL)
+    try:
+        run_context = ConsolidationRunContext(
+            allowed_event_ids=frozenset({1}),
+            allowed_user_event_ids=frozenset({1}),
+        )
+        settings = Settings(memory_block_max_chars=50)
+        registry = consolidation_registry(engine, FakeEmbedder(), run_context, settings)
+        tool = registry.get("memory_propose_rewrite")
+        assert tool is not None
+        tool_ctx = ToolContext(scope_id="web:local", session_id="consolidation:web:local:r1")
+        result = await tool.run(
+            {
+                "block": "human",
+                "proposed_value": "x" * 51,  # exceeds the 50-char cap from Settings
+                "reason": "test",
+                "source_event_ids": [1],
+            },
+            tool_ctx,
+        )
+        assert result.ok is False
+        assert "50" in result.output
+        assert run_context.validation_errors == 1
+    finally:
+        await engine.dispose()
+
+
 async def test_system_context_returns_instruction() -> None:
     assert await consolidation_system_context() == CONSOLIDATION_SYSTEM_INSTRUCTION
 

@@ -113,8 +113,11 @@ async def consolidate_memory(ctx: dict[str, Any], row: ScheduleRow, settings: Se
 
     Fail-closed: the cursor only advances past the batch when the run reaches ``completed``
     with zero validation errors; otherwise the lease is released with an ``error`` status
-    and the same window is retried on the next tick. Never raises — the arq task returns a
-    status string so one bad scope cannot crash the worker.
+    and the same window is retried on the next tick. Best-effort fail-closed: the outer
+    ``except`` block attempts cleanup writes (``cursors.fail``, ``schedules.mark_run``) and
+    logs the exception; those cleanup writes may themselves raise, propagating to the arq
+    task layer. Under normal operation the arq task receives a status string so one bad
+    scope cannot crash the worker.
     """
     engine = ctx["engine"]
     provider = ctx["provider"]
