@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 
@@ -152,3 +153,76 @@ async def test_index_session_filters_and_persists_complete_messages(
     assert indexed == 2
     assert [(r.role, r.content) for r in rows] == [("user", "hello"), ("assistant", "hi")]
     assert all(r.model == "fake/recall" and r.dim == 16 for r in rows)
+
+
+async def test_backfill_scope_is_bounded_and_resumable(migrated_db: AsyncEngine) -> None:
+    scope = f"u:{uuid.uuid4().hex}"
+    session_id = f"s:{uuid.uuid4().hex}"
+    for seq in range(1, 4):
+        await _seed_event(
+            migrated_db,
+            scope,
+            session_id,
+            seq,
+            role="user",
+            content=f"message {seq}",
+        )
+    indexer = MessageEmbeddingIndexer(migrated_db, scope, FakeEmbedder(dim=8))
+
+    first = await indexer.backfill_scope(limit=2)
+    second = await indexer.backfill_scope(limit=2)
+
+    assert first.indexed == 2 and first.remaining is True
+    assert second.indexed == 1 and second.remaining is False
+    assert len(await _projection_rows(migrated_db, scope)) == 3
+
+
+async def test_index_session_is_repeat_and_concurrency_safe(migrated_db: AsyncEngine) -> None:
+    scope = f"u:{uuid.uuid4().hex}"
+    session_id = f"s:{uuid.uuid4().hex}"
+    await _seed_event(migrated_db, scope, session_id, 1, role="user", content="one")
+    indexer = MessageEmbeddingIndexer(migrated_db, scope, FakeEmbedder(dim=8))
+
+    await asyncio.gather(indexer.index_session(session_id), indexer.index_session(session_id))
+    assert len(await _projection_rows(migrated_db, scope)) == 1
+    assert await indexer.index_session(session_id) == 0
+
+
+async def test_projection_is_model_pinned_and_event_cascades(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = f"u:{uuid.uuid4().hex}"
+    session_id = f"s:{uuid.uuid4().hex}"
+    event_id = await _seed_event(migrated_db, scope, session_id, 1, role="user", content="one")
+    await MessageEmbeddingIndexer(
+        migrated_db, scope, FakeEmbedder(dim=8, model="fake/a")
+    ).index_session(session_id)
+    await MessageEmbeddingIndexer(
+        migrated_db, scope, FakeEmbedder(dim=16, model="fake/b")
+    ).index_session(session_id)
+
+    async with migrated_db.begin() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.scope_id', :scope, true)"),
+            {"scope": scope},
+        )
+        pin_rows = (
+            await conn.execute(
+                text("SELECT model, dim FROM message_embeddings WHERE event_id = :event_id"),
+                {"event_id": event_id},
+            )
+        ).all()
+        await conn.execute(
+            text("DELETE FROM events WHERE id = :event_id AND scope_id = :scope"),
+            {"event_id": event_id, "scope": scope},
+        )
+        remaining = await conn.scalar(
+            text("SELECT count(*) FROM message_embeddings WHERE event_id = :event_id"),
+            {"event_id": event_id},
+        )
+
+    assert {(str(row.model), int(row.dim)) for row in pin_rows} == {
+        ("fake/a", 8),
+        ("fake/b", 16),
+    }
+    assert remaining == 0

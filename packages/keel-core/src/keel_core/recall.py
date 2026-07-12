@@ -84,6 +84,14 @@ class MessageEmbeddingIndexer:
         rows = await self._missing_rows(session_id=session_id)
         return await self._index_rows(rows)
 
+    async def backfill_scope(self, *, limit: int = 500) -> BackfillResult:
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+        rows = await self._missing_rows(limit=limit + 1)
+        selected = rows[:limit]
+        indexed = await self._index_rows(selected)
+        return BackfillResult(indexed=indexed, remaining=len(rows) > limit)
+
     async def _missing_rows(
         self,
         *,
