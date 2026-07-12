@@ -9,7 +9,7 @@ from typing import Literal
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from keel_core.embeddings import Embedder
+from keel_core.embeddings import Embedder, rrf_fuse
 from keel_core.types import ScopeId, SessionId
 
 logger = logging.getLogger("keel.core.recall")
@@ -164,3 +164,191 @@ class MessageEmbeddingIndexer:
                     if result.scalar_one_or_none() is not None:
                         inserted += 1
         return inserted
+
+
+async def _lexical_event_ids(
+    engine: AsyncEngine,
+    scope_id: ScopeId,
+    query: str,
+    *,
+    limit: int,
+) -> list[int]:
+    sql = text(
+        "SELECT e.id, GREATEST("
+        "similarity(e.payload->>'text', :query), "
+        "ts_rank(to_tsvector('simple', e.payload->>'text'), "
+        "plainto_tsquery('simple', :query))) AS score "
+        "FROM events e "
+        "WHERE e.scope_id = :scope "
+        "AND e.type = 'message.token' "
+        "AND e.payload->>'role' IN ('user', 'assistant') "
+        "AND COALESCE((e.payload->>'partial')::boolean, false) = false "
+        "AND NULLIF(BTRIM(e.payload->>'text'), '') IS NOT NULL "
+        "AND (similarity(e.payload->>'text', :query) > 0.1 "
+        "OR to_tsvector('simple', e.payload->>'text') "
+        "@@ plainto_tsquery('simple', :query)) "
+        "ORDER BY score DESC, e.id DESC LIMIT :limit"
+    )
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        rows = await conn.execute(
+            sql,
+            {"scope": scope_id, "query": query, "limit": limit},
+        )
+        return [int(row.id) for row in rows]
+
+
+async def _semantic_event_ids(
+    engine: AsyncEngine,
+    scope_id: ScopeId,
+    embedder: Embedder,
+    query: str,
+    *,
+    limit: int,
+) -> list[int]:
+    query_vector = (await embedder.embed([query]))[0]
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        rows = await conn.execute(
+            text(
+                "SELECT event_id FROM message_embeddings "
+                "WHERE scope_id = :scope AND model = :model AND dim = :dim "
+                "ORDER BY embedding <=> CAST(:query_vector AS vector) "
+                "LIMIT :limit"
+            ),
+            {
+                "scope": scope_id,
+                "model": embedder.model,
+                "dim": embedder.dim,
+                "query_vector": _vector_literal(query_vector),
+                "limit": limit,
+            },
+        )
+        return [int(row.event_id) for row in rows]
+
+
+async def _messages_by_id(
+    engine: AsyncEngine,
+    scope_id: ScopeId,
+    event_ids: list[int],
+) -> dict[int, RankedMessage]:
+    if not event_ids:
+        return {}
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        rows = await conn.execute(
+            text(
+                "SELECT id, session_id, seq, payload->>'role' AS role, "
+                "payload->>'text' AS content "
+                "FROM events WHERE scope_id = :scope AND id = ANY(:event_ids)"
+            ),
+            {"scope": scope_id, "event_ids": event_ids},
+        )
+        return {
+            int(row.id): RankedMessage(
+                event_id=int(row.id),
+                session_id=str(row.session_id),
+                seq=int(row.seq),
+                role=str(row.role),
+                content=str(row.content),
+            )
+            for row in rows
+        }
+
+
+async def rank_session_messages(
+    engine: AsyncEngine,
+    scope_id: ScopeId,
+    query: str,
+    *,
+    k: int,
+    embedder: Embedder | None,
+    batch_size: int = 64,
+    catchup_limit: int = 500,
+) -> tuple[list[RankedMessage], RecallStatus]:
+    """Rank complete session messages by lexical + semantic RRF."""
+    if not query.strip():
+        mode: RecallMode = "hybrid" if embedder is not None else "lexical"
+        return [], RecallStatus(mode=mode)
+
+    candidate_limit = max(k * 8, 80)
+    lexical_ids = await _lexical_event_ids(engine, scope_id, query, limit=candidate_limit)
+    semantic_ids: list[int] = []
+    indexed = 0
+    remaining = False
+    catchup_error: str | None = None
+
+    if embedder is None:
+        mode = "lexical"
+    else:
+        indexer = MessageEmbeddingIndexer(engine, scope_id, embedder, batch_size=batch_size)
+        try:
+            backfill = await indexer.backfill_scope(limit=catchup_limit)
+            indexed = backfill.indexed
+            remaining = backfill.remaining
+            if indexed:
+                logger.info(
+                    "session embedding catch-up complete scope=%s model=%s "
+                    "dim=%s indexed=%d remaining=%s",
+                    scope_id,
+                    embedder.model,
+                    embedder.dim,
+                    indexed,
+                    remaining,
+                )
+            if remaining:
+                logger.info(
+                    "session embedding catch-up reached limit scope=%s model=%s dim=%s",
+                    scope_id,
+                    embedder.model,
+                    embedder.dim,
+                )
+        except Exception as exc:  # noqa: BLE001 - visible best-effort catch-up
+            catchup_error = f"{exc.__class__.__name__}: {exc}"
+            logger.exception(
+                "session embedding catch-up failed scope=%s model=%s dim=%s",
+                scope_id,
+                embedder.model,
+                embedder.dim,
+            )
+        try:
+            semantic_ids = await _semantic_event_ids(
+                engine,
+                scope_id,
+                embedder,
+                query,
+                limit=candidate_limit,
+            )
+            mode = "hybrid"
+        except Exception as exc:  # noqa: BLE001 - explicit lexical degradation
+            error = f"{exc.__class__.__name__}: {exc}"
+            logger.exception(
+                "semantic session search failed; using lexical only scope=%s model=%s dim=%s",
+                scope_id,
+                embedder.model,
+                embedder.dim,
+            )
+            fused = rrf_fuse([lexical_ids])[:k]
+            rows = await _messages_by_id(engine, scope_id, fused)
+            return (
+                [rows[event_id] for event_id in fused if event_id in rows],
+                RecallStatus(
+                    mode="lexical-degraded",
+                    indexed=indexed,
+                    remaining=remaining,
+                    error=error,
+                ),
+            )
+
+    ranked_lists = [lexical_ids, semantic_ids] if embedder is not None else [lexical_ids]
+    fused = rrf_fuse(ranked_lists)[:k]
+    rows = await _messages_by_id(engine, scope_id, fused)
+    return (
+        [rows[event_id] for event_id in fused if event_id in rows],
+        RecallStatus(
+            mode=mode,
+            indexed=indexed,
+            remaining=remaining,
+            error=catchup_error,
+        ),
+    )

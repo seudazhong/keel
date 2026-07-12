@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from collections.abc import Sequence
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.embeddings import FakeEmbedder
-from keel_core.recall import MessageEmbeddingIndexer
+from keel_core.recall import MessageEmbeddingIndexer, rank_session_messages
 
 pytestmark = pytest.mark.integration
 
@@ -226,3 +227,85 @@ async def test_projection_is_model_pinned_and_event_cascades(
         ("fake/b", 16),
     }
     assert remaining == 0
+
+
+class _MeaningEmbedder:
+    model = "fake/meaning"
+    dim = 2
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for value in texts:
+            lowered = value.lower()
+            if "feline" in lowered or "cat nap" in lowered:
+                vectors.append([1.0, 0.0])
+            else:
+                vectors.append([0.0, 1.0])
+        return vectors
+
+
+class _FailingEmbedder:
+    model = "fake/failing"
+    dim = 2
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        raise RuntimeError(f"embedding unavailable for {len(texts)} texts")
+
+
+async def test_rank_session_messages_finds_semantic_only_match(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = f"u:{uuid.uuid4().hex}"
+    target = f"s:{uuid.uuid4().hex}"
+    other = f"s:{uuid.uuid4().hex}"
+    await _seed_event(
+        migrated_db, scope, target, 1, role="user", content="The feline sleeps on the sofa"
+    )
+    await _seed_event(migrated_db, scope, other, 1, role="user", content="Quarterly finance report")
+
+    hits, status = await rank_session_messages(
+        migrated_db,
+        scope,
+        "cat nap",
+        k=5,
+        embedder=_MeaningEmbedder(),
+        batch_size=2,
+        catchup_limit=20,
+    )
+
+    assert status.mode == "hybrid"
+    assert hits and hits[0].session_id == target
+    assert "feline" in hits[0].content
+
+
+async def test_rank_session_messages_explicitly_degrades_to_lexical(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = f"u:{uuid.uuid4().hex}"
+    session_id = f"s:{uuid.uuid4().hex}"
+    await _seed_event(migrated_db, scope, session_id, 1, role="user", content="quarterly invoices")
+
+    hits, status = await rank_session_messages(
+        migrated_db,
+        scope,
+        "invoices",
+        k=5,
+        embedder=_FailingEmbedder(),
+    )
+
+    assert status.mode == "lexical-degraded"
+    assert status.error is not None and "RuntimeError" in status.error
+    assert hits and hits[0].session_id == session_id
+
+
+async def test_rank_session_messages_without_embedder_is_lexical(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = f"u:{uuid.uuid4().hex}"
+    session_id = f"s:{uuid.uuid4().hex}"
+    await _seed_event(migrated_db, scope, session_id, 1, role="assistant", content="Tokyo flight")
+
+    hits, status = await rank_session_messages(migrated_db, scope, "Tokyo", k=5, embedder=None)
+
+    assert status.mode == "lexical"
+    assert hits and hits[0].session_id == session_id
