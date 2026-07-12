@@ -78,3 +78,5 @@ def test_memory_embedding_defaults() -> None:
     assert settings.embedding_dim == 1024
     assert settings.embedding_send_dimensions is False
     assert settings.memory_block_max_chars == 2000
+    assert settings.session_embedding_batch_size == 64
+    assert settings.session_embedding_catchup_limit == 500

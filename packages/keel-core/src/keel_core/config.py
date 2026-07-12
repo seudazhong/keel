@@ -39,6 +39,8 @@ class Settings(BaseSettings):
     embedding_dim: int = 1024
     embedding_send_dimensions: bool = False  # OpenAI text-embedding-3 needs it; Ollama rejects it
     memory_block_max_chars: int = 2000
+    session_embedding_batch_size: int = 64
+    session_embedding_catchup_limit: int = 500
 
     # RBAC (B3): comma-separated ``key:role`` pairs (roles: viewer|operator|admin).
     # Empty -> open single-user mode (every request is an implicit admin).

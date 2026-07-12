@@ -53,12 +53,22 @@ from .protocols import (
     Usage,
 )
 from .providers import LiteLLMGateway
+from .recall import (
+    BackfillResult,
+    MessageEmbeddingIndexer,
+    RankedMessage,
+    RecallStatus,
+    rank_session_messages,
+)
 from .search import (
     ArchivalInsertTool,
     ArchivalSearchTool,
     ArchivalStore,
     SearchHit,
     SessionSearchTool,
+    hybrid_search_sessions,
+    hybrid_session_search,
+    search_sessions,
     session_search,
 )
 from .secrets import EnvelopeCipher, SecretsError, cipher_from_settings
@@ -154,6 +164,14 @@ __all__ = [
     "ArchivalSearchTool",
     "ArchivalInsertTool",
     "SessionSearchTool",
+    "BackfillResult",
+    "MessageEmbeddingIndexer",
+    "RankedMessage",
+    "RecallStatus",
+    "rank_session_messages",
+    "hybrid_session_search",
+    "hybrid_search_sessions",
+    "search_sessions",
     # extensibility (WS-G, I8)
     "ImportGuard",
     "ImportVerdict",
