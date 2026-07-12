@@ -48,7 +48,8 @@ agent 主动调用 `memory_*`；Archival memory 仍依赖主动 `archival_insert
 
 - Memory 页面 UI。
 - Memory evals / Langfuse datasets。
-- Archival 自动删除、语义合并、retention/erasure。
+- Archival 自动删除、全局语义合并、retention/erasure。仅为同一 source evidence 的
+  consolidation 重试提供窄范围 semantic dedupe。
 - RAG / Knowledge Base。
 - IM / digest session consolidation。
 - Core proposal 自动批准。
@@ -337,9 +338,15 @@ SHA-256(scope | block | expected_version | normalized proposed_value | sorted so
 行为：
 
 1. 规范化文本并计算 content hash。
-2. 使用现有 embedder 生成向量。
-3. 插入 `archival(origin='consolidation', content_hash, source_event_ids)`。
-4. hash 冲突时返回现有 row ID，并合并 source IDs；不重复 embedding row。
+2. hash 命中时返回现有 row ID，并合并 source IDs；不重复计算 embedding。
+3. hash 未命中时使用现有 embedder 生成向量。
+4. 仅在 `source_event_ids` 有交集、model/dim 相同且 cosine distance `< 0.1`
+   时，把重写后的同一事实视为 retry，合并到现有 row。
+5. 其它情况插入
+   `archival(origin='consolidation', content_hash, source_event_ids)`。
+
+该 semantic check 只解决同一 source-backed batch 的模型改写重试，不对无共同来源的
+Archival facts 做通用语义合并。
 
 该工具可自动写，因为内容不常驻 prompt、可按需检索，且写入经过 confidence/evidence 限制。
 
@@ -513,7 +520,8 @@ Interval 第一版固定为 seed script 的 86400 秒；之后可由 Schedules U
   - cursor 不推进。
 - Retry：
   - proposal idempotency key 避免重复 proposal。
-  - archival content hash 避免重复 passage。
+  - archival content hash 避免字节/格式等价的重复 passage。
+  - source-overlap + cosine distance `< 0.1` 避免模型改写同一事实时产生重复 row。
 - Consolidation 使用独立 durable session，因此完整 tool timeline 可在 event log / tracing 中审计。
 - Schedule `last_status` 暴露 `skipped/busy/completed/error`。
 - Proposal list/status 提供人工审核数据。

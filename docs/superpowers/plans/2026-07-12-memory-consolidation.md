@@ -1475,7 +1475,7 @@ Copilot-Session: e6e934ad-91c1-41c3-a46e-521cd446cb49"
 - Test (integration): `tests/integration/test_consolidation_tools_postgres.py`
 
 **Interfaces:**
-- Produces: `validate_propose_rewrite(args, run_context, *, block_max_chars: int) -> str | None`; `validate_archival_insert(args, run_context, *, min_confidence: float, content_max_chars: int) -> str | None`; `ProposeRewriteTool(engine, run_context, *, block_max_chars: int = 2000)` (`name = "memory_propose_rewrite"`, `writes = True`); `ArchivalConsolidateInsertTool(engine, embedder, run_context, *, min_confidence: float = 0.8, content_max_chars: int = 2000)` (`name = "archival_consolidate_insert"`, `writes = True`); `ArchivalStore.add_consolidated(content: str, *, source_event_ids: Sequence[int]) -> tuple[int, bool]`.
+- Produces: `validate_propose_rewrite(args, run_context, *, block_max_chars: int) -> str | None`; `validate_archival_insert(args, run_context, *, min_confidence: float, content_max_chars: int) -> str | None`; `ProposeRewriteTool(engine, run_context, *, block_max_chars: int = 2000)` (`name = "memory_propose_rewrite"`, `writes = True`); `ArchivalConsolidateInsertTool(engine, embedder, run_context, *, min_confidence: float = 0.8, content_max_chars: int = 2000)` (`name = "archival_consolidate_insert"`, `writes = True`); `ArchivalStore.add_consolidated(content: str, *, source_event_ids: Sequence[int], semantic_dedupe_distance: float = 0.1) -> tuple[int, bool]`.
 - Consumes: `ConsolidationRunContext` (Task 4), `MemoryProposalStore` (Task 7), `ArchivalStore` + `Embedder`, `archival_content_hash` (Task 3).
 
 - [ ] **Step 1: Write the failing tests** — create `tests/unit/test_consolidation_tools.py`:
@@ -3392,7 +3392,9 @@ Run against a live web scope with a real provider once the automated gates pass:
 - [ ] 5. Confirm the Core block is unchanged and only a `pending` proposal was produced.
 - [ ] 6. Approve the proposal (`POST /v1/memory/proposals/{id}/approve`): block `version` grows, a `memory_block_versions` row is appended, the new value is visible in the next chat turn.
 - [ ] 7. After a proposal exists, manually edit the same block, then approve: expect HTTP 409, proposal `stale`, and the newer block value is NOT overwritten.
-- [ ] 8. Retry the same batch: no duplicate proposal or archival row (idempotency key + content-hash dedupe).
+- [ ] 8. Retry the same batch: no duplicate proposal or archival row. Proposal uses its
+  idempotency key; Archival uses exact content hash first, then source-overlap semantic
+  dedupe (`cosine distance < 0.1`) for provider rephrasing.
 - [ ] 9. With fewer than 10 messages: status `skipped`, cursor does not advance, batch accumulates for the next run.
 - [ ] 10. Manual + scheduled run at the same time: exactly one wins the lease, the other returns `busy`.
 

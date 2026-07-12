@@ -84,15 +84,23 @@ class ArchivalStore:
         return int(row.id)
 
     async def add_consolidated(
-        self, content: str, *, source_event_ids: Sequence[int]
+        self,
+        content: str,
+        *,
+        source_event_ids: Sequence[int],
+        semantic_dedupe_distance: float = 0.1,
     ) -> tuple[int, bool]:
-        """Insert a consolidation-origin passage, deduplicated by content hash.
+        """Insert a consolidation-origin passage with retry-safe deduplication.
 
         Returns ``(row_id, created)``. On a content-hash hit the existing row's
         ``source_event_ids`` are merged (union) and no new embedding is computed.
+        Rephrased retries also merge when they cite overlapping source events and
+        their current-model embeddings are within ``semantic_dedupe_distance``.
         """
         from keel_core.consolidation.hashing import archival_content_hash
 
+        if semantic_dedupe_distance < 0:
+            raise ValueError("semantic_dedupe_distance must be >= 0")
         content_hash = archival_content_hash(content)
         ids = [int(i) for i in source_event_ids]
         async with self._engine.begin() as conn:
@@ -120,6 +128,41 @@ class ArchivalStore:
         embedding = (await self._embedder.embed([content]))[0]
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            semantic_existing = (
+                await conn.execute(
+                    text(
+                        "SELECT id, source_event_ids FROM archival "
+                        "WHERE scope_id = :scope AND origin = 'consolidation' "
+                        "AND model = :model AND dim = :dim "
+                        "AND source_event_ids && CAST(:ids AS bigint[]) "
+                        "AND embedding <=> CAST(:emb AS vector) < :distance "
+                        "ORDER BY embedding <=> CAST(:emb AS vector) "
+                        "LIMIT 1 FOR UPDATE"
+                    ),
+                    {
+                        "scope": self._scope_id,
+                        "model": self._embedder.model,
+                        "dim": self._embedder.dim,
+                        "ids": ids,
+                        "emb": _vector_literal(embedding),
+                        "distance": semantic_dedupe_distance,
+                    },
+                )
+            ).one_or_none()
+            if semantic_existing is not None:
+                merged = _union_ids(semantic_existing.source_event_ids, ids)
+                await conn.execute(
+                    text(
+                        "UPDATE archival SET source_event_ids = CAST(:ids AS bigint[]) "
+                        "WHERE scope_id = :scope AND id = :id"
+                    ),
+                    {
+                        "ids": merged,
+                        "scope": self._scope_id,
+                        "id": int(semantic_existing.id),
+                    },
+                )
+                return int(semantic_existing.id), False
             row = (
                 await conn.execute(
                     text(

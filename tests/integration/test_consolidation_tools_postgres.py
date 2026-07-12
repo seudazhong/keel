@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 
 import pytest
 from sqlalchemy import text
@@ -16,6 +17,21 @@ from keel_core.protocols import ToolContext
 from keel_core.search import ArchivalStore
 
 pytestmark = pytest.mark.integration
+
+
+class _SemanticRetryEmbedder:
+    model = "fake/semantic-retry"
+    dim = 2
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for value in texts:
+            lowered = value.lower()
+            if "backup" in lowered or "back up" in lowered:
+                vectors.append([1.0, 0.0])
+            else:
+                vectors.append([0.0, 1.0])
+        return vectors
 
 
 async def _archival_rows(engine: AsyncEngine, scope: str) -> list[tuple[str, list[int]]]:
@@ -94,6 +110,32 @@ async def test_add_consolidated_concurrent_merge(migrated_db: AsyncEngine) -> No
     rows = await _archival_rows(migrated_db, scope)
     assert len(rows) == 1
     assert [ids for _, ids in rows] == [[1, 2, 3]]
+
+
+async def test_add_consolidated_semantically_dedupes_retry_for_same_source(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = "tool:semantic-retry"
+    store = ArchivalStore(migrated_db, scope, _SemanticRetryEmbedder())
+
+    base_id, base_created = await store.add_consolidated(
+        "Create a database backup before release",
+        source_event_ids=[100],
+    )
+    replay_id, replay_created = await store.add_consolidated(
+        "Back up the database prior to deployment",
+        source_event_ids=[100],
+    )
+    distinct_id, distinct_created = await store.add_consolidated(
+        "The API listens on port 8000",
+        source_event_ids=[100],
+    )
+
+    assert base_created is True
+    assert replay_created is False
+    assert replay_id == base_id
+    assert distinct_created is True
+    assert distinct_id != base_id
 
 
 async def test_propose_tool_happy_path_and_idempotency(migrated_db: AsyncEngine) -> None:
