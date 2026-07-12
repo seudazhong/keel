@@ -76,9 +76,7 @@ def _upgrade_head(url: str) -> None:
 async def migrated_db(pg_engine: AsyncEngine) -> AsyncIterator[AsyncEngine]:
     """A Postgres engine with the schema migrated to head and a clean slate."""
     url = os.environ.get("KEEL_TEST_DATABASE_URL", _DEFAULT_PG)
-    # Alembic needs sync URL; convert postgresql+asyncpg -> postgresql+psycopg
-    sync_url = url.replace("postgresql+asyncpg://", "postgresql+psycopg://")
-    await asyncio.to_thread(_upgrade_head, sync_url)
+    await asyncio.to_thread(_upgrade_head, url)
     async with pg_engine.begin() as conn:
         await conn.execute(
             text(
