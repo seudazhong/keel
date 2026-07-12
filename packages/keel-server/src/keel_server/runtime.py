@@ -238,6 +238,7 @@ class AgentRuntime:
         self._runs: dict[RunId, asyncio.Task[None]] = {}
         self._interrupted: set[RunId] = set()
         self._index_tasks: set[asyncio.Task[None]] = set()
+        self._closing = False
 
     @property
     def scope_id(self) -> ScopeId:
@@ -326,7 +327,7 @@ class AgentRuntime:
             self._schedule_session_index(session_id)
 
     def _schedule_session_index(self, session_id: SessionId) -> None:
-        if self._session_indexer is None:
+        if self._session_indexer is None or self._closing:
             return
         task = asyncio.create_task(self._index_session(session_id))
         self._index_tasks.add(task)
@@ -354,6 +355,7 @@ class AgentRuntime:
             )
 
     async def aclose(self) -> None:
+        self._closing = True
         tasks = list(self._index_tasks)
         for task in tasks:
             task.cancel()
