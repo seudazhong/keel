@@ -22,7 +22,7 @@ from keel_core.embeddings import FakeEmbedder
 from keel_core.protocols import ToolContext
 from keel_core.types import PermissionDecision, ScopeKind, TrustLevel
 
-_DUMMY_URL = "postgresql+asyncpg://localhost:5432/keel"
+_DUMMY_URL = "postgresql+psycopg://localhost:5432/keel"
 
 
 def test_agent_identity_and_toolset() -> None:
