@@ -138,6 +138,26 @@ async def test_add_consolidated_semantically_dedupes_retry_for_same_source(
     assert distinct_id != base_id
 
 
+async def test_add_consolidated_does_not_semantically_merge_unrelated_sources(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = "tool:semantic-sources"
+    store = ArchivalStore(migrated_db, scope, _SemanticRetryEmbedder())
+
+    first_id, first_created = await store.add_consolidated(
+        "Create a database backup before release",
+        source_event_ids=[200],
+    )
+    second_id, second_created = await store.add_consolidated(
+        "Back up the database prior to deployment",
+        source_event_ids=[201],
+    )
+
+    assert first_created is True
+    assert second_created is True
+    assert second_id != first_id
+
+
 async def test_propose_tool_happy_path_and_idempotency(migrated_db: AsyncEngine) -> None:
     """ProposeRewriteTool: first call creates a pending proposal; second is idempotent."""
     scope = "tool:propose"
