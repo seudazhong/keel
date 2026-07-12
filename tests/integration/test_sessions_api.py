@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 
 import httpx
 import pytest
@@ -12,11 +12,38 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from keel_core.embeddings import Embedder
 from keel_core.loop import admit
 from keel_core.state import PostgresEventStore, list_sessions
 from keel_server.api.v1 import router
 
 pytestmark = pytest.mark.integration
+
+
+class _ApiMeaningEmbedder:
+    model = "fake/api-meaning"
+    dim = 2
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        return [
+            [1.0, 0.0] if ("feline" in value.lower() or "cat nap" in value.lower()) else [0.0, 1.0]
+            for value in texts
+        ]
+
+
+class _ApiFailingEmbedder:
+    model = "fake/api-failing"
+    dim = 2
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        raise RuntimeError(f"offline for {len(texts)} texts")
+
+
+class _SearchRuntime:
+    def __init__(self, embedder: Embedder | None) -> None:
+        self.embedder = embedder
+        self.session_embedding_batch_size = 64
+        self.session_embedding_catchup_limit = 500
 
 
 async def test_list_sessions(migrated_db: AsyncEngine) -> None:
@@ -39,7 +66,7 @@ async def test_list_sessions(migrated_db: AsyncEngine) -> None:
 @pytest_asyncio.fixture
 async def sessions_client(
     migrated_db: AsyncEngine,
-) -> AsyncIterator[tuple[httpx.AsyncClient, str, AsyncEngine]]:
+) -> AsyncIterator[tuple[httpx.AsyncClient, str, AsyncEngine, FastAPI]]:
     scope = f"u:{uuid.uuid4().hex}"
     app = FastAPI()
     app.include_router(router)
@@ -47,13 +74,13 @@ async def sessions_client(
     app.state.durable_scope = scope
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        yield client, scope, migrated_db
+        yield client, scope, migrated_db, app
 
 
 async def test_sessions_endpoints(
-    sessions_client: tuple[httpx.AsyncClient, str, AsyncEngine],
+    sessions_client: tuple[httpx.AsyncClient, str, AsyncEngine, FastAPI],
 ) -> None:
-    client, scope, engine = sessions_client
+    client, scope, engine, app = sessions_client
     sid = f"s:{uuid.uuid4().hex}"
     await admit(PostgresEventStore(engine, scope), sid, scope, "hi there")
 
@@ -83,10 +110,63 @@ async def test_search_sessions(migrated_db: AsyncEngine) -> None:
     assert await search_sessions(migrated_db, scope, "") == []
 
 
-async def test_search_endpoint(sessions_client: tuple[httpx.AsyncClient, str, AsyncEngine]) -> None:
-    client, scope, engine = sessions_client
+async def test_search_endpoint(
+    sessions_client: tuple[httpx.AsyncClient, str, AsyncEngine, FastAPI],
+) -> None:
+    client, scope, engine, app = sessions_client
     sid = f"s:{uuid.uuid4().hex}"
     await admit(PostgresEventStore(engine, scope), sid, scope, "quarterly OKR review notes")
-    rows = (await client.get("/v1/sessions/search", params={"q": "OKR"})).json()
+
+    response = await client.get("/v1/sessions/search", params={"q": "OKR"})
+    assert response.headers["X-Keel-Search-Mode"] == "lexical"
+    rows = response.json()
     assert any(r["id"] == sid for r in rows)
     assert (await client.get("/v1/sessions/search", params={"q": ""})).json() == []
+
+
+async def test_search_endpoint_hybrid_mode_and_unchanged_body(
+    sessions_client: tuple[httpx.AsyncClient, str, AsyncEngine, FastAPI],
+) -> None:
+    client, scope, engine, app = sessions_client
+    target = f"s:{uuid.uuid4().hex}"
+    other = f"s:{uuid.uuid4().hex}"
+    await admit(
+        PostgresEventStore(engine, scope),
+        target,
+        scope,
+        "The feline sleeps on the sofa",
+    )
+    await admit(
+        PostgresEventStore(engine, scope),
+        other,
+        scope,
+        "Quarterly finance report",
+    )
+    app.state.runtime = _SearchRuntime(_ApiMeaningEmbedder())
+
+    response = await client.get("/v1/sessions/search", params={"q": "cat nap"})
+    rows = response.json()
+
+    assert response.headers["X-Keel-Search-Mode"] == "hybrid"
+    assert isinstance(rows, list)
+    assert rows and rows[0]["id"] == target
+    assert set(rows[0]) == {"id", "title", "snippet", "messages", "updated_at"}
+
+
+async def test_search_endpoint_explicit_lexical_degradation(
+    sessions_client: tuple[httpx.AsyncClient, str, AsyncEngine, FastAPI],
+) -> None:
+    client, scope, engine, app = sessions_client
+    session_id = f"s:{uuid.uuid4().hex}"
+    await admit(
+        PostgresEventStore(engine, scope),
+        session_id,
+        scope,
+        "quarterly invoices",
+    )
+    app.state.runtime = _SearchRuntime(_ApiFailingEmbedder())
+
+    response = await client.get("/v1/sessions/search", params={"q": "invoices"})
+
+    assert response.headers["X-Keel-Search-Mode"] == "lexical-degraded"
+    assert any(row["id"] == session_id for row in response.json())

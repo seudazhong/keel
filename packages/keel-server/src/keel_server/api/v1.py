@@ -13,13 +13,13 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 
 from keel_core.api import ApprovalResolution, CreateMessageRequest, CreateMessageResponse
 from keel_core.approvals import ApprovalStore
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
-from keel_core.search import search_sessions
+from keel_core.search import hybrid_search_sessions
 from keel_core.state import PostgresEventStore, list_sessions
 from keel_core.tokens import delete_token, list_connected
 from keel_core.types import PermissionDecision
@@ -350,22 +350,41 @@ async def list_sessions_endpoint(request: Request) -> list[dict[str, object]]:
     ]
 
 
-@router.get("/sessions/search", summary="Search the scope's sessions (lexical hybrid)")
-async def search_sessions_endpoint(request: Request, q: str = Query("")) -> list[dict[str, object]]:
-    """Rank sessions by a trigram ⊕ FTS match over their messages, with a snippet."""
+@router.get("/sessions/search", summary="Search the scope's sessions (hybrid recall)")
+async def search_sessions_endpoint(
+    request: Request,
+    response: Response,
+    q: str = Query(""),
+) -> list[dict[str, object]]:
+    """Rank sessions by lexical + semantic RRF, with explicit degradation mode."""
     engine = getattr(request.app.state, "engine", None)
     scope = getattr(request.app.state, "durable_scope", "web:local")
+    runtime = getattr(request.app.state, "runtime", None)
+    embedder = getattr(runtime, "embedder", None)
+    batch_size = int(getattr(runtime, "session_embedding_batch_size", 64))
+    catchup_limit = int(getattr(runtime, "session_embedding_catchup_limit", 500))
     if engine is None or not q.strip():
+        response.headers["X-Keel-Search-Mode"] = "hybrid" if embedder is not None else "lexical"
         return []
+
+    hits, recall_status = await hybrid_search_sessions(
+        engine,
+        scope,
+        q,
+        embedder=embedder,
+        batch_size=batch_size,
+        catchup_limit=catchup_limit,
+    )
+    response.headers["X-Keel-Search-Mode"] = recall_status.mode
     return [
         {
-            "id": h.id,
-            "title": h.title,
-            "snippet": h.snippet,
-            "messages": h.messages,
-            "updated_at": h.updated_at.isoformat() if h.updated_at else None,
+            "id": hit.id,
+            "title": hit.title,
+            "snippet": hit.snippet,
+            "messages": hit.messages,
+            "updated_at": hit.updated_at.isoformat() if hit.updated_at else None,
         }
-        for h in await search_sessions(engine, scope, q)
+        for hit in hits
     ]
 
 
