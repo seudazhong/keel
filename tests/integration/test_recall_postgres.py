@@ -330,12 +330,21 @@ async def test_cross_scope_isolation_no_projection_or_message_leak(
     session_a = f"s:{uuid.uuid4().hex}"
     embedder = FakeEmbedder(dim=16, model="fake/cross-scope")
 
-    # Seed and fully index one message in scope A.
+    # Seed one indexed message and one unprojected message in scope A.
     await _seed_event(migrated_db, scope_a, session_a, 1, role="user", content="secret in scope A")
-    indexed_a = await MessageEmbeddingIndexer(migrated_db, scope_a, embedder).index_session(
-        session_a
+    await _seed_event(
+        migrated_db, scope_a, session_a, 2, role="assistant", content="unprojected secret"
     )
-    assert indexed_a == 1
+    
+    # Index only the first message via backfill, leaving the second unprojected.
+    indexer_a = MessageEmbeddingIndexer(migrated_db, scope_a, embedder)
+    backfill_result = await indexer_a.backfill_scope(limit=1)
+    assert backfill_result.indexed == 1, "should index exactly one message in scope A"
+    
+    # Verify scope A has at least one unprojected message before scope B ranking.
+    rows_a_before = await _projection_rows(migrated_db, scope_a)
+    assert len(rows_a_before) == 1, "scope A must have exactly one indexed row"
+    assert backfill_result.remaining is True, "scope A must have remaining unprojected messages"
 
     # Ranking via scope B must return no hits (both lexical and semantic arms are scoped).
     hits_b, status_b = await rank_session_messages(
@@ -353,8 +362,8 @@ async def test_cross_scope_isolation_no_projection_or_message_leak(
     rows_b = await _projection_rows(migrated_db, scope_b)
     assert rows_b == [], "scope B must have no projection rows"
 
-    # Scope A must still be able to find its own message.
-    hits_a, _ = await rank_session_messages(
+    # Scope A must still be able to find its indexed message (positive control).
+    hits_a, status_a = await rank_session_messages(
         migrated_db,
         scope_a,
         "secret in scope A",
@@ -363,3 +372,4 @@ async def test_cross_scope_isolation_no_projection_or_message_leak(
         catchup_limit=20,
     )
     assert any(h.session_id == session_a for h in hits_a), "scope A must see its own message"
+    assert status_a.indexed >= 1, "scope A must have at least one indexed row accessible"

@@ -2,9 +2,10 @@
 
 ``archival_search`` fuses a **lexical** arm (``pg_trgm`` similarity + ``tsvector``
 FTS, CJK-safe) with a **semantic** arm (pgvector KNN over ``(model, dim)``-pinned
-embeddings) using Reciprocal Rank Fusion. ``session_search`` is a lexical search
-over a scope's past messages. Both stores are scope-bound (ADR-0009): every query
-filters ``scope_id`` and sets the RLS GUC.
+embeddings) using Reciprocal Rank Fusion. ``session_search`` is a **lexical-or-hybrid**
+search over a scope's past messages: lexical by default, or hybrid when an embedder is
+configured. Both stores are scope-bound (ADR-0009): every query filters ``scope_id`` and
+sets the RLS GUC.
 """
 
 from __future__ import annotations
