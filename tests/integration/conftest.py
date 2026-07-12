@@ -62,13 +62,18 @@ async def redis_client() -> AsyncIterator[aioredis.Redis]:
 
 
 def _upgrade_head(url: str) -> None:
-    """Run Alembic migrations to head against ``url`` (sync; call in a thread)."""
+    """Run Alembic migrations to head against ``url`` (sync; call in a thread).
+
+    Alembic uses a synchronous engine, so strip any async driver suffix
+    (``+asyncpg``) from the URL before handing it to the config.
+    """
     from alembic import command
     from alembic.config import Config
 
+    sync_url = url.replace("+asyncpg", "")
     cfg = Config(str(_REPO_ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(_REPO_ROOT / "migrations"))
-    cfg.set_main_option("sqlalchemy.url", url)
+    cfg.set_main_option("sqlalchemy.url", sync_url)
     command.upgrade(cfg, "head")
 
 
