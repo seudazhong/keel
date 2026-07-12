@@ -170,7 +170,7 @@ async def session_search(
     batch_size: int = 64,
     catchup_limit: int = 500,
 ) -> list[SearchHit]:
-    """Backward-compatible wrapper: lexical search over a scope's past messages."""
+    """Backward-compatible wrapper: lexical-or-hybrid search over a scope's past messages."""
     hits, _ = await hybrid_session_search(
         engine,
         scope_id,
@@ -200,6 +200,7 @@ async def hybrid_search_sessions(
         scope_id,
         query,
         k=message_limit,
+        candidate_limit=message_limit,
         embedder=embedder,
         batch_size=batch_size,
         catchup_limit=catchup_limit,

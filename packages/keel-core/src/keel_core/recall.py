@@ -81,10 +81,12 @@ class MessageEmbeddingIndexer:
         self._batch_size = batch_size
 
     async def index_session(self, session_id: SessionId) -> int:
+        """Embed and persist any un-projected messages for *session_id*; return count inserted."""
         rows = await self._missing_rows(session_id=session_id)
         return await self._index_rows(rows)
 
     async def backfill_scope(self, *, limit: int = 500) -> BackfillResult:
+        """Embed up to *limit* un-projected scope messages; report whether more remain."""
         if limit < 1:
             raise ValueError("limit must be >= 1")
         rows = await self._missing_rows(limit=limit + 1)
@@ -263,6 +265,7 @@ async def rank_session_messages(
     *,
     k: int,
     embedder: Embedder | None,
+    candidate_limit: int | None = None,
     batch_size: int = 64,
     catchup_limit: int = 500,
 ) -> tuple[list[RankedMessage], RecallStatus]:
@@ -271,8 +274,8 @@ async def rank_session_messages(
         mode: RecallMode = "hybrid" if embedder is not None else "lexical"
         return [], RecallStatus(mode=mode)
 
-    candidate_limit = max(k * 8, 80)
-    lexical_ids = await _lexical_event_ids(engine, scope_id, query, limit=candidate_limit)
+    _climit = candidate_limit if candidate_limit is not None else max(k * 8, 80)
+    lexical_ids = await _lexical_event_ids(engine, scope_id, query, limit=_climit)
     semantic_ids: list[int] = []
     indexed = 0
     remaining = False
@@ -317,7 +320,7 @@ async def rank_session_messages(
                 scope_id,
                 embedder,
                 query,
-                limit=candidate_limit,
+                limit=_climit,
             )
             mode = "hybrid"
         except Exception as exc:  # noqa: BLE001 - explicit lexical degradation

@@ -319,3 +319,47 @@ async def test_rank_session_messages_without_embedder_is_lexical(
 
     assert status.mode == "lexical"
     assert hits and hits[0].session_id == session_id
+
+
+async def test_cross_scope_isolation_no_projection_or_message_leak(
+    migrated_db: AsyncEngine,
+) -> None:
+    """Messages indexed in scope A must not surface when ranking or indexing from scope B."""
+    scope_a = f"u:{uuid.uuid4().hex}"
+    scope_b = f"u:{uuid.uuid4().hex}"
+    session_a = f"s:{uuid.uuid4().hex}"
+    embedder = FakeEmbedder(dim=16, model="fake/cross-scope")
+
+    # Seed and fully index one message in scope A.
+    await _seed_event(migrated_db, scope_a, session_a, 1, role="user", content="secret in scope A")
+    indexed_a = await MessageEmbeddingIndexer(migrated_db, scope_a, embedder).index_session(
+        session_a
+    )
+    assert indexed_a == 1
+
+    # Ranking via scope B must return no hits (both lexical and semantic arms are scoped).
+    hits_b, status_b = await rank_session_messages(
+        migrated_db,
+        scope_b,
+        "secret in scope A",
+        k=5,
+        embedder=embedder,
+        catchup_limit=20,
+    )
+    assert hits_b == [], "scope B must not see scope A messages"
+    assert status_b.indexed == 0, "scope B backfill must not index scope A rows"
+
+    # Confirm the projection row is absent for scope B (RLS check).
+    rows_b = await _projection_rows(migrated_db, scope_b)
+    assert rows_b == [], "scope B must have no projection rows"
+
+    # Scope A must still be able to find its own message.
+    hits_a, _ = await rank_session_messages(
+        migrated_db,
+        scope_a,
+        "secret in scope A",
+        k=5,
+        embedder=embedder,
+        catchup_limit=20,
+    )
+    assert any(h.session_id == session_a for h in hits_a), "scope A must see its own message"

@@ -355,6 +355,7 @@ class AgentRuntime:
             )
 
     async def aclose(self) -> None:
+        """Cancel pending background index tasks and block until all have terminated."""
         self._closing = True
         tasks = list(self._index_tasks)
         for task in tasks:

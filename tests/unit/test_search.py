@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from keel_core.embeddings import FakeEmbedder, rrf_fuse
 
 
@@ -37,3 +39,44 @@ async def test_fake_embedder_shared_words_are_closer() -> None:
 
     # The two animal phrases (share cat+dog) are more similar than either is to physics.
     assert dot(vecs[0], vecs[1]) > dot(vecs[0], vecs[2])
+
+
+async def test_hybrid_search_sessions_passes_candidate_limit_to_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """hybrid_search_sessions must not cause a second 8x candidate expansion.
+
+    Regression guard for the double-expansion bug: without candidate_limit being
+    forwarded, rank_session_messages would compute max(k*8, 80) on the already-
+    expanded message_limit, turning k=20 into 1280 candidates instead of 160.
+    """
+    from keel_core.recall import RecallStatus
+    from keel_core.search import hybrid_search_sessions
+
+    captured: dict[str, object] = {}
+
+    async def _spy(
+        engine: object,
+        scope_id: object,
+        query: object,
+        *,
+        k: int,
+        embedder: object,
+        candidate_limit: int | None = None,
+        batch_size: int = 64,
+        catchup_limit: int = 500,
+    ) -> tuple[list[object], RecallStatus]:
+        captured["k"] = k
+        captured["candidate_limit"] = candidate_limit
+        return [], RecallStatus(mode="lexical")
+
+    monkeypatch.setattr("keel_core.search.rank_session_messages", _spy)
+
+    await hybrid_search_sessions(None, "scope", "query", k=20)  # type: ignore[arg-type]
+
+    expected = max(20 * 8, 80)  # 160
+    assert captured["k"] == expected
+    assert captured["candidate_limit"] == expected, (
+        "candidate_limit must equal message_limit to prevent a second 8x expansion "
+        f"(got {captured['candidate_limit']!r}, expected {expected})"
+    )
