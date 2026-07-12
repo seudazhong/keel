@@ -80,8 +80,8 @@ async def migrated_db(pg_engine: AsyncEngine) -> AsyncIterator[AsyncEngine]:
     async with pg_engine.begin() as conn:
         await conn.execute(
             text(
-                "TRUNCATE events, sessions, memory_blocks, memory_block_versions, "
-                "connector_tokens, archival, schedules, approvals"
+                "TRUNCATE message_embeddings, events, sessions, memory_blocks, "
+                "memory_block_versions, connector_tokens, archival, schedules, approvals"
             )
         )
     yield pg_engine
