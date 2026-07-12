@@ -111,6 +111,18 @@ class PostgresMemoryStore:
             ).all()
         return {str(row.key): str(row.value) for row in rows}
 
+    async def versions(self) -> dict[str, int]:
+        """Return all of the scope's memory blocks as ``{key: version}``."""
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            rows = (
+                await conn.execute(
+                    text("SELECT key, version FROM memory_blocks WHERE scope_id = :scope"),
+                    {"scope": self._scope_id},
+                )
+            ).all()
+        return {str(row.key): int(row.version) for row in rows}
+
 
 class _MemoryTool:
     writes = True
