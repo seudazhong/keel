@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     session_embedding_batch_size: int = 64
     session_embedding_catchup_limit: int = 500
 
+    # Consolidation settings (memory compression & archival).
+    consolidation_min_messages: int = 10
+    consolidation_batch_messages: int = 50
+    consolidation_input_max_chars: int = 20_000
+    consolidation_message_max_chars: int = 4_000
+    consolidation_archival_min_confidence: float = 0.8
+    consolidation_lease_seconds: int = 600
+    consolidation_token_budget: int = 4_000
+
     # RBAC (B3): comma-separated ``key:role`` pairs (roles: viewer|operator|admin).
     # Empty -> open single-user mode (every request is an implicit admin).
     api_keys: str = ""
