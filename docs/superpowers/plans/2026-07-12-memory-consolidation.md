@@ -3513,3 +3513,41 @@ Plan complete and saved. Two execution options per the writing-plans skill:
 1. **Subagent-Driven (recommended)** — dispatch a fresh subagent per task via
    `superpowers:subagent-driven-development`, with a two-stage review between tasks.
 2. **Inline Execution** — batch execution with review checkpoints via `superpowers:executing-plans`.
+
+
+---
+
+## Task 8 Review-Findings Report (2026-07-12)
+
+**Commit:** 9911cd4 fix(consolidation): address task-8 review findings
+
+### Fixes applied
+
+| # | Finding | Fix |
+|---|---------|-----|
+| 1 | dd_consolidated pre-existing-row merge is not race-safe | search.py: changed SELECT id, source_event_ids FROM archival WHERE ... to SELECT ... FOR UPDATE; the INSERT path's ON CONFLICT DO UPDATE already provides atomic merge for the no-row race, so no change needed there. |
+| 2 | alidate_propose_rewrite silently ignores optional confidence | 	ools.py: added guard: if confidence is present, reject ool, reject non-int\|float, reject outside [0, 1]. Default 1.0 when omitted is preserved. |
+| 3 | No tests for block/content length caps and empty required fields | 	ests/unit/test_consolidation_tools.py: added 11 focused validator tests (empty value, too-long value, empty reason, empty content, too-long content, bool/string/out-of-range confidence for propose, plus omitted/valid confidence paths). |
+| 4 | No integration test for ProposeRewriteTool happy-path / idempotency | 	ests/integration/test_consolidation_tools_postgres.py: added 	est_propose_tool_happy_path_and_idempotency (first call writes pending proposal + increments successful_actions; second call is a no-duplicate idempotent return + increments again). |
+| 4b | No concurrent integration test for dd_consolidated | 	ests/integration/test_consolidation_tools_postgres.py: added 	est_add_consolidated_concurrent_merge — seeds row with [1], syncio.gathers two concurrent adds of [2] and [3], asserts final source_event_ids = [1, 2, 3]. |
+
+### Test results
+
+`
+tests/unit/test_consolidation_tools.py   18 passed   (pytest 2026-07-12)
+ruff check .                             All checks passed!
+ruff format --check .                    148 files already formatted
+mypy packages (--strict)                 Success: no issues found in 71 source files
+tests/integration/test_consolidation_tools_postgres.py
+                                         4 skipped (Postgres not reachable on this host;
+                                         to be verified in CI against keel_test)
+`
+
+### Invariants preserved
+
+- Fail-closed counters (alidation_errors, successful_actions) unchanged.
+- Scope / RLS set_config calls unchanged in all paths.
+- Casefold hash (via rchival_content_hash) unchanged.
+- All Task 7 proposal-store behaviour (CAS approve, idempotency key, pending status) unchanged.
+- ON CONFLICT race path for the no-existing-row case is still handled atomically by Postgres.
+- confidence in alidate_archival_insert behaviour unchanged (still uses min_confidence lower bound).
