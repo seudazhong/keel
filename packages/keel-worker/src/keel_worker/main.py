@@ -12,6 +12,7 @@ inject in-memory doubles into ``ctx`` directly."""
 from __future__ import annotations
 
 import logging
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -20,6 +21,18 @@ from arq.connections import RedisSettings
 
 from keel_core import __version__
 from keel_core.config import Settings, get_settings, load_env_file
+from keel_core.consolidation.agent import (
+    MEMORY_CONSOLIDATOR_AGENT_ID,
+    build_consolidation_agent,
+    consolidation_permissions,
+    consolidation_registry,
+    consolidation_session_id,
+    consolidation_system_context,
+    format_consolidation_prompt,
+)
+from keel_core.consolidation.context import ConsolidationRunContext, should_advance_cursor
+from keel_core.consolidation.cursor import ConsolidationCursorStore
+from keel_core.consolidation.reader import ConsolidationBatchReader
 from keel_core.digest import (
     DIGEST_INSTRUCTION,
     build_digest_agent,
@@ -27,8 +40,10 @@ from keel_core.digest import (
     digest_registry,
 )
 from keel_core.loop import ToolRegistry, admit, resume, run
+from keel_core.memory import PostgresMemoryStore
 from keel_core.observability import configure_logging, configure_tracing
-from keel_scheduler.store import due_tick
+from keel_core.state import PostgresEventStore
+from keel_scheduler.store import ScheduleRow, due_tick
 
 logger = logging.getLogger("keel.worker")
 
@@ -58,13 +73,8 @@ def _digest_registry(ctx: dict[str, Any], settings: Settings, scope_id: str) -> 
     return digest_registry(ctx.get("sent"), inbox_action=inbox_action, send_action=send_action)
 
 
-async def run_agent(ctx: dict[str, Any], schedule_id: str) -> str:
+async def _run_digest(ctx: dict[str, Any], row: ScheduleRow, settings: Settings) -> str:
     """Start an unattended digest run for a due schedule; suspend on a gated send."""
-    settings = get_settings()
-    schedules = ctx["schedules"]
-    row = await schedules.get(schedule_id)
-    if row is None:
-        return "missing"
     store, approvals, provider = ctx["store"], ctx["approvals"], ctx["provider"]
     agent = build_digest_agent(row.scope_id).model_copy(update={"model": settings.default_model})
     # The scheduled trigger is a *user* turn (the agent's standing behavior is its
@@ -80,8 +90,95 @@ async def run_agent(ctx: dict[str, Any], schedule_id: str) -> str:
         approvals=approvals,
         expires_at=datetime.now(UTC) + timedelta(hours=settings.approval_timeout_hours),
     )
-    await schedules.mark_run(schedule_id, row.next_run_at, result.reason.value)
+    await ctx["schedules"].mark_run(row.id, row.next_run_at, result.reason.value)
     return result.reason.value
+
+
+async def run_agent(ctx: dict[str, Any], schedule_id: str) -> str:
+    """Dispatch a due schedule to its agent runner (digest or memory consolidation)."""
+    settings = get_settings()
+    row = await ctx["schedules"].get(schedule_id)
+    if row is None:
+        return "missing"
+    if row.agent_id == MEMORY_CONSOLIDATOR_AGENT_ID:
+        return await consolidate_memory(ctx, row, settings)
+    if row.agent_id == "digest":
+        return await _run_digest(ctx, row, settings)
+    logger.warning("run_agent: unsupported agent_id %r (schedule %s)", row.agent_id, schedule_id)
+    return "unsupported"
+
+
+async def consolidate_memory(ctx: dict[str, Any], row: ScheduleRow, settings: Settings) -> str:
+    """Run one memory-consolidation pass for a due schedule (lease -> batch -> agent run).
+
+    Fail-closed: the cursor only advances past the batch when the run reaches ``completed``
+    with zero validation errors; otherwise the lease is released with an ``error`` status
+    and the same window is retried on the next tick. Never raises — the arq task returns a
+    status string so one bad scope cannot crash the worker.
+    """
+    engine = ctx["engine"]
+    provider = ctx["provider"]
+    embedder = ctx["embedder"]
+    schedules = ctx["schedules"]
+    scope_id = row.scope_id
+
+    cursors = ConsolidationCursorStore(engine, scope_id)
+    lease = await cursors.claim(
+        datetime.now(UTC), lease_seconds=settings.consolidation_lease_seconds
+    )
+    if lease is None:
+        return "busy"  # another worker holds a live lease for this scope
+    try:
+        reader = ConsolidationBatchReader(engine, scope_id)
+        batch = await reader.read(
+            lease.last_event_id,
+            limit=settings.consolidation_batch_messages,
+            message_max_chars=settings.consolidation_message_max_chars,
+            input_max_chars=settings.consolidation_input_max_chars,
+        )
+        if batch.eligible_count < settings.consolidation_min_messages:
+            await cursors.fail(lease, "skipped")
+            await schedules.mark_run(row.id, row.next_run_at, "skipped")
+            return "skipped"
+
+        run_context = ConsolidationRunContext(
+            allowed_event_ids=frozenset(message.event_id for message in batch.messages),
+            allowed_user_event_ids=batch.user_event_ids,
+        )
+        memory = PostgresMemoryStore(engine, scope_id)
+        store = PostgresEventStore(engine, scope_id)
+        run_id = uuid.uuid4().hex
+        session_id = consolidation_session_id(scope_id, run_id)
+        prompt = format_consolidation_prompt(
+            await memory.blocks(), await memory.versions(), batch.messages
+        )
+        await admit(store, session_id, scope_id, prompt)
+        result = await run(
+            agent=build_consolidation_agent(
+                scope_id,
+                settings.default_model,
+                token_budget=settings.consolidation_token_budget,
+            ),
+            session_id=session_id,
+            store=store,
+            provider=provider,
+            registry=consolidation_registry(engine, embedder, run_context, settings),
+            permissions=consolidation_permissions(),
+            run_id=run_id,
+            system_context=consolidation_system_context,
+        )
+        if should_advance_cursor(result.reason, run_context.validation_errors):
+            await cursors.complete(lease, batch.max_event_id, "completed")
+            await schedules.mark_run(row.id, row.next_run_at, "completed")
+            return "completed"
+        await cursors.fail(lease, "error")
+        await schedules.mark_run(row.id, row.next_run_at, "error")
+        return "error"
+    except Exception:
+        logger.exception("consolidation run failed for scope %s", scope_id)
+        await cursors.fail(lease, "error")
+        await schedules.mark_run(row.id, row.next_run_at, "error")
+        return "error"
 
 
 async def resume_run(ctx: dict[str, Any], session_id: str, run_id: str, scope_id: str) -> str:
@@ -133,8 +230,8 @@ async def startup(ctx: dict[str, Any]) -> None:
     from sqlalchemy.ext.asyncio import create_async_engine
 
     from keel_core.approvals import PostgresApprovalStore
+    from keel_core.embeddings import LiteLLMEmbedder
     from keel_core.providers import LiteLLMGateway
-    from keel_core.state import PostgresEventStore
     from keel_scheduler.store import PostgresClaimStore, PostgresScheduleStore
 
     engine = create_async_engine(settings.database_url)
@@ -145,6 +242,12 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["schedules"] = PostgresScheduleStore(engine, _SLICE_SCOPE)
     ctx["claim"] = PostgresClaimStore(engine, _SLICE_SCOPE)
     ctx["provider"] = LiteLLMGateway()
+    ctx["embedder"] = LiteLLMEmbedder(
+        settings.embedding_model,
+        settings.embedding_dim,
+        send_dimensions=settings.embedding_send_dimensions,
+        timeout_seconds=settings.embedding_timeout_seconds,
+    )
     ctx["enqueue"] = lambda name, *args: redis.enqueue_job(name, *args)
     logger.info("keel-worker %s starting", __version__)
 

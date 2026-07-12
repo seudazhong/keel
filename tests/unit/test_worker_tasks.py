@@ -5,6 +5,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
+
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.digest import digest_session_id
 from keel_core.protocols import ProviderChunk, ToolCall
@@ -136,3 +138,41 @@ async def test_resume_run_completes_after_grant() -> None:
     reason = await resume_run(ctx2, digest_session_id("u:1"), run_id, "u:1")
     assert reason == StopReason.completed.value
     assert sent == [{"to": "finance@external.example", "idempotency_key": "k"}]
+
+
+async def test_run_agent_dispatches_to_consolidation(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+
+    async def fake_consolidate(ctx: dict[str, Any], row: ScheduleRow, settings: Any) -> str:
+        seen.append(row.id)
+        return "completed"
+
+    monkeypatch.setattr("keel_worker.main.consolidate_memory", fake_consolidate)
+    row = ScheduleRow(
+        id="memory-consolidation:u:1",
+        scope_id="u:1",
+        agent_id="memory-consolidator",
+        session_id="consolidation:u:1",
+        trigger_kind="interval",
+        spec="86400",
+        next_run_at=_NOW,
+        interval_s=86400,
+    )
+    ctx: dict[str, Any] = {"schedules": InMemoryScheduleStore([row])}
+    assert await run_agent(ctx, "memory-consolidation:u:1") == "completed"
+    assert seen == ["memory-consolidation:u:1"]
+
+
+async def test_run_agent_rejects_unknown_agent_id() -> None:
+    row = ScheduleRow(
+        id="weird",
+        scope_id="u:1",
+        agent_id="mystery",
+        session_id="s",
+        trigger_kind="interval",
+        spec="86400",
+        next_run_at=_NOW,
+        interval_s=86400,
+    )
+    ctx: dict[str, Any] = {"schedules": InMemoryScheduleStore([row])}
+    assert await run_agent(ctx, "weird") == "unsupported"
