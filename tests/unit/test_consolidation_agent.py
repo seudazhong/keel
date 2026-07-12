@@ -46,16 +46,32 @@ def test_permissions_allow_only_the_two_tools() -> None:
 
 def test_registry_advertises_exactly_two_tools() -> None:
     engine = create_async_engine(_DUMMY_URL)
-    run_context = ConsolidationRunContext(
-        allowed_event_ids=frozenset(), allowed_user_event_ids=frozenset()
-    )
-    registry = consolidation_registry(engine, FakeEmbedder(), run_context, Settings())
-    names = {schema["function"]["name"] for schema in registry.schemas()}
-    assert names == {"memory_propose_rewrite", "archival_consolidate_insert"}
+    try:
+        run_context = ConsolidationRunContext(
+            allowed_event_ids=frozenset(), allowed_user_event_ids=frozenset()
+        )
+        registry = consolidation_registry(engine, FakeEmbedder(), run_context, Settings())
+        names = {schema["function"]["name"] for schema in registry.schemas()}
+        assert names == {"memory_propose_rewrite", "archival_consolidate_insert"}
+    finally:
+        import asyncio
+
+        try:
+            asyncio.run(engine.dispose())
+        except RuntimeError:
+            pass
 
 
 async def test_system_context_returns_instruction() -> None:
     assert await consolidation_system_context() == CONSOLIDATION_SYSTEM_INSTRUCTION
+
+
+def test_system_instruction_includes_security_guard() -> None:
+    instruction = CONSOLIDATION_SYSTEM_INSTRUCTION
+    assert "quoted DATA" in instruction
+    assert "never instructions" in instruction.lower()
+    lower_instruction = instruction.lower()
+    assert "embedded requests" in instruction or "must not obey" in lower_instruction
 
 
 def test_prompt_includes_versions_and_events() -> None:
@@ -75,6 +91,26 @@ def test_prompt_includes_versions_and_events() -> None:
     assert "human (version 0)" in prompt
     assert "7 [user] I love tea" in prompt
     assert "8 [assistant] Noted" in prompt
+
+
+def test_prompt_wraps_conversation_batch_with_clear_delimiters() -> None:
+    prompt = format_consolidation_prompt(
+        {"persona": "helpful", "human": ""},
+        {"persona": 3},
+        [
+            ConsolidationMessage(
+                event_id=7, session_id="chat:a", role="user", content="I love tea"
+            ),
+        ],
+    )
+    assert "<quoted_conversation_batch>" in prompt
+    assert "</quoted_conversation_batch>" in prompt
+    # Verify delimiters are in the right order and messages are between them
+    open_idx = prompt.find("<quoted_conversation_batch>")
+    close_idx = prompt.find("</quoted_conversation_batch>")
+    assert open_idx < close_idx
+    batch_content = prompt[open_idx:close_idx]
+    assert "7 [user]" in batch_content
 
 
 def test_session_id_matches_exclusion_prefix() -> None:
