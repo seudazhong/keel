@@ -14,10 +14,17 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from keel_core.api import ApprovalResolution, CreateMessageRequest, CreateMessageResponse
 from keel_core.approvals import ApprovalStore
+from keel_core.consolidation import (
+    MemoryProposal,
+    MemoryProposalStore,
+    ProposalOutcome,
+    ProposalResolution,
+    consolidation_schedule_id,
+)
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
 from keel_core.search import hybrid_search_sessions
 from keel_core.state import PostgresEventStore, list_sessions
@@ -397,3 +404,92 @@ async def session_history(session_id: str, request: Request) -> list[dict[str, o
         return []
     store = PostgresEventStore(engine, scope)
     return [event.model_dump(mode="json") async for event in store.read(session_id)]
+
+
+def _proposal_store(request: Request) -> tuple[MemoryProposalStore, str]:
+    engine = getattr(request.app.state, "engine", None)
+    scope: str = getattr(request.app.state, "durable_scope", "web:local")
+    if engine is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "datastore unavailable")
+    return MemoryProposalStore(engine, scope), scope
+
+
+def _proposal_dict(proposal: MemoryProposal) -> dict[str, object]:
+    return {
+        "id": proposal.id,
+        "block": proposal.block,
+        "expected_version": proposal.expected_version,
+        "proposed_value": proposal.proposed_value,
+        "reason": proposal.reason,
+        "confidence": proposal.confidence,
+        "source_event_ids": proposal.source_event_ids,
+        "status": proposal.status,
+        "created_at": proposal.created_at.isoformat(),
+        "resolved_at": proposal.resolved_at.isoformat() if proposal.resolved_at else None,
+        "resolved_by": proposal.resolved_by,
+    }
+
+
+def _resolution_response(resolution: ProposalResolution) -> JSONResponse:
+    """Map a proposal resolution to its HTTP response (404 missing, 409 conflict, 200 ok)."""
+    outcome = resolution.outcome
+    if outcome is ProposalOutcome.not_found:
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"ok": False, "status": outcome.value, "version": None},
+        )
+    if outcome in (ProposalOutcome.stale, ProposalOutcome.already_resolved):
+        return JSONResponse(
+            status_code=status.HTTP_409_CONFLICT,
+            content={"ok": False, "status": outcome.value, "version": None},
+        )
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"ok": True, "status": outcome.value, "version": resolution.version},
+    )
+
+
+@router.get("/memory/proposals", summary="List core-memory rewrite proposals for the scope")
+async def list_memory_proposals(
+    request: Request, status_filter: str | None = Query(None, alias="status")
+) -> list[dict[str, object]]:
+    """Core-memory rewrite proposals awaiting (or past) human review."""
+    store, _ = _proposal_store(request)
+    return [_proposal_dict(p) for p in await store.list_proposals(status=status_filter)]
+
+
+@router.post(
+    "/memory/proposals/{proposal_id}/approve",
+    summary="Approve a proposal (atomically apply it to core memory)",
+    dependencies=[Depends(require_role(Role.operator))],
+)
+async def approve_memory_proposal(proposal_id: str, request: Request) -> JSONResponse:
+    """Apply the proposal under an optimistic version check; stale ones 409."""
+    store, _ = _proposal_store(request)
+    return _resolution_response(await store.approve(proposal_id, "web"))
+
+
+@router.post(
+    "/memory/proposals/{proposal_id}/reject",
+    summary="Reject a proposal (no change to core memory)",
+    dependencies=[Depends(require_role(Role.operator))],
+)
+async def reject_memory_proposal(proposal_id: str, request: Request) -> JSONResponse:
+    """Mark the proposal rejected; core memory is untouched."""
+    store, _ = _proposal_store(request)
+    return _resolution_response(await store.reject(proposal_id, "web"))
+
+
+@router.post(
+    "/memory/consolidation/run",
+    summary="Enqueue a memory-consolidation run for the scope now",
+    dependencies=[Depends(require_role(Role.operator))],
+)
+async def run_consolidation(request: Request) -> dict[str, bool]:
+    """Manually trigger the scope's consolidation schedule (same path as the daily tick)."""
+    enqueue = getattr(request.app.state, "enqueue", None)
+    scope = getattr(request.app.state, "durable_scope", "web:local")
+    if enqueue is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "job queue unavailable")
+    await enqueue("run_agent", consolidation_schedule_id(scope))
+    return {"ok": True}
