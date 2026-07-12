@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.consolidation.context import ConsolidationRunContext
-from keel_core.consolidation.tools import ArchivalConsolidateInsertTool
+from keel_core.consolidation.proposals import MemoryProposalStore
+from keel_core.consolidation.tools import ArchivalConsolidateInsertTool, ProposeRewriteTool
 from keel_core.embeddings import FakeEmbedder
 from keel_core.protocols import ToolContext
 from keel_core.search import ArchivalStore
@@ -67,3 +70,68 @@ async def test_archival_tool_success_path(migrated_db: AsyncEngine) -> None:
     assert run_context.validation_errors == 0
     rows = await _archival_rows(migrated_db, scope)
     assert rows == [("consolidation", [10, 11])]
+
+
+async def test_add_consolidated_concurrent_merge(migrated_db: AsyncEngine) -> None:
+    """FOR UPDATE serializes concurrent source_event_ids merges on the same content hash."""
+    scope = "tool:concurrent"
+    store = ArchivalStore(migrated_db, scope, FakeEmbedder())
+
+    # Establish the base row with source [1].
+    id_base, created_base = await store.add_consolidated("concurrent fact", source_event_ids=[1])
+    assert created_base is True
+
+    # Concurrently add [2] and [3] – FOR UPDATE serializes the two UPDATE paths.
+    results = await asyncio.gather(
+        store.add_consolidated("concurrent fact", source_event_ids=[2]),
+        store.add_consolidated("concurrent fact", source_event_ids=[3]),
+    )
+
+    for row_id, created in results:
+        assert row_id == id_base
+        assert created is False
+
+    rows = await _archival_rows(migrated_db, scope)
+    assert len(rows) == 1
+    assert [ids for _, ids in rows] == [[1, 2, 3]]
+
+
+async def test_propose_tool_happy_path_and_idempotency(migrated_db: AsyncEngine) -> None:
+    """ProposeRewriteTool: first call creates a pending proposal; second is idempotent."""
+    scope = "tool:propose"
+    run_context = ConsolidationRunContext(
+        allowed_event_ids=frozenset({20, 21}),
+        allowed_user_event_ids=frozenset({20}),
+    )
+    tool = ProposeRewriteTool(migrated_db, run_context)
+    args: dict = {
+        "block": "human",
+        "proposed_value": "prefers dark mode",
+        "reason": "explicitly stated in session",
+        "source_event_ids": [20, 21],
+    }
+    tool_ctx = ToolContext(scope_id=scope, session_id=f"consolidation:{scope}:r")
+
+    # First call: creates proposal.
+    result1 = await tool.run(args, tool_ctx)
+    assert result1.ok is True
+    assert "created" in result1.output
+    assert run_context.successful_actions == 1
+    assert run_context.validation_errors == 0
+
+    proposal_store = MemoryProposalStore(migrated_db, scope)
+    pending = await proposal_store.list_proposals(status="pending")
+    assert len(pending) == 1
+    assert pending[0].block == "human"
+    assert pending[0].proposed_value == "prefers dark mode"
+    first_id = pending[0].id
+
+    # Second call with identical args: idempotent, returns the existing proposal.
+    result2 = await tool.run(args, tool_ctx)
+    assert result2.ok is True
+    assert "already proposed" in result2.output
+    assert run_context.successful_actions == 2  # incremented on both paths
+
+    pending_after = await proposal_store.list_proposals(status="pending")
+    assert len(pending_after) == 1
+    assert pending_after[0].id == first_id

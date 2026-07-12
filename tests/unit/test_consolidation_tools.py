@@ -81,6 +81,131 @@ def test_archival_validator_enforces_confidence_floor() -> None:
     assert error is not None and "threshold" in error
 
 
+def test_propose_validator_rejects_empty_value() -> None:
+    error = validate_propose_rewrite(
+        {"block": "human", "proposed_value": "   ", "reason": "y", "source_event_ids": [1]},
+        _ctx(),
+        block_max_chars=2000,
+    )
+    assert error is not None and "non-empty" in error
+
+
+def test_propose_validator_rejects_value_too_long() -> None:
+    error = validate_propose_rewrite(
+        {"block": "human", "proposed_value": "x" * 2001, "reason": "y", "source_event_ids": [1]},
+        _ctx(),
+        block_max_chars=2000,
+    )
+    assert error is not None and "2000" in error
+
+
+def test_propose_validator_rejects_empty_reason() -> None:
+    error = validate_propose_rewrite(
+        {"block": "human", "proposed_value": "x", "reason": "", "source_event_ids": [1]},
+        _ctx(),
+        block_max_chars=2000,
+    )
+    assert error is not None and "reason" in error
+
+
+def test_propose_validator_rejects_bool_confidence() -> None:
+    error = validate_propose_rewrite(
+        {
+            "block": "human",
+            "proposed_value": "x",
+            "reason": "y",
+            "source_event_ids": [1],
+            "confidence": True,
+        },
+        _ctx(),
+        block_max_chars=2000,
+    )
+    assert error is not None and "number" in error
+
+
+def test_propose_validator_rejects_string_confidence() -> None:
+    error = validate_propose_rewrite(
+        {
+            "block": "human",
+            "proposed_value": "x",
+            "reason": "y",
+            "source_event_ids": [1],
+            "confidence": "high",
+        },
+        _ctx(),
+        block_max_chars=2000,
+    )
+    assert error is not None and "number" in error
+
+
+def test_propose_validator_rejects_out_of_range_confidence() -> None:
+    error = validate_propose_rewrite(
+        {
+            "block": "human",
+            "proposed_value": "x",
+            "reason": "y",
+            "source_event_ids": [1],
+            "confidence": 1.5,
+        },
+        _ctx(),
+        block_max_chars=2000,
+    )
+    assert error is not None and "between" in error
+
+
+def test_propose_validator_accepts_omitted_confidence() -> None:
+    assert (
+        validate_propose_rewrite(
+            {
+                "block": "human",
+                "proposed_value": "likes tea",
+                "reason": "stated",
+                "source_event_ids": [1],
+            },
+            _ctx(),
+            block_max_chars=2000,
+        )
+        is None
+    )
+
+
+def test_propose_validator_accepts_valid_confidence() -> None:
+    assert (
+        validate_propose_rewrite(
+            {
+                "block": "human",
+                "proposed_value": "likes tea",
+                "reason": "stated",
+                "source_event_ids": [1],
+                "confidence": 0.75,
+            },
+            _ctx(),
+            block_max_chars=2000,
+        )
+        is None
+    )
+
+
+def test_archival_validator_rejects_empty_content() -> None:
+    error = validate_archival_insert(
+        {"content": "   ", "confidence": 0.9, "source_event_ids": [1]},
+        _ctx(),
+        min_confidence=0.8,
+        content_max_chars=2000,
+    )
+    assert error is not None and "non-empty" in error
+
+
+def test_archival_validator_rejects_content_too_long() -> None:
+    error = validate_archival_insert(
+        {"content": "x" * 2001, "confidence": 0.9, "source_event_ids": [1]},
+        _ctx(),
+        min_confidence=0.8,
+        content_max_chars=2000,
+    )
+    assert error is not None and "2000" in error
+
+
 def test_archival_validator_rejects_boolean_confidence() -> None:
     error = validate_archival_insert(
         {"content": "fact", "confidence": True, "source_event_ids": [1]},

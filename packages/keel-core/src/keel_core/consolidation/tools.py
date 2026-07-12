@@ -60,6 +60,12 @@ def validate_propose_rewrite(
         return f"proposed_value exceeds {block_max_chars} chars"
     if not str(args.get("reason", "")).strip():
         return "reason must be non-empty"
+    confidence_raw = args.get("confidence")
+    if confidence_raw is not None:
+        if isinstance(confidence_raw, bool) or not isinstance(confidence_raw, int | float):
+            return "confidence must be a number"
+        if not (0.0 <= float(confidence_raw) <= 1.0):
+            return "confidence must be between 0 and 1"
     return _citation_error(_coerce_ids(args.get("source_event_ids")), run_context)
 
 

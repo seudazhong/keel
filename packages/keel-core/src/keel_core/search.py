@@ -101,7 +101,8 @@ class ArchivalStore:
                 await conn.execute(
                     text(
                         "SELECT id, source_event_ids FROM archival "
-                        "WHERE scope_id = :scope AND content_hash = :hash"
+                        "WHERE scope_id = :scope AND content_hash = :hash "
+                        "FOR UPDATE"
                     ),
                     {"scope": self._scope_id, "hash": content_hash},
                 )
