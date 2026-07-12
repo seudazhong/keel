@@ -10,6 +10,7 @@ sets the RLS GUC.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -47,6 +48,11 @@ def _vector_literal(vec: list[float]) -> str:
     return "[" + ",".join(repr(float(x)) for x in vec) + "]"
 
 
+def _union_ids(existing: Sequence[int] | None, new: Sequence[int]) -> list[int]:
+    """Sorted set-union of two event-id lists (stable provenance merge)."""
+    return sorted({*(existing or []), *new})
+
+
 class ArchivalStore:
     """Scope-bound archival memory with hybrid (lexical ⊕ semantic) retrieval."""
 
@@ -76,6 +82,71 @@ class ArchivalStore:
                 )
             ).one()
         return int(row.id)
+
+    async def add_consolidated(
+        self, content: str, *, source_event_ids: Sequence[int]
+    ) -> tuple[int, bool]:
+        """Insert a consolidation-origin passage, deduplicated by content hash.
+
+        Returns ``(row_id, created)``. On a content-hash hit the existing row's
+        ``source_event_ids`` are merged (union) and no new embedding is computed.
+        """
+        from keel_core.consolidation.hashing import archival_content_hash
+
+        content_hash = archival_content_hash(content)
+        ids = [int(i) for i in source_event_ids]
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            existing = (
+                await conn.execute(
+                    text(
+                        "SELECT id, source_event_ids FROM archival "
+                        "WHERE scope_id = :scope AND content_hash = :hash"
+                    ),
+                    {"scope": self._scope_id, "hash": content_hash},
+                )
+            ).one_or_none()
+            if existing is not None:
+                merged = _union_ids(existing.source_event_ids, ids)
+                await conn.execute(
+                    text(
+                        "UPDATE archival SET source_event_ids = CAST(:ids AS bigint[]) "
+                        "WHERE scope_id = :scope AND id = :id"
+                    ),
+                    {"ids": merged, "scope": self._scope_id, "id": int(existing.id)},
+                )
+                return int(existing.id), False
+        embedding = (await self._embedder.embed([content]))[0]
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            row = (
+                await conn.execute(
+                    text(
+                        "INSERT INTO archival "
+                        "(scope_id, content, model, dim, embedding, origin, content_hash, "
+                        "source_event_ids) "
+                        "VALUES (:scope, :content, :model, :dim, CAST(:emb AS vector), "
+                        "'consolidation', :hash, CAST(:ids AS bigint[])) "
+                        "ON CONFLICT (scope_id, content_hash) WHERE content_hash IS NOT NULL "
+                        "DO UPDATE SET source_event_ids = ("
+                        "  SELECT array_agg(DISTINCT eid ORDER BY eid) "
+                        "  FROM unnest(archival.source_event_ids || excluded.source_event_ids) "
+                        "  AS eid"
+                        ") "
+                        "RETURNING id, (xmax = 0) AS inserted"
+                    ),
+                    {
+                        "scope": self._scope_id,
+                        "content": content,
+                        "model": self._embedder.model,
+                        "dim": self._embedder.dim,
+                        "emb": _vector_literal(embedding),
+                        "hash": content_hash,
+                        "ids": ids,
+                    },
+                )
+            ).one()
+        return int(row.id), bool(row.inserted)
 
     async def search(self, query: str, *, k: int = 5) -> list[SearchHit]:
         if not query.strip():
