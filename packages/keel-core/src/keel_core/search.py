@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.embeddings import Embedder, rrf_fuse
 from keel_core.protocols import ToolContext, ToolResult
+from keel_core.recall import RecallStatus, rank_session_messages
 from keel_core.types import ScopeId
 
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
@@ -130,71 +131,142 @@ class ArchivalStore:
         return [SearchHit(content=rows[i], source="archival") for i in fused if i in rows]
 
 
+async def hybrid_session_search(
+    engine: AsyncEngine,
+    scope_id: ScopeId,
+    query: str,
+    *,
+    k: int = 5,
+    embedder: Embedder | None = None,
+    batch_size: int = 64,
+    catchup_limit: int = 500,
+) -> tuple[list[SearchHit], RecallStatus]:
+    """Hybrid (lexical + semantic) search over a scope's past messages."""
+    ranked, status = await rank_session_messages(
+        engine,
+        scope_id,
+        query,
+        k=k,
+        embedder=embedder,
+        batch_size=batch_size,
+        catchup_limit=catchup_limit,
+    )
+    return (
+        [
+            SearchHit(content=message.content, source=f"session:{message.session_id}")
+            for message in ranked
+        ],
+        status,
+    )
+
+
 async def session_search(
-    engine: AsyncEngine, scope_id: ScopeId, query: str, *, k: int = 5
+    engine: AsyncEngine,
+    scope_id: ScopeId,
+    query: str,
+    *,
+    k: int = 5,
+    embedder: Embedder | None = None,
+    batch_size: int = 64,
+    catchup_limit: int = 500,
 ) -> list[SearchHit]:
-    """Lexical search over a scope's past messages (CJK-safe trigram)."""
-    if not query.strip():
-        return []
+    """Backward-compatible wrapper: lexical search over a scope's past messages."""
+    hits, _ = await hybrid_session_search(
+        engine,
+        scope_id,
+        query,
+        k=k,
+        embedder=embedder,
+        batch_size=batch_size,
+        catchup_limit=catchup_limit,
+    )
+    return hits
+
+
+async def hybrid_search_sessions(
+    engine: AsyncEngine,
+    scope_id: ScopeId,
+    query: str,
+    *,
+    k: int = 20,
+    embedder: Embedder | None = None,
+    batch_size: int = 64,
+    catchup_limit: int = 500,
+) -> tuple[list[SessionSearchHit], RecallStatus]:
+    """Hybrid (lexical + semantic) session search; best-message per session grouping."""
+    message_limit = max(k * 8, 80)
+    ranked, status = await rank_session_messages(
+        engine,
+        scope_id,
+        query,
+        k=message_limit,
+        embedder=embedder,
+        batch_size=batch_size,
+        catchup_limit=catchup_limit,
+    )
+    best_messages = []
+    seen_sessions: set[str] = set()
+    for message in ranked:
+        if message.session_id not in seen_sessions:
+            seen_sessions.add(message.session_id)
+            best_messages.append(message)
+        if len(best_messages) >= k:
+            break
+    if not best_messages:
+        return [], status
+
+    session_ids = [message.session_id for message in best_messages]
     async with engine.begin() as conn:
         await conn.execute(_SET_SCOPE, {"scope": scope_id})
-        rows = await conn.execute(
-            text(
-                "SELECT session_id, payload->>'text' AS body "
-                "FROM events "
-                "WHERE scope_id = :scope AND type = 'message.token' "
-                "AND payload->>'text' IS NOT NULL "
-                "ORDER BY similarity(payload->>'text', :q) DESC LIMIT :k"
-            ),
-            {"scope": scope_id, "q": query, "k": k},
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT s.id, s.title, s.updated_at, "
+                    "(SELECT count(*) FROM events e "
+                    "WHERE e.session_id = s.id AND e.scope_id = s.scope_id "
+                    "AND e.type = 'message.token') AS messages "
+                    "FROM sessions s "
+                    "WHERE s.scope_id = :scope AND s.id = ANY(:session_ids)"
+                ),
+                {"scope": scope_id, "session_ids": session_ids},
+            )
+        ).all()
+    summaries = {str(row.id): row for row in rows}
+    hits = [
+        SessionSearchHit(
+            id=message.session_id,
+            title=summaries[message.session_id].title,
+            snippet=message.content,
+            messages=int(summaries[message.session_id].messages),
+            updated_at=summaries[message.session_id].updated_at,
         )
-        return [SearchHit(content=r.body, source=f"session:{r.session_id}") for r in rows]
+        for message in best_messages
+        if message.session_id in summaries
+    ]
+    return hits, status
 
 
 async def search_sessions(
-    engine: AsyncEngine, scope_id: ScopeId, query: str, *, k: int = 20
+    engine: AsyncEngine,
+    scope_id: ScopeId,
+    query: str,
+    *,
+    k: int = 20,
+    embedder: Embedder | None = None,
+    batch_size: int = 64,
+    catchup_limit: int = 500,
 ) -> list[SessionSearchHit]:
-    """Rank a scope's sessions by a lexical-hybrid match over their messages.
-
-    Lexical arm only (M1): ``pg_trgm`` similarity ⊕ ``tsvector`` FTS rank, blended by
-    ``GREATEST`` and filtered by (trigram OR FTS) match. The best-matching message per
-    session provides the snippet. The semantic (pgvector) arm is deferred to M3.
-    """
-    if not query.strip():
-        return []
-    sql = text(
-        "WITH hits AS ("
-        "  SELECT DISTINCT ON (e.session_id) e.session_id, e.payload->>'text' AS snippet, "
-        "    GREATEST("
-        "      similarity(e.payload->>'text', :q), "
-        "      ts_rank(to_tsvector('simple', e.payload->>'text'), plainto_tsquery('simple', :q))"
-        "    ) AS score "
-        "  FROM events e "
-        "  WHERE e.scope_id = :scope AND e.type = 'message.token' "
-        "    AND e.payload->>'text' IS NOT NULL "
-        "    AND (similarity(e.payload->>'text', :q) > 0.1 "
-        "         OR to_tsvector('simple', e.payload->>'text') @@ plainto_tsquery('simple', :q)) "
-        "  ORDER BY e.session_id, score DESC"
-        ") "
-        "SELECT h.session_id AS id, h.snippet, h.score, s.title, s.updated_at, "
-        "  (SELECT count(*) FROM events e2 WHERE e2.session_id = s.id "
-        "     AND e2.scope_id = s.scope_id AND e2.type = 'message.token') AS messages "
-        "FROM hits h JOIN sessions s ON s.id = h.session_id AND s.scope_id = :scope "
-        "ORDER BY h.score DESC LIMIT :k"
+    """Backward-compatible wrapper: rank a scope's sessions by hybrid message match."""
+    hits, _ = await hybrid_search_sessions(
+        engine,
+        scope_id,
+        query,
+        k=k,
+        embedder=embedder,
+        batch_size=batch_size,
+        catchup_limit=catchup_limit,
     )
-    async with engine.begin() as conn:
-        await conn.execute(_SET_SCOPE, {"scope": scope_id})
-        rows = (await conn.execute(sql, {"scope": scope_id, "q": query, "k": k})).all()
-    return [
-        SessionSearchHit(
-            id=r.id,
-            title=r.title,
-            snippet=r.snippet,
-            messages=int(r.messages),
-            updated_at=r.updated_at,
-        )
-        for r in rows
-    ]
+    return hits
 
 
 class ArchivalInsertTool:
@@ -246,14 +318,24 @@ class ArchivalSearchTool:
 
 
 class SessionSearchTool:
-    """``session_search`` tool (P3): scope-bound lexical search over past messages."""
+    """``session_search``: scope-bound hybrid recall over past messages."""
 
     name = "session_search"
-    description = "Search this scope's past messages for a query."
+    description = "Search this scope's past messages by lexical and semantic relevance."
     writes = False
 
-    def __init__(self, engine: AsyncEngine) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        embedder: Embedder | None = None,
+        *,
+        batch_size: int = 64,
+        catchup_limit: int = 500,
+    ) -> None:
         self._engine = engine
+        self._embedder = embedder
+        self._batch_size = batch_size
+        self._catchup_limit = catchup_limit
 
     def input_schema(self) -> dict[str, Any]:
         return {
@@ -263,7 +345,16 @@ class SessionSearchTool:
         }
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        hits = await session_search(
-            self._engine, ctx.scope_id, str(args.get("query", "")), k=int(args.get("k", 5))
+        hits, status = await hybrid_session_search(
+            self._engine,
+            ctx.scope_id,
+            str(args.get("query", "")),
+            k=int(args.get("k", 5)),
+            embedder=self._embedder,
+            batch_size=self._batch_size,
+            catchup_limit=self._catchup_limit,
         )
-        return ToolResult(ok=True, output="\n".join(h.content for h in hits))
+        output = "\n".join(hit.content for hit in hits)
+        if status.mode == "lexical-degraded":
+            output = "[semantic unavailable; lexical results only]\n" + output
+        return ToolResult(ok=True, output=output)

@@ -3,15 +3,42 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.embeddings import FakeEmbedder
-from keel_core.search import ArchivalStore, session_search
+from keel_core.protocols import ToolContext
+from keel_core.search import (
+    ArchivalStore,
+    SessionSearchTool,
+    hybrid_search_sessions,
+    hybrid_session_search,
+    session_search,
+)
 
 pytestmark = pytest.mark.integration
+
+
+class _RecallEmbedder:
+    model = "fake/search-meaning"
+    dim = 2
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        return [
+            [1.0, 0.0] if ("feline" in text.lower() or "cat nap" in text.lower()) else [0.0, 1.0]
+            for text in texts
+        ]
+
+
+class _BrokenRecallEmbedder:
+    model = "fake/search-broken"
+    dim = 2
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        raise RuntimeError(f"offline for {len(texts)} texts")
 
 
 async def test_archival_hybrid_search_finds_relevant(migrated_db: AsyncEngine) -> None:
@@ -100,3 +127,63 @@ async def test_archival_insert_then_search(migrated_db: AsyncEngine) -> None:
         {"query": "France capital", "k": 3}, ctx
     )
     assert found.ok and "Paris" in found.output
+
+
+async def test_message_and_session_wrappers_share_semantic_ranking(
+    migrated_db: AsyncEngine,
+) -> None:
+    from keel_core.loop import admit
+    from keel_core.state import PostgresEventStore
+
+    scope = f"u:{uuid.uuid4().hex}"
+    target = f"s:{uuid.uuid4().hex}"
+    other = f"s:{uuid.uuid4().hex}"
+    await admit(
+        PostgresEventStore(migrated_db, scope),
+        target,
+        scope,
+        "The feline sleeps on the sofa",
+    )
+    await admit(
+        PostgresEventStore(migrated_db, scope),
+        other,
+        scope,
+        "Quarterly finance report",
+    )
+
+    message_hits, message_status = await hybrid_session_search(
+        migrated_db, scope, "cat nap", k=5, embedder=_RecallEmbedder()
+    )
+    session_hits, session_status = await hybrid_search_sessions(
+        migrated_db, scope, "cat nap", k=5, embedder=_RecallEmbedder()
+    )
+
+    assert message_status.mode == session_status.mode == "hybrid"
+    assert message_hits and message_hits[0].source == f"session:{target}"
+    assert session_hits and session_hits[0].id == target
+    assert "feline" in session_hits[0].snippet
+
+
+async def test_session_search_tool_marks_degraded_results(
+    migrated_db: AsyncEngine,
+) -> None:
+    from keel_core.loop import admit
+    from keel_core.state import PostgresEventStore
+
+    scope = f"u:{uuid.uuid4().hex}"
+    session_id = f"s:{uuid.uuid4().hex}"
+    await admit(
+        PostgresEventStore(migrated_db, scope),
+        session_id,
+        scope,
+        "quarterly invoices",
+    )
+
+    result = await SessionSearchTool(migrated_db, _BrokenRecallEmbedder()).run(
+        {"query": "invoices", "k": 5},
+        ToolContext(scope_id=scope, session_id="current"),
+    )
+
+    assert result.ok
+    assert result.output.startswith("[semantic unavailable; lexical results only]")
+    assert "invoices" in result.output
