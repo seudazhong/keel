@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import MagicMock
+
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from keel_core.embeddings import FakeEmbedder
+from keel_core.embeddings import FakeEmbedder, LiteLLMEmbedder
 from keel_core.permissions import RuleBasedPermissionEngine
 from keel_core.protocols import ToolContext
 from keel_core.types import PermissionDecision
-from keel_server.runtime import _build_memory_tools, _web_permissions
+from keel_server.runtime import AgentRuntime, _build_memory_tools, _web_permissions
 
 _ENGINE = create_async_engine("postgresql+psycopg://keel:keel@localhost:5432/keel")  # not connected
 
@@ -55,3 +58,16 @@ def test_web_permissions_allow_memory_tools() -> None:
     assert perms.evaluate("memory_append", {}, ctx) is PermissionDecision.allow
     assert perms.evaluate("archival_insert", {}, ctx) is PermissionDecision.allow
     assert perms.evaluate("write", {}, ctx) is PermissionDecision.ask  # mutating still gated
+
+
+def test_runtime_passes_embedding_timeout_to_default_embedder() -> None:
+    runtime = AgentRuntime(
+        redis_client=MagicMock(),
+        model="m",
+        workspace=Path("."),
+        engine=_ENGINE,
+        embedding_timeout_seconds=2.5,
+    )
+
+    assert isinstance(runtime.embedder, LiteLLMEmbedder)
+    assert runtime.embedder.timeout_seconds == 2.5

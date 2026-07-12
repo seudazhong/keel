@@ -52,6 +52,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         embedding_model=settings.embedding_model,
         embedding_dim=settings.embedding_dim,
         embedding_send_dimensions=settings.embedding_send_dimensions,
+        embedding_timeout_seconds=settings.embedding_timeout_seconds,
         memory_block_max_chars=settings.memory_block_max_chars,
         session_embedding_batch_size=settings.session_embedding_batch_size,
         session_embedding_catchup_limit=settings.session_embedding_catchup_limit,

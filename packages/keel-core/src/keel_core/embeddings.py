@@ -8,6 +8,7 @@ scales — the standard hybrid-search combiner.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import math
 from collections.abc import Iterable, Sequence
@@ -52,10 +53,20 @@ class FakeEmbedder:
 class LiteLLMEmbedder:
     """A ``(model, dim)``-pinned embedder over LiteLLM (any provider)."""
 
-    def __init__(self, model: str, dim: int, *, send_dimensions: bool = False) -> None:
+    def __init__(
+        self,
+        model: str,
+        dim: int,
+        *,
+        send_dimensions: bool = False,
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be > 0")
         self.model = model
         self.dim = dim
         self.send_dimensions = send_dimensions
+        self.timeout_seconds = timeout_seconds
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         from litellm import aembedding
@@ -63,7 +74,8 @@ class LiteLLMEmbedder:
         kwargs: dict[str, Any] = {"model": self.model, "input": list(texts)}
         if self.send_dimensions:  # OpenAI text-embedding-3 accepts it; Ollama rejects it
             kwargs["dimensions"] = self.dim
-        response = await aembedding(**kwargs)
+        async with asyncio.timeout(self.timeout_seconds):
+            response = await aembedding(**kwargs)
         data: list[dict[str, Any]] = response.data
         vectors = [list(item["embedding"]) for item in data]
         for vec in vectors:

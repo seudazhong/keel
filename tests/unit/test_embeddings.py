@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import litellm
@@ -42,3 +43,18 @@ async def test_dimension_mismatch_raises(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(litellm, "aembedding", _fake_aembedding(captured, 3))  # wrong length
     with pytest.raises(ValueError, match="!= expected 1024"):
         await LiteLLMEmbedder("ollama/bge-m3", 1024).embed(["hi"])
+
+
+async def test_embedding_call_times_out(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def slow_aembedding(**kwargs: Any) -> Any:
+        await asyncio.sleep(1)
+        raise AssertionError(f"unexpected completion: {kwargs}")
+
+    monkeypatch.setattr(litellm, "aembedding", slow_aembedding)
+
+    with pytest.raises(TimeoutError):
+        await LiteLLMEmbedder(
+            "ollama/bge-m3",
+            1024,
+            timeout_seconds=0.01,
+        ).embed(["hi"])

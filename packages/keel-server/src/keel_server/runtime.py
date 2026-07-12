@@ -187,6 +187,7 @@ class AgentRuntime:
         embedding_model: str = "ollama/bge-m3",
         embedding_dim: int = 1024,
         embedding_send_dimensions: bool = False,
+        embedding_timeout_seconds: float = 10.0,
         memory_block_max_chars: int = 2000,
         session_embedding_batch_size: int = 64,
         session_embedding_catchup_limit: int = 500,
@@ -198,7 +199,10 @@ class AgentRuntime:
         self._scope = Scope(id=scope_id, kind=ScopeKind.personal, trust=TrustLevel.trusted)
         if embedder is None and engine is not None and embedding_model:
             embedder = LiteLLMEmbedder(
-                embedding_model, embedding_dim, send_dimensions=embedding_send_dimensions
+                embedding_model,
+                embedding_dim,
+                send_dimensions=embedding_send_dimensions,
+                timeout_seconds=embedding_timeout_seconds,
             )
         self._embedder = embedder
         self._session_embedding_batch_size = session_embedding_batch_size
