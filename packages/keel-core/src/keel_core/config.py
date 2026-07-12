@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     embedding_model: str = "ollama/bge-m3"
     embedding_dim: int = 1024
     embedding_send_dimensions: bool = False  # OpenAI text-embedding-3 needs it; Ollama rejects it
-    embedding_timeout_seconds: float = 10.0
+    embedding_timeout_seconds: float = 10.0  # hard deadline for each provider embed call
     memory_block_max_chars: int = 2000
     session_embedding_batch_size: int = 64
     session_embedding_catchup_limit: int = 500

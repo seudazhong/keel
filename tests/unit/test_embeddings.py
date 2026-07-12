@@ -28,6 +28,7 @@ async def test_omits_dimensions_by_default(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(litellm, "aembedding", _fake_aembedding(captured, 4))
     out = await LiteLLMEmbedder("ollama/bge-m3", 4).embed(["hi"])
     assert "dimensions" not in captured  # Ollama rejects it
+    assert "timeout" not in captured and "timeout_seconds" not in captured
     assert out == [[0.0] * 4]
 
 
@@ -58,3 +59,9 @@ async def test_embedding_call_times_out(monkeypatch: pytest.MonkeyPatch) -> None
             1024,
             timeout_seconds=0.01,
         ).embed(["hi"])
+
+
+@pytest.mark.parametrize("timeout_seconds", [0.0, -1.0])
+def test_embedding_timeout_must_be_positive(timeout_seconds: float) -> None:
+    with pytest.raises(ValueError, match="timeout_seconds must be > 0"):
+        LiteLLMEmbedder("ollama/bge-m3", 1024, timeout_seconds=timeout_seconds)
