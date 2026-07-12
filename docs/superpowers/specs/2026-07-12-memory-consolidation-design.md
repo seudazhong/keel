@@ -48,8 +48,8 @@ agent 主动调用 `memory_*`；Archival memory 仍依赖主动 `archival_insert
 
 - Memory 页面 UI。
 - Memory evals / Langfuse datasets。
-- Archival 自动删除、全局语义合并、retention/erasure。仅为同一 source evidence 的
-  consolidation 重试提供窄范围 semantic dedupe。
+- Archival 自动删除、全局语义合并、retention/erasure。仅为 source evidence 完全相同的
+  consolidation 重试提供窄范围、可配置（默认 0.05）的 semantic dedupe。
 - RAG / Knowledge Base。
 - IM / digest session consolidation。
 - Core proposal 自动批准。
@@ -337,16 +337,19 @@ SHA-256(scope | block | expected_version | normalized proposed_value | sorted so
 
 行为：
 
-1. 规范化文本并计算 content hash。
+1. 规范化文本并计算 content hash；同时把 `source_event_ids` 规范化为排序去重数组。
 2. hash 命中时返回现有 row ID，并合并 source IDs；不重复计算 embedding。
 3. hash 未命中时使用现有 embedder 生成向量。
-4. 仅在 `source_event_ids` 有交集、model/dim 相同且 cosine distance `< 0.1`
-   时，把重写后的同一事实视为 retry，合并到现有 row。
+4. 仅在存在一条 `origin='consolidation'`、`model/dim` 相同、`source_event_ids` 与本次
+   **完全相等**（不是有交集）且 cosine distance `< consolidation_semantic_dedupe_distance`
+   （默认 0.05，从 live replay 校准，最大观测 0.0468；设为 0 关闭该 pass，范围 0..2）的
+   row 时，把模型改写后的同一事实视为 retry，直接解析到现有 row（source 已相同，无需再
+   合并），并在 INFO 记录一条事件（scope、row id、distance、source id 数量；绝不记录内容）。
 5. 其它情况插入
    `archival(origin='consolidation', content_hash, source_event_ids)`。
 
-该 semantic check 只解决同一 source-backed batch 的模型改写重试，不对无共同来源的
-Archival facts 做通用语义合并。
+该 semantic check 只解决 exact source-backed 同一事实的模型改写重试，不对来源不同
+（含仅有交集）或无共同来源的 Archival facts 做通用语义合并。
 
 该工具可自动写，因为内容不常驻 prompt、可按需检索，且写入经过 confidence/evidence 限制。
 
@@ -521,7 +524,9 @@ Interval 第一版固定为 seed script 的 86400 秒；之后可由 Schedules U
 - Retry：
   - proposal idempotency key 避免重复 proposal。
   - archival content hash 避免字节/格式等价的重复 passage。
-  - source-overlap + cosine distance `< 0.1` 避免模型改写同一事实时产生重复 row。
+  - exact-source（`source_event_ids` 完全相等）+ cosine distance `<
+    consolidation_semantic_dedupe_distance`（默认 0.05）避免模型改写同一事实时产生重复
+    row；merge 时在 INFO 记录 scope / row id / distance / source id 数量（不含内容）。
 - Consolidation 使用独立 durable session，因此完整 tool timeline 可在 event log / tracing 中审计。
 - Schedule `last_status` 暴露 `skipped/busy/completed/error`。
 - Proposal list/status 提供人工审核数据。

@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     consolidation_archival_min_confidence: float = 0.8
     consolidation_lease_seconds: int = 600
     consolidation_token_budget: int = 4_000
+    # Semantic retry dedupe: merge a rephrased archival write into an existing
+    # consolidation row only when it cites the *exact same* source events and its
+    # embedding is within this cosine distance (calibrated from live replay, max
+    # observed 0.0468). 0 disables the semantic pass; exact content-hash dedupe stays.
+    consolidation_semantic_dedupe_distance: float = 0.05
 
     # RBAC (B3): comma-separated ``key:role`` pairs (roles: viewer|operator|admin).
     # Empty -> open single-user mode (every request is an implicit admin).

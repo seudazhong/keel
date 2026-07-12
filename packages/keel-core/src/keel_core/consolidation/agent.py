@@ -98,6 +98,7 @@ def consolidation_registry(
                 embedder,
                 run_context,
                 min_confidence=settings.consolidation_archival_min_confidence,
+                semantic_dedupe_distance=settings.consolidation_semantic_dedupe_distance,
             ),
         ]
     )

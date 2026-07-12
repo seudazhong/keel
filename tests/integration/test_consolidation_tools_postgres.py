@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Sequence
 
 import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from keel_core.config import Settings
+from keel_core.consolidation.agent import consolidation_registry
 from keel_core.consolidation.context import ConsolidationRunContext
 from keel_core.consolidation.proposals import MemoryProposalStore
 from keel_core.consolidation.tools import ArchivalConsolidateInsertTool, ProposeRewriteTool
@@ -31,6 +34,27 @@ class _SemanticRetryEmbedder:
                 vectors.append([1.0, 0.0])
             else:
                 vectors.append([0.0, 1.0])
+        return vectors
+
+
+# Second component of a unit vector whose cosine distance from [1, 0] is exactly 0.06:
+# just past the 0.05 default but under a configured 0.08 (and the retired 0.1).
+_ORTHO = math.sqrt(1.0 - 0.94**2)
+
+
+class _AngleEmbedder:
+    """Maps 'two'-tagged text to a vector 0.06 (cosine) away from every other text."""
+
+    model = "fake/angle"
+    dim = 2
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        vectors: list[list[float]] = []
+        for value in texts:
+            if "two" in value.lower():
+                vectors.append([0.94, _ORTHO])
+            else:
+                vectors.append([1.0, 0.0])
         return vectors
 
 
@@ -156,6 +180,109 @@ async def test_add_consolidated_does_not_semantically_merge_unrelated_sources(
     assert first_created is True
     assert second_created is True
     assert second_id != first_id
+
+
+async def test_add_consolidated_keeps_distinct_when_sources_overlap_but_differ(
+    migrated_db: AsyncEngine,
+) -> None:
+    """A distance-0 rephrase must NOT merge when its source set merely overlaps.
+
+    Regression guard: overlap + distance was the false-merge bug; exact-source
+    equality now keeps two related-but-distinct facts apart.
+    """
+    scope = "tool:semantic-overlap"
+    store = ArchivalStore(migrated_db, scope, _SemanticRetryEmbedder())
+
+    base_id, base_created = await store.add_consolidated(
+        "Create a database backup before release",
+        source_event_ids=[100],
+    )
+    overlap_id, overlap_created = await store.add_consolidated(
+        "Back up the database prior to deployment",
+        source_event_ids=[100, 200],  # overlaps [100] but is not the same set
+    )
+
+    assert base_created is True
+    assert overlap_created is True  # distance 0, yet the source set differs -> distinct
+    assert overlap_id != base_id
+    rows = await _archival_rows(migrated_db, scope)
+    assert [ids for _, ids in rows] == [[100], [100, 200]]
+
+
+async def test_add_consolidated_keeps_distinct_when_distance_above_threshold(
+    migrated_db: AsyncEngine,
+) -> None:
+    """Exact same source but an embedding just past the 0.05 default stays distinct."""
+    scope = "tool:semantic-distance"
+    store = ArchivalStore(migrated_db, scope, _AngleEmbedder())
+
+    base_id, base_created = await store.add_consolidated("fact one", source_event_ids=[300])
+    far_id, far_created = await store.add_consolidated("fact two", source_event_ids=[300])
+
+    assert base_created is True
+    assert far_created is True  # cosine distance 0.06 > 0.05 default -> distinct
+    assert far_id != base_id
+
+
+async def test_add_consolidated_semantic_dedupe_disabled_when_threshold_zero(
+    migrated_db: AsyncEngine,
+) -> None:
+    """Distance 0 disables the semantic pass; exact content-hash dedupe still merges."""
+    scope = "tool:semantic-off"
+    store = ArchivalStore(migrated_db, scope, _SemanticRetryEmbedder())
+
+    base_id, base_created = await store.add_consolidated(
+        "Create a database backup before release",
+        source_event_ids=[400],
+        semantic_dedupe_distance=0.0,
+    )
+    # Distance-0 rephrase over the same source must NOT merge when the pass is off.
+    rephrase_id, rephrase_created = await store.add_consolidated(
+        "Back up the database prior to deployment",
+        source_event_ids=[400],
+        semantic_dedupe_distance=0.0,
+    )
+    # Byte/format-equivalent content still merges by content hash regardless.
+    hash_id, hash_created = await store.add_consolidated(
+        "Create a database backup before release",
+        source_event_ids=[401],
+        semantic_dedupe_distance=0.0,
+    )
+
+    assert base_created is True
+    assert rephrase_created is True
+    assert rephrase_id != base_id
+    assert hash_created is False
+    assert hash_id == base_id
+
+
+async def test_registry_threads_non_default_semantic_dedupe_distance(
+    migrated_db: AsyncEngine,
+) -> None:
+    """A non-default Settings threshold flows registry -> tool -> store and merges at 0.06."""
+    scope = "tool:registry-threshold"
+    run_context = ConsolidationRunContext(
+        allowed_event_ids=frozenset({500}),
+        allowed_user_event_ids=frozenset({500}),
+    )
+    settings = Settings(consolidation_semantic_dedupe_distance=0.08)
+    registry = consolidation_registry(migrated_db, _AngleEmbedder(), run_context, settings)
+    tool = registry.get("archival_consolidate_insert")
+    assert tool is not None
+    ctx = ToolContext(scope_id=scope, session_id=f"consolidation:{scope}:r")
+
+    first = await tool.run(
+        {"content": "fact one", "confidence": 0.9, "source_event_ids": [500]}, ctx
+    )
+    second = await tool.run(
+        {"content": "fact two", "confidence": 0.9, "source_event_ids": [500]}, ctx
+    )
+
+    assert "inserted" in first.output
+    # 0.06 distance exceeds the 0.05 default but is under the configured 0.08 -> merges.
+    assert "merged" in second.output
+    rows = await _archival_rows(migrated_db, scope)
+    assert len(rows) == 1
 
 
 async def test_propose_tool_happy_path_and_idempotency(migrated_db: AsyncEngine) -> None:

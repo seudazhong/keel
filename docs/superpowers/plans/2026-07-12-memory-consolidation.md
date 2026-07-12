@@ -85,7 +85,7 @@
 - Test: `tests/unit/test_config.py`
 
 **Interfaces:**
-- Produces (all on `Settings`, `KEEL_` env prefix): `consolidation_min_messages: int = 10`, `consolidation_batch_messages: int = 50`, `consolidation_input_max_chars: int = 20_000`, `consolidation_message_max_chars: int = 4_000`, `consolidation_archival_min_confidence: float = 0.8`, `consolidation_lease_seconds: int = 600`, `consolidation_token_budget: int = 4_000`.
+- Produces (all on `Settings`, `KEEL_` env prefix): `consolidation_min_messages: int = 10`, `consolidation_batch_messages: int = 50`, `consolidation_input_max_chars: int = 20_000`, `consolidation_message_max_chars: int = 4_000`, `consolidation_archival_min_confidence: float = 0.8`, `consolidation_lease_seconds: int = 600`, `consolidation_token_budget: int = 4_000`, `consolidation_semantic_dedupe_distance: float = 0.05` (cosine ceiling for the exact-source archival retry merge; calibrated from live replay max 0.0468; `0` disables the semantic pass).
 - Consumes: nothing.
 
 - [ ] **Step 1: Write the failing test** — append to `tests/unit/test_config.py`:
@@ -102,17 +102,20 @@ def test_consolidation_defaults() -> None:
     assert settings.consolidation_archival_min_confidence == 0.8
     assert settings.consolidation_lease_seconds == 600
     assert settings.consolidation_token_budget == 4_000
+    assert settings.consolidation_semantic_dedupe_distance == 0.05
 
 
 def test_consolidation_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KEEL_CONSOLIDATION_MIN_MESSAGES", "3")
     monkeypatch.setenv("KEEL_CONSOLIDATION_ARCHIVAL_MIN_CONFIDENCE", "0.5")
+    monkeypatch.setenv("KEEL_CONSOLIDATION_SEMANTIC_DEDUPE_DISTANCE", "0.2")
 
     from keel_core.config import Settings
 
     settings = Settings()
     assert settings.consolidation_min_messages == 3
     assert settings.consolidation_archival_min_confidence == 0.5
+    assert settings.consolidation_semantic_dedupe_distance == 0.2
 ```
 
 - [ ] **Step 2: Run RED** — `python -m uv run pytest tests/unit/test_config.py::test_consolidation_defaults -v`
@@ -128,6 +131,8 @@ def test_consolidation_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     consolidation_archival_min_confidence: float = 0.8
     consolidation_lease_seconds: int = 600
     consolidation_token_budget: int = 4_000
+    # Exact-source archival retry merge: cosine ceiling; 0 disables the semantic pass.
+    consolidation_semantic_dedupe_distance: float = 0.05
 ```
 
 - [ ] **Step 4: Run GREEN** — `python -m uv run pytest tests/unit/test_config.py -v` (all config tests pass).
@@ -1475,7 +1480,7 @@ Copilot-Session: e6e934ad-91c1-41c3-a46e-521cd446cb49"
 - Test (integration): `tests/integration/test_consolidation_tools_postgres.py`
 
 **Interfaces:**
-- Produces: `validate_propose_rewrite(args, run_context, *, block_max_chars: int) -> str | None`; `validate_archival_insert(args, run_context, *, min_confidence: float, content_max_chars: int) -> str | None`; `ProposeRewriteTool(engine, run_context, *, block_max_chars: int = 2000)` (`name = "memory_propose_rewrite"`, `writes = True`); `ArchivalConsolidateInsertTool(engine, embedder, run_context, *, min_confidence: float = 0.8, content_max_chars: int = 2000)` (`name = "archival_consolidate_insert"`, `writes = True`); `ArchivalStore.add_consolidated(content: str, *, source_event_ids: Sequence[int], semantic_dedupe_distance: float = 0.1) -> tuple[int, bool]`.
+- Produces: `validate_propose_rewrite(args, run_context, *, block_max_chars: int) -> str | None`; `validate_archival_insert(args, run_context, *, min_confidence: float, content_max_chars: int) -> str | None`; `ProposeRewriteTool(engine, run_context, *, block_max_chars: int = 2000)` (`name = "memory_propose_rewrite"`, `writes = True`); `ArchivalConsolidateInsertTool(engine, embedder, run_context, *, min_confidence: float = 0.8, content_max_chars: int = 2000, semantic_dedupe_distance: float = 0.05)` (`name = "archival_consolidate_insert"`, `writes = True`); `ArchivalStore.add_consolidated(content: str, *, source_event_ids: Sequence[int], semantic_dedupe_distance: float = 0.05) -> tuple[int, bool]` (normalizes sources to a sorted-unique array and merges a rephrased retry only when an existing `consolidation` row of the same `(model, dim)` has the *exact same* array within `semantic_dedupe_distance`; `0` disables the pass; range `0..2`).
 - Consumes: `ConsolidationRunContext` (Task 4), `MemoryProposalStore` (Task 7), `ArchivalStore` + `Embedder`, `archival_content_hash` (Task 3).
 
 - [ ] **Step 1: Write the failing tests** — create `tests/unit/test_consolidation_tools.py`:
@@ -1676,7 +1681,7 @@ async def test_archival_tool_success_path(migrated_db: AsyncEngine) -> None:
   - Expected failure: `ModuleNotFoundError: No module named 'keel_core.consolidation.tools'`.
 
 - [ ] **Step 3a: Implement `add_consolidated`** — in `packages/keel-core/src/keel_core/search.py`:
-  1. add `from collections.abc import Sequence` before `from dataclasses import dataclass` in the standard-library import block;
+  1. add `import logging` to the standard-library import block and a module-level `logger = logging.getLogger("keel.core.search")`; keep `from collections.abc import Sequence` before `from dataclasses import dataclass`;
   2. add this module-level helper directly below `_vector_literal`:
 
 ```python
@@ -1685,28 +1690,47 @@ def _union_ids(existing: Sequence[int] | None, new: Sequence[int]) -> list[int]:
     return sorted({*(existing or []), *new})
 ```
 
-  3. add this method to `ArchivalStore`, directly after `add`:
+  3. add this method to `ArchivalStore`, directly after `add`. Exact content-hash
+     dedupe runs first; a rephrased retry then merges **only** when an existing
+     `consolidation` row of the same `(model, dim)` carries the *exact same*
+     normalized `source_event_ids` and its embedding is within
+     `semantic_dedupe_distance` (cosine). `0` disables that pass; the merge is
+     logged at INFO (scope, row id, distance, source-id count — never content):
 
 ```python
     async def add_consolidated(
-        self, content: str, *, source_event_ids: Sequence[int]
+        self,
+        content: str,
+        *,
+        source_event_ids: Sequence[int],
+        semantic_dedupe_distance: float = 0.05,
     ) -> tuple[int, bool]:
-        """Insert a consolidation-origin passage, deduplicated by content hash.
+        """Insert a consolidation-origin passage with retry-safe deduplication.
 
         Returns ``(row_id, created)``. On a content-hash hit the existing row's
         ``source_event_ids`` are merged (union) and no new embedding is computed.
+        A rephrased retry also merges, but only when it cites the *exact same*
+        normalized ``source_event_ids`` as an existing ``consolidation`` row of the
+        same ``(model, dim)`` whose current embedding is within
+        ``semantic_dedupe_distance`` (cosine). This targets provider rephrasing of
+        one source-backed fact — it is deliberately NOT a general semantic merge.
+        ``semantic_dedupe_distance == 0`` disables the semantic pass; exact
+        content-hash dedupe still applies.
         """
         from keel_core.consolidation.hashing import archival_content_hash
 
+        if not 0.0 <= semantic_dedupe_distance <= 2.0:
+            raise ValueError("semantic_dedupe_distance must be between 0 and 2")
         content_hash = archival_content_hash(content)
-        ids = [int(i) for i in source_event_ids]
+        ids = sorted({int(i) for i in source_event_ids})
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             existing = (
                 await conn.execute(
                     text(
                         "SELECT id, source_event_ids FROM archival "
-                        "WHERE scope_id = :scope AND content_hash = :hash"
+                        "WHERE scope_id = :scope AND content_hash = :hash "
+                        "FOR UPDATE"
                     ),
                     {"scope": self._scope_id, "hash": content_hash},
                 )
@@ -1724,6 +1748,39 @@ def _union_ids(existing: Sequence[int] | None, new: Sequence[int]) -> list[int]:
         embedding = (await self._embedder.embed([content]))[0]
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            if semantic_dedupe_distance > 0:
+                semantic_existing = (
+                    await conn.execute(
+                        text(
+                            "SELECT id, embedding <=> CAST(:emb AS vector) AS distance "
+                            "FROM archival "
+                            "WHERE scope_id = :scope AND origin = 'consolidation' "
+                            "AND model = :model AND dim = :dim "
+                            "AND source_event_ids = CAST(:ids AS bigint[]) "
+                            "AND embedding <=> CAST(:emb AS vector) < :distance "
+                            "ORDER BY embedding <=> CAST(:emb AS vector) "
+                            "LIMIT 1 FOR UPDATE"
+                        ),
+                        {
+                            "scope": self._scope_id,
+                            "model": self._embedder.model,
+                            "dim": self._embedder.dim,
+                            "ids": ids,
+                            "emb": _vector_literal(embedding),
+                            "distance": semantic_dedupe_distance,
+                        },
+                    )
+                ).one_or_none()
+                if semantic_existing is not None:
+                    logger.info(
+                        "consolidation semantic dedupe merge scope=%s row_id=%s "
+                        "distance=%.6f source_ids=%d",
+                        self._scope_id,
+                        int(semantic_existing.id),
+                        float(semantic_existing.distance),
+                        len(ids),
+                    )
+                    return int(semantic_existing.id), False
             row = (
                 await conn.execute(
                     text(
@@ -2172,6 +2229,7 @@ def consolidation_registry(
                 embedder,
                 run_context,
                 min_confidence=settings.consolidation_archival_min_confidence,
+                semantic_dedupe_distance=settings.consolidation_semantic_dedupe_distance,
             ),
         ]
     )
@@ -3393,8 +3451,10 @@ Run against a live web scope with a real provider once the automated gates pass:
 - [ ] 6. Approve the proposal (`POST /v1/memory/proposals/{id}/approve`): block `version` grows, a `memory_block_versions` row is appended, the new value is visible in the next chat turn.
 - [ ] 7. After a proposal exists, manually edit the same block, then approve: expect HTTP 409, proposal `stale`, and the newer block value is NOT overwritten.
 - [ ] 8. Retry the same batch: no duplicate proposal or archival row. Proposal uses its
-  idempotency key; Archival uses exact content hash first, then source-overlap semantic
-  dedupe (`cosine distance < 0.1`) for provider rephrasing.
+  idempotency key; Archival uses exact content hash first, then an exact-source semantic
+  retry merge (identical normalized `source_event_ids` + `cosine distance <
+  consolidation_semantic_dedupe_distance`, default `0.05`) for provider rephrasing. A
+  merely-overlapping source set stays distinct; the merge is logged at INFO.
 - [ ] 9. With fewer than 10 messages: status `skipped`, cursor does not advance, batch accumulates for the next run.
 - [ ] 10. Manual + scheduled run at the same time: exactly one wins the lease, the other returns `busy`.
 
@@ -3501,7 +3561,7 @@ Cross-checked the names/types shared across task boundaries; all align:
 - `ArchivalStore.add_consolidated(content, *, source_event_ids) -> tuple[int, bool]` — defined Task 8; exercised in Task 12.
 - Tool contract `ToolResult(ok=..., output=...)` and the arg schemas for
   `memory_propose_rewrite` / `archival_consolidate_insert` — defined Task 8; scripted verbatim in Task 12's `_scripted`.
-- Config fields `consolidation_min_messages … consolidation_token_budget` — defined Task 1; read in Tasks 6, 8, 9, 10.
+- Config fields `consolidation_min_messages … consolidation_token_budget` plus `consolidation_semantic_dedupe_distance` — defined Task 1; read in Tasks 6, 8, 9, 10.
 
 No signature drift found. The one reconciliation (constant → `consolidation_schedule_id()`
 helper) was applied everywhere it is referenced.

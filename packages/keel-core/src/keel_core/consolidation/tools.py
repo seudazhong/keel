@@ -165,12 +165,14 @@ class ArchivalConsolidateInsertTool:
         *,
         min_confidence: float = 0.8,
         content_max_chars: int = 2000,
+        semantic_dedupe_distance: float = 0.05,
     ) -> None:
         self._engine = engine
         self._embedder = embedder
         self._run_context = run_context
         self._min_confidence = min_confidence
         self._content_max_chars = content_max_chars
+        self._semantic_dedupe_distance = semantic_dedupe_distance
 
     def input_schema(self) -> dict[str, Any]:
         return {
@@ -198,6 +200,7 @@ class ArchivalConsolidateInsertTool:
             row_id, created = await store.add_consolidated(
                 str(args["content"]),
                 source_event_ids=_coerce_ids(args["source_event_ids"]) or [],
+                semantic_dedupe_distance=self._semantic_dedupe_distance,
             )
         except Exception as exc:  # infra failure must block the cursor
             self._run_context.validation_errors += 1

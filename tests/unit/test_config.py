@@ -94,14 +94,17 @@ def test_consolidation_defaults() -> None:
     assert settings.consolidation_archival_min_confidence == 0.8
     assert settings.consolidation_lease_seconds == 600
     assert settings.consolidation_token_budget == 4_000
+    assert settings.consolidation_semantic_dedupe_distance == 0.05
 
 
 def test_consolidation_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KEEL_CONSOLIDATION_MIN_MESSAGES", "3")
     monkeypatch.setenv("KEEL_CONSOLIDATION_ARCHIVAL_MIN_CONFIDENCE", "0.5")
+    monkeypatch.setenv("KEEL_CONSOLIDATION_SEMANTIC_DEDUPE_DISTANCE", "0.2")
 
     from keel_core.config import Settings
 
     settings = Settings()
     assert settings.consolidation_min_messages == 3
     assert settings.consolidation_archival_min_confidence == 0.5
+    assert settings.consolidation_semantic_dedupe_distance == 0.2

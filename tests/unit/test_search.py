@@ -6,6 +6,8 @@ import pytest
 
 from keel_core.embeddings import FakeEmbedder, rrf_fuse
 
+_DUMMY_URL = "postgresql+psycopg://localhost:5432/keel"
+
 
 def test_rrf_prefers_items_ranked_high_by_either_arm() -> None:
     lexical = [1, 2, 3]
@@ -39,6 +41,25 @@ async def test_fake_embedder_shared_words_are_closer() -> None:
 
     # The two animal phrases (share cat+dog) are more similar than either is to physics.
     assert dot(vecs[0], vecs[1]) > dot(vecs[0], vecs[2])
+
+
+@pytest.mark.parametrize("bad_distance", [-0.01, 2.01, 5.0])
+async def test_add_consolidated_rejects_out_of_range_distance(bad_distance: float) -> None:
+    """The semantic-dedupe distance must stay within the valid cosine range [0, 2]."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from keel_core.search import ArchivalStore
+
+    engine = create_async_engine(_DUMMY_URL)
+    store = ArchivalStore(engine, "web:local", FakeEmbedder())
+    try:
+        with pytest.raises(ValueError, match="between 0 and 2"):
+            # Validation happens before any DB access, so no live engine is needed.
+            await store.add_consolidated(
+                "fact", source_event_ids=[1], semantic_dedupe_distance=bad_distance
+            )
+    finally:
+        await engine.dispose()
 
 
 async def test_hybrid_search_sessions_passes_candidate_limit_to_rank(
