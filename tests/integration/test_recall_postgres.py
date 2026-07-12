@@ -248,8 +248,14 @@ class _FailingEmbedder:
     model = "fake/failing"
     dim = 2
 
+    def __init__(self) -> None:
+        self.call_count = 0
+
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        raise RuntimeError(f"embedding unavailable for {len(texts)} texts")
+        self.call_count += 1
+        if self.call_count == 1:
+            raise RuntimeError(f"catch-up embedding failed for {len(texts)} texts")
+        raise RuntimeError(f"query embedding failed for {len(texts)} texts")
 
 
 async def test_rank_session_messages_finds_semantic_only_match(
@@ -285,16 +291,20 @@ async def test_rank_session_messages_explicitly_degrades_to_lexical(
     session_id = f"s:{uuid.uuid4().hex}"
     await _seed_event(migrated_db, scope, session_id, 1, role="user", content="quarterly invoices")
 
+    embedder = _FailingEmbedder()
     hits, status = await rank_session_messages(
         migrated_db,
         scope,
         "invoices",
         k=5,
-        embedder=_FailingEmbedder(),
+        embedder=embedder,
     )
 
     assert status.mode == "lexical-degraded"
-    assert status.error is not None and "RuntimeError" in status.error
+    assert status.error is not None
+    # Both catch-up and query error messages should be present
+    assert "catch-up embedding failed" in status.error
+    assert "query embedding failed" in status.error
     assert hits and hits[0].session_id == session_id
 
 

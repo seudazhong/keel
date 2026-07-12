@@ -328,7 +328,11 @@ async def rank_session_messages(
                 embedder.model,
                 embedder.dim,
             )
-            fused = rrf_fuse([lexical_ids])[:k]
+            # Combine both errors deterministically if both are present
+            combined_error = error
+            if catchup_error:
+                combined_error = "; ".join(filter(None, [catchup_error, error]))
+            fused = rrf_fuse([lexical_ids, semantic_ids])[:k]
             rows = await _messages_by_id(engine, scope_id, fused)
             return (
                 [rows[event_id] for event_id in fused if event_id in rows],
@@ -336,7 +340,7 @@ async def rank_session_messages(
                     mode="lexical-degraded",
                     indexed=indexed,
                     remaining=remaining,
-                    error=error,
+                    error=combined_error,
                 ),
             )
 

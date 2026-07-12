@@ -37,6 +37,9 @@ if sys.platform == "win32":
 @pytest_asyncio.fixture
 async def pg_engine() -> AsyncIterator[AsyncEngine]:
     url = os.environ.get("KEEL_TEST_DATABASE_URL", _DEFAULT_PG)
+    # Convert postgresql:// to postgresql+psycopg:// for async support
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
     engine = create_async_engine(url)
     try:
         async with engine.connect() as conn:
