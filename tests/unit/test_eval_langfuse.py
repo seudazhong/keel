@@ -41,8 +41,10 @@ def test_import_failure_is_recorded_not_raised(monkeypatch: pytest.MonkeyPatch) 
 
 
 def test_publishes_per_run_and_per_case_scores(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A fake langfuse client confirms run metadata and per-case scores are pushed."""
+    """A fake Langfuse v4 client confirms trace metadata and scores are pushed."""
     fake_client = MagicMock()
+    fake_span = MagicMock()
+    fake_client.start_as_current_observation.return_value.__enter__.return_value = fake_span
     fake_langfuse_mod = MagicMock()
     fake_langfuse_mod.Langfuse.return_value = fake_client
     monkeypatch.setitem(sys.modules, "langfuse", fake_langfuse_mod)
@@ -53,23 +55,29 @@ def test_publishes_per_run_and_per_case_scores(monkeypatch: pytest.MonkeyPatch) 
             suite="consolidation",
             passed=True,
             cases=[
-                CaseResult(
-                    case_id="c1", suite="consolidation", status="pass", score=0.9
-                ),
-                CaseResult(
-                    case_id="c2", suite="consolidation", status="fail", score=0.5
-                ),
+                CaseResult(case_id="c1", suite="consolidation", status="pass", score=0.9),
+                CaseResult(case_id="c2", suite="consolidation", status="fail", score=0.5),
             ],
         )
     )
 
-    LangfuseEvalReporter(public_key="pk", secret_key="sk", host="https://cloud.langfuse.com").publish(report)
+    LangfuseEvalReporter(
+        public_key="pk", secret_key="sk", host="https://cloud.langfuse.com"
+    ).publish(report)
 
     assert report.reporting_errors == []
-    fake_client.create_dataset_run.assert_called_once()
-    call_kwargs = fake_client.create_dataset_run.call_args[1]
-    assert call_kwargs["metadata"]["weighted_overall"] == 0.0
-    assert call_kwargs["metadata"]["exit_code"] == 0
-    # Per-case scores: one call per case
-    assert fake_client.score.call_count == 2
+    fake_langfuse_mod.Langfuse.assert_called_once_with(
+        public_key="pk",
+        secret_key="sk",
+        base_url="https://cloud.langfuse.com",
+    )
+    fake_client.start_as_current_observation.assert_called_once()
+    assert (
+        len(fake_client.start_as_current_observation.call_args[1]["trace_context"]["trace_id"])
+        == 32
+    )
+    assert fake_span.update.call_args[1]["metadata"]["weighted_overall"] == 0.0
+    assert fake_span.update.call_args[1]["metadata"]["exit_code"] == 0
+    # One run-level score plus one score per case.
+    assert fake_client.create_score.call_count == 3
     fake_client.flush.assert_called_once()

@@ -7,6 +7,7 @@ marks a ``fail`` case as ``<failure>`` and an ``error`` (infra/cassette) case as
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 from typing import Protocol
@@ -133,26 +134,51 @@ class LangfuseEvalReporter:
             from langfuse import Langfuse  # lazy: not a hard dependency
 
             client = Langfuse(
-                public_key=self._public_key, secret_key=self._secret_key, host=self._host
+                public_key=self._public_key,
+                secret_key=self._secret_key,
+                base_url=self._host,
             )
-            client.create_dataset_run(
+            trace_id = hashlib.sha256(report.run_id.encode("utf-8")).hexdigest()[:32]
+            metadata = {
+                "dataset_version": report.dataset_version,
+                "dataset_hash": report.dataset_hash,
+                "mode": report.mode,
+                "weighted_overall": report.weighted_overall,
+                "exit_code": report.exit_code,
+                "gates": {gate.name: gate.passed for gate in report.gates},
+            }
+            with client.start_as_current_observation(
+                as_type="span",
                 name=f"memory-evals-{report.run_id}",
-                metadata={
-                    "dataset_version": report.dataset_version,
-                    "dataset_hash": report.dataset_hash,
-                    "mode": report.mode,
-                    "weighted_overall": report.weighted_overall,
-                    "exit_code": report.exit_code,
-                    "gates": {g.name: g.passed for g in report.gates},
-                },
-            )
-            for suite in report.suites:
-                for case in suite.cases:
-                    client.score(
-                        name=f"{case.suite}/{case.case_id}",
-                        value=case.score,
-                        data_type="NUMERIC",
-                    )
+                trace_context={"trace_id": trace_id},
+            ) as span:
+                span.update(
+                    input={
+                        "dataset_version": report.dataset_version,
+                        "dataset_hash": report.dataset_hash,
+                    },
+                    output={
+                        "weighted_overall": report.weighted_overall,
+                        "exit_code": report.exit_code,
+                    },
+                    metadata=metadata,
+                )
+                client.create_score(
+                    name="memory-evals/weighted-overall",
+                    value=report.weighted_overall,
+                    trace_id=trace_id,
+                    data_type="NUMERIC",
+                    comment=f"exit_code={report.exit_code}",
+                )
+                for suite in report.suites:
+                    for case in suite.cases:
+                        client.create_score(
+                            name=f"{case.suite}/{case.case_id}",
+                            value=case.score,
+                            trace_id=trace_id,
+                            data_type="NUMERIC",
+                            comment=f"status={case.status}",
+                        )
             client.flush()
         except Exception as exc:  # noqa: BLE001 - external reporter is fail-open
             message = f"langfuse reporting failed: {exc.__class__.__name__}: {exc}"
