@@ -12,9 +12,7 @@ from keel_worker.evals.database import (
 
 
 def test_refuses_live_keel_url(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(
-        "KEEL_EVAL_DATABASE_URL", "postgresql://localhost:5432/keel"
-    )
+    monkeypatch.setenv("KEEL_EVAL_DATABASE_URL", "postgresql://localhost:5432/keel")
     with pytest.raises(EvalDatabaseError):
         require_eval_database_url()
 

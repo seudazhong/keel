@@ -83,9 +83,7 @@ async def seed_core(engine: AsyncEngine, scope: str, blocks: dict[str, str]) -> 
         await store.set(key, value)
 
 
-async def seed_messages(
-    engine: AsyncEngine, scope: str, case_id: str, messages: list[Any]
-) -> int:
+async def seed_messages(engine: AsyncEngine, scope: str, case_id: str, messages: list[Any]) -> int:
     """Insert one ``message.token`` event per message with a deterministic eval id."""
     session_id = _eval_session_id(case_id)
     now = datetime.now(UTC)
@@ -282,9 +280,7 @@ async def run_consolidation_case(
     )
 
 
-async def seed_recall_corpus(
-    engine: AsyncEngine, scope: str, case: RecallCase
-) -> dict[str, str]:
+async def seed_recall_corpus(engine: AsyncEngine, scope: str, case: RecallCase) -> dict[str, str]:
     """Seed session messages (no pre-embedding — recall backfills at query time).
 
     Returns a ``session_id -> label`` map for resolving ``session:<id>`` hit sources.

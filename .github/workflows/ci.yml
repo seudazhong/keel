@@ -56,10 +56,10 @@ jobs:
         env:
           POSTGRES_USER: keel
           POSTGRES_PASSWORD: keel
-          POSTGRES_DB: keel
+          POSTGRES_DB: keel_test
         ports: ["5432:5432"]
         options: >-
-          --health-cmd "pg_isready -U keel -d keel"
+          --health-cmd "pg_isready -U keel -d keel_test"
           --health-interval 5s --health-timeout 5s --health-retries 20
       redis:
         image: redis:7-alpine
@@ -81,6 +81,6 @@ jobs:
       - name: Integration tests (spikes S4, S5-RLS)
         run: uv run pytest -m integration
         env:
-          KEEL_TEST_DATABASE_URL: postgresql+psycopg://keel:keel@localhost:5432/keel
+          KEEL_TEST_DATABASE_URL: postgresql+psycopg://keel:keel@localhost:5432/keel_test
+          KEEL_EVAL_DATABASE_URL: postgresql+psycopg://keel:keel@localhost:5432/keel_test
           KEEL_TEST_REDIS_URL: redis://localhost:6379/0
-

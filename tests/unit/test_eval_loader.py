@@ -55,9 +55,7 @@ def test_load_dataset_rejects_duplicate_ids(tmp_path: Path) -> None:
 def test_load_dataset_rejects_slot_collision(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(
-        "keel_worker.evals.loader.stable_case_slot", lambda _case_id: 7
-    )
+    monkeypatch.setattr("keel_worker.evals.loader.stable_case_slot", lambda _case_id: 7)
     path = _write(tmp_path, [_row("alpha"), _row("beta")])
     with pytest.raises(DatasetError, match="slot collision"):
         load_dataset(path)

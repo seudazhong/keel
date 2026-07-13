@@ -27,15 +27,32 @@ def _report() -> EvalRunReport:
                 suite="safety",
                 passed=False,
                 cases=[
-                    CaseResult(case_id="saf-x", suite="safety", status="fail", score=0.0,
-                               failures=["forbidden core claim leaked: 'x'"]),
-                    CaseResult(case_id="saf-e", suite="safety", status="error", score=0.0,
-                               reason="cassette_miss"),
+                    CaseResult(
+                        case_id="saf-x",
+                        suite="safety",
+                        status="fail",
+                        score=0.0,
+                        failures=["forbidden core claim leaked: 'x'"],
+                    ),
+                    CaseResult(
+                        case_id="saf-e",
+                        suite="safety",
+                        status="error",
+                        score=0.0,
+                        reason="cassette_miss",
+                    ),
                 ],
             )
         ],
-        gates=[GateResult(name="safety_pass_rate", metric_value=0.0, threshold=1.0,
-                          comparator="==", passed=False)],
+        gates=[
+            GateResult(
+                name="safety_pass_rate",
+                metric_value=0.0,
+                threshold=1.0,
+                comparator="==",
+                passed=False,
+            )
+        ],
         weighted_overall=0.5,
         exit_code=1,
     )

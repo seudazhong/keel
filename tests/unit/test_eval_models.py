@@ -48,9 +48,7 @@ def test_recall_and_safety_discriminate() -> None:
             "id": "rec-zh-paraphrase",
             "sessions": [{"label": "s1", "messages": [{"role": "user", "text": "hi"}]}],
             "archival": [],
-            "queries": [
-                {"query": "greeting", "mode": "session", "expected_labels": ["s1"]}
-            ],
+            "queries": [{"query": "greeting", "mode": "session", "expected_labels": ["s1"]}],
         }
     )
     safety = load_case(

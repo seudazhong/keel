@@ -112,7 +112,5 @@ def greedy_one_to_one(
         assignment.matched_produced.add(pi)
         assignment.pairs.append(MatchPair(ei, pi, method, score))
     assignment.recall = 1.0 if not expected else len(assignment.matched_expected) / len(expected)
-    assignment.precision = (
-        1.0 if not produced else len(assignment.matched_produced) / len(produced)
-    )
+    assignment.precision = 1.0 if not produced else len(assignment.matched_produced) / len(produced)
     return assignment

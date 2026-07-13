@@ -21,9 +21,7 @@ async def test_recall_session_hit(migrated_db: AsyncEngine) -> None:
         sessions=[
             RecallSession(
                 label="cycling",
-                messages=[
-                    Message(role="user", text="I love cycling on weekends near the coast.")
-                ],
+                messages=[Message(role="user", text="I love cycling on weekends near the coast.")],
             ),
             RecallSession(
                 label="cooking",

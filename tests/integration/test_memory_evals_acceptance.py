@@ -53,9 +53,7 @@ async def test_cassette_drift_exits_2_without_fallback(tmp_path: Path) -> None:
     corrupt = json.loads(await asyncio.to_thread(PROVIDER_CASSETTE.read_text, "utf-8"))
     corrupt["con-en-preference"][0]["fingerprint"] = "deadbeef"  # force a mismatch
     corrupt_path = tmp_path / "provider.json"
-    await asyncio.to_thread(
-        corrupt_path.write_text, json.dumps(corrupt), "utf-8"
-    )
+    await asyncio.to_thread(corrupt_path.write_text, json.dumps(corrupt), "utf-8")
     report = await run_evals(
         dataset_path=DATASET,
         provider_cassette_path=corrupt_path,
@@ -123,7 +121,5 @@ async def test_gate_failure_exits_1_with_junit_failure(tmp_path: Path) -> None:
         deps=deps,
     )
     assert report.exit_code == 1  # a gate failed, but nothing errored
-    junit_text = await asyncio.to_thread(
-        (tmp_path / "run" / "junit.xml").read_text, "utf-8"
-    )
+    junit_text = await asyncio.to_thread((tmp_path / "run" / "junit.xml").read_text, "utf-8")
     assert "<failure" in junit_text

@@ -27,9 +27,7 @@ class EmbeddingCassetteMiss(Exception):
     """Raised (and captured) when a text has no recorded embedding for (model, dim)."""
 
     def __init__(self, model: str, dim: int, text_hash: str) -> None:
-        super().__init__(
-            f"no recorded embedding for model={model} dim={dim} hash={text_hash}"
-        )
+        super().__init__(f"no recorded embedding for model={model} dim={dim} hash={text_hash}")
         self.model = model
         self.dim = dim
         self.text_hash = text_hash
@@ -148,9 +146,7 @@ class ReplayEmbedder:
     misses raise but do not overwrite the captured one.
     """
 
-    def __init__(
-        self, cassette: EmbeddingCassette, *, model: str, dim: int
-    ) -> None:
+    def __init__(self, cassette: EmbeddingCassette, *, model: str, dim: int) -> None:
         self._cassette = cassette
         self.model = model
         self.dim = dim
@@ -161,9 +157,7 @@ class ReplayEmbedder:
         for text in texts:
             vector = self._cassette.get(self.model, self.dim, text)
             if vector is None:
-                digest = hashlib.sha256(
-                    normalize_embedding_text(text).encode("utf-8")
-                ).hexdigest()
+                digest = hashlib.sha256(normalize_embedding_text(text).encode("utf-8")).hexdigest()
                 miss = EmbeddingCassetteMiss(self.model, self.dim, digest)
                 if self.miss is None:
                     self.miss = miss
@@ -189,6 +183,4 @@ class FailingEmbedder:
         self.dim = dim
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
-        raise RuntimeError(
-            "FailingEmbedder: embedding backend unavailable (injected)"
-        )
+        raise RuntimeError("FailingEmbedder: embedding backend unavailable (injected)")

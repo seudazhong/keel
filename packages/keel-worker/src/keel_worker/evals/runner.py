@@ -185,9 +185,7 @@ async def _attach_judge(
         result.judge_error = verdict.error
 
 
-def build_reporters(
-    *, out_dir: Path, langfuse: bool, settings: Settings
-) -> list[EvalReporter]:
+def build_reporters(*, out_dir: Path, langfuse: bool, settings: Settings) -> list[EvalReporter]:
     """Assemble the run's reporters (spec §14). Langfuse is opt-in via ``--langfuse`` and is
     published **first** so any ``reporting_errors`` it records are captured by the always-on
     JSON reporter, which writes to disk **last**."""
@@ -273,9 +271,7 @@ async def run_evals(
     deps = deps or build_deps(
         mode, record, provider_cassette_path, embedding_cassette_path, settings
     )
-    judge_client = (
-        LiteLLMMemoryJudge(judge_model or settings.default_model) if judge else None
-    )
+    judge_client = LiteLLMMemoryJudge(judge_model or settings.default_model) if judge else None
 
     engine = create_eval_engine()
     await assert_current_database(engine)
@@ -287,9 +283,7 @@ async def run_evals(
             scope = case_scope(dataset_version, case.id)
             await cleanup_scope(engine, scope)
             try:
-                results.append(
-                    await _score_case(case, engine, deps, dataset_version, judge_client)
-                )
+                results.append(await _score_case(case, engine, deps, dataset_version, judge_client))
             except (CassetteMiss, EmbeddingCassetteMiss) as miss:
                 infra_error = True
                 results.append(

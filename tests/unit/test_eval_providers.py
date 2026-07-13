@@ -31,14 +31,10 @@ def test_canonicalize_masks_volatile_ids_but_keeps_state() -> None:
         canonicalize_tool_content("proposal a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4 created")
         == "proposal <ID> created"
     )
-    assert (
-        canonicalize_tool_content("archival 917 inserted") == "archival <ID> inserted"
-    )
+    assert canonicalize_tool_content("archival 917 inserted") == "archival <ID> inserted"
     # state word is preserved (created vs already proposed must still differ)
     assert (
-        canonicalize_tool_content(
-            "proposal ffffffffffffffffffffffffffffffff already proposed"
-        )
+        canonicalize_tool_content("proposal ffffffffffffffffffffffffffffffff already proposed")
         == "proposal <ID> already proposed"
     )
 
@@ -54,12 +50,8 @@ def _request(tool_content: str) -> ProviderRequest:
 
 
 def test_fingerprint_stable_across_volatile_ids() -> None:
-    a = canonical_request_fingerprint(
-        _request("proposal aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa created")
-    )
-    b = canonical_request_fingerprint(
-        _request("proposal bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb created")
-    )
+    a = canonical_request_fingerprint(_request("proposal aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa created"))
+    b = canonical_request_fingerprint(_request("proposal bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb created"))
     assert a == b
 
 
@@ -118,9 +110,7 @@ async def test_replay_fingerprint_mismatch(tmp_path: Path) -> None:
     recorder = RecordingCaseProviderGateway(
         ScriptedProviderGateway([_turn()]), CaseCassette(path), "con-x"
     )
-    await _drain(
-        recorder, _request("proposal aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa created")
-    )
+    await _drain(recorder, _request("proposal aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa created"))
     recorder.cassette.save()
     replay = ReplayCaseProviderGateway(CaseCassette(path), "con-x")
     with pytest.raises(CassetteMiss):
@@ -164,6 +154,7 @@ def test_save_is_atomic_and_preserves_old_on_failure(
 # ---------------------------------------------------------------------------
 # InvalidCitationWrapper — deterministic fault injection for golden replay
 # ---------------------------------------------------------------------------
+
 
 def _tool_chunk(source_event_ids: list[int]) -> ProviderChunk:
     return ProviderChunk(

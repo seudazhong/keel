@@ -40,9 +40,7 @@ async def test_record_then_replay(tmp_path: Path) -> None:
 
 
 async def test_replay_miss_sets_flag_and_raises(tmp_path: Path) -> None:
-    replay = ReplayEmbedder(
-        EmbeddingCassette(tmp_path / "empty.json"), model="fake/embed", dim=16
-    )
+    replay = ReplayEmbedder(EmbeddingCassette(tmp_path / "empty.json"), model="fake/embed", dim=16)
     with pytest.raises(EmbeddingCassetteMiss):
         await replay.embed(["never recorded"])
     assert replay.miss is not None
