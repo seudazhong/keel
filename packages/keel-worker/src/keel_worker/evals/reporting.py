@@ -7,11 +7,14 @@ marks a ``fail`` case as ``<failure>`` and an ``error`` (infra/cassette) case as
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Protocol
 from xml.etree import ElementTree as ET
 
 from keel_worker.evals.models import EvalRunReport
+
+logger = logging.getLogger("keel.evals.reporting")
 
 
 def to_json(report: EvalRunReport) -> str:
@@ -109,3 +112,49 @@ class JsonEvalReporter:
 
     def publish(self, report: EvalRunReport) -> None:
         self.paths = write_reports(report, self._out_dir)
+
+
+class LangfuseEvalReporter:
+    """Best-effort external experiment reporter; disabled unless both keys are set."""
+
+    def __init__(self, *, public_key: str, secret_key: str, host: str) -> None:
+        self._public_key = public_key
+        self._secret_key = secret_key
+        self._host = host
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._public_key and self._secret_key)
+
+    def publish(self, report: EvalRunReport) -> None:
+        if not self.enabled:
+            return
+        try:
+            from langfuse import Langfuse  # lazy: not a hard dependency
+
+            client = Langfuse(
+                public_key=self._public_key, secret_key=self._secret_key, host=self._host
+            )
+            client.create_dataset_run(
+                name=f"memory-evals-{report.run_id}",
+                metadata={
+                    "dataset_version": report.dataset_version,
+                    "dataset_hash": report.dataset_hash,
+                    "mode": report.mode,
+                    "weighted_overall": report.weighted_overall,
+                    "exit_code": report.exit_code,
+                    "gates": {g.name: g.passed for g in report.gates},
+                },
+            )
+            for suite in report.suites:
+                for case in suite.cases:
+                    client.score(
+                        name=f"{case.suite}/{case.case_id}",
+                        value=case.score,
+                        data_type="NUMERIC",
+                    )
+            client.flush()
+        except Exception as exc:  # noqa: BLE001 - external reporter is fail-open
+            message = f"langfuse reporting failed: {exc.__class__.__name__}: {exc}"
+            logger.warning(message)
+            report.reporting_errors.append(message)
