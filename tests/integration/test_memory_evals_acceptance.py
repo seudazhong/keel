@@ -46,6 +46,13 @@ async def test_replay_enforce_all_gates_pass(tmp_path: Path) -> None:
     )
     assert report.exit_code == 0, [g for g in report.gates if not g.passed]
     assert all(gate.passed for gate in report.gates)
+    idempotent = next(
+        case
+        for suite in report.suites
+        for case in suite.cases
+        if case.case_id == "con-idempotent-replay"
+    )
+    assert idempotent.status == "pass", idempotent.failures
     assert (tmp_path / "run" / "report.json").exists()
 
 

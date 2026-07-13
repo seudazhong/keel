@@ -22,7 +22,7 @@ async def test_propose_is_idempotent(migrated_db: AsyncEngine) -> None:
     )
     pid2, created2 = await store.propose(
         block="human",
-        proposed_value="likes tea",
+        proposed_value="Tea is the user's preferred drink.",
         reason="stated",
         confidence=0.9,
         source_event_ids=[2, 1],

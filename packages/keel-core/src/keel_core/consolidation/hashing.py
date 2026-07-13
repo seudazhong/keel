@@ -11,12 +11,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Sequence
+
+_MARKDOWN_LIST_PREFIX = re.compile(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+")
+_TRAILING_SENTENCE_PUNCTUATION = re.compile(r"[.!?。！？]+$")
 
 
 def normalize_whitespace(text: str) -> str:
     """Collapse every run of whitespace to a single space and strip the ends."""
     return " ".join(text.split())
+
+
+def normalize_proposed_value(text: str) -> str:
+    """Canonicalize formatting-only model drift without collapsing different facts."""
+    without_list_markers = _MARKDOWN_LIST_PREFIX.sub("", text)
+    normalized = normalize_whitespace(without_list_markers).casefold()
+    return _TRAILING_SENTENCE_PUNCTUATION.sub("", normalized)
 
 
 def archival_content_hash(content: str) -> str:
@@ -32,13 +43,13 @@ def consolidation_idempotency_key(
     proposed_value: str,
     source_event_ids: Sequence[int],
 ) -> str:
-    """A stable SHA-256 identifying one proposal write (order-independent event ids)."""
+    """A stable SHA-256 identifying one normalized proposal write."""
     payload = json.dumps(
         {
             "scope_id": scope_id,
             "block": block,
             "expected_version": expected_version,
-            "proposed_value": proposed_value,
+            "proposed_value": normalize_proposed_value(proposed_value),
             "source_event_ids": sorted({int(i) for i in source_event_ids}),
         },
         sort_keys=True,

@@ -437,12 +437,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Sequence
+
+_MARKDOWN_LIST_PREFIX = re.compile(r"(?m)^\s*(?:[-*+]|\d+[.)])\s+")
+_TRAILING_SENTENCE_PUNCTUATION = re.compile(r"[.!?。！？]+$")
 
 
 def normalize_whitespace(text: str) -> str:
     """Collapse every run of whitespace to a single space and strip the ends."""
     return " ".join(text.split())
+
+
+def normalize_proposed_value(text: str) -> str:
+    """Canonicalize formatting-only model drift without collapsing different facts."""
+    without_list_markers = _MARKDOWN_LIST_PREFIX.sub("", text)
+    normalized = normalize_whitespace(without_list_markers).casefold()
+    return _TRAILING_SENTENCE_PUNCTUATION.sub("", normalized)
 
 
 def archival_content_hash(content: str) -> str:
@@ -458,13 +469,13 @@ def consolidation_idempotency_key(
     proposed_value: str,
     source_event_ids: Sequence[int],
 ) -> str:
-    """A stable SHA-256 identifying one proposal write (order-independent event ids)."""
+    """A stable SHA-256 identifying one normalized proposal write."""
     payload = json.dumps(
         {
             "scope_id": scope_id,
             "block": block,
             "expected_version": expected_version,
-            "proposed_value": proposed_value,
+            "proposed_value": normalize_proposed_value(proposed_value),
             "source_event_ids": sorted({int(i) for i in source_event_ids}),
         },
         sort_keys=True,
@@ -1265,8 +1276,14 @@ class MemoryProposalStore:
         confidence: float,
         source_event_ids: list[int],
     ) -> tuple[str, bool]:
-        """Insert a proposal idempotently. Returns ``(proposal_id, created)``."""
+        """Insert a proposal idempotently. Returns ``(proposal_id, created)``.
+
+        A whole-batch retry may paraphrase the proposed block value. For the same
+        block version, an exact source-event set therefore identifies the same
+        evidence-backed proposal even when the model wording changes.
+        """
         proposal_id = uuid.uuid4().hex
+        normalized_source_ids = sorted({int(event_id) for event_id in source_event_ids})
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             current = (
@@ -1279,8 +1296,32 @@ class MemoryProposalStore:
                 )
             ).one_or_none()
             expected_version = 0 if current is None else int(current.version)
+            retry = (
+                await conn.execute(
+                    text(
+                        "SELECT id FROM memory_proposals "
+                        "WHERE scope_id = :scope AND block = :block "
+                        "AND expected_version = :expected "
+                        "AND source_event_ids @> CAST(:ids AS bigint[]) "
+                        "AND source_event_ids <@ CAST(:ids AS bigint[]) "
+                        "ORDER BY created_at LIMIT 1"
+                    ),
+                    {
+                        "scope": self._scope_id,
+                        "block": block,
+                        "expected": expected_version,
+                        "ids": normalized_source_ids,
+                    },
+                )
+            ).one_or_none()
+            if retry is not None:
+                return str(retry.id), False
             key = consolidation_idempotency_key(
-                self._scope_id, block, expected_version, proposed_value, source_event_ids
+                self._scope_id,
+                block,
+                expected_version,
+                proposed_value,
+                normalized_source_ids,
             )
             inserted = (
                 await conn.execute(
@@ -1301,7 +1342,7 @@ class MemoryProposalStore:
                         "value": proposed_value,
                         "reason": reason,
                         "confidence": confidence,
-                        "ids": list(source_event_ids),
+                        "ids": normalized_source_ids,
                         "key": key,
                     },
                 )

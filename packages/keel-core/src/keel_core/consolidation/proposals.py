@@ -92,8 +92,14 @@ class MemoryProposalStore:
         confidence: float,
         source_event_ids: list[int],
     ) -> tuple[str, bool]:
-        """Insert a proposal idempotently. Returns ``(proposal_id, created)``."""
+        """Insert a proposal idempotently. Returns ``(proposal_id, created)``.
+
+        A whole-batch retry may paraphrase the proposed block value. For the same
+        block version, an exact source-event set therefore identifies the same
+        evidence-backed proposal even when the model wording changes.
+        """
         proposal_id = uuid.uuid4().hex
+        normalized_source_ids = sorted({int(event_id) for event_id in source_event_ids})
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             current = (
@@ -105,8 +111,32 @@ class MemoryProposalStore:
                 )
             ).one_or_none()
             expected_version = 0 if current is None else int(current.version)
+            retry = (
+                await conn.execute(
+                    text(
+                        "SELECT id FROM memory_proposals "
+                        "WHERE scope_id = :scope AND block = :block "
+                        "AND expected_version = :expected "
+                        "AND source_event_ids @> CAST(:ids AS bigint[]) "
+                        "AND source_event_ids <@ CAST(:ids AS bigint[]) "
+                        "ORDER BY created_at LIMIT 1"
+                    ),
+                    {
+                        "scope": self._scope_id,
+                        "block": block,
+                        "expected": expected_version,
+                        "ids": normalized_source_ids,
+                    },
+                )
+            ).one_or_none()
+            if retry is not None:
+                return str(retry.id), False
             key = consolidation_idempotency_key(
-                self._scope_id, block, expected_version, proposed_value, source_event_ids
+                self._scope_id,
+                block,
+                expected_version,
+                proposed_value,
+                normalized_source_ids,
             )
             inserted = (
                 await conn.execute(
@@ -127,7 +157,7 @@ class MemoryProposalStore:
                         "value": proposed_value,
                         "reason": reason,
                         "confidence": confidence,
-                        "ids": list(source_event_ids),
+                        "ids": normalized_source_ids,
                         "key": key,
                     },
                 )

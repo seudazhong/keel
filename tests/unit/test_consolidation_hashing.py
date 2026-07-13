@@ -5,6 +5,7 @@ from __future__ import annotations
 from keel_core.consolidation.hashing import (
     archival_content_hash,
     consolidation_idempotency_key,
+    normalize_proposed_value,
     normalize_whitespace,
 )
 
@@ -19,9 +20,15 @@ def test_archival_content_hash_ignores_whitespace_and_case_differences() -> None
     assert archival_content_hash("hello world") != archival_content_hash("hello mars")
 
 
+def test_normalize_proposed_value_ignores_formatting_only_drift() -> None:
+    assert normalize_proposed_value("- Favorite programming language: Python") == (
+        normalize_proposed_value("  favorite   programming language: Python. ")
+    )
+
+
 def test_idempotency_key_is_stable_and_order_independent() -> None:
-    a = consolidation_idempotency_key("web:local", "human", 0, "likes tea", [3, 1, 2])
-    b = consolidation_idempotency_key("web:local", "human", 0, "likes tea", [2, 3, 1])
+    a = consolidation_idempotency_key("web:local", "human", 0, "- Likes tea", [3, 1, 2])
+    b = consolidation_idempotency_key("web:local", "human", 0, "likes tea.", [2, 3, 1])
     assert a == b
     assert len(a) == 64
 

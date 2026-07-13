@@ -309,6 +309,13 @@ User message 包含：
 SHA-256(scope | block | expected_version | normalized proposed_value | sorted source IDs)
 ```
 
+`normalized proposed_value` 只折叠格式漂移：case-fold、空白归一、移除行首 Markdown
+列表标记与末尾句号/问号/感叹号。它不会做语义改写，因此不同事实仍产生不同 key。
+
+另外，整批重试时，同一 `scope + block + expected_version + exact source ID set`
+直接解析到已有 proposal，即使模型对 block rewrite 做了语义等价的改写。该窄去重不跨
+source set，也不跨 block version。
+
 重复调用返回已有 proposal ID，不创建新行。
 
 工具只写 `memory_proposals`，绝不直接修改 Core block。

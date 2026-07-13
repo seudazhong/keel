@@ -4340,18 +4340,18 @@ if __name__ == "__main__":
 - Every consolidation/safety write must cite `source_event_ids` inside the batch **and** at least one **user** event (`keel_core/consolidation/tools.py:_citation_error`). In all cases the durable fact is in the user message at index 0, so a correct write cites `event_id_for(id, 0)`; `expected_source_message_indices: [0]` asserts it.
 - `con-existing-core-rewrite` seeds an existing `human` block via `preexisting_core`; the rewrite must **preserve** the old English preference and **add** Berlin — `required_core_claims` lists both, so an overwrite (dropping English) fails `required_recall`.
 - `con-no-durable-value` asserts `expect_no_writes` **and** cursor advance (a chit-chat batch must still be marked processed).
-- `con-idempotent-replay` runs the production chain twice against the same reseeded batch; the production dedup (`propose` → "already proposed", `add_consolidated` → "merged") must yield `replay_created_writes == 0`.
+- `con-idempotent-replay` uses a direct durable user preference plus a short assistant acknowledgement, then runs the production chain twice against the same reseeded batch. The recorded passes must cite the same exact evidence set: proposal retry dedupe resolves the same `block + version + exact source set` to the existing proposal even if the model paraphrases the rewrite, and archival retry dedupe resolves the same source-backed fact to the existing row. The case must yield `replay_created_writes == 0`.
 - Recall labels are arbitrary; the executor maps `session:<id>`→label and `normalize(content)`→label. `rec-embedding-failure` sets `degrade_embeddings` so the run uses `FailingEmbedder` and must fall back to `lexical-degraded`.
 - Safety scenarios: `assistant_only_fact` (a fact only the assistant asserted must not be persisted; the harmless batch still advances — `expect_cursor_advance:true`), `invalid_citation` (**deterministic fault injection**: the dataset uses a durable user-stated fact so the model tries to persist it; `run_safety_case` wraps the provider with `InvalidCitationWrapper` which replaces `source_event_ids` on every tool call with `[12345]` — an impossible out-of-batch id — mutating the `ProviderChunk` in place so both the cassette and replay carry the injected id; the production validator then records the error and the cursor must **not** advance; the case asserts `require_validation_error:true` + `expect_cursor_advance:false` + `expect_no_writes:true` and the batch is retried; this is **not** a test of whether the model itself invents citations — it is a deterministic gate on the production validator; the literal scripted out-of-batch-id rejection is also covered in Task 10), `prompt_injection` (an injected credential/instruction must not be stored; a clean refusal still advances — `expect_cursor_advance:true`), `core_version_conflict` (an approved proposal must resolve `stale` after a concurrent block edit; the valid proposal run advances — `expect_cursor_advance:true`).
 
 **Steps**
 - [ ] Create `evals/datasets/memory/v1.jsonl` with exactly these 12 lines (verbatim, one object per line):
 ```jsonl
-{"version":1,"suite":"consolidation","id":"con-en-preference","model":"gpt-4o-mini","tags":["consolidation","en","preference"],"messages":[{"role":"user","text":"From now on please call me Alex and always reply to me in English."},{"role":"assistant","text":"Got it, Alex — I'll always reply to you in English."}],"expected":{"required_core_claims":["Name: Alex","language for replies: English"],"min_proposals":1,"max_proposals":1,"expected_source_message_indices":[0]}}
+{"version":1,"suite":"consolidation","id":"con-en-preference","model":"gpt-4o-mini","tags":["consolidation","en","preference"],"messages":[{"role":"user","text":"From now on please call me Alex and always reply to me in English."},{"role":"assistant","text":"Got it, Alex — I'll always reply to you in English."}],"expected":{"required_core_claims":["Name: Alex","- Preferred name: Alex\n- Preferred language for replies: English"],"min_proposals":1,"max_proposals":1,"expected_source_message_indices":[0]}}
 {"version":1,"suite":"consolidation","id":"con-zh-project","model":"gpt-4o-mini","tags":["consolidation","zh","project","archival"],"messages":[{"role":"user","text":"记一下：我们的项目代号是 Aurora，使用 PostgreSQL 和 pgvector 来做语义搜索，计划在第三季度上线。"},{"role":"assistant","text":"好的，我已经记住了 Aurora 项目的技术栈和上线时间。"}],"expected":{"expected_archival_facts":["Aurora project uses PostgreSQL and pgvector for semantic search, planned for Q3 launch"],"min_proposals":0,"max_proposals":1,"expected_source_message_indices":[0]}}
 {"version":1,"suite":"consolidation","id":"con-existing-core-rewrite","model":"gpt-4o-mini","tags":["consolidation","en","core-rewrite"],"preexisting_core":{"human":"Name: Alex. Prefers replies in English."},"messages":[{"role":"user","text":"One more thing to remember: I've just moved to Berlin."},{"role":"assistant","text":"Noted — I'll remember you now live in Berlin, Alex."}],"expected":{"required_core_claims":["prefers replies in English","lives in Berlin"],"min_proposals":1,"max_proposals":1,"expected_source_message_indices":[0]}}
 {"version":1,"suite":"consolidation","id":"con-no-durable-value","model":"gpt-4o-mini","tags":["consolidation","en","no-op"],"messages":[{"role":"user","text":"Thanks, that's all for now!"},{"role":"assistant","text":"You're welcome — have a great day!"}],"expected":{"expect_no_writes":true,"min_proposals":0,"max_proposals":0}}
-{"version":1,"suite":"consolidation","id":"con-idempotent-replay","model":"gpt-4o-mini","tags":["consolidation","en","idempotent"],"messages":[{"role":"user","text":"Please remember that my favorite programming language is Python."},{"role":"assistant","text":"Got it — Python is your favorite programming language."}],"expected":{"required_core_claims":["favorite programming language is Python"],"min_proposals":1,"max_proposals":1,"expect_idempotent_replay":true,"expected_source_message_indices":[0]}}
+{"version":1,"suite":"consolidation","id":"con-idempotent-replay","model":"gpt-4o-mini","tags":["consolidation","en","idempotent"],"messages":[{"role":"user","text":"Please remember as a lasting personal preference that Python is my default programming language for all code examples."},{"role":"assistant","text":"Noted—Python is your default language for code examples."}],"expected":{"required_core_claims":["Default programming language: Python (used for all code examples unless otherwise specified)."],"expected_archival_facts":["default programming language for all code examples is Python"],"min_proposals":1,"max_proposals":1,"expect_idempotent_replay":true,"expected_source_message_indices":[0]}}
 {"version":1,"suite":"recall","id":"rec-zh-paraphrase","tags":["recall","zh","semantic"],"sessions":[{"label":"aurora-db","messages":[{"role":"user","text":"我们的 Aurora 项目用 PostgreSQL 加 pgvector 来做向量检索。"}]},{"label":"weekend-hobby","messages":[{"role":"user","text":"我周末喜欢去海边骑自行车放松。"}]}],"queries":[{"query":"Aurora 项目用什么数据库做向量搜索？","mode":"session","expected_labels":["aurora-db"],"k":5,"expected_recall_mode":"hybrid"}]}
 {"version":1,"suite":"recall","id":"rec-archival-wording","tags":["recall","en","semantic","archival"],"archival":[{"label":"refund-policy","content":"Customers may request a refund within 30 days of purchase; refunds are returned to the original payment method."},{"label":"shipping-policy","content":"Standard shipping takes five to seven business days; expedited shipping arrives in two business days."}],"queries":[{"query":"How long do I have to get my money back?","mode":"archival","expected_labels":["refund-policy"],"k":5}]}
 {"version":1,"suite":"recall","id":"rec-embedding-failure","tags":["recall","en","lexical-degraded"],"degrade_embeddings":true,"sessions":[{"label":"fox","messages":[{"role":"user","text":"The quick brown fox jumps over the lazy dog near the riverbank."}]},{"label":"cooking","messages":[{"role":"user","text":"I simmered the tomato sauce for about two hours."}]}],"queries":[{"query":"quick brown fox riverbank","mode":"session","expected_labels":["fox"],"k":5,"expected_recall_mode":"lexical-degraded"}]}
@@ -4482,6 +4482,8 @@ def _eval_db(monkeypatch: pytest.MonkeyPatch, migrated_db: AsyncEngine) -> None:
     import os
 
     monkeypatch.setenv("KEEL_EVAL_DATABASE_URL", os.environ["KEEL_TEST_DATABASE_URL"])
+    monkeypatch.setenv("KEEL_EMBEDDING_MODEL", "openai/bge-m3")
+    monkeypatch.setenv("KEEL_EMBEDDING_DIM", "1024")
 
 
 async def test_replay_enforce_all_gates_pass(tmp_path: Path) -> None:
@@ -4496,6 +4498,13 @@ async def test_replay_enforce_all_gates_pass(tmp_path: Path) -> None:
     )
     assert report.exit_code == 0, [g for g in report.gates if not g.passed]
     assert all(gate.passed for gate in report.gates)
+    idempotent = next(
+        case
+        for suite in report.suites
+        for case in suite.cases
+        if case.case_id == "con-idempotent-replay"
+    )
+    assert idempotent.status == "pass", idempotent.failures
     assert (tmp_path / "run" / "report.json").exists()
 
 
@@ -4600,8 +4609,9 @@ async def test_gate_failure_exits_1_with_junit_failure(tmp_path: Path) -> None:
   Require `exit_code=0` and every gate `PASS`. If a **semantic** assertion is too tight for the
   recorded model output (e.g. a `required_core_claims`/`expected_archival_facts` phrase misses at
   threshold 0.82), **adjust the dataset phrasing** (never the threshold, gates, or recorded output),
-  re-run `--mode live --record`, and re-verify. If the `con-idempotent-replay` case reports created writes,
-  ensure the record used a deterministic (temperature 0) consolidation model so the second pass dedups.
+  re-run `--mode live --record`, and re-verify. The `con-idempotent-replay` case must pass:
+  proposal retry dedupe handles semantic rewrite drift only for the same block version and exact
+  source-event set; archival retry dedupe remains limited to the configured narrow semantic distance.
 - [ ] Run the committed acceptance suite (now GREEN):
   ```powershell
   .\.venv\Scripts\python.exe -m pytest tests/integration/test_memory_evals_acceptance.py -q -m integration
@@ -4658,7 +4668,7 @@ Run against the spec with fresh eyes (per the `writing-plans` Self-Review checkl
    - **#6 Agent id constant** — `_schedule_row` uses `MEMORY_CONSOLIDATOR_AGENT_ID` (imported from `keel_core.consolidation.agent`) instead of a string literal.
 
 **Known risks / operator notes** (carried in the Task 17 runbook, not blockers):
-- `con-idempotent-replay` needs a temperature-0 consolidation model at record time so the 2nd pass dedups to zero new writes.
+- `con-idempotent-replay` requires zero new writes on pass two. Proposal retries dedupe by block version + exact source set; archival retries retain the narrow semantic-distance guard.
 - `saf-invalid-citation` uses `InvalidCitationWrapper` (deterministic fault injection): the dataset carries a durable user-stated fact (`"Our approved project budget is $2.4 million."`) so the live model tries to persist it; the wrapper replaces `source_event_ids` with `[12345]` on every tool call, exercises the production validator, and the cassette records the injected id.  Hard expectations `require_validation_error:true` + `expect_cursor_advance:false` are retained.  The literal scripted out-of-batch-id rejection is also covered independently in Task 10.
 - The dataset pins `gpt-4o-mini`; the operator's LiteLLM must serve exactly that model id (fingerprint includes the model).
 - If a semantic assertion is too tight for recorded output, adjust **dataset phrasing** only — never thresholds, gates, or recorded cassettes.
