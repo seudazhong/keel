@@ -19,6 +19,19 @@ normalized content. When ``case.degrade_embeddings`` is set, a
 :class:`FailingEmbedder` deterministically triggers the ``lexical-degraded``
 path via the same production error handling — so eval graduation and
 graceful-degradation live on the same code path production users hit.
+
+The safety executor reuses the same consolidation chain (seed + direct
+``consolidate_memory`` + ``raise_on_miss``) so assistant-only, invalid-citation
+and prompt-injection scenarios are graded on the exact production tool
+validators. It derives ``validation_error`` from the run status (``"error"``
+means ``should_advance_cursor`` refused to advance because a tool recorded a
+validation error — e.g. an out-of-batch citation); cassette/infra misses are
+surfaced earlier by ``raise_on_miss`` so they never masquerade as a validation
+error. For the ``core_version_conflict`` scenario, the executor bumps the
+targeted block underneath the still-pending proposal and then calls
+``MemoryProposalStore.approve`` so the production compare-and-set path
+resolves ``stale`` — proving core edits made concurrent with a proposal are
+never silently applied.
 """
 
 from __future__ import annotations
@@ -48,6 +61,8 @@ from keel_worker.evals.models import (
     RecallActual,
     RecallCase,
     RecallQueryResult,
+    SafetyActual,
+    SafetyCase,
 )
 
 EVAL_SESSION_PREFIX = "evalseed"  # not consolidation:/digest: so the reader includes it
@@ -359,3 +374,79 @@ async def run_recall_case(
     if not case.degrade_embeddings:
         raise_on_miss(None, active)  # a missing recorded query embedding is an infra failure
     return RecallActual(results=results)
+
+
+def safety_settings(case: SafetyCase) -> Settings:
+    """Per-case settings: force one big batch so every scripted message is eligible."""
+    return Settings(
+        default_model=case.model,
+        consolidation_min_messages=1,
+        consolidation_batch_messages=max(1000, len(case.messages) + 1),
+        consolidation_archival_min_confidence=0.5,
+    )
+
+
+async def run_safety_case(
+    case: SafetyCase,
+    *,
+    engine: AsyncEngine,
+    provider: Any,
+    embedder: Any,
+    dataset_version: str,
+) -> SafetyActual:
+    """Drive the production consolidation chain for a safety case + optional apply.
+
+    The scripted turn is graded on the exact production tool validators (out-of-batch
+    citations, missing user evidence, etc.). For ``core_version_conflict`` the block
+    is bumped underneath the still-pending proposal before ``approve`` is called, so
+    the production compare-and-set path resolves ``stale`` — proving a concurrent
+    core edit is never silently overwritten.
+    """
+    from keel_worker.evals.database import case_scope
+    from keel_worker.main import consolidate_memory
+
+    scope = case_scope(dataset_version, case.id)
+    await seed_core(engine, scope, case.preexisting_core)
+    await seed_messages(engine, scope, case.id, case.messages)
+    await seed_cursor(engine, scope, cursor_seed_for(case.id))
+
+    row = _schedule_row(scope, case.id)
+    ctx: dict[str, Any] = {
+        "engine": engine,
+        "provider": provider,
+        "embedder": embedder,
+        "schedules": InMemoryScheduleStore([row]),
+    }
+    status = await consolidate_memory(ctx, row, safety_settings(case))
+    raise_on_miss(provider, embedder)
+
+    proposals = await read_proposals(engine, scope)
+    archival = await read_archival(engine, scope)
+    cursor_advanced = await read_cursor(engine, scope) > cursor_seed_for(case.id)
+
+    # Force a version conflict: bump the block underneath the pending proposal.
+    if case.simulate_core_edit_block is not None and case.simulate_core_edit_value is not None:
+        await PostgresMemoryStore(engine, scope).set(
+            case.simulate_core_edit_block, case.simulate_core_edit_value
+        )
+
+    apply_outcomes: list[str] = []
+    if case.expect_proposal_stale_on_apply:
+        store = MemoryProposalStore(engine, scope)
+        for proposal in await store.list_proposals(status="pending"):
+            resolution = await store.approve(proposal.id, "eval")
+            apply_outcomes.append(resolution.outcome.value)
+
+    # A scripted safety run only reaches "error" when the production chain recorded a
+    # validation error (``should_advance_cursor`` stayed False) — e.g. an out-of-batch
+    # citation — so the batch is deliberately not marked processed. Cassette/infra misses
+    # are surfaced earlier by ``raise_on_miss``, so they never masquerade as a validation
+    # error here.
+    return SafetyActual(
+        status=status,
+        cursor_advanced=cursor_advanced,
+        validation_error=status == "error",
+        proposals=proposals,
+        archival=archival,
+        apply_outcomes=apply_outcomes,
+    )
