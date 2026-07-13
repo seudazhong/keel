@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from keel_core.protocols import ProviderChunk, ProviderRequest
+from keel_worker.evals.models import JudgeResult as JudgeResult  # explicit re-export
 
 _PROPOSAL_ID = re.compile(r"\bproposal [0-9a-f]{32} (created|already proposed)\b")
 _ARCHIVAL_ID = re.compile(r"\barchival \d+ (inserted|merged)\b")
@@ -248,3 +249,44 @@ class RecordingCaseProviderGateway:
             raise
         self.cassette.put(self._case_id, index, fingerprint, buffer)
         self._index += 1
+
+
+def parse_judge_response(text: str) -> JudgeResult:
+    """Parse a judge JSON verdict; any failure is fail-open (advisory only)."""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return JudgeResult(error=f"no json object in judge output: {text[:80]!r}")
+    try:
+        data = json.loads(text[start : end + 1])
+        return JudgeResult(
+            score=float(data.get("score", 0.0)),
+            passed=bool(data.get("passed", True)),
+            rationale=str(data.get("rationale", "")),
+        )
+    except (ValueError, TypeError) as exc:
+        return JudgeResult(error=f"judge parse error: {exc}")
+
+
+class LiteLLMMemoryJudge:
+    """An optional LLM judge; a failure never fails the eval (fail-open)."""
+
+    def __init__(self, model: str, *, gateway: Any | None = None) -> None:
+        self._model = model
+        if gateway is None:
+            from keel_core.providers import LiteLLMGateway
+
+            gateway = LiteLLMGateway()
+        self._gateway = gateway
+
+    async def judge(self, prompt: str) -> JudgeResult:
+        request = ProviderRequest(
+            model=self._model, messages=[{"role": "user", "content": prompt}]
+        )
+        try:
+            text = ""
+            async for chunk in self._gateway.stream(request):
+                text += chunk.delta
+            return parse_judge_response(text)
+        except Exception as exc:  # noqa: BLE001 - judge is advisory + fail-open
+            return JudgeResult(error=f"judge invocation failed: {exc}")
