@@ -1,6 +1,6 @@
-"""cleanup_scope removes only the target scope's rows; guard rechecks the live DB name."""
-
 from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import text
@@ -9,7 +9,6 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from keel_worker.evals.database import (
     EvalDatabaseError,
     assert_current_database,
-    assert_eval_database_name,
     case_scope,
     cleanup_scope,
 )
@@ -41,8 +40,19 @@ async def test_cleanup_scope_is_scoped(migrated_db: AsyncEngine) -> None:
     assert remaining == 0
 
 
-async def test_assert_current_database_rejects_live(migrated_db: AsyncEngine) -> None:
-    # migrated_db is keel_test; monkeypatch the recheck to simulate a live name.
+async def test_assert_current_database_rejects_live() -> None:
+    fake_conn = AsyncMock()
+    fake_conn.scalar = AsyncMock(return_value="keel")
+    fake_engine = MagicMock()
+    fake_engine.connect = MagicMock()
+    fake_engine.connect.__aenter__ = AsyncMock(return_value=fake_conn)
+    fake_engine.connect.__aexit__ = AsyncMock(return_value=None)
+
     with pytest.raises(EvalDatabaseError):
-        assert_eval_database_name("keel")
-    await assert_current_database(migrated_db)  # keel_test passes
+        await assert_current_database(fake_engine)
+
+
+async def test_assert_current_database_accepts_eval_test(
+    migrated_db: AsyncEngine,
+) -> None:
+    await assert_current_database(migrated_db)
