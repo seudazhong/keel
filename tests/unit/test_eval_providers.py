@@ -1,4 +1,9 @@
-"""Fingerprint canonicalization + case-cassette replay/record + miss capture."""
+"""Fingerprint canonicalization + case-cassette replay/record + miss capture.
+
+Also covers ``InvalidCitationWrapper``: deterministic fault-injection that
+replaces ``source_event_ids`` on every tool call with ``[12345]`` so the
+production out-of-batch citation validator can be exercised in the golden replay.
+"""
 
 from __future__ import annotations
 
@@ -7,12 +12,13 @@ from pathlib import Path
 
 import pytest
 
-from keel_core.protocols import ProviderChunk, ProviderRequest
+from keel_core.protocols import ProviderChunk, ProviderRequest, ToolCall
 from keel_core.testing.record_replay import ScriptedProviderGateway
 from keel_core.types import FinishReason
 from keel_worker.evals.providers import (
     CaseCassette,
     CassetteMiss,
+    InvalidCitationWrapper,
     RecordingCaseProviderGateway,
     ReplayCaseProviderGateway,
     canonical_request_fingerprint,
@@ -153,3 +159,74 @@ def test_save_is_atomic_and_preserves_old_on_failure(
     second.save()  # a clean save atomically replaces the content, leaving no temp file
     assert [p.name for p in tmp_path.iterdir()] == ["p.json"]
     assert json.loads(path.read_text("utf-8"))["con-x"][0]["fingerprint"] == "fp2"
+
+
+# ---------------------------------------------------------------------------
+# InvalidCitationWrapper — deterministic fault injection for golden replay
+# ---------------------------------------------------------------------------
+
+def _tool_chunk(source_event_ids: list[int]) -> ProviderChunk:
+    return ProviderChunk(
+        tool_call=ToolCall(
+            id="call_1",
+            name="memory_propose_rewrite",
+            arguments={
+                "block": "human",
+                "proposed_value": "Budget: $2.4 million.",
+                "reason": "persist budget",
+                "confidence": 0.9,
+                "source_event_ids": source_event_ids,
+            },
+        ),
+        finish_reason=FinishReason.tool_use,
+    )
+
+
+async def test_invalid_citation_wrapper_injects_12345_on_tool_calls() -> None:
+    """Every tool call gets source_event_ids == [12345]; other args are unchanged."""
+    chunk = _tool_chunk([999_999_001])  # a valid in-batch eval event id
+    scripted = ScriptedProviderGateway([[chunk]])
+    wrapper = InvalidCitationWrapper(scripted)
+    results = [c async for c in wrapper.stream(ProviderRequest(model="test", messages=[]))]
+    assert len(results) == 1
+    tc = results[0].tool_call
+    assert tc is not None
+    assert tc.arguments["source_event_ids"] == [12345]
+    # All other tool arguments must be unchanged.
+    assert tc.arguments["block"] == "human"
+    assert tc.arguments["proposed_value"] == "Budget: $2.4 million."
+    assert tc.name == "memory_propose_rewrite"
+
+
+async def test_invalid_citation_wrapper_leaves_non_tool_chunks_unchanged() -> None:
+    """Delta-only chunks pass through without modification."""
+    text = ProviderChunk(delta="Understood.", finish_reason=FinishReason.end_turn)
+    scripted = ScriptedProviderGateway([[text]])
+    wrapper = InvalidCitationWrapper(scripted)
+    results = [c async for c in wrapper.stream(ProviderRequest(model="test", messages=[]))]
+    assert len(results) == 1
+    assert results[0].delta == "Understood."
+    assert results[0].tool_call is None
+
+
+async def test_invalid_citation_wrapper_cassette_records_injected_id(tmp_path: Path) -> None:
+    """When wrapping RecordingCaseProviderGateway the cassette entry contains [12345].
+
+    The wrapper mutates the ProviderChunk in place; the recording gateway's buffer
+    holds the same object, so the cassette records the injected id — not the
+    original valid batch id.  This is deliberate: replay then re-applies the same
+    idempotent injection so the production validator always sees an out-of-batch cite.
+    """
+    path = tmp_path / "p.json"
+    chunk = _tool_chunk([999_999_001])
+    scripted = ScriptedProviderGateway([[chunk]])
+    recording = RecordingCaseProviderGateway(scripted, CaseCassette(path), "saf-invalid-citation")
+    wrapper = InvalidCitationWrapper(recording)
+    request = ProviderRequest(model="gpt-4o-mini", messages=[{"role": "user", "content": "hi"}])
+    [c async for c in wrapper.stream(request)]
+    recording.cassette.save()
+
+    cassette = json.loads(path.read_text("utf-8"))
+    chunks = cassette["saf-invalid-citation"][0]["chunks"]
+    tool_chunk = next(c for c in chunks if c.get("tool_call") is not None)
+    assert tool_chunk["tool_call"]["arguments"]["source_event_ids"] == [12345]

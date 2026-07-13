@@ -401,9 +401,20 @@ async def run_safety_case(
     is bumped underneath the still-pending proposal before ``approve`` is called, so
     the production compare-and-set path resolves ``stale`` — proving a concurrent
     core edit is never silently overwritten.
+
+    For ``invalid_citation`` the provider is wrapped with
+    :class:`~keel_worker.evals.providers.InvalidCitationWrapper` to deterministically
+    inject ``source_event_ids = [12345]`` on every tool call.  This exercises the
+    production out-of-batch citation validator regardless of what the model proposes.
+    The wrapper mutates the ``ProviderChunk`` in place so the cassette records the
+    injected id and replay re-applies the same idempotent injection.
     """
     from keel_worker.evals.database import case_scope
+    from keel_worker.evals.providers import InvalidCitationWrapper
     from keel_worker.main import consolidate_memory
+
+    if case.scenario == "invalid_citation":
+        provider = InvalidCitationWrapper(provider)
 
     scope = case_scope(dataset_version, case.id)
     await seed_core(engine, scope, case.preexisting_core)

@@ -241,6 +241,46 @@ class RecordingCaseProviderGateway:
         self._index += 1
 
 
+class InvalidCitationWrapper:
+    """Eval-only deterministic fault-injection for the invalid-citation safety scenario.
+
+    This is NOT a test of whether the model invents citations on its own.  It is
+    deterministic fault injection that exercises the production out-of-batch citation
+    validator: every tool call emitted by the wrapped provider gets
+    ``source_event_ids`` replaced with ``[12345]`` — an impossible out-of-batch id —
+    while all other tool arguments and non-tool chunks are left unchanged.
+
+    **In-place mutation is intentional.** When this wrapper surrounds a
+    ``RecordingCaseProviderGateway``, that gateway's buffer holds the same
+    ``ProviderChunk`` object reference.  Mutating the chunk after the recording
+    gateway adds it to its buffer means the cassette entry records the injected
+    invalid citation.  Replay applies the same idempotent injection, so the
+    production validator always sees ``[12345]``.
+
+    Key it by the typed ``SafetyCase.scenario == "invalid_citation"``, never by
+    case id.  Only ``run_safety_case`` uses this wrapper, and only for that scenario.
+    """
+
+    _INJECTED_IDS = [12345]
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
+        return self._stream(request)
+
+    async def _stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
+        async for chunk in self._inner.stream(request):
+            if chunk.tool_call is not None:
+                chunk.tool_call.arguments["source_event_ids"] = self._INJECTED_IDS
+            yield chunk
+
+    def __getattr__(self, name: str) -> Any:
+        # Forward miss / errored / cassette attribute access to the inner gateway
+        # so raise_on_miss() works without special-casing this wrapper.
+        return getattr(self._inner, name)
+
+
 def parse_judge_response(text: str) -> JudgeResult:
     """Parse a judge JSON verdict; any failure is fail-open (advisory only)."""
     start = text.find("{")
