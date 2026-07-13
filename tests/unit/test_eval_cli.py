@@ -8,6 +8,7 @@ from keel_worker.evals.cli import (
     build_parser,
     resolve_enforce,
     resolve_suites,
+    run_cli,
     validate_paths,
     validate_record,
 )
@@ -19,6 +20,9 @@ def test_defaults() -> None:
     assert args.suite == "all"
     assert args.record is False
     assert args.enforce is None  # unset → resolved from mode
+    assert args.dataset == Path("evals/datasets/memory/v1.jsonl")
+    assert args.provider_cassette == Path("evals/cassettes/memory/v1-provider.json")
+    assert args.embedding_cassette == Path("evals/cassettes/memory/v1-embeddings.json")
     assert args.output == Path(".keel/evals")
     assert args.model is None  # no override
     assert args.judge is False and args.judge_model is None  # judge opt-in
@@ -66,3 +70,24 @@ def test_validate_paths_live_ignores_cassettes(tmp_path: Path) -> None:
 def test_validate_paths_missing_dataset(tmp_path: Path) -> None:
     errors = validate_paths("live", tmp_path / "nope.jsonl", tmp_path / "x", tmp_path / "y")
     assert any("dataset" in e for e in errors)
+
+
+async def test_run_cli_returns_infra_exit_for_invalid_paths(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    args = build_parser().parse_args(
+        [
+            "--mode",
+            "replay",
+            "--dataset",
+            str(tmp_path / "missing.jsonl"),
+            "--provider-cassette",
+            str(tmp_path / "missing-provider.json"),
+            "--embedding-cassette",
+            str(tmp_path / "missing-embeddings.json"),
+        ]
+    )
+
+    assert await run_cli(args) == 2
+    assert "error:" in capsys.readouterr().err
