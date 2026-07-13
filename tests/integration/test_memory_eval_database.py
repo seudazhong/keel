@@ -44,12 +44,15 @@ async def test_assert_current_database_rejects_live() -> None:
     fake_conn = AsyncMock()
     fake_conn.scalar = AsyncMock(return_value="keel")
     fake_engine = MagicMock()
-    fake_engine.connect = MagicMock()
-    fake_engine.connect.__aenter__ = AsyncMock(return_value=fake_conn)
-    fake_engine.connect.__aexit__ = AsyncMock(return_value=None)
+    fake_engine.connect = MagicMock(return_value=fake_conn)
+    fake_engine.connect.return_value.__aenter__ = AsyncMock(return_value=fake_conn)
+    fake_engine.connect.return_value.__aexit__ = AsyncMock(return_value=None)
 
-    with pytest.raises(EvalDatabaseError):
+    with pytest.raises(EvalDatabaseError, match="refusing eval database 'keel'"):
         await assert_current_database(fake_engine)
+
+    # Verify scalar was awaited (passed through the function)
+    fake_conn.scalar.assert_called_once()
 
 
 async def test_assert_current_database_accepts_eval_test(
