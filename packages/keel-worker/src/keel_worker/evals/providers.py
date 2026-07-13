@@ -20,9 +20,9 @@ import tempfile
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Protocol
 
-from keel_core.protocols import ProviderChunk, ProviderRequest
+from keel_core.protocols import ProviderChunk, ProviderGateway, ProviderRequest
 from keel_worker.evals.models import JudgeResult as JudgeResult  # explicit re-export
 
 _PROPOSAL_ID = re.compile(r"\bproposal [0-9a-f]{32} (created|already proposed)\b")
@@ -83,9 +83,7 @@ def canonical_request_fingerprint(request: ProviderRequest) -> str:
         "messages": _canonical_messages(request.messages),
         "tools": request.tools,
     }
-    blob = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    )
+    blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -174,9 +172,7 @@ class CaseCassette:
         file stays intact until the atomic replace and any failure leaves it
         untouched.
         """
-        blob = (
-            json.dumps(self._data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
-        )
+        blob = json.dumps(self._data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
         _atomic_write_text(self.path, blob)
 
 
@@ -200,15 +196,11 @@ class ReplayCaseProviderGateway:
         if entry is None:
             self._fail(self._index, "cassette_miss", None, fingerprint)
         if entry.fingerprint != fingerprint:
-            self._fail(
-                self._index, "fingerprint_mismatch", entry.fingerprint, fingerprint
-            )
+            self._fail(self._index, "fingerprint_mismatch", entry.fingerprint, fingerprint)
         self._index += 1  # advance only on a matched turn (retry-safe)
         return _aiter(entry.chunks)
 
-    def _fail(
-        self, index: int, kind: str, expected: str | None, actual: str
-    ) -> NoReturn:
+    def _fail(self, index: int, kind: str, expected: str | None, actual: str) -> NoReturn:
         miss = CassetteMiss(
             self._case_id,
             index,
@@ -234,9 +226,7 @@ class RecordingCaseProviderGateway:
     def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
         return self._record_stream(request)
 
-    async def _record_stream(
-        self, request: ProviderRequest
-    ) -> AsyncIterator[ProviderChunk]:
+    async def _record_stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
         fingerprint = canonical_request_fingerprint(request)
         index = self._index
         buffer: list[ProviderChunk] = []
@@ -259,19 +249,28 @@ def parse_judge_response(text: str) -> JudgeResult:
         return JudgeResult(error=f"no json object in judge output: {text[:80]!r}")
     try:
         data = json.loads(text[start : end + 1])
+        passed = data.get("passed", True)
+        if not isinstance(passed, bool):
+            raise TypeError("judge field 'passed' must be a JSON boolean")
         return JudgeResult(
             score=float(data.get("score", 0.0)),
-            passed=bool(data.get("passed", True)),
+            passed=passed,
             rationale=str(data.get("rationale", "")),
         )
     except (ValueError, TypeError) as exc:
         return JudgeResult(error=f"judge parse error: {exc}")
 
 
+class Judge(Protocol):
+    """Advisory memory-quality judge seam."""
+
+    async def judge(self, prompt: str) -> JudgeResult: ...
+
+
 class LiteLLMMemoryJudge:
     """An optional LLM judge; a failure never fails the eval (fail-open)."""
 
-    def __init__(self, model: str, *, gateway: Any | None = None) -> None:
+    def __init__(self, model: str, *, gateway: ProviderGateway | None = None) -> None:
         self._model = model
         if gateway is None:
             from keel_core.providers import LiteLLMGateway
@@ -280,9 +279,7 @@ class LiteLLMMemoryJudge:
         self._gateway = gateway
 
     async def judge(self, prompt: str) -> JudgeResult:
-        request = ProviderRequest(
-            model=self._model, messages=[{"role": "user", "content": prompt}]
-        )
+        request = ProviderRequest(model=self._model, messages=[{"role": "user", "content": prompt}])
         try:
             text = ""
             async for chunk in self._gateway.stream(request):

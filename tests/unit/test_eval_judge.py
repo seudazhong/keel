@@ -6,8 +6,8 @@ from collections.abc import AsyncIterator
 
 from keel_core.protocols import ProviderChunk
 from keel_core.types import FinishReason
-from keel_worker.evals.providers import (  # noqa: F401
-    JudgeResult,
+from keel_worker.evals.providers import (
+    Judge,
     LiteLLMMemoryJudge,
     parse_judge_response,
 )
@@ -24,6 +24,12 @@ def test_parse_is_fail_open_on_garbage() -> None:
     result = parse_judge_response("not json at all")
     assert result.passed is True  # advisory only: never blocks
     assert result.error is not None
+
+
+def test_parse_is_fail_open_on_non_boolean_passed() -> None:
+    result = parse_judge_response('{"score": 0.2, "passed": "false", "rationale": "bad type"}')
+    assert result.passed is True
+    assert "JSON boolean" in (result.error or "")
 
 
 class _Gateway:
@@ -45,7 +51,7 @@ class _BoomGateway:
 
 
 async def test_judge_reads_stream() -> None:
-    judge = LiteLLMMemoryJudge("eval/judge", gateway=_Gateway())
+    judge: Judge = LiteLLMMemoryJudge("eval/judge", gateway=_Gateway())
     result = await judge.judge("grade this")
     assert result.score == 0.5
     assert result.passed is False
