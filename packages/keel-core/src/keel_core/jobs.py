@@ -20,7 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from keel_core.config import Settings
 from keel_core.events import Event, EventType
-from keel_core.state import InMemoryEventStore
+from keel_core.state import InMemoryEventStore, append_event_in_transaction
 
 _MAX_JSON_DEPTH = 100
 _MAX_ERROR_CODE_CHARS = 128
@@ -1325,6 +1325,237 @@ class PostgresJobStore:
                 .one()
             )
         return _to_job_record(row)
+
+    async def _finalize_in_transaction(
+        self,
+        conn: AsyncConnection,
+        *,
+        job_id: str,
+        status: JobStatus,
+        now: datetime,
+        lease_token: str | None = None,
+        result: JobResult | None = None,
+        error: JobError | None = None,
+        exhaustion: bool = False,
+        locked: Mapping[str, Any] | None = None,
+    ) -> JobRecord | None:
+        if locked is None:
+            locked = cast(
+                Mapping[str, Any] | None,
+                (
+                    await conn.execute(
+                        text("SELECT * FROM jobs WHERE id = :id AND scope_id = :scope FOR UPDATE"),
+                        {"id": job_id, "scope": self._scope_id},
+                    )
+                )
+                .mappings()
+                .one_or_none(),
+            )
+        if locked is None:
+            return None
+        current = _to_job_record(locked)
+        if exhaustion:
+            if (
+                current.status is not JobStatus.running
+                or current.lease_expires_at is None
+                or current.lease_expires_at > now
+                or current.attempt < current.max_attempts
+            ):
+                return None
+        elif lease_token is not None:
+            if (
+                current.status is not JobStatus.running
+                or current.lease_token != lease_token
+                or current.lease_expires_at is None
+                or current.lease_expires_at <= now
+            ):
+                raise JobLeaseLostError(job_id)
+            if status is JobStatus.cancelled and current.cancel_requested_at is None:
+                raise JobValidationError(
+                    "cancellation_not_requested",
+                    "job cancellation was not requested",
+                )
+        elif current.status is not JobStatus.queued:
+            raise JobLeaseLostError(job_id)
+
+        safe_result = None if result is None else self._limits.validate_result(result.data)
+        safe_error = (
+            None
+            if error is None
+            else JobError(error.kind, self._limits.error_message(error.message))
+        )
+        text_value = self._limits.result_message(
+            _terminal_message(current, status, result=result, error=safe_error)
+        )
+        injected_seq = current.injected_event_seq
+        if current.target_session_id is not None and injected_seq is None:
+            target = (
+                await conn.execute(
+                    text(
+                        "SELECT id FROM sessions WHERE id = :session "
+                        "AND scope_id = :scope FOR UPDATE"
+                    ),
+                    {
+                        "session": current.target_session_id,
+                        "scope": self._scope_id,
+                    },
+                )
+            ).one_or_none()
+            if target is None:
+                raise JobValidationError(
+                    "target_session_not_found",
+                    "target session does not exist in the current scope",
+                )
+            injected_seq = await append_event_in_transaction(
+                conn,
+                _injection_event(current, status, text_value, now),
+                require_existing_session=True,
+            )
+
+        stored_result = safe_result if status is JobStatus.succeeded else None
+        result_assignment = "result = NULL"
+        params: dict[str, Any] = {
+            "status": status.value,
+            "result_message": text_value,
+            "error_kind": None if safe_error is None else safe_error.kind,
+            "error_message": None if safe_error is None else safe_error.message,
+            "injected_seq": injected_seq,
+            "now": now,
+            "id": job_id,
+            "scope": self._scope_id,
+        }
+        if stored_result is not None:
+            result_assignment = "result = CAST(:result AS jsonb)"
+            params["result"] = json.dumps(stored_result, ensure_ascii=False)
+        update_sql = text(
+            "UPDATE jobs SET status = :status, "
+            "lease_token = NULL, lease_expires_at = NULL, heartbeat_at = NULL, "
+            f"{result_assignment}, result_message = :result_message, "
+            "error_kind = :error_kind, error_message = :error_message, "
+            "injected_event_seq = :injected_seq, updated_at = :now, "
+            "finished_at = :now "
+            "WHERE id = :id AND scope_id = :scope RETURNING *"
+        )
+        row = (await conn.execute(update_sql, params)).mappings().one()
+        return _to_job_record(row)
+
+    async def request_cancel(self, job_id: str, now: datetime) -> JobRecord | None:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            locked = cast(
+                Mapping[str, Any] | None,
+                (
+                    await conn.execute(
+                        text("SELECT * FROM jobs WHERE id = :id AND scope_id = :scope FOR UPDATE"),
+                        {"id": job_id, "scope": self._scope_id},
+                    )
+                )
+                .mappings()
+                .one_or_none(),
+            )
+            if locked is None:
+                return None
+            record = _to_job_record(locked)
+            if record.status is JobStatus.queued:
+                return await self._finalize_in_transaction(
+                    conn,
+                    job_id=job_id,
+                    status=JobStatus.cancelled,
+                    now=now,
+                    locked=locked,
+                )
+            if record.status is JobStatus.running:
+                row = (
+                    (
+                        await conn.execute(
+                            text(
+                                "UPDATE jobs SET "
+                                "cancel_requested_at = COALESCE(cancel_requested_at, :now), "
+                                "updated_at = :now "
+                                "WHERE id = :id AND scope_id = :scope RETURNING *"
+                            ),
+                            {
+                                "now": now,
+                                "id": job_id,
+                                "scope": self._scope_id,
+                            },
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+                return _to_job_record(row)
+            return record
+
+    async def succeed(self, lease: JobLease, result: JobResult, now: datetime) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
+        if lease.scope_id != self._scope_id:
+            raise JobLeaseLostError(lease.job_id)
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            row = await self._finalize_in_transaction(
+                conn,
+                job_id=lease.job_id,
+                status=JobStatus.succeeded,
+                now=now,
+                lease_token=lease.token,
+                result=result,
+            )
+        if row is None:
+            raise JobLeaseLostError(lease.job_id)
+        return row
+
+    async def fail_terminal(self, lease: JobLease, error: JobError, now: datetime) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
+        if lease.scope_id != self._scope_id:
+            raise JobLeaseLostError(lease.job_id)
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            row = await self._finalize_in_transaction(
+                conn,
+                job_id=lease.job_id,
+                status=JobStatus.failed,
+                now=now,
+                lease_token=lease.token,
+                error=error,
+            )
+        if row is None:
+            raise JobLeaseLostError(lease.job_id)
+        return row
+
+    async def finish_cancelled(self, lease: JobLease, now: datetime) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
+        if lease.scope_id != self._scope_id:
+            raise JobLeaseLostError(lease.job_id)
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            row = await self._finalize_in_transaction(
+                conn,
+                job_id=lease.job_id,
+                status=JobStatus.cancelled,
+                now=now,
+                lease_token=lease.token,
+            )
+        if row is None:
+            raise JobLeaseLostError(lease.job_id)
+        return row
+
+    async def fail_exhausted(self, job_id: str, now: datetime) -> JobRecord | None:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            return await self._finalize_in_transaction(
+                conn,
+                job_id=job_id,
+                status=JobStatus.failed,
+                now=now,
+                error=JobError(
+                    "attempts_exhausted",
+                    "job attempts were exhausted after worker lease expiry",
+                ),
+                exhaustion=True,
+            )
 
 
 def retry_delay_seconds(attempt: int, base_seconds: int, max_seconds: int) -> int:

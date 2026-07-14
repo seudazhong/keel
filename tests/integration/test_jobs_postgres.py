@@ -10,10 +10,12 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from keel_core.events import Event, EventType
 from keel_core.jobs import (
     JobError,
     JobLeaseLostError,
     JobLimits,
+    JobResult,
     JobStatus,
     JobValidationError,
     PostgresJobStore,
@@ -461,6 +463,14 @@ async def _pg_job(
     return row.id
 
 
+async def _job_events(engine: AsyncEngine, scope: str, session_id: str, job_id: str) -> list[Event]:
+    return [
+        event
+        async for event in PostgresEventStore(engine, scope).read(session_id)
+        if event.payload.get("job_id") == job_id
+    ]
+
+
 async def test_postgres_concurrent_claim_has_one_winner(
     migrated_db: AsyncEngine,
 ) -> None:
@@ -798,3 +808,458 @@ async def test_postgres_requeue_rejects_exhausted_attempt_without_mutation(
     assert row is not None
     assert row.status is JobStatus.running
     assert row.lease_token == lease.token
+
+
+async def test_postgres_queued_cancel_is_atomic_and_idempotent(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope, session_id = "scope:cancel:q", "target-cancel-q"
+    await _target(migrated_db, scope, session_id)
+    store = PostgresJobStore(migrated_db, scope)
+    job_id = await _pg_job(store, "cancel-q", target_session_id=session_id)
+
+    first = await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+    second = await store.request_cancel(job_id, _NOW + timedelta(seconds=2))
+
+    assert first is not None
+    assert first.status is JobStatus.cancelled
+    assert first.result is None
+    assert first.result_message == "后台任务 test.echo 已取消。"
+    assert first.error_kind is None
+    assert first.error_message is None
+    assert first.finished_at == _NOW + timedelta(seconds=1)
+    assert first.injected_event_seq is not None
+    assert second == first
+    assert await store.request_cancel("missing", _NOW) is None
+    events = await _job_events(migrated_db, scope, session_id, job_id)
+    assert len(events) == 1
+    assert events[0].type is EventType.message_token
+    assert events[0].seq == first.injected_event_seq
+
+
+async def test_postgres_running_cancel_is_persisted_and_success_can_win(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:cancel:r")
+    job_id = await _pg_job(store, "cancel-r")
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+
+    requested = await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+    again = await store.request_cancel(job_id, _NOW + timedelta(seconds=2))
+
+    assert requested is not None and requested.status is JobStatus.running
+    assert requested.cancel_requested_at == _NOW + timedelta(seconds=1)
+    assert again is not None
+    assert again.cancel_requested_at == requested.cancel_requested_at
+    assert again.updated_at == _NOW + timedelta(seconds=2)
+    assert await store.heartbeat(lease, _NOW + timedelta(seconds=3)) is True
+    result = await store.succeed(
+        lease,
+        JobResult(data={"ok": True}, message="completed"),
+        _NOW + timedelta(seconds=4),
+    )
+    assert result.status is JobStatus.succeeded
+    assert result.result == {"ok": True}
+    assert result.cancel_requested_at == requested.cancel_requested_at
+    assert await store.request_cancel(job_id, _NOW + timedelta(seconds=5)) == result
+
+
+async def test_postgres_reclaimed_stale_lease_cannot_complete(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:stale-complete")
+    job_id = await _pg_job(store, "stale-complete")
+    first = await store.claim(job_id, _NOW, 10)
+    assert first is not None
+    second = await store.claim(job_id, _NOW + timedelta(seconds=11), 10)
+    assert second is not None
+
+    with pytest.raises(JobLeaseLostError):
+        await store.succeed(
+            first,
+            JobResult(data={"owner": "stale"}, message="must not commit"),
+            _NOW + timedelta(seconds=12),
+        )
+
+    running = await store.get(job_id)
+    assert running is not None
+    assert running.status is JobStatus.running
+    assert running.attempt == 2
+    assert running.lease_token == second.token
+    completed = await store.succeed(
+        second,
+        JobResult(data={"owner": "current"}, message="current owner completed"),
+        _NOW + timedelta(seconds=12),
+    )
+    assert completed.status is JobStatus.succeeded
+    assert completed.result == {"owner": "current"}
+
+
+@pytest.mark.parametrize(
+    ("terminal", "expected_text"),
+    [
+        ("succeeded", "indexed 42 chunks"),
+        ("failed", "后台任务 test.echo 失败：embedding_timeout"),
+        ("cancelled", "后台任务 test.echo 已取消。"),
+    ],
+)
+async def test_postgres_terminal_transition_injects_one_assistant_event(
+    migrated_db: AsyncEngine,
+    terminal: str,
+    expected_text: str,
+) -> None:
+    scope = f"scope:terminal:{terminal}"
+    session_id = f"target-{terminal}"
+    await _target(migrated_db, scope, session_id)
+    store = PostgresJobStore(migrated_db, scope)
+    job_id = await _pg_job(
+        store,
+        f"terminal-{terminal}",
+        target_session_id=session_id,
+    )
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+    terminal_at = _NOW + timedelta(seconds=2)
+
+    if terminal == "succeeded":
+        row = await store.succeed(
+            lease,
+            JobResult(data={"chunks": 42}, message="indexed 42 chunks"),
+            terminal_at,
+        )
+    elif terminal == "failed":
+        row = await store.fail_terminal(
+            lease,
+            JobError("embedding_timeout", "safe public error"),
+            terminal_at,
+        )
+    else:
+        await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+        row = await store.finish_cancelled(lease, terminal_at)
+
+    assert row.status.value == terminal
+    assert row.result_message == expected_text
+    assert row.finished_at == terminal_at
+    assert row.lease_token is None
+    assert row.lease_expires_at is None
+    assert row.heartbeat_at is None
+    if terminal == "succeeded":
+        assert row.result == {"chunks": 42}
+    else:
+        assert row.result is None
+    if terminal == "failed":
+        assert row.error_kind == "embedding_timeout"
+        assert row.error_message == "safe public error"
+    else:
+        assert row.error_kind is None
+        assert row.error_message is None
+    assert row.injected_event_seq is not None
+    injected = await _job_events(migrated_db, scope, session_id, job_id)
+    assert len(injected) == 1
+    assert injected[0].seq == row.injected_event_seq
+    assert injected[0].payload == {
+        "role": "assistant",
+        "text": expected_text,
+        "partial": False,
+        "job_id": job_id,
+        "job_kind": "test.echo",
+        "job_status": terminal,
+    }
+    with pytest.raises(JobLeaseLostError):
+        await store.succeed(
+            lease,
+            JobResult(data={}, message="duplicate"),
+            terminal_at + timedelta(seconds=1),
+        )
+    assert await store.request_cancel(job_id, terminal_at + timedelta(seconds=2)) == row
+    assert len(await _job_events(migrated_db, scope, session_id, job_id)) == 1
+
+
+async def test_postgres_finalizer_rolls_back_event_and_job_together(
+    migrated_db: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import keel_core.jobs as jobs_module
+
+    scope, session_id = "scope:rollback", "target-rollback"
+    await _target(migrated_db, scope, session_id)
+    store = PostgresJobStore(migrated_db, scope)
+    job_id = await _pg_job(store, "rollback", target_session_id=session_id)
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+    before = await store.get(job_id)
+    assert before is not None
+    real_append = jobs_module.append_event_in_transaction
+
+    async def append_then_fail(*args: object, **kwargs: object) -> int:
+        await real_append(*args, **kwargs)  # type: ignore[arg-type]
+        raise RuntimeError("after event insert")
+
+    monkeypatch.setattr(jobs_module, "append_event_in_transaction", append_then_fail)
+    with pytest.raises(RuntimeError, match="after event insert"):
+        await store.succeed(
+            lease,
+            JobResult(data={"ok": True}, message="done"),
+            _NOW + timedelta(seconds=1),
+        )
+
+    assert await store.get(job_id) == before
+    assert await _job_events(migrated_db, scope, session_id, job_id) == []
+
+
+async def test_postgres_fail_exhausted_is_terminal_and_exactly_once(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope, session_id = "scope:exhausted", "target-exhausted"
+    await _target(migrated_db, scope, session_id)
+    store = PostgresJobStore(migrated_db, scope)
+    job_id = await _pg_job(
+        store,
+        "exhausted",
+        max_attempts=1,
+        target_session_id=session_id,
+    )
+    assert await store.claim(job_id, _NOW, 10) is not None
+    assert await store.fail_exhausted(job_id, _NOW + timedelta(seconds=9)) is None
+
+    failed = await store.fail_exhausted(job_id, _NOW + timedelta(seconds=10))
+
+    assert failed is not None
+    assert failed.status is JobStatus.failed
+    assert failed.result is None
+    assert failed.error_kind == "attempts_exhausted"
+    assert failed.error_message == "job attempts were exhausted after worker lease expiry"
+    assert failed.finished_at == _NOW + timedelta(seconds=10)
+    assert await store.fail_exhausted(job_id, _NOW + timedelta(seconds=11)) is None
+    assert len(await _job_events(migrated_db, scope, session_id, job_id)) == 1
+
+    retryable = await _pg_job(store, "not-exhausted", max_attempts=2)
+    assert await store.claim(retryable, _NOW, 10) is not None
+    assert await store.fail_exhausted(retryable, _NOW + timedelta(seconds=10)) is None
+    assert await store.fail_exhausted("missing", _NOW) is None
+
+
+@pytest.mark.parametrize("operation", ["succeed", "fail_terminal", "finish_cancelled"])
+async def test_postgres_terminal_finalizers_require_current_unexpired_lease(
+    migrated_db: AsyncEngine,
+    operation: str,
+) -> None:
+    store = PostgresJobStore(migrated_db, f"scope:expired-finalizer:{operation}")
+    job_id = await _pg_job(store, f"expired-finalizer-{operation}")
+    lease = await store.claim(job_id, _NOW, 10)
+    assert lease is not None
+    if operation == "finish_cancelled":
+        await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+    before = await store.get(job_id)
+    assert before is not None
+    expired_at = _NOW + timedelta(seconds=10)
+
+    with pytest.raises(JobLeaseLostError):
+        if operation == "succeed":
+            await store.succeed(
+                lease,
+                JobResult(data={}, message="late"),
+                expired_at,
+            )
+        elif operation == "fail_terminal":
+            await store.fail_terminal(
+                lease,
+                JobError("late_failure", "safe"),
+                expired_at,
+            )
+        else:
+            await store.finish_cancelled(lease, expired_at)
+
+    assert await store.get(job_id) == before
+
+
+async def test_postgres_finish_cancelled_requires_persisted_request(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope, session_id = "scope:cancel-required", "target-cancel-required"
+    await _target(migrated_db, scope, session_id)
+    store = PostgresJobStore(migrated_db, scope)
+    job_id = await _pg_job(
+        store,
+        "cancel-required",
+        target_session_id=session_id,
+    )
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+    before = await store.get(job_id)
+    assert before is not None
+
+    with pytest.raises(JobValidationError, match="cancellation_not_requested"):
+        await store.finish_cancelled(lease, _NOW + timedelta(seconds=1))
+
+    assert await store.get(job_id) == before
+    assert await _job_events(migrated_db, scope, session_id, job_id) == []
+
+
+async def test_postgres_terminal_finalizers_validate_and_clip_results_and_errors(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope, session_id = "scope:terminal-limits", "target-terminal-limits"
+    await _target(migrated_db, scope, session_id)
+    store = PostgresJobStore(
+        migrated_db,
+        scope,
+        limits=JobLimits(
+            result_max_bytes=12,
+            result_message_max_chars=10,
+            error_message_max_chars=4,
+        ),
+    )
+    success_id = await _pg_job(
+        store,
+        "bounded-success",
+        target_session_id=session_id,
+    )
+    success_lease = await store.claim(success_id, _NOW, 60)
+    assert success_lease is not None
+    before = await store.get(success_id)
+    assert before is not None
+
+    with pytest.raises(JobValidationError, match="result_too_large"):
+        await store.succeed(
+            success_lease,
+            JobResult(data={"long": "value"}, message="must not persist"),
+            _NOW + timedelta(seconds=1),
+        )
+    assert await store.get(success_id) == before
+    assert await _job_events(migrated_db, scope, session_id, success_id) == []
+
+    result_data = {"a": 1}
+    succeeded = await store.succeed(
+        success_lease,
+        JobResult(data=result_data, message=" completed successfully "),
+        _NOW + timedelta(seconds=2),
+    )
+    result_data["a"] = 2
+    assert succeeded.result == {"a": 1}
+    assert succeeded.result_message == "completed "
+    assert (await store.get(success_id)).result == {"a": 1}  # type: ignore[union-attr]
+    success_events = await _job_events(migrated_db, scope, session_id, success_id)
+    assert [event.payload["text"] for event in success_events] == ["completed "]
+
+    failed_id = await _pg_job(
+        store,
+        "bounded-failure",
+        target_session_id=session_id,
+    )
+    failed_lease = await store.claim(failed_id, _NOW, 60)
+    assert failed_lease is not None
+    failed = await store.fail_terminal(
+        failed_lease,
+        JobError("provider_timeout", " safe public message "),
+        _NOW + timedelta(seconds=3),
+    )
+    expected_failure = "后台任务 test.echo 失败：provider_timeout"[:10]
+    assert failed.result is None
+    assert failed.result_message == expected_failure
+    assert failed.error_kind == "provider_timeout"
+    assert failed.error_message == "safe"
+    failure_events = await _job_events(migrated_db, scope, session_id, failed_id)
+    assert [event.payload["text"] for event in failure_events] == [expected_failure]
+
+
+async def test_postgres_finalizer_revalidates_target_scope_before_injection(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = "scope:target-revalidate"
+    original_session = "target-original"
+    foreign_scope, foreign_session = "scope:target-foreign", "target-foreign"
+    await _target(migrated_db, scope, original_session)
+    await _target(migrated_db, foreign_scope, foreign_session)
+    store = PostgresJobStore(migrated_db, scope)
+    job_id = await _pg_job(
+        store,
+        "target-revalidate",
+        target_session_id=original_session,
+    )
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+    async with migrated_db.begin() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.scope_id', :scope, true)"),
+            {"scope": scope},
+        )
+        await conn.execute(
+            text(
+                "UPDATE jobs SET target_session_id = :target WHERE id = :id AND scope_id = :scope"
+            ),
+            {"target": foreign_session, "id": job_id, "scope": scope},
+        )
+    before = await store.get(job_id)
+    assert before is not None
+
+    with pytest.raises(JobValidationError, match="target_session_not_found"):
+        await store.succeed(
+            lease,
+            JobResult(data={}, message="must not inject"),
+            _NOW + timedelta(seconds=1),
+        )
+
+    assert await store.get(job_id) == before
+    assert await _job_events(migrated_db, scope, original_session, job_id) == []
+    assert await _job_events(migrated_db, foreign_scope, foreign_session, job_id) == []
+
+
+async def test_postgres_finalizer_honors_existing_injected_event_seq(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope, session_id = "scope:injection-guard", "target-injection-guard"
+    await _target(migrated_db, scope, session_id)
+    store = PostgresJobStore(migrated_db, scope)
+    job_id = await _pg_job(
+        store,
+        "injection-guard",
+        target_session_id=session_id,
+    )
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+    async with migrated_db.begin() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.scope_id', :scope, true)"),
+            {"scope": scope},
+        )
+        await conn.execute(
+            text("UPDATE jobs SET injected_event_seq = 1 WHERE id = :id AND scope_id = :scope"),
+            {"id": job_id, "scope": scope},
+        )
+
+    succeeded = await store.succeed(
+        lease,
+        JobResult(data={"ok": True}, message="already injected"),
+        _NOW + timedelta(seconds=1),
+    )
+
+    assert succeeded.status is JobStatus.succeeded
+    assert succeeded.injected_event_seq == 1
+    assert await _job_events(migrated_db, scope, session_id, job_id) == []
+
+
+async def test_postgres_terminal_methods_reject_naive_timestamps(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:terminal-naive")
+    queued_id = await _pg_job(store, "naive-queued")
+    running_id = await _pg_job(store, "naive-running")
+    lease = await store.claim(running_id, _NOW, 60)
+    assert lease is not None
+    naive = datetime(2026, 7, 14, 9, 0)
+
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.request_cancel(queued_id, naive)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.succeed(lease, JobResult(data={}, message="done"), naive)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.fail_terminal(lease, JobError("bad_input", "safe"), naive)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.finish_cancelled(lease, naive)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.fail_exhausted(running_id, naive)
+
+    assert (await store.get(queued_id)).status is JobStatus.queued  # type: ignore[union-attr]
+    assert (await store.get(running_id)).status is JobStatus.running  # type: ignore[union-attr]
