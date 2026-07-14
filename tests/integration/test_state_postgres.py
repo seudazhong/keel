@@ -89,6 +89,8 @@ async def test_append_event_allocates_sequences_in_outer_transaction(
         await conn.execute(text("SELECT set_config('app.scope_id', 'A', true)"))
         assert await append_event_in_transaction(conn, first) == 1
         assert await append_event_in_transaction(conn, second) == 2
+        assert first.seq == 0
+        assert second.seq == 0
         sequences = (
             await conn.execute(
                 text(
@@ -117,6 +119,7 @@ async def test_append_event_in_outer_transaction_rolls_back(
             assert await append_event_in_transaction(conn, event) == 1
             raise RuntimeError("force rollback")
 
+    assert event.seq == 0
     store = PostgresEventStore(migrated_db, "A")
     assert [row async for row in store.read(session_id)] == []
     replacement = _msg(session_id, "A", "replacement")
@@ -150,7 +153,7 @@ async def test_existing_session_guard_is_scope_safe(migrated_db: AsyncEngine) ->
     scope_a = PostgresEventStore(migrated_db, "A")
     await scope_a.append(_msg(session_id, "A", "seed"))
 
-    with pytest.raises(LookupError, match="session"):
+    with pytest.raises(CrossScopeError):
         async with migrated_db.begin() as conn:
             await conn.execute(text("SELECT set_config('app.scope_id', 'B', true)"))
             await append_event_in_transaction(
@@ -158,6 +161,28 @@ async def test_existing_session_guard_is_scope_safe(migrated_db: AsyncEngine) ->
                 _msg(session_id, "B", "cross-scope"),
                 require_existing_session=True,
             )
+
+    next_event = _msg(session_id, "A", "next")
+    await scope_a.append(next_event)
+    assert next_event.seq == 2
+    assert [e async for e in PostgresEventStore(migrated_db, "B").read(session_id)] == []
+
+
+async def test_transactional_append_rejects_guc_mismatch_and_global_id_conflict(
+    migrated_db: AsyncEngine,
+) -> None:
+    with pytest.raises(CrossScopeError):
+        async with migrated_db.begin() as conn:
+            await conn.execute(text("SELECT set_config('app.scope_id', 'A', true)"))
+            await append_event_in_transaction(conn, _msg("mismatch", "B", "no"))
+
+    session_id = f"s-{uuid.uuid4().hex}"
+    scope_a = PostgresEventStore(migrated_db, "A")
+    await scope_a.append(_msg(session_id, "A", "seed"))
+    with pytest.raises(CrossScopeError):
+        async with migrated_db.begin() as conn:
+            await conn.execute(text("SELECT set_config('app.scope_id', 'B', true)"))
+            await append_event_in_transaction(conn, _msg(session_id, "B", "no"))
 
     next_event = _msg(session_id, "A", "next")
     await scope_a.append(next_event)

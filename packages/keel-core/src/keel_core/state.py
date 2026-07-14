@@ -58,6 +58,11 @@ async def append_event_in_transaction(
     require_existing_session: bool = False,
 ) -> int:
     """Allocate a session sequence and append an event inside the caller's transaction."""
+    active_scope = await conn.scalar(text("SELECT current_setting('app.scope_id', true)"))
+    if str(active_scope or "") != event.scope_id:
+        raise CrossScopeError(str(active_scope or "<unset>"), event.scope_id)
+
+    payload = json.dumps(event.payload, default=str)
     params = {"sid": event.session_id, "scope": event.scope_id}
     if require_existing_session:
         row = (
@@ -71,9 +76,13 @@ async def append_event_in_transaction(
             )
         ).one_or_none()
         if row is None:
-            raise LookupError(
-                f"session {event.session_id!r} does not exist in scope {event.scope_id!r}"
+            existing_scope = await conn.scalar(
+                text("SELECT scope_id FROM sessions WHERE id = :sid"),
+                {"sid": event.session_id},
             )
+            if existing_scope is not None and str(existing_scope) != event.scope_id:
+                raise CrossScopeError(event.scope_id, str(existing_scope))
+            raise LookupError(f"session {event.session_id!r} does not exist in this scope")
     else:
         row = (
             await conn.execute(
@@ -82,13 +91,19 @@ async def append_event_in_transaction(
                     "VALUES (:sid, :scope, 2) "
                     "ON CONFLICT (id) DO UPDATE "
                     "SET next_seq = sessions.next_seq + 1, updated_at = now() "
+                    "WHERE sessions.scope_id = EXCLUDED.scope_id "
                     "RETURNING next_seq - 1 AS seq"
                 ),
                 params,
             )
-        ).one()
+        ).one_or_none()
+        if row is None:
+            existing_scope = await conn.scalar(
+                text("SELECT scope_id FROM sessions WHERE id = :sid"),
+                {"sid": event.session_id},
+            )
+            raise CrossScopeError(event.scope_id, str(existing_scope or "<foreign-session>"))
     seq = int(row.seq)
-    event.seq = seq
     await conn.execute(
         text(
             "INSERT INTO events "
@@ -103,7 +118,7 @@ async def append_event_in_transaction(
             "version": event.version,
             "run_id": event.run_id,
             "ts": event.ts,
-            "payload": json.dumps(event.payload, default=str),
+            "payload": payload,
         },
     )
     return seq
@@ -128,7 +143,8 @@ class PostgresEventStore:
             raise CrossScopeError(self._scope_id, event.scope_id)
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            await append_event_in_transaction(conn, event)
+            seq = await append_event_in_transaction(conn, event)
+        event.seq = seq
 
     def read(self, session_id: SessionId, after: int | None = None) -> AsyncIterator[Event]:
         return self._read(session_id, after)
