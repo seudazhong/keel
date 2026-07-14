@@ -35,6 +35,7 @@ ADR-0010. **Every task implicitly includes them.**
 - **Command convention (Windows):** run `.\.venv\Scripts\python.exe` directly. Unit tests need no services. Integration commands set:
   ```powershell
   $env:KEEL_TEST_DATABASE_URL = "postgresql+psycopg://keel:keel@localhost:5432/keel_test"
+  $env:KEEL_EVAL_DATABASE_URL = $env:KEEL_TEST_DATABASE_URL
   $env:KEEL_TEST_REDIS_URL = "redis://localhost:6379/15"
   ```
 - **Quality gates after every code task:** run the task’s targeted tests, then
@@ -6105,6 +6106,7 @@ If this acceptance file is applied before Tasks 1–15, run:
 
 ```powershell
 $env:KEEL_TEST_DATABASE_URL = "postgresql+psycopg://keel:keel@localhost:5432/keel_test"
+$env:KEEL_EVAL_DATABASE_URL = $env:KEEL_TEST_DATABASE_URL
 $env:KEEL_TEST_REDIS_URL = "redis://localhost:6379/15"
 .\.venv\Scripts\python.exe -m pytest tests\integration\test_jobs_worker.py -v
 ```
