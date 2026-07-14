@@ -361,6 +361,175 @@ def test_multiple_pre_run_job_results_keep_fifo_order() -> None:
     ]
 
 
+def test_replacement_run_reconciles_suspended_tool_owner() -> None:
+    events = [
+        _event(1, EventType.run_started, {}),
+        _event(2, EventType.tool_call, {"tool": "read", "call_id": "c1", "args": {}}),
+        _event(3, EventType.run_suspended, {"reason": "approval"}),
+        Event(
+            type=EventType.message_token,
+            seq=4,
+            session_id="s1",
+            scope_id="u:1",
+            run_id=None,
+            ts=datetime.now(UTC),
+            payload={"role": "assistant", "text": "background result", "job_id": "job_1"},
+        ),
+        Event(
+            type=EventType.message_token,
+            seq=5,
+            session_id="s1",
+            scope_id="u:1",
+            run_id=None,
+            ts=datetime.now(UTC),
+            payload={"role": "user", "text": "replacement"},
+        ),
+        Event(
+            type=EventType.run_started,
+            seq=6,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={},
+        ),
+        Event(
+            type=EventType.message_token,
+            seq=7,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={"role": "assistant", "text": "replacement complete"},
+        ),
+        Event(
+            type=EventType.run_ended,
+            seq=8,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={"reason": "completed"},
+        ),
+    ]
+
+    messages = project_messages(events)
+    assert messages == [
+        {"role": "assistant", "content": "background result"},
+        {"role": "user", "content": "replacement"},
+        {"role": "assistant", "content": "replacement complete"},
+    ]
+    assert all("tool_calls" not in message for message in messages)
+
+
+def test_late_events_from_superseded_run_are_ignored() -> None:
+    events = [
+        _event(1, EventType.run_started, {}),
+        _event(2, EventType.tool_call, {"tool": "read", "call_id": "c1", "args": {}}),
+        _event(
+            3,
+            EventType.message_token,
+            {"role": "assistant", "text": "background result", "job_id": "job_1"},
+        ),
+        Event(
+            type=EventType.run_started,
+            seq=4,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={},
+        ),
+        _event(5, EventType.tool_result, {"call_id": "c1", "ok": True, "output": "late"}),
+        Event(
+            type=EventType.message_token,
+            seq=6,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={"role": "assistant", "text": "second run complete"},
+        ),
+        Event(
+            type=EventType.run_ended,
+            seq=7,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={"reason": "completed"},
+        ),
+    ]
+
+    assert project_messages(events) == [
+        {
+            "role": "assistant",
+            "content": "second run complete\n\nbackground result",
+        }
+    ]
+
+
+def test_job_after_later_user_waits_for_that_users_run() -> None:
+    events = [
+        _event(1, EventType.message_token, {"role": "user", "text": "first"}),
+        _event(2, EventType.run_started, {}),
+        _event(3, EventType.message_token, {"role": "assistant", "text": "first reply"}),
+        Event(
+            type=EventType.message_token,
+            seq=4,
+            session_id="s1",
+            scope_id="u:1",
+            run_id=None,
+            ts=datetime.now(UTC),
+            payload={"role": "user", "text": "second"},
+        ),
+        Event(
+            type=EventType.message_token,
+            seq=5,
+            session_id="s1",
+            scope_id="u:1",
+            run_id=None,
+            ts=datetime.now(UTC),
+            payload={"role": "assistant", "text": "background result", "job_id": "job_1"},
+        ),
+        _event(6, EventType.run_ended, {"reason": "completed"}),
+        Event(
+            type=EventType.run_started,
+            seq=7,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={},
+        ),
+        Event(
+            type=EventType.message_token,
+            seq=8,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={"role": "assistant", "text": "second reply"},
+        ),
+        Event(
+            type=EventType.run_ended,
+            seq=9,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={"reason": "completed"},
+        ),
+    ]
+
+    assert project_messages(events) == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "second reply\n\nbackground result"},
+    ]
+
+
 @pytest.mark.parametrize(
     "model",
     ["openai/gpt-4o-mini", "anthropic/claude-3-5-sonnet-20241022"],
