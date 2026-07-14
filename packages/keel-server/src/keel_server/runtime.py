@@ -139,14 +139,23 @@ class CompositeEventStore:
         self._durable = durable
         self._fanout = fanout
         self._poll_interval = poll_interval
+        self._durable_cursors: dict[str, int] = {}
 
     async def append(self, event: Event) -> None:
         # Streaming-only partial deltas relay to Redis but never touch the durable
         # log (the whole message.token is emitted at turn end).
         if event.type is EventType.message_token and event.payload.get("partial"):
-            await self._fanout.append(event)
+            watermark = self._durable_cursors.get(event.session_id)
+            if watermark is None:
+                existing = await self._durable_events(event.session_id, 0)
+                watermark = max((item.seq for item in existing), default=0)
+                self._durable_cursors[event.session_id] = watermark
+            payload = dict(event.payload)
+            payload["_durable_after_seq"] = watermark
+            await self._fanout.append(event.model_copy(update={"payload": payload}))
             return
         await self._durable.append(event)  # assigns seq
+        self._durable_cursors[event.session_id] = event.seq
         await self._fanout.append(event)  # same event, now carrying seq
 
     def read(self, session_id: SessionId, after: int | None = None) -> AsyncIterator[Event]:
@@ -211,10 +220,16 @@ class CompositeEventStore:
                     poll_task = None
 
                 if fanout_event is not None and fanout_event.seq == 0:
-                    for event in await self._durable_events(session_id, cursor):
+                    watermark_raw = fanout_event.payload.get("_durable_after_seq", cursor)
+                    watermark = (
+                        int(watermark_raw) if isinstance(watermark_raw, int | str) else cursor
+                    )
+                    for event in await self._durable_events(session_id, cursor, through=watermark):
                         cursor = event.seq
                         yield event
-                    yield fanout_event
+                    payload = dict(fanout_event.payload)
+                    payload.pop("_durable_after_seq", None)
+                    yield fanout_event.model_copy(update={"payload": payload})
 
                 completed_seq = (
                     fanout_event.seq
