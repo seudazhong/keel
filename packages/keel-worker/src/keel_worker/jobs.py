@@ -285,7 +285,11 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
         nonlocal final_status
         final_status = status
 
-    with tracer.start_as_current_span("job.execute") as span:
+    with tracer.start_as_current_span(
+        "job.execute",
+        record_exception=False,
+        set_status_on_exception=False,
+    ) as span:
         span.set_attribute("job.id", lease.job_id)
         span.set_attribute("job.kind", lease.kind)
         span.set_attribute("job.scope_id", lease.scope_id)

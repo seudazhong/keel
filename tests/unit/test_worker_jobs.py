@@ -663,7 +663,11 @@ async def test_cancelled_deferred_enqueue_reports_queued_telemetry(
             return None
 
     class Tracer:
-        def start_as_current_span(self, name: str) -> SpanScope:
+        def start_as_current_span(self, name: str, **options: object) -> SpanScope:
+            assert options == {
+                "record_exception": False,
+                "set_status_on_exception": False,
+            }
             return SpanScope()
 
     monkeypatch.setattr("keel_worker.jobs.get_tracer", lambda name: Tracer())
@@ -801,6 +805,7 @@ async def test_run_job_traces_only_safe_execution_attributes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     attributes: dict[str, object] = {}
+    span_options: dict[str, object] = {}
 
     class Span:
         def set_attribute(self, name: str, value: object) -> None:
@@ -819,8 +824,9 @@ async def test_run_job_traces_only_safe_execution_attributes(
             return None
 
     class Tracer:
-        def start_as_current_span(self, name: str) -> SpanScope:
+        def start_as_current_span(self, name: str, **options: object) -> SpanScope:
             assert name == "job.execute"
+            span_options.update(options)
             return SpanScope()
 
     monkeypatch.setattr("keel_worker.jobs.get_tracer", lambda name: Tracer())
@@ -845,6 +851,10 @@ async def test_run_job_traces_only_safe_execution_attributes(
         "job.scope_id": "web:local",
         "job.attempt": 1,
         "job.status": JobStatus.succeeded.value,
+    }
+    assert span_options == {
+        "record_exception": False,
+        "set_status_on_exception": False,
     }
     assert "DO-NOT-TRACE" not in repr(attributes)
     assert "done" not in repr(attributes)
