@@ -1137,11 +1137,20 @@ Copilot-Session: e6e934ad-91c1-41c3-a46e-521cd446cb49"
 **Files:**
 - Modify: `packages/keel-core/src/keel_core/state.py`
 - Modify: `tests/integration/test_state_postgres.py`
+- Create: `tests/unit/test_state.py`
 
 **Interfaces:**
 - Produces `append_event_in_transaction(conn, event, *, require_existing_session=False) -> int`.
-- `PostgresEventStore.append()` remains scope-checked and transaction-owning, but delegates sequence allocation + insert to the helper.
-- `require_existing_session=True` updates only an existing `(id, scope_id)` session and raises `LookupError` without creating one.
+- `PostgresEventStore.append()` remains scope-checked and transaction-owning, delegates
+  sequence allocation + insert to the helper, and mutates `event.seq` only after commit.
+- The helper verifies `current_setting('app.scope_id') == event.scope_id`, even when the
+  deployed DB owner bypasses RLS.
+- Global session-ID conflicts across scopes raise `CrossScopeError` and never increment
+  the foreign session.
+- `require_existing_session=True` updates only an existing `(id, scope_id)` session;
+  missing same-scope sessions raise `LookupError`, known foreign-scope IDs raise
+  `CrossScopeError`.
+- The helper returns the allocated seq but never mutates the caller's `Event`.
 - Produces `InMemoryEventStore.has_session(session_id, scope_id) -> bool`.
 - Consumed by both in-memory target validation and Postgres terminal finalization.
 
@@ -1166,6 +1175,7 @@ async def test_append_event_in_outer_transaction_rolls_back(
             assert await append_event_in_transaction(conn, event) == 1
             raise RuntimeError("force rollback")
 
+    assert event.seq == 0
     assert [row async for row in PostgresEventStore(migrated_db, "A").read(session_id)] == []
 
 
@@ -1195,6 +1205,23 @@ async def test_append_event_can_require_an_existing_same_scope_session(
         1,
         2,
     ]
+
+
+async def test_transactional_append_rejects_guc_mismatch_and_global_id_conflict(
+    migrated_db: AsyncEngine,
+) -> None:
+    with pytest.raises(CrossScopeError):
+        async with migrated_db.begin() as conn:
+            await conn.execute(text("SELECT set_config('app.scope_id', 'A', true)"))
+            await append_event_in_transaction(conn, _msg("mismatch", "B", "no"))
+
+    session_id = f"s-{uuid.uuid4().hex}"
+    scope_a = PostgresEventStore(migrated_db, "A")
+    await scope_a.append(_msg(session_id, "A", "seed"))
+    with pytest.raises(CrossScopeError):
+        async with migrated_db.begin() as conn:
+            await conn.execute(text("SELECT set_config('app.scope_id', 'B', true)"))
+            await append_event_in_transaction(conn, _msg(session_id, "B", "no"))
 ```
 
 - [ ] **Step 2: Run RED**
@@ -1229,6 +1256,11 @@ async def append_event_in_transaction(
     require_existing_session: bool = False,
 ) -> int:
     """Allocate a session sequence and append an event inside the caller's transaction."""
+    active_scope = await conn.scalar(text("SELECT current_setting('app.scope_id', true)"))
+    if str(active_scope or "") != event.scope_id:
+        raise CrossScopeError(str(active_scope or "<unset>"), event.scope_id)
+
+    payload = json.dumps(event.payload, default=str)
     params = {"sid": event.session_id, "scope": event.scope_id}
     if require_existing_session:
         row = (
@@ -1242,9 +1274,13 @@ async def append_event_in_transaction(
             )
         ).one_or_none()
         if row is None:
-            raise LookupError(
-                f"session {event.session_id!r} does not exist in scope {event.scope_id!r}"
+            existing_scope = await conn.scalar(
+                text("SELECT scope_id FROM sessions WHERE id = :sid"),
+                {"sid": event.session_id},
             )
+            if existing_scope is not None and str(existing_scope) != event.scope_id:
+                raise CrossScopeError(event.scope_id, str(existing_scope))
+            raise LookupError(f"session {event.session_id!r} does not exist in this scope")
     else:
         row = (
             await conn.execute(
@@ -1253,13 +1289,21 @@ async def append_event_in_transaction(
                     "VALUES (:sid, :scope, 2) "
                     "ON CONFLICT (id) DO UPDATE "
                     "SET next_seq = sessions.next_seq + 1, updated_at = now() "
+                    "WHERE sessions.scope_id = EXCLUDED.scope_id "
                     "RETURNING next_seq - 1 AS seq"
                 ),
                 params,
             )
-        ).one()
+        ).one_or_none()
+        if row is None:
+            existing_scope = await conn.scalar(
+                text("SELECT scope_id FROM sessions WHERE id = :sid"),
+                {"sid": event.session_id},
+            )
+            raise CrossScopeError(
+                event.scope_id, str(existing_scope or "<foreign-session>")
+            )
     seq = int(row.seq)
-    event.seq = seq
     await conn.execute(
         text(
             "INSERT INTO events "
@@ -1274,7 +1318,7 @@ async def append_event_in_transaction(
             "version": event.version,
             "run_id": event.run_id,
             "ts": event.ts,
-            "payload": json.dumps(event.payload, default=str),
+            "payload": payload,
         },
     )
     return seq
@@ -1285,10 +1329,13 @@ Refactor `PostgresEventStore.append()` to retain the existing cross-scope check 
 ```python
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            await append_event_in_transaction(conn, event)
+            seq = await append_event_in_transaction(conn, event)
+        event.seq = seq
 ```
 
 Do not set the scope GUC inside the helper; the transaction owner must do that explicitly.
+The helper only verifies it. Serialize before sequence allocation so payload failures cannot
+advance `sessions.next_seq`.
 
 - [ ] **Step 4: Run GREEN and regression tests**
 
@@ -1313,7 +1360,7 @@ Expected: exit `0`.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add packages/keel-core/src/keel_core/state.py tests/integration/test_state_postgres.py
+git add packages/keel-core/src/keel_core/state.py tests/integration/test_state_postgres.py tests/unit/test_state.py
 git commit -m "refactor(jobs): expose transactional event append" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 Copilot-Session: e6e934ad-91c1-41c3-a46e-521cd446cb49"
 ```
