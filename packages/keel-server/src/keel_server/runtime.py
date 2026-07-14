@@ -211,6 +211,9 @@ class CompositeEventStore:
                     poll_task = None
 
                 if fanout_event is not None and fanout_event.seq == 0:
+                    for event in await self._durable_events(session_id, cursor):
+                        cursor = event.seq
+                        yield event
                     yield fanout_event
 
                 completed_seq = (

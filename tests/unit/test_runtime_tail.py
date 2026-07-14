@@ -114,6 +114,28 @@ async def test_tail_emits_live_partial_with_zero_sequence() -> None:
     await _close(stream, fanout)
 
 
+async def test_tail_drains_earlier_durable_event_before_live_partial() -> None:
+    durable = InMemoryEventStore()
+    fanout = _QueueFanout()
+    store = CompositeEventStore(durable, fanout, poll_interval=60.0)  # type: ignore[arg-type]
+    stream = store.tail("s1", 0)
+    first = asyncio.create_task(anext(stream))
+    await fanout.started.wait()
+
+    await durable.append(_event("durable first"))
+    await fanout.append(_event("live partial", partial=True))
+
+    events = [
+        await asyncio.wait_for(first, timeout=0.5),
+        await asyncio.wait_for(anext(stream), timeout=0.5),
+    ]
+    assert [(event.seq, event.payload["text"]) for event in events] == [
+        (1, "durable first"),
+        (0, "live partial"),
+    ]
+    await _close(stream, fanout)
+
+
 async def test_tail_polls_durable_before_completed_redis_event() -> None:
     durable = InMemoryEventStore()
     fanout = _QueueFanout()
