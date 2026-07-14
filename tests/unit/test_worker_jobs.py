@@ -2,23 +2,39 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import UTC, datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
+from keel_core.config import Settings
 from keel_core.jobs import (
     InMemoryJobStore,
     JobCancellationRequested,
     JobLeaseLostError,
     JobResult,
+    JobStatus,
+    JobValidationError,
+    PermanentJobError,
+    RetryableJobError,
 )
-from keel_worker.jobs import JobContext, JobDefinition, JobRegistry
+from keel_worker.jobs import JobContext, JobDefinition, JobRegistry, run_job
 
 _NOW = datetime(2026, 7, 14, 9, 0, tzinfo=UTC)
 
 
 async def _handler(context: JobContext, payload: dict[str, object]) -> JobResult:
     return JobResult(data={"attempt": context.attempt, **payload}, message="done")
+
+
+class _Clock:
+    def __init__(self, value: datetime) -> None:
+        self.value = value
+
+    def __call__(self) -> datetime:
+        return self.value
 
 
 async def _claimed_context(
@@ -38,6 +54,44 @@ async def _claimed_context(
     lease = await store.claim(job.id, _NOW, 60)
     assert lease is not None
     return store, JobContext(store, lease, clock=lambda: clock)
+
+
+async def _enqueued_job(
+    store: InMemoryJobStore,
+    *,
+    key: str,
+    kind: str = "test.echo",
+    payload: dict[str, Any] | None = None,
+    max_attempts: int = 3,
+) -> str:
+    job, _ = await store.enqueue_once(
+        kind=kind,
+        payload=payload or {},
+        target_session_id=None,
+        idempotency_key=key,
+        max_attempts=max_attempts,
+        now=_NOW,
+    )
+    return job.id
+
+
+def _ctx(
+    store: InMemoryJobStore,
+    registry: JobRegistry,
+    clock: _Clock,
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]],
+) -> dict[str, Any]:
+    async def enqueue(name: str, *args: object, **options: object) -> None:
+        enqueued.append((name, args, options))
+
+    return {
+        "jobs": store,
+        "job_registry": registry,
+        "durable_scope": "web:local",
+        "enqueue": enqueue,
+        "job_clock": clock,
+        "job_settings": Settings(),
+    }
 
 
 def test_registry_is_empty_by_default_and_uses_injected_handler() -> None:
@@ -137,3 +191,451 @@ async def test_job_context_checkpoint_and_progress_raise_cooperative_cancel() ->
         await context.checkpoint()
     with pytest.raises(JobCancellationRequested):
         await context.progress(1)
+
+
+async def test_run_job_executes_registered_handler_and_succeeds() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    calls: list[tuple[int, dict[str, Any]]] = []
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        calls.append((context.attempt, payload))
+        await context.progress(1, total=1, message="done")
+        return JobResult(data={"echo": payload["value"]}, message="completed")
+
+    registry.register(JobDefinition("test.echo", handler, max_attempts=3, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="success", payload={"value": "secret-value"})
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    result = await run_job(_ctx(store, registry, _Clock(_NOW), enqueued), "web:local", job_id)
+
+    assert result == JobStatus.succeeded.value
+    assert calls == [(1, {"value": "secret-value"})]
+    row = await store.get(job_id)
+    assert row is not None and row.result == {"echo": "secret-value"}
+    assert enqueued == []
+
+
+async def test_run_job_rejects_argument_scope_before_store_access() -> None:
+    class StoreMustNotBeRead:
+        @property
+        def scope_id(self) -> str:
+            raise AssertionError("store must not be accessed")
+
+    result = await run_job(
+        {
+            "durable_scope": "web:local",
+            "jobs": StoreMustNotBeRead(),
+        },
+        "scope:other",
+        "job_scope",
+    )
+
+    assert result == "scope_mismatch"
+
+
+async def test_run_job_rejects_store_bound_to_another_scope() -> None:
+    store = InMemoryJobStore("scope:store")
+    job_id = await _enqueued_job(store, key="store-scope")
+
+    result = await run_job(
+        _ctx(store, JobRegistry(), _Clock(_NOW), []),
+        "web:local",
+        job_id,
+    )
+
+    assert result == "scope_mismatch"
+    assert (await store.get(job_id)).status is JobStatus.queued  # type: ignore[union-attr]
+
+
+async def test_run_job_returns_missing_without_claiming() -> None:
+    store = InMemoryJobStore("web:local")
+
+    result = await run_job(
+        _ctx(store, JobRegistry(), _Clock(_NOW), []),
+        "web:local",
+        "job_missing",
+    )
+
+    assert result == "missing"
+
+
+async def test_run_job_returns_terminal_status_without_reclaiming() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    called = False
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        nonlocal called
+        called = True
+        return JobResult(data={}, message="should not run")
+
+    registry.register(JobDefinition("test.echo", handler, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="terminal")
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+    await store.succeed(lease, JobResult(data={}, message="already done"), _NOW)
+
+    result = await run_job(
+        _ctx(store, registry, _Clock(_NOW), []),
+        "web:local",
+        job_id,
+    )
+
+    assert result == JobStatus.succeeded.value
+    assert called is False
+    assert (await store.get(job_id)).attempt == 1  # type: ignore[union-attr]
+
+
+async def test_run_job_treats_claim_as_atomic_authority() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    called = False
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        nonlocal called
+        called = True
+        return JobResult(data={}, message="should not run")
+
+    registry.register(JobDefinition("test.echo", handler, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="busy")
+    assert await store.claim(job_id, _NOW, 60) is not None
+
+    result = await run_job(
+        _ctx(store, registry, _Clock(_NOW), []),
+        "web:local",
+        job_id,
+    )
+
+    assert result == JobStatus.running.value
+    assert called is False
+    assert (await store.get(job_id)).attempt == 1  # type: ignore[union-attr]
+
+
+async def test_run_job_unknown_kind_is_permanent_and_never_imported() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _enqueued_job(store, key="unknown", kind="python.module:function")
+
+    result = await run_job(
+        _ctx(store, JobRegistry(), _Clock(_NOW), []),
+        "web:local",
+        job_id,
+    )
+
+    row = await store.get(job_id)
+    assert result == JobStatus.failed.value
+    assert row is not None and row.error_kind == "unknown_job_kind"
+    assert row.attempt == 1
+
+
+async def test_run_job_permanent_error_executes_once() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    calls = 0
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        nonlocal calls
+        calls += 1
+        raise PermanentJobError("invalid_document", "Document is invalid.")
+
+    registry.register(JobDefinition("test.echo", handler, max_attempts=3, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="permanent")
+
+    result = await run_job(
+        _ctx(store, registry, _Clock(_NOW), []),
+        "web:local",
+        job_id,
+    )
+
+    assert result == JobStatus.failed.value
+    assert calls == 1
+    assert (await store.get(job_id)).error_kind == "invalid_document"  # type: ignore[union-attr]
+
+
+async def test_run_job_validation_error_is_terminal() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise JobValidationError("invalid_payload", "Payload is invalid.")
+
+    registry.register(JobDefinition("test.echo", handler, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="validation")
+
+    result = await run_job(
+        _ctx(store, registry, _Clock(_NOW), []),
+        "web:local",
+        job_id,
+    )
+
+    row = await store.get(job_id)
+    assert result == JobStatus.failed.value
+    assert row is not None and row.error_kind == "invalid_payload"
+
+
+async def test_run_job_rejects_non_job_result_as_permanent() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> Any:
+        return {"not": "a JobResult"}
+
+    registry.register(JobDefinition("test.echo", handler, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="invalid-result")
+
+    result = await run_job(
+        _ctx(store, registry, _Clock(_NOW), []),
+        "web:local",
+        job_id,
+    )
+
+    row = await store.get(job_id)
+    assert result == JobStatus.failed.value
+    assert row is not None and row.error_kind == "invalid_job_result"
+
+
+async def test_run_job_retryable_error_requeues_and_defers_delivery() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise RetryableJobError("provider_timeout", "Provider timed out.")
+
+    registry.register(JobDefinition("test.echo", handler, max_attempts=3, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="retry")
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    clock = _Clock(_NOW)
+
+    result = await run_job(_ctx(store, registry, clock, enqueued), "web:local", job_id)
+
+    row = await store.get(job_id)
+    assert result == JobStatus.queued.value
+    assert row is not None and row.next_attempt_at == _NOW + timedelta(seconds=5)
+    assert enqueued == [
+        (
+            "run_job",
+            ("web:local", job_id),
+            {"_defer_until": _NOW + timedelta(seconds=5)},
+        )
+    ]
+
+
+async def test_run_job_retryable_error_fails_terminal_on_last_attempt() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise RetryableJobError("provider_timeout", "Provider timed out.")
+
+    registry.register(JobDefinition("test.echo", handler, max_attempts=1, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="retry-final", max_attempts=1)
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    result = await run_job(
+        _ctx(store, registry, _Clock(_NOW), enqueued),
+        "web:local",
+        job_id,
+    )
+
+    row = await store.get(job_id)
+    assert result == JobStatus.failed.value
+    assert row is not None and row.error_kind == "provider_timeout"
+    assert row.attempt == 1
+    assert enqueued == []
+
+
+async def test_run_job_retry_enqueue_is_best_effort() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise RetryableJobError("provider_timeout", "Provider timed out.")
+
+    async def failed_enqueue(name: str, *args: object, **options: object) -> None:
+        raise RuntimeError("queue unavailable")
+
+    registry.register(JobDefinition("test.echo", handler, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="retry-enqueue")
+    ctx = _ctx(store, registry, _Clock(_NOW), [])
+    ctx["enqueue"] = failed_enqueue
+
+    result = await run_job(ctx, "web:local", job_id)
+
+    row = await store.get(job_id)
+    assert result == JobStatus.queued.value
+    assert row is not None and row.next_attempt_at == _NOW + timedelta(seconds=5)
+
+
+async def test_run_job_unknown_exception_retries_then_fails_terminal() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    calls = 0
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("unexpected")
+
+    registry.register(JobDefinition("test.echo", handler, max_attempts=2, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="unknown-error", max_attempts=2)
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    clock = _Clock(_NOW)
+
+    assert (
+        await run_job(_ctx(store, registry, clock, enqueued), "web:local", job_id)
+        == JobStatus.queued.value
+    )
+    clock.value = _NOW + timedelta(seconds=5)
+    assert (
+        await run_job(_ctx(store, registry, clock, enqueued), "web:local", job_id)
+        == JobStatus.failed.value
+    )
+
+    row = await store.get(job_id)
+    assert calls == 2
+    assert row is not None and row.error_kind == "internal_error"
+    assert row.error_message == "job failed with a temporary internal error"
+    assert row.attempt == 2
+    assert len(enqueued) == 1
+
+
+async def test_run_job_observes_persisted_cancel_before_reclaimed_handler() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    called = False
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        nonlocal called
+        called = True
+        return JobResult(data={}, message="should not run")
+
+    registry.register(JobDefinition("test.echo", handler, max_attempts=3, lease_seconds=10))
+    job_id = await _enqueued_job(store, key="cancel")
+    first = await store.claim(job_id, _NOW, 10)
+    assert first is not None
+    await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+    clock = _Clock(_NOW + timedelta(seconds=11))
+
+    result = await run_job(_ctx(store, registry, clock, []), "web:local", job_id)
+
+    assert result == JobStatus.cancelled.value
+    assert called is False
+
+
+async def test_run_job_returns_current_status_when_lease_is_lost() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    clock = _Clock(_NOW)
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        clock.value = _NOW + timedelta(seconds=61)
+        await context.checkpoint()
+        return JobResult(data={}, message="should not finish")
+
+    registry.register(JobDefinition("test.echo", handler, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="lease-lost")
+
+    result = await run_job(
+        _ctx(store, registry, clock, []),
+        "web:local",
+        job_id,
+    )
+
+    assert result == JobStatus.running.value
+    assert (await store.get(job_id)).status is JobStatus.running  # type: ignore[union-attr]
+
+
+async def test_run_job_propagates_asyncio_cancelled_error() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise asyncio.CancelledError
+
+    registry.register(JobDefinition("test.echo", handler, max_attempts=3, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="worker-shutdown")
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_job(
+            _ctx(store, registry, _Clock(_NOW), []),
+            "web:local",
+            job_id,
+        )
+
+    assert (await store.get(job_id)).status is JobStatus.running  # type: ignore[union-attr]
+
+
+async def test_run_job_traces_only_safe_execution_attributes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attributes: dict[str, object] = {}
+
+    class Span:
+        def set_attribute(self, name: str, value: object) -> None:
+            attributes[name] = value
+
+    class SpanScope:
+        def __enter__(self) -> Span:
+            return Span()
+
+        def __exit__(
+            self,
+            exc_type: object,
+            exc_value: object,
+            traceback: object,
+        ) -> None:
+            return None
+
+    class Tracer:
+        def start_as_current_span(self, name: str) -> SpanScope:
+            assert name == "job.execute"
+            return SpanScope()
+
+    monkeypatch.setattr("keel_worker.jobs.get_tracer", lambda name: Tracer())
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    registry.register(JobDefinition("test.echo", _handler, lease_seconds=60))
+    job_id = await _enqueued_job(
+        store,
+        key="trace-redaction",
+        payload={"secret": "DO-NOT-TRACE"},
+    )
+
+    await run_job(
+        _ctx(store, registry, _Clock(_NOW), []),
+        "web:local",
+        job_id,
+    )
+
+    assert attributes == {
+        "job.id": job_id,
+        "job.kind": "test.echo",
+        "job.scope_id": "web:local",
+        "job.attempt": 1,
+        "job.status": JobStatus.succeeded.value,
+    }
+    assert "DO-NOT-TRACE" not in repr(attributes)
+    assert "done" not in repr(attributes)
+
+
+async def test_run_job_logs_no_payload_or_result(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="keel.worker.jobs")
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    registry.register(JobDefinition("test.echo", _handler, lease_seconds=60))
+    job_id = await _enqueued_job(
+        store,
+        key="redaction",
+        payload={"secret": "DO-NOT-LOG"},
+    )
+
+    await run_job(
+        _ctx(store, registry, _Clock(_NOW), []),
+        "web:local",
+        job_id,
+    )
+
+    assert "DO-NOT-LOG" not in caplog.text
+    assert "done" not in caplog.text
