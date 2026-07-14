@@ -8,10 +8,14 @@ import copy
 import json
 import math
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol, cast
+
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.config import Settings
 from keel_core.events import Event, EventType
@@ -438,6 +442,57 @@ def _validate_limit(limit: int) -> None:
         raise ValueError("limit must be between 1 and 100")
 
 
+_SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
+
+
+def _validate_enqueue_fields(kind: str, idempotency_key: str, max_attempts: int) -> tuple[str, str]:
+    kind = _validated_identity(kind, field="kind", code="invalid_kind")
+    idempotency_key = _validated_identity(
+        idempotency_key,
+        field="idempotency_key",
+        code="invalid_idempotency_key",
+    )
+    if max_attempts < 1:
+        raise JobValidationError("invalid_max_attempts", "max_attempts must be at least 1")
+    return kind, idempotency_key
+
+
+def _to_job_record(row: Mapping[Any, Any]) -> JobRecord:
+    payload = row["payload"] if isinstance(row["payload"], dict) else {}
+    result = row["result"] if isinstance(row["result"], dict) else None
+    return JobRecord(
+        id=str(row["id"]),
+        scope_id=str(row["scope_id"]),
+        kind=str(row["kind"]),
+        status=JobStatus(str(row["status"])),
+        payload=copy.deepcopy(payload),
+        target_session_id=row["target_session_id"],
+        idempotency_key=str(row["idempotency_key"]),
+        attempt=int(row["attempt"]),
+        max_attempts=int(row["max_attempts"]),
+        next_attempt_at=row["next_attempt_at"],
+        lease_token=row["lease_token"],
+        lease_expires_at=row["lease_expires_at"],
+        heartbeat_at=row["heartbeat_at"],
+        cancel_requested_at=row["cancel_requested_at"],
+        progress_current=int(row["progress_current"]),
+        progress_total=None if row["progress_total"] is None else int(row["progress_total"]),
+        progress_message=row["progress_message"],
+        progress_updated_at=row["progress_updated_at"],
+        result=copy.deepcopy(result),
+        result_message=row["result_message"],
+        error_kind=row["error_kind"],
+        error_message=row["error_message"],
+        injected_event_seq=(
+            None if row["injected_event_seq"] is None else int(row["injected_event_seq"])
+        ),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+    )
+
+
 def _validate_progress(current: int, total: int | None) -> None:
     invalid_current = (
         isinstance(current, bool)
@@ -552,14 +607,7 @@ class InMemoryJobStore:
         max_attempts: int,
         now: datetime | None = None,
     ) -> tuple[JobRecord, bool]:
-        kind = _validated_identity(kind, field="kind", code="invalid_kind")
-        idempotency_key = _validated_identity(
-            idempotency_key,
-            field="idempotency_key",
-            code="invalid_idempotency_key",
-        )
-        if max_attempts < 1:
-            raise JobValidationError("invalid_max_attempts", "max_attempts must be at least 1")
+        kind, idempotency_key = _validate_enqueue_fields(kind, idempotency_key, max_attempts)
         timestamp = _normalized_utc_timestamp(now, field="now") if now is not None else _utcnow()
         key = (self._scope_id, kind, idempotency_key)
         async with self._lock:
@@ -854,6 +902,199 @@ class InMemoryJobStore:
                     "job attempts were exhausted after worker lease expiry",
                 ),
             )
+
+
+class PostgresJobStore:
+    """Scope-bound durable JobStore over Postgres with RLS defense in depth."""
+
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        scope_id: str,
+        *,
+        limits: JobLimits | None = None,
+    ) -> None:
+        try:
+            normalized_scope = _validated_identity(
+                scope_id, field="scope_id", code="invalid_scope_id"
+            )
+        except JobValidationError as exc:
+            raise ValueError(exc.public_message) from exc
+        self._engine = engine
+        self._scope_id = normalized_scope
+        self._limits = limits or JobLimits()
+
+    @property
+    def scope_id(self) -> str:
+        return self._scope_id
+
+    async def enqueue_once(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        target_session_id: str | None,
+        idempotency_key: str,
+        max_attempts: int,
+        now: datetime | None = None,
+    ) -> tuple[JobRecord, bool]:
+        kind, idempotency_key = _validate_enqueue_fields(kind, idempotency_key, max_attempts)
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            existing_sql = text(
+                "SELECT * FROM jobs WHERE scope_id = :scope "
+                "AND kind = :kind AND idempotency_key = :key"
+            )
+            dedupe_params = {
+                "scope": self._scope_id,
+                "kind": kind,
+                "key": idempotency_key,
+            }
+            existing = (await conn.execute(existing_sql, dedupe_params)).mappings().one_or_none()
+            if existing is not None:
+                return _to_job_record(existing), False
+
+            safe_payload = self._limits.validate_payload(payload)
+            safe_target_session_id = None
+            if target_session_id is not None:
+                safe_target_session_id = _validated_identity(
+                    target_session_id,
+                    field="target_session_id",
+                    code="invalid_target_session_id",
+                )
+                exists = (
+                    await conn.execute(
+                        text("SELECT 1 FROM sessions WHERE id = :session AND scope_id = :scope"),
+                        {"session": safe_target_session_id, "scope": self._scope_id},
+                    )
+                ).one_or_none()
+                if exists is None:
+                    raise JobValidationError(
+                        "target_session_not_found",
+                        "target session does not exist in the current scope",
+                    )
+            timestamp = (
+                _normalized_utc_timestamp(now, field="now") if now is not None else _utcnow()
+            )
+            job_id = f"job_{uuid.uuid4().hex}"
+            inserted = (
+                (
+                    await conn.execute(
+                        text(
+                            "INSERT INTO jobs "
+                            "(id, scope_id, kind, payload, target_session_id, "
+                            "idempotency_key, max_attempts, next_attempt_at, "
+                            "created_at, updated_at) VALUES "
+                            "(:id, :scope, :kind, CAST(:payload AS jsonb), :target, "
+                            ":key, :max_attempts, :now, :now, :now) "
+                            "ON CONFLICT (scope_id, kind, idempotency_key) DO NOTHING "
+                            "RETURNING *"
+                        ),
+                        {
+                            "id": job_id,
+                            "scope": self._scope_id,
+                            "kind": kind,
+                            "payload": json.dumps(safe_payload, ensure_ascii=False),
+                            "target": safe_target_session_id,
+                            "key": idempotency_key,
+                            "max_attempts": max_attempts,
+                            "now": timestamp,
+                        },
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if inserted is not None:
+                return _to_job_record(inserted), True
+            existing = (await conn.execute(existing_sql, dedupe_params)).mappings().one()
+            return _to_job_record(existing), False
+
+    async def get(self, job_id: str) -> JobRecord | None:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            row = (
+                (
+                    await conn.execute(
+                        text("SELECT * FROM jobs WHERE id = :id AND scope_id = :scope"),
+                        {"id": job_id, "scope": self._scope_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return None if row is None else _to_job_record(row)
+
+    async def list(
+        self,
+        *,
+        status: JobStatus | None = None,
+        kind: str | None = None,
+        limit: int = 50,
+    ) -> builtins.list[JobRecord]:
+        _validate_limit(limit)
+        clauses = ["scope_id = :scope"]
+        params: dict[str, Any] = {"scope": self._scope_id, "limit": limit}
+        if status is not None:
+            clauses.append("status = :status")
+            params["status"] = status.value
+        if kind is not None:
+            clauses.append("kind = :kind")
+            params["kind"] = kind
+        sql = (
+            "SELECT * FROM jobs WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY created_at DESC, id DESC LIMIT :limit"
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            rows = (await conn.execute(text(sql), params)).mappings().all()
+        return [_to_job_record(row) for row in rows]
+
+    async def dispatchable(self, now: datetime, limit: int) -> builtins.list[str]:
+        _validate_limit(limit)
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            rows = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT id FROM jobs WHERE scope_id = :scope "
+                            "AND attempt < max_attempts AND ("
+                            "  (status = 'queued' AND next_attempt_at <= :now) OR "
+                            "  (status = 'running' AND lease_expires_at <= :now)"
+                            ") ORDER BY next_attempt_at, created_at, id LIMIT :limit"
+                        ),
+                        {"scope": self._scope_id, "now": now, "limit": limit},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [str(value) for value in rows]
+
+    async def exhausted(self, now: datetime, limit: int) -> builtins.list[str]:
+        _validate_limit(limit)
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            rows = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT id FROM jobs WHERE scope_id = :scope "
+                            "AND status = 'running' AND lease_expires_at <= :now "
+                            "AND attempt >= max_attempts "
+                            "ORDER BY lease_expires_at, created_at, id LIMIT :limit"
+                        ),
+                        {"scope": self._scope_id, "now": now, "limit": limit},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        return [str(value) for value in rows]
 
 
 def retry_delay_seconds(attempt: int, base_seconds: int, max_seconds: int) -> int:
