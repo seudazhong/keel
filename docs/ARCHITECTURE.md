@@ -442,6 +442,7 @@ OneBot → adapter → normalize → InboundEvent(session_key) → wake rules/ra
 | [0007](./adr/0007-embeddings-and-rerank.md) | Local `bge-m3` embeddings default; hosted via gateway; rerank optional |
 | [0008](./adr/0008-deployment-profiles-and-first-run.md) | `lite`/`dev`/`full`/`demo` profiles; MinIO & Ollama gating; first-run |
 | [0009](./adr/0009-product-form-and-primary-use-cases.md) | Server-primary connected assistant; agent = scoped entity; Connectors first-class; pluggable execution |
+| [0010](./adr/0010-durable-background-jobs.md) | Durable jobs: at-least-once delivery + DB leases; schedules keep at-most-once triggers |
 
 ---
 
