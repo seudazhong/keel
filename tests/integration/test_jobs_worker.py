@@ -9,8 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-import redis.asyncio as aioredis
-from arq.connections import RedisSettings, create_pool
+from arq.connections import ArqRedis, RedisSettings, create_pool
 from arq.constants import (
     health_check_key_suffix,
     in_progress_key_prefix,
@@ -144,15 +143,47 @@ def _assert_injection(
 def _arq_keys(queue_name: str, arq_job_ids: list[str]) -> list[str]:
     keys = [queue_name, f"{queue_name}{health_check_key_suffix}"]
     for arq_job_id in arq_job_ids:
-        keys.extend(
-            [
-                f"{job_key_prefix}{arq_job_id}",
-                f"{result_key_prefix}{arq_job_id}",
-                f"{in_progress_key_prefix}{arq_job_id}",
-                f"{retry_key_prefix}{arq_job_id}",
-            ]
-        )
+        keys.extend(_arq_job_keys(arq_job_id))
     return keys
+
+
+def _arq_job_keys(arq_job_id: str) -> list[str]:
+    return [
+        f"{job_key_prefix}{arq_job_id}",
+        f"{result_key_prefix}{arq_job_id}",
+        f"{in_progress_key_prefix}{arq_job_id}",
+        f"{retry_key_prefix}{arq_job_id}",
+    ]
+
+
+async def _discard_arq_delivery(
+    pool: ArqRedis,
+    queue_name: str,
+    arq_job_id: str,
+) -> None:
+    await pool.zrem(queue_name, arq_job_id)
+    await pool.delete(*_arq_job_keys(arq_job_id))
+
+
+async def _run_one_arq_delivery(
+    pool: ArqRedis,
+    queue_name: str,
+    ctx: dict[str, Any],
+) -> Worker:
+    worker = Worker(
+        functions=[run_job],
+        queue_name=queue_name,
+        redis_pool=pool,
+        burst=True,
+        handle_signals=False,
+        max_jobs=1,
+        max_burst_jobs=1,
+        keep_result=0,
+        poll_delay=0.01,
+        ctx=ctx,
+    )
+    await worker.async_run()
+    return worker
 
 
 async def _noop_enqueue(
@@ -165,7 +196,6 @@ async def _noop_enqueue(
 
 async def test_dispatcher_heals_missed_enqueue_and_real_arq_duplicates_execute_once(
     migrated_db: AsyncEngine,
-    redis_client: aioredis.Redis,
 ) -> None:
     scope = f"accept:arq:{uuid.uuid4().hex}"
     session_id = f"target:{uuid.uuid4().hex}"
@@ -255,9 +285,11 @@ async def test_dispatcher_heals_missed_enqueue_and_real_arq_duplicates_execute_o
             for event in await _events(migrated_db, scope, session_id)
         )
     finally:
-        await pool.delete(*keys)
-        assert await redis_client.exists(*keys) == 0
-        await pool.aclose()
+        try:
+            await pool.delete(*keys)
+            assert await pool.exists(*keys) == 0
+        finally:
+            await pool.aclose()
 
 
 async def test_concurrent_deliveries_execute_handler_once_and_inject_once(
@@ -305,7 +337,7 @@ async def test_concurrent_deliveries_execute_handler_once_and_inject_once(
     assert row.injected_event_seq == injection.seq
 
 
-async def test_retryable_handler_fails_twice_then_succeeds_at_deterministic_times(
+async def test_retryable_handler_uses_fresh_arq_workers_and_dispatcher_recovery(
     migrated_db: AsyncEngine,
 ) -> None:
     scope = f"accept:retry:{uuid.uuid4().hex}"
@@ -336,42 +368,101 @@ async def test_retryable_handler_fails_twice_then_succeeds_at_deterministic_time
         target_session_id=session_id,
         max_attempts=3,
     )
-    deferred: list[datetime] = []
+    redis_url = os.environ.get("KEEL_TEST_REDIS_URL", "redis://localhost:6379/15")
+    pool = await create_pool(RedisSettings.from_dsn(redis_url))
+    key_namespace = uuid.uuid4().hex
+    queue_name = f"arq:jobs:retry:{key_namespace}"
+    arq_job_ids = [f"acceptance-retry-{key_namespace}-{index}" for index in range(5)]
+    keys = _arq_keys(queue_name, arq_job_ids)
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object], str]] = []
 
     async def enqueue(name: str, *args: object, **options: object) -> None:
-        assert name == "run_job"
-        assert args == (scope, job_id)
-        defer_until = options.get("_defer_until")
-        assert isinstance(defer_until, datetime)
-        deferred.append(defer_until)
+        arq_job_id = arq_job_ids[len(enqueued)]
+        delivery = await pool.enqueue_job(
+            name,
+            *args,
+            _job_id=arq_job_id,
+            _queue_name=queue_name,
+            **options,
+        )
+        assert delivery is not None
+        enqueued.append((name, args, options, arq_job_id))
 
     clock = _Clock()
     ctx = _ctx(store, registry, clock, enqueue)
-    assert await run_job(ctx, scope, job_id) == JobStatus.queued.value
-    assert await _job_events(migrated_db, scope, session_id, job_id) == []
-    clock.advance(5)
-    assert await run_job(ctx, scope, job_id) == JobStatus.queued.value
-    assert await _job_events(migrated_db, scope, session_id, job_id) == []
-    clock.advance(10)
-    assert await run_job(ctx, scope, job_id) == JobStatus.succeeded.value
+    try:
+        await pool.delete(*keys)
 
-    row = await store.get(job_id)
-    assert row is not None
-    assert row.status is JobStatus.succeeded
-    assert row.attempt == 3
-    assert row.result == {"chunks": 42}
-    assert calls == 3
-    assert deferred == [
-        _NOW + timedelta(seconds=5),
-        _NOW + timedelta(seconds=15),
-    ]
-    injection = _assert_injection(
-        await _job_events(migrated_db, scope, session_id, job_id),
-        job_id=job_id,
-        status=JobStatus.succeeded,
-    )
-    assert injection.payload["text"] == "indexed 42 chunks"
-    assert row.injected_event_seq == injection.seq
+        assert await dispatch_jobs(ctx) == 1
+        assert enqueued == [("run_job", (scope, job_id), {}, arq_job_ids[0])]
+        assert await pool.zcard(queue_name) == 1
+
+        first_worker = await _run_one_arq_delivery(pool, queue_name, ctx)
+        assert first_worker.jobs_complete == 1
+        after_first = await store.get(job_id)
+        assert after_first is not None
+        assert after_first.status is JobStatus.queued
+        assert after_first.attempt == 1
+        assert after_first.next_attempt_at == _NOW + timedelta(seconds=5)
+        assert enqueued[1] == (
+            "run_job",
+            (scope, job_id),
+            {"_defer_until": _NOW + timedelta(seconds=5)},
+            arq_job_ids[1],
+        )
+        assert await _job_events(migrated_db, scope, session_id, job_id) == []
+        assert await pool.zcard(queue_name) == 1
+
+        # Model a lost deferred delivery, then advance the durable clock and let
+        # the dispatcher recover it instead of calling run_job directly.
+        await _discard_arq_delivery(pool, queue_name, arq_job_ids[1])
+        clock.advance(5)
+        assert await dispatch_jobs(ctx) == 1
+        assert enqueued[2] == ("run_job", (scope, job_id), {}, arq_job_ids[2])
+
+        second_worker = await _run_one_arq_delivery(pool, queue_name, ctx)
+        assert second_worker.jobs_complete == 1
+        after_second = await store.get(job_id)
+        assert after_second is not None
+        assert after_second.status is JobStatus.queued
+        assert after_second.attempt == 2
+        assert after_second.next_attempt_at == _NOW + timedelta(seconds=15)
+        assert enqueued[3] == (
+            "run_job",
+            (scope, job_id),
+            {"_defer_until": _NOW + timedelta(seconds=15)},
+            arq_job_ids[3],
+        )
+        assert await _job_events(migrated_db, scope, session_id, job_id) == []
+        assert await pool.zcard(queue_name) == 1
+
+        await _discard_arq_delivery(pool, queue_name, arq_job_ids[3])
+        clock.advance(10)
+        assert await dispatch_jobs(ctx) == 1
+        assert enqueued[4] == ("run_job", (scope, job_id), {}, arq_job_ids[4])
+
+        third_worker = await _run_one_arq_delivery(pool, queue_name, ctx)
+        assert third_worker.jobs_complete == 1
+        row = await store.get(job_id)
+        assert row is not None
+        assert row.status is JobStatus.succeeded
+        assert row.attempt == 3
+        assert row.result == {"chunks": 42}
+        assert calls == 3
+        assert await pool.zcard(queue_name) == 0
+        injection = _assert_injection(
+            await _job_events(migrated_db, scope, session_id, job_id),
+            job_id=job_id,
+            status=JobStatus.succeeded,
+        )
+        assert injection.payload["text"] == "indexed 42 chunks"
+        assert row.injected_event_seq == injection.seq
+    finally:
+        try:
+            await pool.delete(*keys)
+            assert await pool.exists(*keys) == 0
+        finally:
+            await pool.aclose()
 
 
 async def test_permanent_handler_executes_once_and_duplicate_delivery_stays_terminal(
@@ -418,7 +509,7 @@ async def test_permanent_handler_executes_once_and_duplicate_delivery_stays_term
     assert row.injected_event_seq == injection.seq
 
 
-async def test_worker_cancelled_error_leaves_lease_for_reclaim(
+async def test_worker_cancelled_error_is_redelivered_after_lease_expiry(
     migrated_db: AsyncEngine,
 ) -> None:
     scope = f"accept:crash:{uuid.uuid4().hex}"
@@ -449,31 +540,75 @@ async def test_worker_cancelled_error_leaves_lease_for_reclaim(
         target_session_id=session_id,
         max_attempts=2,
     )
+    redis_url = os.environ.get("KEEL_TEST_REDIS_URL", "redis://localhost:6379/15")
+    pool = await create_pool(RedisSettings.from_dsn(redis_url))
+    key_namespace = uuid.uuid4().hex
+    queue_name = f"arq:jobs:crash:{key_namespace}"
+    arq_job_ids = [f"acceptance-crash-{key_namespace}-{index}" for index in range(2)]
+    keys = _arq_keys(queue_name, arq_job_ids)
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object], str]] = []
+
+    async def enqueue(name: str, *args: object, **options: object) -> None:
+        arq_job_id = arq_job_ids[len(enqueued)]
+        delivery = await pool.enqueue_job(
+            name,
+            *args,
+            _job_id=arq_job_id,
+            _queue_name=queue_name,
+            **options,
+        )
+        assert delivery is not None
+        enqueued.append((name, args, options, arq_job_id))
+
     clock = _Clock()
-    ctx = _ctx(store, registry, clock, _noop_enqueue)
+    ctx = _ctx(store, registry, clock, enqueue)
+    try:
+        await pool.delete(*keys)
 
-    with pytest.raises(asyncio.CancelledError):
-        await run_job(ctx, scope, job_id)
-    after_crash = await store.get(job_id)
-    assert after_crash is not None
-    assert after_crash.status is JobStatus.running
-    assert after_crash.attempt == 1
-    assert after_crash.injected_event_seq is None
-    assert await _job_events(migrated_db, scope, session_id, job_id) == []
+        assert await dispatch_jobs(ctx) == 1
+        assert enqueued == [("run_job", (scope, job_id), {}, arq_job_ids[0])]
+        first_worker = await _run_one_arq_delivery(pool, queue_name, ctx)
+        assert first_worker.jobs_retried == 1
+        assert await pool.zcard(queue_name) == 1
 
-    clock.advance(11)
-    assert await run_job(ctx, scope, job_id) == JobStatus.succeeded.value
-    recovered = await store.get(job_id)
-    assert recovered is not None
-    assert recovered.status is JobStatus.succeeded
-    assert recovered.attempt == 2
-    assert calls == 2
-    injection = _assert_injection(
-        await _job_events(migrated_db, scope, session_id, job_id),
-        job_id=job_id,
-        status=JobStatus.succeeded,
-    )
-    assert recovered.injected_event_seq == injection.seq
+        # A crashed process can lose arq's transport-level retry. Remove that
+        # delivery so lease expiry and the durable dispatcher are the recovery path.
+        await _discard_arq_delivery(pool, queue_name, arq_job_ids[0])
+        assert await pool.zcard(queue_name) == 0
+
+        after_crash = await store.get(job_id)
+        assert after_crash is not None
+        assert after_crash.status is JobStatus.running
+        assert after_crash.attempt == 1
+        assert after_crash.lease_expires_at == _NOW + timedelta(seconds=10)
+        assert after_crash.injected_event_seq is None
+        assert await _job_events(migrated_db, scope, session_id, job_id) == []
+
+        clock.advance(11)
+        assert await dispatch_jobs(ctx) == 1
+        assert enqueued[1] == ("run_job", (scope, job_id), {}, arq_job_ids[1])
+        assert await pool.zcard(queue_name) == 1
+
+        recovered_worker = await _run_one_arq_delivery(pool, queue_name, ctx)
+        assert recovered_worker.jobs_complete == 1
+        recovered = await store.get(job_id)
+        assert recovered is not None
+        assert recovered.status is JobStatus.succeeded
+        assert recovered.attempt == 2
+        assert calls == 2
+        assert await pool.zcard(queue_name) == 0
+        injection = _assert_injection(
+            await _job_events(migrated_db, scope, session_id, job_id),
+            job_id=job_id,
+            status=JobStatus.succeeded,
+        )
+        assert recovered.injected_event_seq == injection.seq
+    finally:
+        try:
+            await pool.delete(*keys)
+            assert await pool.exists(*keys) == 0
+        finally:
+            await pool.aclose()
 
 
 async def test_crash_at_attempt_ceiling_is_atomically_failed_and_injected(
