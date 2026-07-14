@@ -33,6 +33,7 @@ logger = logging.getLogger("keel.worker.jobs")
 JobHandler = Callable[["JobContext", dict[str, Any]], Awaitable[JobResult]]
 JobClock = Callable[[], datetime]
 EnqueueJob = Callable[..., Awaitable[None]]
+JobStatusSink = Callable[[JobStatus], None]
 
 
 def _normalized_kind(kind: str) -> str:
@@ -159,6 +160,15 @@ async def _transition_or_current(
         return await _authoritative_status(store, job_id)
 
 
+async def _without_exception_context(
+    operation: Awaitable[tuple[str, JobStatus | None]],
+) -> tuple[str, JobStatus | None]:
+    try:
+        return await operation
+    except BaseException as exc:
+        raise exc from None
+
+
 def _safe_exception_frames(exc: BaseException) -> str:
     frames = traceback.extract_tb(exc.__traceback__, limit=8)
     if not frames:
@@ -175,13 +185,17 @@ async def _retry_or_fail(
     lease: JobLease,
     error: JobError,
     now: datetime,
+    on_status: JobStatusSink,
 ) -> tuple[str, JobStatus | None]:
     if lease.attempt >= lease.max_attempts:
-        return await _transition_or_current(
+        result = await _transition_or_current(
             store,
             lease.job_id,
             store.fail_terminal(lease, error, now),
         )
+        if result[1] is not None:
+            on_status(result[1])
+        return result
     settings = ctx["job_settings"]
     retry_at = now + timedelta(
         seconds=retry_delay_seconds(
@@ -196,7 +210,10 @@ async def _retry_or_fail(
         store.requeue(lease, error, retry_at, now),
     )
     if status is not JobStatus.queued:
+        if status is not None:
+            on_status(status)
         return status_value, status
+    on_status(status)
     try:
         enqueue: EnqueueJob = ctx["enqueue"]
         await enqueue(
@@ -260,6 +277,11 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
     tracer = get_tracer("keel.worker.jobs")
     started = perf_counter()
     final_status = JobStatus.running
+
+    def set_final_status(status: JobStatus) -> None:
+        nonlocal final_status
+        final_status = status
+
     with tracer.start_as_current_span("job.execute") as span:
         span.set_attribute("job.id", lease.job_id)
         span.set_attribute("job.kind", lease.kind)
@@ -301,39 +323,48 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
         except asyncio.CancelledError:
             raise
         except JobCancellationRequested:
-            status_value, status = await _transition_or_current(
-                store,
-                job_id,
-                store.finish_cancelled(lease, clock()),
+            status_value, status = await _without_exception_context(
+                _transition_or_current(
+                    store,
+                    job_id,
+                    store.finish_cancelled(lease, clock()),
+                )
             )
             if status is not None:
                 final_status = status
             return status_value
         except PermanentJobError as exc:
-            status_value, status = await _transition_or_current(
-                store,
-                job_id,
-                store.fail_terminal(lease, JobError(exc.code, exc.public_message), clock()),
+            status_value, status = await _without_exception_context(
+                _transition_or_current(
+                    store,
+                    job_id,
+                    store.fail_terminal(lease, JobError(exc.code, exc.public_message), clock()),
+                )
             )
             if status is not None:
                 final_status = status
             return status_value
         except JobValidationError as exc:
-            status_value, status = await _transition_or_current(
-                store,
-                job_id,
-                store.fail_terminal(lease, JobError(exc.code, exc.public_message), clock()),
+            status_value, status = await _without_exception_context(
+                _transition_or_current(
+                    store,
+                    job_id,
+                    store.fail_terminal(lease, JobError(exc.code, exc.public_message), clock()),
+                )
             )
             if status is not None:
                 final_status = status
             return status_value
         except RetryableJobError as exc:
-            status_value, status = await _retry_or_fail(
-                ctx=ctx,
-                store=store,
-                lease=lease,
-                error=JobError(exc.code, exc.public_message),
-                now=clock(),
+            status_value, status = await _without_exception_context(
+                _retry_or_fail(
+                    ctx=ctx,
+                    store=store,
+                    lease=lease,
+                    error=JobError(exc.code, exc.public_message),
+                    now=clock(),
+                    on_status=set_final_status,
+                )
             )
             if status is not None:
                 final_status = status
@@ -353,15 +384,18 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                 type(exc).__name__,
                 _safe_exception_frames(exc),
             )
-            status_value, status = await _retry_or_fail(
-                ctx=ctx,
-                store=store,
-                lease=lease,
-                error=JobError(
-                    "internal_error",
-                    "job failed with a temporary internal error",
-                ),
-                now=clock(),
+            status_value, status = await _without_exception_context(
+                _retry_or_fail(
+                    ctx=ctx,
+                    store=store,
+                    lease=lease,
+                    error=JobError(
+                        "internal_error",
+                        "job failed with a temporary internal error",
+                    ),
+                    now=clock(),
+                    on_status=set_final_status,
+                )
             )
             if status is not None:
                 final_status = status

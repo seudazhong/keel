@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import traceback
 from datetime import UTC, datetime, timedelta, timezone
 from typing import Any
 
@@ -501,6 +502,40 @@ async def test_run_job_failure_logs_do_not_include_exception_secrets(
     assert "RuntimeError" in caplog.text
 
 
+async def test_finalization_error_suppresses_original_handler_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise RuntimeError(f"token={payload['secret']}")
+
+    async def broken_finalizer(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("database unavailable")
+
+    registry.register(JobDefinition("test.echo", handler, max_attempts=1, lease_seconds=60))
+    job_id = await _enqueued_job(
+        store,
+        key="secret-context",
+        max_attempts=1,
+        payload={"secret": "DO-NOT-LEAK"},
+    )
+    monkeypatch.setattr(store, "fail_terminal", broken_finalizer)
+
+    with pytest.raises(RuntimeError) as caught:
+        await run_job(
+            _ctx(store, registry, _Clock(_NOW), []),
+            "web:local",
+            job_id,
+        )
+    formatted = "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
+    assert "database unavailable" in formatted
+    assert "DO-NOT-LEAK" not in formatted
+
+
 @pytest.mark.parametrize(
     "error_kind",
     ["permanent", "validation", "retryable", "unknown", "cancelled"],
@@ -570,6 +605,52 @@ async def test_run_job_unknown_exception_retries_then_fails_terminal() -> None:
     assert row.error_message == "job failed with a temporary internal error"
     assert row.attempt == 2
     assert len(enqueued) == 1
+
+
+async def test_cancelled_deferred_enqueue_reports_queued_telemetry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attributes: dict[str, object] = {}
+
+    class Span:
+        def set_attribute(self, name: str, value: object) -> None:
+            attributes[name] = value
+
+    class SpanScope:
+        def __enter__(self) -> Span:
+            return Span()
+
+        def __exit__(
+            self,
+            exc_type: object,
+            exc_value: object,
+            traceback_value: object,
+        ) -> None:
+            return None
+
+    class Tracer:
+        def start_as_current_span(self, name: str) -> SpanScope:
+            return SpanScope()
+
+    monkeypatch.setattr("keel_worker.jobs.get_tracer", lambda name: Tracer())
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise RetryableJobError("temporary", "temporary")
+
+    async def cancelled_enqueue(name: str, *args: object, **options: object) -> None:
+        raise asyncio.CancelledError
+
+    registry.register(JobDefinition("test.echo", handler, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="cancelled-enqueue")
+    ctx = _ctx(store, registry, _Clock(_NOW), [])
+    ctx["enqueue"] = cancelled_enqueue
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_job(ctx, "web:local", job_id)
+    assert (await store.get(job_id)).status is JobStatus.queued  # type: ignore[union-attr]
+    assert attributes["job.status"] == JobStatus.queued.value
 
 
 async def test_run_job_observes_persisted_cancel_before_reclaimed_handler() -> None:
