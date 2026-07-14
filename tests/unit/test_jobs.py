@@ -118,6 +118,31 @@ def test_limits_reject_cycles_without_echoing_payload_keys() -> None:
     assert len(caught.value.public_message) < 200
 
 
+def test_limits_reject_excessive_json_depth_with_a_bounded_error() -> None:
+    limits = JobLimits()
+    deep: dict[str, object] = {}
+    cursor = deep
+    for _ in range(150):
+        child: dict[str, object] = {}
+        cursor["child"] = child
+        cursor = child
+
+    with pytest.raises(JobValidationError, match="json_too_deep") as caught:
+        limits.validate_payload(deep)
+    assert len(caught.value.public_message) < 200
+
+
+def test_persisted_error_fields_reject_storage_invalid_text() -> None:
+    with pytest.raises(ValueError, match="storage-safe"):
+        RetryableJobError("bad\x00code", "safe")
+    with pytest.raises(ValueError, match="storage-safe"):
+        PermanentJobError("bad", "unsafe\ud800")
+    with pytest.raises(ValueError, match="storage-safe"):
+        JobError(kind="bad\x00kind", message="safe")
+    with pytest.raises(ValueError, match="storage-safe"):
+        JobError(kind="safe", message="bad\x00message")
+
+
 def test_job_limits_are_built_from_settings() -> None:
     settings = Settings(
         job_payload_max_bytes=101,

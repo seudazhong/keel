@@ -12,6 +12,19 @@ from typing import Any, Protocol, cast
 
 from keel_core.config import Settings
 
+_MAX_JSON_DEPTH = 100
+_MAX_ERROR_CODE_CHARS = 128
+
+
+def _ensure_storage_safe_text(value: str, *, field: str) -> str:
+    if not isinstance(value, str) or "\x00" in value:
+        raise ValueError(f"{field} must be storage-safe UTF-8 text without NUL characters")
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"{field} must be storage-safe UTF-8 text") from exc
+    return value
+
 
 class JobStatus(StrEnum):
     queued = "queued"
@@ -29,6 +42,10 @@ class _PublicJobException(Exception):
             raise ValueError("code must not be empty")
         if not public_message:
             raise ValueError("public_message must not be empty")
+        code = _ensure_storage_safe_text(code, field="code")
+        public_message = _ensure_storage_safe_text(public_message, field="public_message")
+        if len(code) > _MAX_ERROR_CODE_CHARS:
+            raise ValueError(f"code must not exceed {_MAX_ERROR_CODE_CHARS} characters")
         self.code = code
         self.public_message = public_message
         super().__init__(public_message)
@@ -62,22 +79,26 @@ class JobCancellationRequested(Exception):
 
 
 def _validated_storage_text(value: str, *, field: str) -> str:
-    if not isinstance(value, str) or "\x00" in value:
-        raise JobValidationError(
-            "storage_text_invalid", f"{field} must be valid text without NUL characters"
-        )
     try:
-        value.encode("utf-8")
-    except UnicodeEncodeError as exc:
+        return _ensure_storage_safe_text(value, field=field)
+    except ValueError as exc:
         raise JobValidationError(
-            "storage_text_invalid", f"{field} must be valid UTF-8 text"
+            "storage_text_invalid", f"{field} must be storage-safe UTF-8 text"
         ) from exc
-    return value
 
 
 def _normalize_json_value(
-    value: Any, *, field: str, seen_containers: set[int] | None = None
+    value: Any,
+    *,
+    field: str,
+    seen_containers: set[int] | None = None,
+    depth: int = 0,
 ) -> Any:
+    if depth > _MAX_JSON_DEPTH:
+        raise JobValidationError(
+            "json_too_deep",
+            f"{field} exceeds the maximum JSON nesting depth of {_MAX_JSON_DEPTH}",
+        )
     seen = seen_containers if seen_containers is not None else set()
     if value is None or isinstance(value, bool | int):
         return value
@@ -98,8 +119,9 @@ def _normalize_json_value(
             return [
                 _normalize_json_value(
                     item,
-                    field=f"{field} array item",
+                    field=field,
                     seen_containers=seen,
+                    depth=depth + 1,
                 )
                 for item in value
             ]
@@ -120,8 +142,9 @@ def _normalize_json_value(
                 safe_key = _validated_storage_text(key, field=f"{field} object key")
                 normalized[safe_key] = _normalize_json_value(
                     item,
-                    field=f"{field} object value",
+                    field=field,
                     seen_containers=seen,
+                    depth=depth + 1,
                 )
             return normalized
         finally:
@@ -135,7 +158,12 @@ def _normalize_json_value(
 def _validated_json_object(value: dict[str, Any], *, field: str, max_bytes: int) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise JobValidationError("json_object_required", f"{field} must be a JSON object")
-    normalized = cast(dict[str, Any], _normalize_json_value(value, field=field))
+    try:
+        normalized = cast(dict[str, Any], _normalize_json_value(value, field=field))
+    except RecursionError as exc:  # defensive if the runtime recursion limit is unusually low
+        raise JobValidationError(
+            "json_too_deep", f"{field} exceeds the maximum JSON nesting depth"
+        ) from exc
     try:
         encoded = json.dumps(
             normalized,
@@ -249,6 +277,7 @@ class JobResult:
     def __post_init__(self) -> None:
         if not self.message.strip():
             raise ValueError("JobResult.message must not be empty")
+        _ensure_storage_safe_text(self.message, field="JobResult.message")
 
 
 @dataclass(frozen=True)
@@ -261,6 +290,10 @@ class JobError:
             raise ValueError("JobError.kind must not be empty")
         if not self.message.strip():
             raise ValueError("JobError.message must not be empty")
+        _ensure_storage_safe_text(self.kind, field="JobError.kind")
+        _ensure_storage_safe_text(self.message, field="JobError.message")
+        if len(self.kind) > _MAX_ERROR_CODE_CHARS:
+            raise ValueError(f"JobError.kind must not exceed {_MAX_ERROR_CODE_CHARS} characters")
 
 
 @dataclass(frozen=True)
