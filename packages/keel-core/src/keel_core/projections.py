@@ -28,9 +28,9 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
     """
     messages: list[dict[str, Any]] = []
     pending_assistant: dict[str, Any] | None = None
-    pending_assistant_is_job = False
-    deferred_assistants: list[dict[str, Any]] = []
+    deferred_messages: list[dict[str, Any]] = []
     open_tool_call_ids: set[str] = set()
+    open_tool_thread_start: int | None = None
     active_run_ids: set[str] = set()
 
     def append_message(message: dict[str, Any]) -> None:
@@ -48,79 +48,106 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
             return
         messages.append(message)
 
-    def flush() -> None:
-        nonlocal pending_assistant, pending_assistant_is_job
-        if pending_assistant is not None:
-            for tool_call in pending_assistant.get("tool_calls", []):
+    def flush_pending() -> None:
+        nonlocal pending_assistant, open_tool_thread_start
+        if pending_assistant is None:
+            return
+        tool_calls = pending_assistant.get("tool_calls", [])
+        if tool_calls:
+            open_tool_thread_start = len(messages)
+            for tool_call in tool_calls:
                 call_id = str(tool_call.get("id", ""))
                 if call_id:
                     open_tool_call_ids.add(call_id)
-            append_message(pending_assistant)
-            pending_assistant = None
-            pending_assistant_is_job = False
+        append_message(pending_assistant)
+        pending_assistant = None
 
-    def defer_pending_job() -> None:
-        nonlocal pending_assistant, pending_assistant_is_job
-        if pending_assistant is not None and pending_assistant_is_job:
-            deferred_assistants.append(pending_assistant)
-            pending_assistant = None
-            pending_assistant_is_job = False
-
-    def flush_deferred() -> None:
+    def flush_all_deferred() -> None:
         if pending_assistant is not None or open_tool_call_ids or active_run_ids:
             return
-        while deferred_assistants:
-            append_message(deferred_assistants.pop(0))
+        while deferred_messages:
+            append_message(deferred_messages.pop(0))
+
+    def flush_deferred_before_run() -> None:
+        if pending_assistant is not None or open_tool_call_ids:
+            return
+        boundary = -1
+        for index, message in enumerate(deferred_messages):
+            if message.get("role") in ("user", "system"):
+                boundary = index
+        if boundary < 0:
+            return
+        ready = deferred_messages[: boundary + 1]
+        del deferred_messages[: boundary + 1]
+        for message in ready:
+            append_message(message)
+
+    def reconcile_incomplete_tool_thread() -> None:
+        nonlocal pending_assistant, open_tool_thread_start
+        content = ""
+        if pending_assistant is not None and pending_assistant.get("tool_calls"):
+            content = str(pending_assistant.get("content", ""))
+            pending_assistant = None
+        elif open_tool_thread_start is not None:
+            content = str(messages[open_tool_thread_start].get("content", ""))
+            del messages[open_tool_thread_start:]
+        open_tool_call_ids.clear()
+        open_tool_thread_start = None
+        if content.strip():
+            append_message({"role": "assistant", "content": content})
+
+    def start_run(run_id: str) -> None:
+        if active_run_ids and run_id not in active_run_ids:
+            reconcile_incomplete_tool_thread()
+            active_run_ids.clear()
+        flush_pending()
+        flush_deferred_before_run()
+        active_run_ids.add(run_id)
 
     for event in events:
         role = event.payload.get("role")
         if event.type is EventType.run_started and event.run_id is not None:
-            if pending_assistant_is_job:
-                defer_pending_job()
-            else:
-                flush()
-            if active_run_ids and event.run_id not in active_run_ids:
-                active_run_ids.clear()
-            active_run_ids.add(event.run_id)
-        elif event.type in (EventType.run_ended, EventType.run_suspended):
-            flush()
+            start_run(event.run_id)
+        elif event.type is EventType.run_resumed and event.run_id is not None:
+            start_run(event.run_id)
+        elif event.type is EventType.run_suspended:
+            flush_pending()
             if event.run_id is not None:
                 active_run_ids.discard(event.run_id)
-            flush_deferred()
-        elif event.type is EventType.run_resumed and event.run_id is not None:
-            if pending_assistant_is_job:
-                defer_pending_job()
+            flush_all_deferred()
+        elif event.type is EventType.run_ended:
+            if open_tool_call_ids or (
+                pending_assistant is not None and pending_assistant.get("tool_calls")
+            ):
+                reconcile_incomplete_tool_thread()
             else:
-                flush()
-            if active_run_ids and event.run_id not in active_run_ids:
-                active_run_ids.clear()
-            active_run_ids.add(event.run_id)
+                flush_pending()
+            if event.run_id is not None:
+                active_run_ids.discard(event.run_id)
+            flush_all_deferred()
         elif event.type is EventType.message_token and role in ("user", "assistant", "system"):
             if event.payload.get("partial"):
                 continue  # streaming-only delta; the whole message lands at turn end
-            if role in ("user", "system"):
-                flush()
-                flush_deferred()
-                append_message({"role": role, "content": str(event.payload.get("text", ""))})
-            else:  # assistant text — may be joined by tool calls in the same turn
-                message = {
-                    "role": "assistant",
-                    "content": str(event.payload.get("text", "")),
-                }
-                if event.payload.get("job_id") and (
-                    pending_assistant is not None or open_tool_call_ids or active_run_ids
-                ):
-                    deferred_assistants.append(message)
-                    continue
-                flush()
-                flush_deferred()
+            message = {"role": role, "content": str(event.payload.get("text", ""))}
+            if role == "assistant" and event.payload.get("job_id"):
+                deferred_messages.append(message)
+            elif role in ("user", "system"):
+                if active_run_ids or open_tool_call_ids:
+                    deferred_messages.append(message)
+                else:
+                    flush_pending()
+                    flush_all_deferred()
+                    append_message(message)
+            elif open_tool_call_ids:
+                deferred_messages.append(message)
+            else:
+                flush_pending()
+                if not active_run_ids:
+                    flush_all_deferred()
                 pending_assistant = message
-                pending_assistant_is_job = bool(event.payload.get("job_id"))
         elif event.type is EventType.tool_call:
-            defer_pending_job()
             if pending_assistant is None:
                 pending_assistant = {"role": "assistant", "content": ""}
-                pending_assistant_is_job = False
             pending_assistant.setdefault("tool_calls", []).append(
                 {
                     "id": str(event.payload.get("call_id", "")),
@@ -132,7 +159,7 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
                 }
             )
         elif event.type is EventType.tool_result:
-            flush()  # the assistant tool_calls message must precede the tool results
+            flush_pending()  # the assistant tool_calls message must precede the tool results
             call_id = str(event.payload.get("call_id", ""))
             append_message(
                 {
@@ -142,8 +169,10 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
                 }
             )
             open_tool_call_ids.discard(call_id)
-            flush_deferred()
+            if not open_tool_call_ids:
+                open_tool_thread_start = None
+                flush_all_deferred()
 
-    flush()
-    flush_deferred()
+    flush_pending()
+    flush_all_deferred()
     return messages

@@ -270,6 +270,97 @@ def test_new_run_reconciles_orphaned_active_run_without_losing_job_result() -> N
     ]
 
 
+def test_new_run_drops_stale_unmatched_tool_protocol_and_releases_job_result() -> None:
+    events = [
+        _event(1, EventType.run_started, {}),
+        _event(2, EventType.tool_call, {"tool": "read", "call_id": "c1", "args": {}}),
+        _event(
+            3,
+            EventType.message_token,
+            {"role": "assistant", "text": "background result", "job_id": "job_1"},
+        ),
+        Event(
+            type=EventType.run_started,
+            seq=4,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={},
+        ),
+        Event(
+            type=EventType.message_token,
+            seq=5,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={"role": "assistant", "text": "second run complete"},
+        ),
+        Event(
+            type=EventType.run_ended,
+            seq=6,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={"reason": "completed"},
+        ),
+    ]
+
+    messages = project_messages(events)
+    assert messages == [
+        {
+            "role": "assistant",
+            "content": "second run complete\n\nbackground result",
+        }
+    ]
+    assert all("tool_calls" not in message for message in messages)
+
+
+def test_deferred_job_stays_before_later_user_boundary() -> None:
+    events = [
+        _event(1, EventType.message_token, {"role": "user", "text": "first"}),
+        _event(2, EventType.run_started, {}),
+        _event(
+            3,
+            EventType.message_token,
+            {"role": "assistant", "text": "background result", "job_id": "job_1"},
+        ),
+        _event(4, EventType.message_token, {"role": "assistant", "text": "run reply"}),
+        _event(5, EventType.message_token, {"role": "user", "text": "second"}),
+        _event(6, EventType.run_ended, {"reason": "completed"}),
+    ]
+
+    assert project_messages(events) == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "run reply\n\nbackground result"},
+        {"role": "user", "content": "second"},
+    ]
+
+
+def test_multiple_pre_run_job_results_keep_fifo_order() -> None:
+    events = [
+        _event(
+            1,
+            EventType.message_token,
+            {"role": "assistant", "text": "job 1", "job_id": "job_1"},
+        ),
+        _event(
+            2,
+            EventType.message_token,
+            {"role": "assistant", "text": "job 2", "job_id": "job_2"},
+        ),
+        _event(3, EventType.run_started, {}),
+        _event(4, EventType.message_token, {"role": "assistant", "text": "run reply"}),
+        _event(5, EventType.run_ended, {"reason": "completed"}),
+    ]
+
+    assert project_messages(events) == [
+        {"role": "assistant", "content": "run reply\n\njob 1\n\njob 2"}
+    ]
+
+
 @pytest.mark.parametrize(
     "model",
     ["openai/gpt-4o-mini", "anthropic/claude-3-5-sonnet-20241022"],
