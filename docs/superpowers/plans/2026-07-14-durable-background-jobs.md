@@ -1649,10 +1649,20 @@ def _validate_limit(limit: int) -> None:
 
 
 def _validate_progress(current: int, total: int | None) -> None:
-    if current < 0 or (total is not None and (total < 0 or current > total)):
+    invalid_current = (
+        isinstance(current, bool)
+        or not isinstance(current, int)
+        or not 0 <= current <= 2**63 - 1
+    )
+    invalid_total = total is not None and (
+        isinstance(total, bool)
+        or not isinstance(total, int)
+        or not 0 <= total <= 2**63 - 1
+    )
+    if invalid_current or invalid_total or (total is not None and current > total):
         raise JobValidationError(
             "invalid_progress",
-            "progress requires current >= 0 and current <= total when total is set",
+            "progress requires PostgreSQL bigint integers with current <= total",
         )
 ```
 
@@ -1998,13 +2008,15 @@ Expected: `AttributeError` because the three methods do not exist.
 - [ ] **Step 3: Add lease validation helpers** inside `InMemoryJobStore`:
 
 ```python
-    def _owned(self, lease: JobLease) -> JobRecord:
+    def _owned(self, lease: JobLease, now: datetime) -> JobRecord:
         row = self._rows.get(lease.job_id)
         if (
             row is None
             or lease.scope_id != self._scope_id
             or row.status is not JobStatus.running
             or row.lease_token != lease.token
+            or row.lease_expires_at is None
+            or row.lease_expires_at <= now
         ):
             raise JobLeaseLostError(lease.job_id)
         return row
@@ -2019,6 +2031,7 @@ Expected: `AttributeError` because the three methods do not exist.
     ) -> JobLease | None:
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be positive")
+        now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
             row = self._rows.get(job_id)
             if row is None or row.attempt >= row.max_attempts:
@@ -2065,8 +2078,9 @@ Expected: `AttributeError` because the three methods do not exist.
 
 ```python
     async def heartbeat(self, lease: JobLease, now: datetime) -> bool:
+        now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
-            row = self._owned(lease)
+            row = self._owned(lease, now)
             updated = replace(
                 row,
                 heartbeat_at=now,
@@ -2086,8 +2100,14 @@ Expected: `AttributeError` because the three methods do not exist.
         now: datetime,
     ) -> JobProgressResult:
         _validate_progress(current, total)
+        safe_message = (
+            None
+            if message is None
+            else _validated_storage_text(message, field="progress_message")
+        )
+        now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
-            row = self._owned(lease)
+            row = self._owned(lease, now)
             if current < row.progress_current:
                 raise JobValidationError(
                     "progress_regression",
@@ -2097,7 +2117,7 @@ Expected: `AttributeError` because the three methods do not exist.
                 row,
                 progress_current=current,
                 progress_total=total,
-                progress_message=message,
+                progress_message=safe_message,
                 progress_updated_at=now,
                 heartbeat_at=now,
                 lease_expires_at=now + timedelta(seconds=lease.lease_seconds),
@@ -2467,7 +2487,7 @@ def _injection_event(
         self, lease: JobLease, error: JobError, retry_at: datetime, now: datetime
     ) -> JobRecord:
         async with self._lock:
-            row = self._owned(lease)
+            row = self._owned(lease, now)
             if row.attempt >= row.max_attempts:
                 raise JobValidationError(
                     "attempts_exhausted", "job has no retry attempts remaining"
@@ -2494,7 +2514,7 @@ def _injection_event(
         self, lease: JobLease, result: JobResult, now: datetime
     ) -> JobRecord:
         async with self._lock:
-            row = self._owned(lease)
+            row = self._owned(lease, now)
             return await self._finalize_locked(
                 row, status=JobStatus.succeeded, now=now, result=result
             )
@@ -2503,14 +2523,14 @@ def _injection_event(
         self, lease: JobLease, error: JobError, now: datetime
     ) -> JobRecord:
         async with self._lock:
-            row = self._owned(lease)
+            row = self._owned(lease, now)
             return await self._finalize_locked(
                 row, status=JobStatus.failed, now=now, error=error
             )
 
     async def finish_cancelled(self, lease: JobLease, now: datetime) -> JobRecord:
         async with self._lock:
-            row = self._owned(lease)
+            row = self._owned(lease, now)
             return await self._finalize_locked(
                 row, status=JobStatus.cancelled, now=now
             )
@@ -3254,6 +3274,7 @@ Expected: `AttributeError` for transition methods.
     ) -> JobLease | None:
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be positive")
+        now = _normalized_utc_timestamp(now, field="now")
         token = uuid.uuid4().hex
         expires = now + timedelta(seconds=lease_seconds)
         async with self._engine.begin() as conn:
@@ -3306,7 +3327,7 @@ Expected: `AttributeError` for transition methods.
 
 ```python
     async def _locked_owned_row(
-        self, conn: Any, lease: JobLease
+        self, conn: Any, lease: JobLease, now: datetime
     ) -> Mapping[str, Any]:
         if lease.scope_id != self._scope_id:
             raise JobLeaseLostError(lease.job_id)
@@ -3327,14 +3348,17 @@ Expected: `AttributeError` for transition methods.
             row is None
             or row["status"] != JobStatus.running.value
             or row["lease_token"] != lease.token
+            or row["lease_expires_at"] is None
+            or row["lease_expires_at"] <= now
         ):
             raise JobLeaseLostError(lease.job_id)
         return row
 
     async def heartbeat(self, lease: JobLease, now: datetime) -> bool:
+        now = _normalized_utc_timestamp(now, field="now")
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            await self._locked_owned_row(conn, lease)
+            await self._locked_owned_row(conn, lease, now)
             cancel_requested_at = (
                 await conn.execute(
                     text(
@@ -3371,9 +3395,15 @@ snippet avoids repeating the import already added in Task 3.
         now: datetime,
     ) -> JobProgressResult:
         _validate_progress(current, total)
+        safe_message = (
+            None
+            if message is None
+            else _validated_storage_text(message, field="progress_message")
+        )
+        now = _normalized_utc_timestamp(now, field="now")
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            locked = await self._locked_owned_row(conn, lease)
+            locked = await self._locked_owned_row(conn, lease, now)
             if current < int(locked["progress_current"]):
                 raise JobValidationError(
                     "progress_regression",
@@ -3394,7 +3424,7 @@ snippet avoids repeating the import already added in Task 3.
                         {
                             "current": current,
                             "total": total,
-                            "message": message,
+                            "message": safe_message,
                             "now": now,
                             "expires": now
                             + timedelta(seconds=lease.lease_seconds),
@@ -3423,9 +3453,11 @@ not duplicate or move it in this task.
     async def requeue(
         self, lease: JobLease, error: JobError, retry_at: datetime, now: datetime
     ) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
+        retry_at = _normalized_utc_timestamp(retry_at, field="retry_at")
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            locked = await self._locked_owned_row(conn, lease)
+            locked = await self._locked_owned_row(conn, lease, now)
             if int(locked["attempt"]) >= int(locked["max_attempts"]):
                 raise JobValidationError(
                     "attempts_exhausted", "job has no retry attempts remaining"
