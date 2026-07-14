@@ -1,7 +1,7 @@
 # Keel 当前状态与里程碑
 
 > **快照日期：** 2026-07-14  
-> **代码基线：** `feat/durable-background-jobs@34c9c72`（待最终验证/合并）  
+> **代码基线：** `main`（Durable Background Jobs 已合并基线）  
 > **路线来源：** [`PRD.md`](./PRD.md) §11、[`ARCHITECTURE.md`](./ARCHITECTURE.md) §19、
 > [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md)
 
@@ -63,7 +63,7 @@ Keel 当前处于 **M3（Knowledge & quality）中段**：
 
 ## 3. 当前验证基线
 
-- Python test suite：**542 passed / 1 skipped**。
+- Python test suite：**750 passed / 1 skipped**。
 - Ruff lint + format：通过。
 - mypy strict：通过。
 - Memory golden replay：
@@ -162,5 +162,4 @@ Security review、performance、backup/restore drill、multi-tenant groundwork �
 
 ## 7. 当前下一步
 
-完成 durable background jobs 的最终分支验证与合并，然后立即进入
-**RAG/Knowledge Base 设计**。
+立即进入 **RAG/Knowledge Base 设计**。
