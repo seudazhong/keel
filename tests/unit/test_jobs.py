@@ -622,3 +622,375 @@ async def test_lease_operations_reject_invalid_duration_and_naive_timestamps() -
             message=None,
             now=datetime(2026, 7, 14, 9, 1),
         )
+
+
+async def test_queued_cancel_is_terminal_idempotent_and_injects_once() -> None:
+    events = InMemoryEventStore()
+    await _session(events, "target", "web:local")
+    store = InMemoryJobStore("web:local", events=events)
+    job, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id="target",
+        idempotency_key="cancel-queued",
+        max_attempts=3,
+        now=_NOW,
+    )
+
+    cancelled = await store.request_cancel(job.id, _NOW + timedelta(seconds=1))
+    again = await store.request_cancel(job.id, _NOW + timedelta(seconds=2))
+
+    assert cancelled is not None and cancelled.status is JobStatus.cancelled
+    assert cancelled.result_message == "后台任务 test.echo 已取消。"
+    assert cancelled.finished_at == _NOW + timedelta(seconds=1)
+    assert again == cancelled
+    assert await store.request_cancel("missing", _NOW) is None
+    injected = [
+        event for event in events.snapshot("target") if event.payload.get("job_id") == job.id
+    ]
+    assert len(injected) == 1
+    assert injected[0].payload == {
+        "role": "assistant",
+        "text": "后台任务 test.echo 已取消。",
+        "partial": False,
+        "job_id": job.id,
+        "job_kind": "test.echo",
+        "job_status": "cancelled",
+    }
+
+
+async def test_running_cancel_is_observed_by_heartbeat_but_success_can_win() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _queued(store, "cancel-running")
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+    local_zone = timezone(timedelta(hours=8))
+
+    requested = await store.request_cancel(
+        job_id, (_NOW + timedelta(seconds=1)).astimezone(local_zone)
+    )
+    again = await store.request_cancel(job_id, _NOW + timedelta(seconds=2))
+    assert requested is not None and requested.status is JobStatus.running
+    assert requested.cancel_requested_at == _NOW + timedelta(seconds=1)
+    assert again is not None
+    assert again.cancel_requested_at == requested.cancel_requested_at
+    assert await store.heartbeat(lease, _NOW + timedelta(seconds=3)) is True
+
+    succeeded = await store.succeed(
+        lease,
+        JobResult(data={"count": 1}, message="completed before checkpoint"),
+        _NOW + timedelta(seconds=4),
+    )
+    assert succeeded.status is JobStatus.succeeded
+    assert succeeded.cancel_requested_at == requested.cancel_requested_at
+    assert succeeded.result == {"count": 1}
+    assert await store.request_cancel(job_id, _NOW + timedelta(seconds=5)) == succeeded
+
+
+async def test_requeue_is_non_terminal_bounded_utc_and_does_not_inject() -> None:
+    events = InMemoryEventStore()
+    await _session(events, "target", "web:local")
+    store = InMemoryJobStore(
+        "web:local",
+        events=events,
+        limits=JobLimits(error_message_max_chars=4),
+    )
+    job, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id="target",
+        idempotency_key="retry",
+        max_attempts=3,
+        now=_NOW,
+    )
+    lease = await store.claim(job.id, _NOW, 60)
+    assert lease is not None
+    local_zone = timezone(timedelta(hours=8))
+    retry_at = (_NOW + timedelta(seconds=5)).astimezone(local_zone)
+    updated_at = (_NOW + timedelta(seconds=1)).astimezone(local_zone)
+
+    queued = await store.requeue(
+        lease,
+        JobError("provider_timeout", "safe public message"),
+        retry_at,
+        updated_at,
+    )
+
+    assert queued.status is JobStatus.queued
+    assert queued.attempt == 1
+    assert queued.next_attempt_at == _NOW + timedelta(seconds=5)
+    assert queued.updated_at == _NOW + timedelta(seconds=1)
+    assert queued.error_kind == "provider_timeout"
+    assert queued.error_message == "safe"
+    assert queued.lease_token is None
+    assert queued.lease_expires_at is None
+    assert queued.heartbeat_at is None
+    assert queued.finished_at is None
+    assert queued.injected_event_seq is None
+    assert not any(e.payload.get("job_id") == job.id for e in events.snapshot("target"))
+
+
+async def test_requeue_rejects_an_exhausted_attempt_without_mutating_the_job() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _queued(store, "retry-exhausted", max_attempts=1)
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+
+    with pytest.raises(JobValidationError, match="attempts_exhausted"):
+        await store.requeue(
+            lease,
+            JobError("provider_timeout", "safe"),
+            _NOW + timedelta(seconds=5),
+            _NOW + timedelta(seconds=1),
+        )
+
+    record = await store.get(job_id)
+    assert record is not None
+    assert record.status is JobStatus.running
+    assert record.lease_token == lease.token
+
+
+@pytest.mark.parametrize(
+    ("terminal", "expected_text"),
+    [
+        ("succeeded", "done"),
+        ("failed", "后台任务 test.echo 失败：bad_input"),
+        ("cancelled", "后台任务 test.echo 已取消。"),
+    ],
+)
+async def test_terminal_finalizers_inject_exactly_once_and_freeze_the_job(
+    terminal: str, expected_text: str
+) -> None:
+    events = InMemoryEventStore()
+    await _session(events, "target", "web:local")
+    store = InMemoryJobStore("web:local", events=events)
+    job, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id="target",
+        idempotency_key=f"terminal-{terminal}",
+        max_attempts=3,
+        now=_NOW,
+    )
+    lease = await store.claim(job.id, _NOW, 60)
+    assert lease is not None
+
+    if terminal == "succeeded":
+        result = await store.succeed(lease, JobResult(data={"ok": True}, message="done"), _NOW)
+    elif terminal == "failed":
+        result = await store.fail_terminal(lease, JobError("bad_input", "safe"), _NOW)
+    else:
+        result = await store.finish_cancelled(lease, _NOW)
+
+    assert result.status.value == terminal
+    assert result.result_message == expected_text
+    assert result.lease_token is None
+    assert result.lease_expires_at is None
+    assert result.heartbeat_at is None
+    with pytest.raises(JobLeaseLostError):
+        await store.succeed(
+            lease,
+            JobResult(data={}, message="again"),
+            _NOW + timedelta(seconds=1),
+        )
+    assert await store.request_cancel(job.id, _NOW + timedelta(seconds=2)) == result
+    assert await store.get(job.id) == result
+    injected = [
+        event for event in events.snapshot("target") if event.payload.get("job_id") == job.id
+    ]
+    assert len(injected) == 1
+    assert injected[0].payload["role"] == "assistant"
+    assert injected[0].payload["text"] == expected_text
+    assert injected[0].payload["partial"] is False
+    assert injected[0].payload["job_status"] == terminal
+
+
+async def test_terminal_finalizer_bounds_record_error_and_injected_messages() -> None:
+    events = InMemoryEventStore()
+    await _session(events, "target", "web:local")
+    store = InMemoryJobStore(
+        "web:local",
+        events=events,
+        limits=JobLimits(result_message_max_chars=10, error_message_max_chars=4),
+    )
+
+    for terminal in ("succeeded", "failed", "cancelled"):
+        job, _ = await store.enqueue_once(
+            kind="test.echo",
+            payload={},
+            target_session_id="target",
+            idempotency_key=f"bounded-{terminal}",
+            max_attempts=3,
+            now=_NOW,
+        )
+        lease = await store.claim(job.id, _NOW, 60)
+        assert lease is not None
+        if terminal == "succeeded":
+            row = await store.succeed(
+                lease,
+                JobResult(data={"ok": True}, message="completed successfully"),
+                _NOW,
+            )
+            full_message = "completed successfully"
+        elif terminal == "failed":
+            row = await store.fail_terminal(
+                lease,
+                JobError("provider_timeout", "safe public message"),
+                _NOW,
+            )
+            full_message = "后台任务 test.echo 失败：provider_timeout"
+            assert row.error_message == "safe"
+        else:
+            row = await store.finish_cancelled(lease, _NOW)
+            full_message = "后台任务 test.echo 已取消。"
+
+        injected = [
+            event for event in events.snapshot("target") if event.payload.get("job_id") == job.id
+        ]
+        assert row.result_message == full_message[:10]
+        assert len(injected) == 1
+        assert injected[0].payload["text"] == row.result_message
+
+
+async def test_fail_exhausted_uses_terminal_finalizer_once() -> None:
+    events = InMemoryEventStore()
+    await _session(events, "target", "web:local")
+    store = InMemoryJobStore("web:local", events=events)
+    job, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id="target",
+        idempotency_key="exhausted",
+        max_attempts=1,
+        now=_NOW,
+    )
+    assert await store.claim(job.id, _NOW, 10) is not None
+    assert await store.fail_exhausted(job.id, _NOW + timedelta(seconds=9)) is None
+    local_zone = timezone(timedelta(hours=8))
+    failed = await store.fail_exhausted(
+        job.id, (_NOW + timedelta(seconds=10)).astimezone(local_zone)
+    )
+
+    assert failed is not None and failed.status is JobStatus.failed
+    assert failed.error_kind == "attempts_exhausted"
+    assert failed.finished_at == _NOW + timedelta(seconds=10)
+    assert await store.fail_exhausted(job.id, _NOW + timedelta(seconds=11)) is None
+    assert len([e for e in events.snapshot("target") if e.payload.get("job_id") == job.id]) == 1
+
+    retryable_id = await _queued(store, "not-exhausted", max_attempts=2)
+    assert await store.claim(retryable_id, _NOW, 10) is not None
+    assert await store.fail_exhausted(retryable_id, _NOW + timedelta(seconds=10)) is None
+
+
+async def test_failed_rerun_requires_a_new_enqueue_request_key() -> None:
+    store = InMemoryJobStore("web:local")
+    first, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={"version": 1},
+        target_session_id=None,
+        idempotency_key="request-1",
+        max_attempts=1,
+        now=_NOW,
+    )
+    lease = await store.claim(first.id, _NOW, 10)
+    assert lease is not None
+    await store.fail_terminal(lease, JobError("bad_input", "safe"), _NOW)
+
+    duplicate, duplicate_created = await store.enqueue_once(
+        kind="test.echo",
+        payload={"version": 2},
+        target_session_id=None,
+        idempotency_key="request-1",
+        max_attempts=1,
+        now=_NOW + timedelta(seconds=1),
+    )
+    rerun, rerun_created = await store.enqueue_once(
+        kind="test.echo",
+        payload={"version": 2},
+        target_session_id=None,
+        idempotency_key="request-2",
+        max_attempts=1,
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    assert duplicate_created is False
+    assert duplicate.id == first.id
+    assert duplicate.status is JobStatus.failed
+    assert rerun_created is True
+    assert rerun.id != first.id
+    assert rerun.status is JobStatus.queued
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["requeue", "succeed", "fail_terminal", "finish_cancelled"],
+)
+async def test_lifecycle_writes_require_a_current_non_expired_lease(
+    operation: str,
+) -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _queued(store, f"expired-{operation}")
+    lease = await store.claim(job_id, _NOW, 10)
+    assert lease is not None
+    expired_at = _NOW + timedelta(seconds=10)
+
+    with pytest.raises(JobLeaseLostError):
+        if operation == "requeue":
+            await store.requeue(
+                lease,
+                JobError("provider_timeout", "safe"),
+                expired_at + timedelta(seconds=5),
+                expired_at,
+            )
+        elif operation == "succeed":
+            await store.succeed(
+                lease,
+                JobResult(data={}, message="late"),
+                expired_at,
+            )
+        elif operation == "fail_terminal":
+            await store.fail_terminal(
+                lease,
+                JobError("bad_input", "safe"),
+                expired_at,
+            )
+        else:
+            await store.finish_cancelled(lease, expired_at)
+
+    record = await store.get(job_id)
+    assert record is not None
+    assert record.status is JobStatus.running
+    assert record.lease_token == lease.token
+
+
+async def test_new_lifecycle_methods_reject_naive_timestamps() -> None:
+    store = InMemoryJobStore("web:local")
+    queued_id = await _queued(store, "naive-cancel")
+    naive = datetime(2026, 7, 14, 9, 0)
+
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.request_cancel(queued_id, naive)
+
+    running_id = await _queued(store, "naive-running")
+    lease = await store.claim(running_id, _NOW, 60)
+    assert lease is not None
+    error = JobError("provider_timeout", "safe")
+    result = JobResult(data={}, message="done")
+
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.requeue(lease, error, naive, _NOW)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.requeue(lease, error, _NOW + timedelta(seconds=5), naive)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.succeed(lease, result, naive)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.fail_terminal(lease, error, naive)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.finish_cancelled(lease, naive)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.fail_exhausted("missing", naive)
+
+    record = await store.get(running_id)
+    assert record is not None
+    assert record.status is JobStatus.running
+    assert record.lease_token == lease.token

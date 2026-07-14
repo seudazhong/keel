@@ -14,6 +14,7 @@ from enum import StrEnum
 from typing import Any, Protocol, cast
 
 from keel_core.config import Settings
+from keel_core.events import Event, EventType
 from keel_core.state import InMemoryEventStore
 
 _MAX_JSON_DEPTH = 100
@@ -393,6 +394,41 @@ def _copy_record(record: JobRecord) -> JobRecord:
     )
 
 
+def _terminal_message(
+    record: JobRecord,
+    status: JobStatus,
+    *,
+    result: JobResult | None,
+    error: JobError | None,
+) -> str:
+    if status is JobStatus.succeeded:
+        assert result is not None
+        return result.message
+    if status is JobStatus.failed:
+        assert error is not None
+        return f"后台任务 {record.kind} 失败：{error.kind}"
+    return f"后台任务 {record.kind} 已取消。"
+
+
+def _injection_event(record: JobRecord, status: JobStatus, text_value: str, now: datetime) -> Event:
+    assert record.target_session_id is not None
+    return Event(
+        type=EventType.message_token,
+        seq=0,
+        session_id=record.target_session_id,
+        scope_id=record.scope_id,
+        ts=now,
+        payload={
+            "role": "assistant",
+            "text": text_value,
+            "partial": False,
+            "job_id": record.id,
+            "job_kind": record.kind,
+            "job_status": status.value,
+        },
+    )
+
+
 def _validate_limit(limit: int) -> None:
     if not 1 <= limit <= 100:
         raise ValueError("limit must be between 1 and 100")
@@ -452,6 +488,55 @@ class InMemoryJobStore:
         ):
             raise JobLeaseLostError(lease.job_id)
         return row
+
+    async def _finalize_locked(
+        self,
+        row: JobRecord,
+        *,
+        status: JobStatus,
+        now: datetime,
+        result: JobResult | None = None,
+        error: JobError | None = None,
+    ) -> JobRecord:
+        safe_result = (
+            None if result is None else copy.deepcopy(self._limits.validate_result(result.data))
+        )
+        safe_error = (
+            None
+            if error is None
+            else JobError(error.kind, self._limits.error_message(error.message))
+        )
+        text_value = self._limits.result_message(
+            _terminal_message(row, status, result=result, error=safe_error)
+        )
+        injected_seq = row.injected_event_seq
+        if row.target_session_id is not None and injected_seq is None:
+            if self._events is None or not self._events.has_session(
+                row.target_session_id, self._scope_id
+            ):
+                raise JobValidationError(
+                    "target_session_not_found",
+                    "target session does not exist in the current scope",
+                )
+            event = _injection_event(row, status, text_value, now)
+            await self._events.append(event)
+            injected_seq = event.seq
+        updated = replace(
+            row,
+            status=status,
+            lease_token=None,
+            lease_expires_at=None,
+            heartbeat_at=None,
+            result=safe_result if status is JobStatus.succeeded else None,
+            result_message=text_value,
+            error_kind=safe_error.kind if safe_error is not None else None,
+            error_message=safe_error.message if safe_error is not None else None,
+            injected_event_seq=injected_seq,
+            updated_at=now,
+            finished_at=now,
+        )
+        self._rows[row.id] = updated
+        return _copy_record(updated)
 
     async def enqueue_once(
         self,
@@ -674,6 +759,91 @@ class InMemoryJobStore:
             return JobProgressResult(
                 record=_copy_record(updated),
                 cancel_requested=updated.cancel_requested_at is not None,
+            )
+
+    async def request_cancel(self, job_id: str, now: datetime) -> JobRecord | None:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._lock:
+            row = self._rows.get(job_id)
+            if row is None:
+                return None
+            if row.status is JobStatus.queued:
+                return await self._finalize_locked(row, status=JobStatus.cancelled, now=now)
+            if row.status is JobStatus.running:
+                updated = replace(
+                    row,
+                    cancel_requested_at=row.cancel_requested_at or now,
+                    updated_at=now,
+                )
+                self._rows[job_id] = updated
+                return _copy_record(updated)
+            return _copy_record(row)
+
+    async def requeue(
+        self, lease: JobLease, error: JobError, retry_at: datetime, now: datetime
+    ) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
+        retry_at = _normalized_utc_timestamp(retry_at, field="retry_at")
+        async with self._lock:
+            row = self._owned(lease, now)
+            if row.attempt >= row.max_attempts:
+                raise JobValidationError(
+                    "attempts_exhausted", "job has no retry attempts remaining"
+                )
+            updated = replace(
+                row,
+                status=JobStatus.queued,
+                next_attempt_at=retry_at,
+                lease_token=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                error_kind=error.kind,
+                error_message=self._limits.error_message(error.message),
+                updated_at=now,
+            )
+            self._rows[row.id] = updated
+            return _copy_record(updated)
+
+    async def succeed(self, lease: JobLease, result: JobResult, now: datetime) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._lock:
+            row = self._owned(lease, now)
+            return await self._finalize_locked(
+                row, status=JobStatus.succeeded, now=now, result=result
+            )
+
+    async def fail_terminal(self, lease: JobLease, error: JobError, now: datetime) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._lock:
+            row = self._owned(lease, now)
+            return await self._finalize_locked(row, status=JobStatus.failed, now=now, error=error)
+
+    async def finish_cancelled(self, lease: JobLease, now: datetime) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._lock:
+            row = self._owned(lease, now)
+            return await self._finalize_locked(row, status=JobStatus.cancelled, now=now)
+
+    async def fail_exhausted(self, job_id: str, now: datetime) -> JobRecord | None:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._lock:
+            row = self._rows.get(job_id)
+            if (
+                row is None
+                or row.status is not JobStatus.running
+                or row.lease_expires_at is None
+                or row.lease_expires_at > now
+                or row.attempt < row.max_attempts
+            ):
+                return None
+            return await self._finalize_locked(
+                row,
+                status=JobStatus.failed,
+                now=now,
+                error=JobError(
+                    "attempts_exhausted",
+                    "job attempts were exhausted after worker lease expiry",
+                ),
             )
 
 
