@@ -366,6 +366,24 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def _validated_identity(value: str, *, field: str, code: str) -> str:
+    if not isinstance(value, str):
+        raise JobValidationError(code, f"{field} must be storage-safe text")
+    normalized = value.strip()
+    if not normalized:
+        raise JobValidationError(code, f"{field} must not be empty")
+    try:
+        return _ensure_storage_safe_text(normalized, field=field)
+    except ValueError as exc:
+        raise JobValidationError(code, f"{field} must be storage-safe UTF-8 text") from exc
+
+
+def _normalized_utc_timestamp(value: datetime, *, field: str = "timestamp") -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise JobValidationError("timezone_required", f"{field} must include a timezone offset")
+    return value.astimezone(UTC)
+
+
 def _copy_record(record: JobRecord) -> JobRecord:
     return replace(
         record,
@@ -397,9 +415,12 @@ class InMemoryJobStore:
         events: InMemoryEventStore | None = None,
         limits: JobLimits | None = None,
     ) -> None:
-        if not scope_id.strip():
-            raise ValueError("scope_id must not be empty")
-        self._scope_id = scope_id
+        try:
+            self._scope_id = _validated_identity(
+                scope_id, field="scope_id", code="invalid_scope_id"
+            )
+        except JobValidationError as exc:
+            raise ValueError(exc.public_message) from exc
         self._events = events
         self._limits = limits or JobLimits()
         self._rows: dict[str, JobRecord] = {}
@@ -420,29 +441,35 @@ class InMemoryJobStore:
         max_attempts: int,
         now: datetime | None = None,
     ) -> tuple[JobRecord, bool]:
-        kind = kind.strip()
-        idempotency_key = idempotency_key.strip()
-        if not kind:
-            raise JobValidationError("invalid_kind", "kind must not be empty")
-        if not idempotency_key:
-            raise JobValidationError("invalid_idempotency_key", "idempotency_key must not be empty")
+        kind = _validated_identity(kind, field="kind", code="invalid_kind")
+        idempotency_key = _validated_identity(
+            idempotency_key,
+            field="idempotency_key",
+            code="invalid_idempotency_key",
+        )
         if max_attempts < 1:
             raise JobValidationError("invalid_max_attempts", "max_attempts must be at least 1")
-        timestamp = now or _utcnow()
+        timestamp = _normalized_utc_timestamp(now, field="now") if now is not None else _utcnow()
         key = (self._scope_id, kind, idempotency_key)
         async with self._lock:
             existing_id = self._dedupe.get(key)
             if existing_id is not None:
                 return _copy_record(self._rows[existing_id]), False
             safe_payload = copy.deepcopy(self._limits.validate_payload(payload))
-            if target_session_id is not None and (
-                self._events is None
-                or not self._events.has_session(target_session_id, self._scope_id)
-            ):
-                raise JobValidationError(
-                    "target_session_not_found",
-                    "target session does not exist in the current scope",
+            safe_target_session_id = None
+            if target_session_id is not None:
+                safe_target_session_id = _validated_identity(
+                    target_session_id,
+                    field="target_session_id",
+                    code="invalid_target_session_id",
                 )
+                if self._events is None or not self._events.has_session(
+                    safe_target_session_id, self._scope_id
+                ):
+                    raise JobValidationError(
+                        "target_session_not_found",
+                        "target session does not exist in the current scope",
+                    )
             job_id = f"job_{uuid.uuid4().hex}"
             record = JobRecord(
                 id=job_id,
@@ -450,7 +477,7 @@ class InMemoryJobStore:
                 kind=kind,
                 status=JobStatus.queued,
                 payload=safe_payload,
-                target_session_id=target_session_id,
+                target_session_id=safe_target_session_id,
                 idempotency_key=idempotency_key,
                 attempt=0,
                 max_attempts=max_attempts,
@@ -501,6 +528,7 @@ class InMemoryJobStore:
 
     async def dispatchable(self, now: datetime, limit: int) -> builtins.list[str]:
         _validate_limit(limit)
+        now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
             rows = [
                 row
@@ -520,6 +548,7 @@ class InMemoryJobStore:
 
     async def exhausted(self, now: datetime, limit: int) -> builtins.list[str]:
         _validate_limit(limit)
+        now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
             rows = [
                 row

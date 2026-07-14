@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 
@@ -291,6 +291,67 @@ async def test_in_memory_enqueue_validates_target_session_and_scope() -> None:
             max_attempts=3,
             now=_NOW,
         )
+
+
+async def test_in_memory_rejects_storage_invalid_identities() -> None:
+    with pytest.raises(ValueError, match="scope_id"):
+        InMemoryJobStore("bad\x00scope")
+
+    store = InMemoryJobStore("web:local")
+    with pytest.raises(JobValidationError, match="invalid_kind"):
+        await store.enqueue_once(
+            kind="bad\x00kind",
+            payload={},
+            target_session_id=None,
+            idempotency_key="request",
+            max_attempts=3,
+            now=_NOW,
+        )
+    with pytest.raises(JobValidationError, match="invalid_idempotency_key"):
+        await store.enqueue_once(
+            kind="test.echo",
+            payload={},
+            target_session_id=None,
+            idempotency_key="bad\ud800key",
+            max_attempts=3,
+            now=_NOW,
+        )
+    with pytest.raises(JobValidationError, match="invalid_target_session_id"):
+        await store.enqueue_once(
+            kind="test.echo",
+            payload={},
+            target_session_id="bad\x00target",
+            idempotency_key="target",
+            max_attempts=3,
+            now=_NOW,
+        )
+
+
+async def test_in_memory_normalizes_aware_timestamps_and_rejects_naive_values() -> None:
+    store = InMemoryJobStore("web:local")
+    local_time = datetime(2026, 7, 14, 17, 0, tzinfo=timezone(timedelta(hours=8)))
+    row, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id=None,
+        idempotency_key="aware",
+        max_attempts=3,
+        now=local_time,
+    )
+    assert row.created_at == _NOW
+    assert await store.dispatchable(_NOW, 100) == [row.id]
+
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.enqueue_once(
+            kind="test.echo",
+            payload={},
+            target_session_id=None,
+            idempotency_key="naive",
+            max_attempts=3,
+            now=datetime(2026, 7, 14, 9, 0),
+        )
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.dispatchable(datetime(2026, 7, 14, 9, 0), 100)
 
 
 async def test_in_memory_get_and_list_are_copied_filtered_and_newest_first() -> None:
