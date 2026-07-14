@@ -11,12 +11,18 @@ Evolution policy (DESIGN-REVIEW G14): ``/v1`` is additive-only.
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from typing import Any
+from datetime import UTC, datetime
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from keel_core.api import ApprovalResolution, CreateMessageRequest, CreateMessageResponse
+from keel_core.api import (
+    ApprovalResolution,
+    CreateMessageRequest,
+    CreateMessageResponse,
+    JobResponse,
+)
 from keel_core.approvals import ApprovalStore
 from keel_core.consolidation import (
     MemoryProposal,
@@ -26,6 +32,7 @@ from keel_core.consolidation import (
     consolidation_schedule_id,
 )
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
+from keel_core.jobs import JobStatus, JobStore
 from keel_core.search import hybrid_search_sessions
 from keel_core.state import PostgresEventStore, list_sessions
 from keel_core.tokens import delete_token, list_connected
@@ -44,6 +51,16 @@ def _runtime(request: Request) -> AgentRuntime:
     if runtime is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "runtime unavailable")
     return runtime
+
+
+def _jobs(request: Request) -> JobStore:
+    store: JobStore | None = getattr(request.app.state, "jobs", None)
+    scope: object = getattr(request.app.state, "durable_scope", None)
+    if store is None or not isinstance(scope, str) or not scope:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "jobs datastore unavailable")
+    if store.scope_id != scope:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "jobs scope misconfigured")
+    return store
 
 
 def _durable_approvals(request: Request) -> tuple[ApprovalStore, str]:
@@ -79,6 +96,46 @@ async def interrupt_run(run_id: str, request: Request) -> dict[str, bool]:
     """Ask an in-flight run to stop at its next iteration (StopReason.interrupted)."""
     runtime = _runtime(request)
     return {"ok": runtime.interrupt_run(run_id)}
+
+
+@router.get("/jobs", response_model=list[JobResponse], summary="List durable jobs")
+async def list_jobs(
+    request: Request,
+    status_filter: Annotated[JobStatus | None, Query(alias="status")] = None,
+    kind: str | None = None,
+    limit: Annotated[int, Query(ge=1, le=100)] = 50,
+) -> list[JobResponse]:
+    rows = await _jobs(request).list(
+        status=status_filter,
+        kind=kind,
+        limit=limit,
+    )
+    return [JobResponse.from_record(row) for row in rows]
+
+
+@router.get(
+    "/jobs/{job_id}",
+    response_model=JobResponse,
+    summary="Get a durable job",
+)
+async def get_job(job_id: str, request: Request) -> JobResponse:
+    row = await _jobs(request).get(job_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    return JobResponse.from_record(row)
+
+
+@router.post(
+    "/jobs/{job_id}/cancel",
+    response_model=JobResponse,
+    summary="Request durable-job cancellation",
+    dependencies=[Depends(require_role(Role.operator))],
+)
+async def cancel_job(job_id: str, request: Request) -> JobResponse:
+    row = await _jobs(request).request_cancel(job_id, datetime.now(UTC))
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    return JobResponse.from_record(row)
 
 
 @router.get("/schedules", summary="List the scope's schedules (management view)")

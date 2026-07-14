@@ -7,8 +7,12 @@ OpenAPI schema (and generated SDK) reflect the contract in M0.
 
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from datetime import datetime
+from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field
+
+from .jobs import JobRecord, JobStatus
 from .types import PermissionDecision, RunId, SessionId
 
 
@@ -48,3 +52,59 @@ class ReadinessResponse(BaseModel):
 
     ready: bool
     checks: dict[str, str] = Field(default_factory=dict)
+
+
+class JobResponse(BaseModel):
+    """Strict public read model for a durable background job."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    kind: str
+    status: JobStatus
+    target_session_id: str | None
+    attempt: int
+    max_attempts: int
+    next_attempt_at: datetime
+    lease_expires_at: datetime | None
+    cancel_requested: bool
+    progress_current: int
+    progress_total: int | None
+    progress_message: str | None
+    progress_updated_at: datetime | None
+    result: dict[str, Any] | None
+    result_message: str | None
+    error_kind: str | None
+    error_message: str | None
+    injected_event_seq: int | None
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+
+    @classmethod
+    def from_record(cls, record: JobRecord) -> JobResponse:
+        return cls(
+            id=record.id,
+            kind=record.kind,
+            status=record.status,
+            target_session_id=record.target_session_id,
+            attempt=record.attempt,
+            max_attempts=record.max_attempts,
+            next_attempt_at=record.next_attempt_at,
+            lease_expires_at=record.lease_expires_at,
+            cancel_requested=record.cancel_requested_at is not None,
+            progress_current=record.progress_current,
+            progress_total=record.progress_total,
+            progress_message=record.progress_message,
+            progress_updated_at=record.progress_updated_at,
+            result=record.result,
+            result_message=record.result_message,
+            error_kind=record.error_kind,
+            error_message=record.error_message,
+            injected_event_seq=record.injected_event_seq,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+            started_at=record.started_at,
+            finished_at=record.finished_at,
+        )
