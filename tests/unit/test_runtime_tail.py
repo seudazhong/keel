@@ -160,6 +160,53 @@ async def test_partial_watermark_does_not_wait_for_later_completed_message() -> 
     await _close(stream, fanout)
 
 
+async def test_partial_watermark_observes_external_durable_job_injection() -> None:
+    durable = InMemoryEventStore()
+    fanout = _QueueFanout()
+    store = CompositeEventStore(durable, fanout, poll_interval=60.0)  # type: ignore[arg-type]
+
+    await store.append(_event("prior durable"))
+    stream = store.tail("s1", after=1)
+    pending = asyncio.create_task(anext(stream))
+    await fanout.started.wait()
+
+    await durable.append(_event("job complete"))  # bypasses CompositeEventStore
+    await store.append(_event("Hel", partial=True))
+
+    events = [
+        await asyncio.wait_for(pending, timeout=0.5),
+        await asyncio.wait_for(anext(stream), timeout=0.5),
+    ]
+    assert [(event.seq, event.payload["text"]) for event in events] == [
+        (2, "job complete"),
+        (0, "Hel"),
+    ]
+    await _close(stream, fanout)
+
+
+async def test_initial_replay_suppresses_partial_superseded_by_completed_message() -> None:
+    durable = InMemoryEventStore()
+    fanout = _QueueFanout()
+    writer = CompositeEventStore(durable, fanout, poll_interval=60.0)  # type: ignore[arg-type]
+
+    await writer.append(_event("prior durable"))
+    await writer.append(_event("Hel", partial=True))  # watermark = 1
+    await durable.append(_event("Hello"))  # final committed before the reader starts
+
+    reader = CompositeEventStore(durable, fanout, poll_interval=60.0)  # type: ignore[arg-type]
+    stream = reader.tail("s1", after=1)
+    first = await asyncio.wait_for(anext(stream), timeout=0.5)
+    assert (first.seq, first.payload["text"]) == (2, "Hello")
+
+    pending = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0.05)
+    assert pending.done() is False
+    pending.cancel()
+    with suppress(asyncio.CancelledError):
+        await pending
+    await _close(stream, fanout)
+
+
 async def test_tail_polls_durable_before_completed_redis_event() -> None:
     durable = InMemoryEventStore()
     fanout = _QueueFanout()

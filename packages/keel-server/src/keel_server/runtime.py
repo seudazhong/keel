@@ -145,11 +145,10 @@ class CompositeEventStore:
         # Streaming-only partial deltas relay to Redis but never touch the durable
         # log (the whole message.token is emitted at turn end).
         if event.type is EventType.message_token and event.payload.get("partial"):
-            watermark = self._durable_cursors.get(event.session_id)
-            if watermark is None:
-                existing = await self._durable_events(event.session_id, 0)
-                watermark = max((item.seq for item in existing), default=0)
-                self._durable_cursors[event.session_id] = watermark
+            known = self._durable_cursors.get(event.session_id, 0)
+            existing = await self._durable_events(event.session_id, known)
+            watermark = max((item.seq for item in existing), default=known)
+            self._durable_cursors[event.session_id] = watermark
             payload = dict(event.payload)
             payload["_durable_after_seq"] = watermark
             await self._fanout.append(event.model_copy(update={"payload": payload}))
@@ -221,9 +220,14 @@ class CompositeEventStore:
 
                 if fanout_event is not None and fanout_event.seq == 0:
                     watermark_raw = fanout_event.payload.get("_durable_after_seq", cursor)
-                    watermark = (
-                        int(watermark_raw) if isinstance(watermark_raw, int | str) else cursor
-                    )
+                    try:
+                        watermark = (
+                            int(watermark_raw) if not isinstance(watermark_raw, bool) else cursor
+                        )
+                    except (TypeError, ValueError):
+                        watermark = cursor
+                    if watermark < cursor:
+                        continue  # a later durable message already superseded this partial
                     for event in await self._durable_events(session_id, cursor, through=watermark):
                         cursor = event.seq
                         yield event
