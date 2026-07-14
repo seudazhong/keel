@@ -372,7 +372,9 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                 final_status = status
             return status_value
         except JobLeaseLostError:
-            status_value, status = await _authoritative_status(store, job_id)
+            status_value, status = await _without_exception_context(
+                _authoritative_status(store, job_id)
+            )
             if status is not None:
                 final_status = status
             return status_value

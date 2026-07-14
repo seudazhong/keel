@@ -703,6 +703,42 @@ async def test_run_job_returns_current_status_when_lease_is_lost() -> None:
     assert (await store.get(job_id)).status is JobStatus.running  # type: ignore[union-attr]
 
 
+async def test_lease_loss_status_lookup_suppresses_context_and_cancellation_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise JobLeaseLostError("HANDLER-SECRET")
+
+    registry.register(JobDefinition("test.echo", handler, lease_seconds=60))
+    job_id = await _enqueued_job(store, key="status-lookup-secret")
+    real_get = store.get
+    calls = 0
+
+    async def cancelling_get(value: str) -> object:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            raise asyncio.CancelledError("STATUS-SECRET")
+        return await real_get(value)
+
+    monkeypatch.setattr(store, "get", cancelling_get)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await run_job(
+            _ctx(store, registry, _Clock(_NOW), []),
+            "web:local",
+            job_id,
+        )
+    formatted = "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
+    assert str(caught.value) == ""
+    assert "STATUS-SECRET" not in formatted
+    assert "HANDLER-SECRET" not in formatted
+
+
 async def test_run_job_propagates_asyncio_cancelled_error() -> None:
     store = InMemoryJobStore("web:local")
     registry = JobRegistry()
