@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from keel_core.errors import CrossScopeError
 from keel_core.events import Event, EventType
@@ -40,12 +40,73 @@ class InMemoryEventStore:
             if after is None or event.seq > after:
                 yield event
 
+    def has_session(self, session_id: SessionId, scope_id: ScopeId) -> bool:
+        return any(event.scope_id == scope_id for event in self._events.get(session_id, []))
+
     def snapshot(self, session_id: SessionId) -> list[Event]:
         """Return a copy of a session's events (test/debug helper)."""
         return list(self._events.get(session_id, []))
 
 
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
+
+
+async def append_event_in_transaction(
+    conn: AsyncConnection,
+    event: Event,
+    *,
+    require_existing_session: bool = False,
+) -> int:
+    """Allocate a session sequence and append an event inside the caller's transaction."""
+    params = {"sid": event.session_id, "scope": event.scope_id}
+    if require_existing_session:
+        row = (
+            await conn.execute(
+                text(
+                    "UPDATE sessions SET next_seq = next_seq + 1, updated_at = now() "
+                    "WHERE id = :sid AND scope_id = :scope "
+                    "RETURNING next_seq - 1 AS seq"
+                ),
+                params,
+            )
+        ).one_or_none()
+        if row is None:
+            raise LookupError(
+                f"session {event.session_id!r} does not exist in scope {event.scope_id!r}"
+            )
+    else:
+        row = (
+            await conn.execute(
+                text(
+                    "INSERT INTO sessions (id, scope_id, next_seq) "
+                    "VALUES (:sid, :scope, 2) "
+                    "ON CONFLICT (id) DO UPDATE "
+                    "SET next_seq = sessions.next_seq + 1, updated_at = now() "
+                    "RETURNING next_seq - 1 AS seq"
+                ),
+                params,
+            )
+        ).one()
+    seq = int(row.seq)
+    event.seq = seq
+    await conn.execute(
+        text(
+            "INSERT INTO events "
+            "(session_id, scope_id, seq, type, version, run_id, ts, payload) "
+            "VALUES (:sid, :scope, :seq, :type, :version, :run_id, :ts, "
+            "CAST(:payload AS jsonb))"
+        ),
+        {
+            **params,
+            "seq": seq,
+            "type": str(event.type),
+            "version": event.version,
+            "run_id": event.run_id,
+            "ts": event.ts,
+            "payload": json.dumps(event.payload, default=str),
+        },
+    )
+    return seq
 
 
 class PostgresEventStore:
@@ -67,41 +128,7 @@ class PostgresEventStore:
             raise CrossScopeError(self._scope_id, event.scope_id)
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            seq = int(
-                (
-                    await conn.execute(
-                        text(
-                            "INSERT INTO sessions (id, scope_id, next_seq) "
-                            "VALUES (:sid, :scope, 2) "
-                            "ON CONFLICT (id) DO UPDATE "
-                            "SET next_seq = sessions.next_seq + 1, updated_at = now() "
-                            "RETURNING next_seq - 1 AS seq"
-                        ),
-                        {"sid": event.session_id, "scope": self._scope_id},
-                    )
-                )
-                .one()
-                .seq
-            )
-            event.seq = seq
-            await conn.execute(
-                text(
-                    "INSERT INTO events "
-                    "(session_id, scope_id, seq, type, version, run_id, ts, payload) "
-                    "VALUES (:sid, :scope, :seq, :type, :version, :run_id, :ts, "
-                    "CAST(:payload AS jsonb))"
-                ),
-                {
-                    "sid": event.session_id,
-                    "scope": self._scope_id,
-                    "seq": seq,
-                    "type": str(event.type),
-                    "version": event.version,
-                    "run_id": event.run_id,
-                    "ts": event.ts,
-                    "payload": json.dumps(event.payload, default=str),
-                },
-            )
+            await append_event_in_transaction(conn, event)
 
     def read(self, session_id: SessionId, after: int | None = None) -> AsyncIterator[Event]:
         return self._read(session_id, after)
