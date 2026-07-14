@@ -8,6 +8,7 @@ import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
@@ -34,7 +35,8 @@ JobHandler = Callable[["JobContext", dict[str, Any]], Awaitable[JobResult]]
 JobClock = Callable[[], datetime]
 EnqueueJob = Callable[..., Awaitable[None]]
 JobStatusSink = Callable[[JobStatus], None]
-StatusOperation = Callable[[], Awaitable[tuple[str, JobStatus | None]]]
+type AsyncOperation[T] = Callable[[], Awaitable[T]]
+_MISSING = object()
 
 
 def _normalized_kind(kind: str) -> str:
@@ -130,10 +132,25 @@ class JobContext:
 
 
 def _clock(ctx: dict[str, Any]) -> JobClock:
-    clock = ctx.get("job_clock")
-    if callable(clock):
-        return cast(JobClock, clock)
-    return lambda: datetime.now(UTC)
+    configured = ctx.get("job_clock", _MISSING)
+    if configured is _MISSING:
+        return lambda: datetime.now(UTC)
+    if not callable(configured):
+        raise TypeError("job_clock must be callable")
+    clock = cast(JobClock, configured)
+
+    def checked_clock() -> datetime:
+        try:
+            value = clock()
+        except BaseException as exc:
+            if isinstance(exc, asyncio.CancelledError):
+                raise asyncio.CancelledError from None
+            raise exc from None
+        if not isinstance(value, datetime):
+            raise TypeError("job_clock must return a datetime")
+        return value
+
+    return checked_clock
 
 
 async def _current_status(store: JobStore, job_id: str) -> str:
@@ -161,9 +178,7 @@ async def _transition_or_current(
         return await _authoritative_status(store, job_id)
 
 
-async def _without_exception_context(
-    operation: StatusOperation,
-) -> tuple[str, JobStatus | None]:
+async def _without_exception_context[T](operation: AsyncOperation[T]) -> T:
     try:
         return await operation()
     except BaseException as exc:
@@ -423,3 +438,51 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                 final_status.value,
                 int((perf_counter() - started) * 1000),
             )
+
+
+async def dispatch_jobs(ctx: dict[str, Any]) -> int:
+    store: JobStore = ctx["jobs"]
+    scope_id = str(ctx["durable_scope"])
+    if store.scope_id != scope_id:
+        logger.error(
+            "job dispatcher scope mismatch configured=%s store=%s",
+            scope_id,
+            store.scope_id,
+        )
+        return 0
+
+    settings = ctx["job_settings"]
+    now = _clock(ctx)()
+    limit = settings.job_dispatch_limit
+    enqueue: EnqueueJob = ctx["enqueue"]
+    processed = 0
+
+    dispatchable_ids = await _without_exception_context(lambda: store.dispatchable(now, limit))
+    for job_id in dispatchable_ids:
+        try:
+            await _without_exception_context(partial(enqueue, "run_job", scope_id, job_id))
+            processed += 1
+        except Exception as exc:
+            logger.warning(
+                "job dispatch enqueue failed scope=%s job=%s error_type=%s frames=%s",
+                scope_id,
+                job_id,
+                type(exc).__name__,
+                _safe_exception_frames(exc),
+            )
+
+    exhausted_ids = await _without_exception_context(lambda: store.exhausted(now, limit))
+    for job_id in exhausted_ids:
+        try:
+            row = await _without_exception_context(partial(store.fail_exhausted, job_id, now))
+            if row is not None:
+                processed += 1
+        except Exception as exc:
+            logger.error(
+                "job exhaustion finalizer failed scope=%s job=%s error_type=%s frames=%s",
+                scope_id,
+                job_id,
+                type(exc).__name__,
+                _safe_exception_frames(exc),
+            )
+    return processed

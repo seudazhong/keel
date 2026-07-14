@@ -21,7 +21,7 @@ from keel_core.jobs import (
     PermanentJobError,
     RetryableJobError,
 )
-from keel_worker.jobs import JobContext, JobDefinition, JobRegistry, run_job
+from keel_worker.jobs import JobContext, JobDefinition, JobRegistry, dispatch_jobs, run_job
 
 _NOW = datetime(2026, 7, 14, 9, 0, tzinfo=UTC)
 
@@ -881,3 +881,309 @@ async def test_run_job_logs_no_payload_or_result(
 
     assert "DO-NOT-LOG" not in caplog.text
     assert "done" not in caplog.text
+
+
+async def test_failed_deferred_enqueue_is_recovered_when_retry_becomes_due(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise RetryableJobError("provider_timeout", "Provider timed out.")
+
+    async def unavailable(name: str, *args: object, **options: object) -> None:
+        raise RuntimeError("redis-token=DO-NOT-LOG")
+
+    registry.register(JobDefinition("test.echo", handler, lease_seconds=10))
+    job_id = await _enqueued_job(store, key="lost-defer")
+    clock = _Clock(_NOW)
+    ctx = _ctx(store, registry, clock, [])
+    ctx["enqueue"] = unavailable
+    caplog.set_level(logging.WARNING, logger="keel.worker.jobs")
+
+    assert await run_job(ctx, "web:local", job_id) == JobStatus.queued.value
+
+    recovered: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    async def enqueue(name: str, *args: object, **options: object) -> None:
+        recovered.append((name, args, options))
+
+    ctx["enqueue"] = enqueue
+    clock.value = _NOW + timedelta(seconds=4)
+    assert await dispatch_jobs(ctx) == 0
+    clock.value = _NOW + timedelta(seconds=5)
+    assert await dispatch_jobs(ctx) == 1
+    assert recovered == [("run_job", ("web:local", job_id), {})]
+    assert "DO-NOT-LOG" not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+async def test_dispatcher_queries_clock_and_limit_then_enqueues_due_and_reclaimable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryJobStore("web:local")
+    due_id = await _enqueued_job(store, key="dispatch-due")
+    reclaimable_id = await _enqueued_job(
+        store,
+        key="dispatch-reclaimable",
+        max_attempts=2,
+    )
+    assert await store.claim(reclaimable_id, _NOW, 10) is not None
+    local_now = datetime(
+        2026,
+        7,
+        14,
+        17,
+        0,
+        11,
+        tzinfo=timezone(timedelta(hours=8)),
+    )
+    clock_calls = 0
+
+    def clock() -> datetime:
+        nonlocal clock_calls
+        clock_calls += 1
+        return local_now
+
+    queries: list[tuple[str, datetime, int]] = []
+    real_dispatchable = store.dispatchable
+    real_exhausted = store.exhausted
+
+    async def dispatchable(now: datetime, limit: int) -> list[str]:
+        queries.append(("dispatchable", now, limit))
+        return await real_dispatchable(now, limit)
+
+    async def exhausted(now: datetime, limit: int) -> list[str]:
+        queries.append(("exhausted", now, limit))
+        return await real_exhausted(now, limit)
+
+    monkeypatch.setattr(store, "dispatchable", dispatchable)
+    monkeypatch.setattr(store, "exhausted", exhausted)
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    ctx = _ctx(store, JobRegistry(), _Clock(_NOW), enqueued)
+    ctx["job_clock"] = clock
+    ctx["job_settings"] = Settings(job_dispatch_limit=2)
+
+    assert await dispatch_jobs(ctx) == 2
+    assert clock_calls == 1
+    assert queries == [
+        ("dispatchable", local_now, 2),
+        ("exhausted", local_now, 2),
+    ]
+    assert {str(args[1]) for _, args, _ in enqueued} == {due_id, reclaimable_id}
+    assert all(name == "run_job" and options == {} for name, _, options in enqueued)
+
+
+async def test_dispatcher_finalizes_crash_at_attempt_ceiling() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise asyncio.CancelledError
+
+    registry.register(JobDefinition("test.echo", handler, max_attempts=1, lease_seconds=10))
+    job_id = await _enqueued_job(store, key="dispatch-exhausted", max_attempts=1)
+    clock = _Clock(_NOW)
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    ctx = _ctx(store, registry, clock, enqueued)
+
+    with pytest.raises(asyncio.CancelledError):
+        await run_job(ctx, "web:local", job_id)
+    clock.value = _NOW + timedelta(seconds=11)
+
+    assert await dispatch_jobs(ctx) == 1
+    assert enqueued == []
+    exhausted = await store.get(job_id)
+    assert exhausted is not None and exhausted.status is JobStatus.failed
+    assert exhausted.error_kind == "attempts_exhausted"
+
+
+async def test_dispatcher_recovers_lost_immediate_enqueue_and_tolerates_duplicates() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    calls = 0
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        return JobResult(data={"calls": calls}, message="done")
+
+    registry.register(JobDefinition("test.echo", handler, lease_seconds=30))
+    job_id = await _enqueued_job(store, key="lost-immediate")
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    ctx = _ctx(store, registry, _Clock(_NOW), enqueued)
+
+    assert await dispatch_jobs(ctx) == 1
+    assert await dispatch_jobs(ctx) == 1
+    assert enqueued == [
+        ("run_job", ("web:local", job_id), {}),
+        ("run_job", ("web:local", job_id), {}),
+    ]
+
+    first, second = await asyncio.gather(
+        run_job(ctx, "web:local", job_id),
+        run_job(ctx, "web:local", job_id),
+    )
+    assert {first, second} <= {JobStatus.running.value, JobStatus.succeeded.value}
+    assert await run_job(ctx, "web:local", job_id) == JobStatus.succeeded.value
+    assert calls == 1
+
+
+async def test_dispatcher_continues_after_enqueue_failure_without_logging_secret(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = InMemoryJobStore("web:local")
+    first = await _enqueued_job(store, key="dispatch-1")
+    second = await _enqueued_job(store, key="dispatch-2")
+    attempted: list[str] = []
+
+    async def flaky(name: str, *args: object, **options: object) -> None:
+        job_id = str(args[1])
+        attempted.append(job_id)
+        if job_id == first:
+            raise RuntimeError("redis-token=DO-NOT-LOG")
+
+    ctx = _ctx(store, JobRegistry(), _Clock(_NOW), [])
+    ctx["enqueue"] = flaky
+    ctx["job_settings"] = Settings(job_dispatch_limit=100)
+    caplog.set_level(logging.WARNING, logger="keel.worker.jobs")
+
+    assert await dispatch_jobs(ctx) == 1
+    assert set(attempted) == {first, second}
+    assert "DO-NOT-LOG" not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+async def test_dispatcher_continues_after_exhaustion_failure_without_logging_secret(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = InMemoryJobStore("web:local")
+    first = await _enqueued_job(store, key="exhaustion-1", max_attempts=1)
+    second = await _enqueued_job(store, key="exhaustion-2", max_attempts=1)
+    assert await store.claim(first, _NOW, 10) is not None
+    assert await store.claim(second, _NOW, 10) is not None
+    attempted: list[str] = []
+    real_fail_exhausted = store.fail_exhausted
+
+    async def flaky(job_id: str, now: datetime) -> object:
+        attempted.append(job_id)
+        if job_id == first:
+            raise RuntimeError("database-token=DO-NOT-LOG")
+        return await real_fail_exhausted(job_id, now)
+
+    monkeypatch.setattr(store, "fail_exhausted", flaky)
+    caplog.set_level(logging.ERROR, logger="keel.worker.jobs")
+
+    assert (
+        await dispatch_jobs(
+            _ctx(
+                store,
+                JobRegistry(),
+                _Clock(_NOW + timedelta(seconds=11)),
+                [],
+            )
+        )
+        == 1
+    )
+    assert set(attempted) == {first, second}
+    assert (await store.get(first)).status is JobStatus.running  # type: ignore[union-attr]
+    assert (await store.get(second)).status is JobStatus.failed  # type: ignore[union-attr]
+    assert "DO-NOT-LOG" not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+async def test_dispatcher_fails_closed_on_store_scope_mismatch() -> None:
+    store = InMemoryJobStore("scope:store")
+    job_id = await _enqueued_job(store, key="dispatch-scope")
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    ctx = _ctx(store, JobRegistry(), _Clock(_NOW), enqueued)
+
+    assert await dispatch_jobs(ctx) == 0
+    assert enqueued == []
+    assert (await store.get(job_id)).status is JobStatus.queued  # type: ignore[union-attr]
+
+
+@pytest.mark.parametrize("clock", [None, "not-callable", lambda: "not-a-datetime"])
+async def test_dispatcher_rejects_invalid_configured_clocks(clock: object) -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _enqueued_job(store, key=f"invalid-clock-{type(clock).__name__}")
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    ctx = _ctx(store, JobRegistry(), _Clock(_NOW), enqueued)
+    ctx["job_clock"] = clock
+
+    with pytest.raises(TypeError, match="job_clock"):
+        await dispatch_jobs(ctx)
+    assert enqueued == []
+    assert (await store.get(job_id)).status is JobStatus.queued  # type: ignore[union-attr]
+
+
+async def test_dispatcher_rejects_naive_clock_before_delivery() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _enqueued_job(store, key="naive-dispatch-clock")
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    ctx = _ctx(
+        store,
+        JobRegistry(),
+        _Clock(datetime(2026, 7, 14, 9, 0)),
+        enqueued,
+    )
+
+    with pytest.raises(JobValidationError) as caught:
+        await dispatch_jobs(ctx)
+    assert caught.value.code == "timezone_required"
+    assert enqueued == []
+    assert (await store.get(job_id)).status is JobStatus.queued  # type: ignore[union-attr]
+
+
+async def test_dispatcher_redacts_cancelled_enqueue_message() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _enqueued_job(store, key="cancelled-dispatch-enqueue")
+    ctx = _ctx(store, JobRegistry(), _Clock(_NOW), [])
+
+    async def cancelled_enqueue(
+        name: str,
+        *args: object,
+        **options: object,
+    ) -> None:
+        raise asyncio.CancelledError("QUEUE-SECRET")
+
+    ctx["enqueue"] = cancelled_enqueue
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await dispatch_jobs(ctx)
+    formatted = "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
+    assert str(caught.value) == ""
+    assert "QUEUE-SECRET" not in formatted
+    assert (await store.get(job_id)).status is JobStatus.queued  # type: ignore[union-attr]
+
+
+async def test_dispatcher_redacts_cancelled_finalizer_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _enqueued_job(store, key="cancelled-finalizer", max_attempts=1)
+    assert await store.claim(job_id, _NOW, 10) is not None
+
+    async def cancelled_finalizer(value: str, now: datetime) -> None:
+        raise asyncio.CancelledError("FINALIZER-SECRET")
+
+    monkeypatch.setattr(store, "fail_exhausted", cancelled_finalizer)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        await dispatch_jobs(
+            _ctx(
+                store,
+                JobRegistry(),
+                _Clock(_NOW + timedelta(seconds=11)),
+                [],
+            )
+        )
+    formatted = "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
+    assert str(caught.value) == ""
+    assert "FINALIZER-SECRET" not in formatted
+    assert (await store.get(job_id)).status is JobStatus.running  # type: ignore[union-attr]
