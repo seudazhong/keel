@@ -166,6 +166,8 @@ async def _without_exception_context(
     try:
         return await operation
     except BaseException as exc:
+        if isinstance(exc, asyncio.CancelledError):
+            raise asyncio.CancelledError from None
         raise exc from None
 
 
@@ -321,7 +323,7 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                 final_status = status
             return status_value
         except asyncio.CancelledError:
-            raise
+            raise asyncio.CancelledError from None
         except JobCancellationRequested:
             status_value, status = await _without_exception_context(
                 _transition_or_current(

@@ -640,15 +640,19 @@ async def test_cancelled_deferred_enqueue_reports_queued_telemetry(
         raise RetryableJobError("temporary", "temporary")
 
     async def cancelled_enqueue(name: str, *args: object, **options: object) -> None:
-        raise asyncio.CancelledError
+        raise asyncio.CancelledError("QUEUE-SECRET")
 
     registry.register(JobDefinition("test.echo", handler, lease_seconds=60))
     job_id = await _enqueued_job(store, key="cancelled-enqueue")
     ctx = _ctx(store, registry, _Clock(_NOW), [])
     ctx["enqueue"] = cancelled_enqueue
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as caught:
         await run_job(ctx, "web:local", job_id)
+    assert str(caught.value) == ""
+    assert "QUEUE-SECRET" not in "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
     assert (await store.get(job_id)).status is JobStatus.queued  # type: ignore[union-attr]
     assert attributes["job.status"] == JobStatus.queued.value
 
@@ -704,17 +708,21 @@ async def test_run_job_propagates_asyncio_cancelled_error() -> None:
     registry = JobRegistry()
 
     async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
-        raise asyncio.CancelledError
+        raise asyncio.CancelledError("HANDLER-SECRET")
 
     registry.register(JobDefinition("test.echo", handler, max_attempts=3, lease_seconds=60))
     job_id = await _enqueued_job(store, key="worker-shutdown")
 
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(asyncio.CancelledError) as caught:
         await run_job(
             _ctx(store, registry, _Clock(_NOW), []),
             "web:local",
             job_id,
         )
+    assert str(caught.value) == ""
+    assert "HANDLER-SECRET" not in "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
 
     assert (await store.get(job_id)).status is JobStatus.running  # type: ignore[union-attr]
 
