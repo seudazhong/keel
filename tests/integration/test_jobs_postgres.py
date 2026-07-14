@@ -11,6 +11,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.jobs import (
+    JobError,
+    JobLeaseLostError,
     JobLimits,
     JobStatus,
     JobValidationError,
@@ -439,3 +441,360 @@ async def test_postgres_dispatchable_and_exhausted_queries(
     assert "expired-left" in dispatchable
     assert "expired-done" not in dispatchable
     assert await store.exhausted(_NOW, 100) == ["expired-done"]
+
+
+async def _pg_job(
+    store: PostgresJobStore,
+    key: str,
+    *,
+    max_attempts: int = 3,
+    target_session_id: str | None = None,
+) -> str:
+    row, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id=target_session_id,
+        idempotency_key=key,
+        max_attempts=max_attempts,
+        now=_NOW,
+    )
+    return row.id
+
+
+async def test_postgres_concurrent_claim_has_one_winner(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:claim")
+    job_id = await _pg_job(store, "one-winner")
+
+    first, second = await asyncio.gather(
+        store.claim(job_id, _NOW, 60),
+        store.claim(job_id, _NOW, 60),
+    )
+
+    assert sum(lease is not None for lease in (first, second)) == 1
+    winner = first or second
+    assert winner is not None
+    assert winner.attempt == 1
+    assert await store.claim(job_id, _NOW + timedelta(seconds=59), 60) is None
+    row = await store.get(job_id)
+    assert row is not None
+    assert row.status is JobStatus.running
+    assert row.lease_token == winner.token
+    assert row.heartbeat_at == _NOW
+    assert row.lease_expires_at == _NOW + timedelta(seconds=60)
+
+
+async def test_postgres_expired_reclaim_increments_attempt_replaces_token_and_resets_progress(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:reclaim")
+    job_id = await _pg_job(store, "reclaim")
+    first = await store.claim(job_id, _NOW, 10)
+    assert first is not None
+    await store.progress(
+        first,
+        current=2,
+        total=5,
+        message="attempt 1",
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    second = await store.claim(job_id, _NOW + timedelta(seconds=12), 10)
+
+    assert second is not None
+    assert second.attempt == 2
+    assert second.token != first.token
+    row = await store.get(job_id)
+    assert row is not None
+    assert row.progress_current == 0
+    assert row.progress_total is None
+    assert row.progress_message is None
+    assert row.progress_updated_at is None
+    assert row.started_at == _NOW
+    with pytest.raises(JobLeaseLostError):
+        await store.heartbeat(first, _NOW + timedelta(seconds=13))
+    with pytest.raises(JobLeaseLostError):
+        await store.progress(
+            first,
+            current=3,
+            total=5,
+            message="stale attempt",
+            now=_NOW + timedelta(seconds=13),
+        )
+    with pytest.raises(JobLeaseLostError):
+        await store.requeue(
+            first,
+            JobError("provider_timeout", "safe"),
+            _NOW + timedelta(seconds=20),
+            _NOW + timedelta(seconds=13),
+        )
+    unchanged = await store.get(job_id)
+    assert unchanged is not None
+    assert unchanged.lease_token == second.token
+    assert unchanged.status is JobStatus.running
+
+
+async def test_postgres_claim_sql_enforces_attempt_ceiling(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:ceiling")
+    job_id = await _pg_job(store, "ceiling", max_attempts=1)
+    assert await store.claim(job_id, _NOW, 10) is not None
+    assert await store.claim(job_id, _NOW + timedelta(seconds=11), 10) is None
+    assert await store.dispatchable(_NOW + timedelta(seconds=11), 100) == []
+    assert await store.exhausted(_NOW + timedelta(seconds=11), 100) == [job_id]
+
+
+async def test_postgres_heartbeat_and_progress_extend_current_lease_and_report_cancel(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = "scope:lease-extension"
+    store = PostgresJobStore(migrated_db, scope)
+    job_id = await _pg_job(store, "lease-extension")
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+    async with migrated_db.begin() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.scope_id', :scope, true)"), {"scope": scope}
+        )
+        await conn.execute(
+            text(
+                "UPDATE jobs SET cancel_requested_at = :requested "
+                "WHERE id = :id AND scope_id = :scope"
+            ),
+            {
+                "requested": _NOW + timedelta(seconds=1),
+                "id": job_id,
+                "scope": scope,
+            },
+        )
+
+    assert await store.heartbeat(lease, _NOW + timedelta(seconds=5)) is True
+    heartbeat_row = await store.get(job_id)
+    assert heartbeat_row is not None
+    assert heartbeat_row.heartbeat_at == _NOW + timedelta(seconds=5)
+    assert heartbeat_row.lease_expires_at == _NOW + timedelta(seconds=65)
+
+    progress = await store.progress(
+        lease,
+        current=1,
+        total=None,
+        message=None,
+        now=_NOW + timedelta(seconds=6),
+    )
+    assert progress.cancel_requested is True
+    assert progress.record.heartbeat_at == _NOW + timedelta(seconds=6)
+    assert progress.record.progress_updated_at == _NOW + timedelta(seconds=6)
+    assert progress.record.lease_expires_at == _NOW + timedelta(seconds=66)
+    assert await store.claim(job_id, _NOW + timedelta(seconds=65), 60) is None
+
+
+async def test_postgres_progress_is_monotonic_bigint_bounded_and_storage_safe(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:progress")
+    job_id = await _pg_job(store, "progress")
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+
+    result = await store.progress(
+        lease,
+        current=4,
+        total=10,
+        message="batch 2",
+        now=_NOW + timedelta(seconds=5),
+    )
+
+    assert result.record.progress_current == 4
+    assert result.record.progress_total == 10
+    assert result.record.progress_message == "batch 2"
+    assert result.record.lease_expires_at == _NOW + timedelta(seconds=65)
+    assert result.cancel_requested is False
+    with pytest.raises(JobValidationError, match="progress_regression"):
+        await store.progress(
+            lease,
+            current=3,
+            total=10,
+            message=None,
+            now=_NOW + timedelta(seconds=6),
+        )
+    for current, total in [
+        (11, 10),
+        (-1, None),
+        (True, None),
+        (1.5, 2),
+        (2**63, None),
+        (1, 2**63),
+    ]:
+        with pytest.raises(JobValidationError, match="invalid_progress"):
+            await store.progress(  # type: ignore[arg-type]
+                lease,
+                current=current,
+                total=total,
+                message=None,
+                now=_NOW + timedelta(seconds=6),
+            )
+    for message in ["bad\x00message", "bad\ud800message"]:
+        with pytest.raises(JobValidationError, match="storage_text_invalid"):
+            await store.progress(
+                lease,
+                current=5,
+                total=10,
+                message=message,
+                now=_NOW + timedelta(seconds=6),
+            )
+    unchanged = await store.get(job_id)
+    assert unchanged is not None
+    assert unchanged.progress_current == 4
+    assert unchanged.lease_expires_at == _NOW + timedelta(seconds=65)
+
+
+async def test_postgres_expired_owner_cannot_extend_or_requeue_lease(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:expired-owner")
+    job_id = await _pg_job(store, "expired-owner", max_attempts=1)
+    lease = await store.claim(job_id, _NOW, 10)
+    assert lease is not None
+
+    with pytest.raises(JobLeaseLostError):
+        await store.heartbeat(lease, _NOW + timedelta(seconds=10))
+    with pytest.raises(JobLeaseLostError):
+        await store.progress(
+            lease,
+            current=1,
+            total=1,
+            message="too late",
+            now=_NOW + timedelta(seconds=11),
+        )
+    with pytest.raises(JobLeaseLostError):
+        await store.requeue(
+            lease,
+            JobError("provider_timeout", "safe"),
+            _NOW + timedelta(seconds=20),
+            _NOW + timedelta(seconds=11),
+        )
+    assert await store.exhausted(_NOW + timedelta(seconds=11), 100) == [job_id]
+
+
+async def test_postgres_lease_transitions_normalize_utc_and_reject_naive_timestamps(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:lease-utc")
+    job_id = await _pg_job(store, "lease-utc")
+    naive = datetime(2026, 7, 14, 9, 0)
+    local_zone = timezone(timedelta(hours=8))
+
+    with pytest.raises(ValueError, match="lease_seconds"):
+        await store.claim(job_id, _NOW, 0)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.claim(job_id, naive, 60)
+
+    lease = await store.claim(job_id, _NOW.astimezone(local_zone), 60)
+    assert lease is not None
+    claimed = await store.get(job_id)
+    assert claimed is not None
+    assert claimed.heartbeat_at == _NOW
+    assert claimed.lease_expires_at == _NOW + timedelta(seconds=60)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.heartbeat(lease, naive)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.progress(
+            lease,
+            current=1,
+            total=None,
+            message=None,
+            now=naive,
+        )
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.requeue(
+            lease,
+            JobError("provider_timeout", "safe"),
+            naive,
+            _NOW + timedelta(seconds=1),
+        )
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.requeue(
+            lease,
+            JobError("provider_timeout", "safe"),
+            _NOW + timedelta(seconds=5),
+            naive,
+        )
+
+
+async def test_postgres_requeue_is_nonterminal_bounded_and_has_no_injection(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = "scope:requeue"
+    target_session_id = "target-requeue"
+    await _target(migrated_db, scope, target_session_id)
+    store = PostgresJobStore(
+        migrated_db,
+        scope,
+        limits=JobLimits(error_message_max_chars=4),
+    )
+    job_id = await _pg_job(
+        store,
+        "requeue",
+        target_session_id=target_session_id,
+    )
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+    local_zone = timezone(timedelta(hours=8))
+    retry_at = (_NOW + timedelta(seconds=5)).astimezone(local_zone)
+    updated_at = (_NOW + timedelta(seconds=1)).astimezone(local_zone)
+
+    row = await store.requeue(
+        lease,
+        JobError("provider_timeout", "safe public message"),
+        retry_at,
+        updated_at,
+    )
+
+    assert row.status is JobStatus.queued
+    assert row.attempt == 1
+    assert row.next_attempt_at == _NOW + timedelta(seconds=5)
+    assert row.updated_at == _NOW + timedelta(seconds=1)
+    assert row.error_kind == "provider_timeout"
+    assert row.error_message == "safe"
+    assert row.lease_token is None
+    assert row.lease_expires_at is None
+    assert row.heartbeat_at is None
+    assert row.finished_at is None
+    assert row.injected_event_seq is None
+    assert job_id not in await store.dispatchable(_NOW + timedelta(seconds=4), 100)
+    assert job_id in await store.dispatchable(_NOW + timedelta(seconds=5), 100)
+    events = [
+        event async for event in PostgresEventStore(migrated_db, scope).read(target_session_id)
+    ]
+    assert not any(event.payload.get("job_id") == job_id for event in events)
+    with pytest.raises(JobLeaseLostError):
+        await store.requeue(
+            lease,
+            JobError("provider_timeout", "safe"),
+            _NOW + timedelta(seconds=10),
+            _NOW + timedelta(seconds=2),
+        )
+
+
+async def test_postgres_requeue_rejects_exhausted_attempt_without_mutation(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:requeue-exhausted")
+    job_id = await _pg_job(store, "requeue-exhausted", max_attempts=1)
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+
+    with pytest.raises(JobValidationError, match="attempts_exhausted"):
+        await store.requeue(
+            lease,
+            JobError("provider_timeout", "safe"),
+            _NOW + timedelta(seconds=5),
+            _NOW + timedelta(seconds=1),
+        )
+
+    row = await store.get(job_id)
+    assert row is not None
+    assert row.status is JobStatus.running
+    assert row.lease_token == lease.token

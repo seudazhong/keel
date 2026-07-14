@@ -16,7 +16,7 @@ from enum import StrEnum
 from typing import Any, Protocol, cast
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from keel_core.config import Settings
 from keel_core.events import Event, EventType
@@ -1129,6 +1129,202 @@ class PostgresJobStore:
                 .all()
             )
         return [str(value) for value in rows]
+
+    async def claim(self, job_id: str, now: datetime, lease_seconds: int) -> JobLease | None:
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        now = _normalized_utc_timestamp(now, field="now")
+        token = uuid.uuid4().hex
+        expires = now + timedelta(seconds=lease_seconds)
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            row = (
+                (
+                    await conn.execute(
+                        text(
+                            "UPDATE jobs SET "
+                            "status = 'running', attempt = attempt + 1, "
+                            "lease_token = :token, lease_expires_at = :expires, "
+                            "heartbeat_at = :now, progress_current = 0, "
+                            "progress_total = NULL, progress_message = NULL, "
+                            "progress_updated_at = NULL, updated_at = :now, "
+                            "started_at = COALESCE(started_at, :now) "
+                            "WHERE id = :id AND scope_id = :scope "
+                            "AND attempt < max_attempts AND ("
+                            "  (status = 'queued' AND next_attempt_at <= :now) OR "
+                            "  (status = 'running' AND lease_expires_at <= :now)"
+                            ") RETURNING *"
+                        ),
+                        {
+                            "token": token,
+                            "expires": expires,
+                            "now": now,
+                            "id": job_id,
+                            "scope": self._scope_id,
+                        },
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if row is None:
+            return None
+        record = _to_job_record(row)
+        return JobLease(
+            job_id=record.id,
+            scope_id=record.scope_id,
+            token=token,
+            kind=record.kind,
+            payload=record.payload,
+            attempt=record.attempt,
+            max_attempts=record.max_attempts,
+            lease_seconds=lease_seconds,
+        )
+
+    async def _locked_owned_row(
+        self, conn: AsyncConnection, lease: JobLease, now: datetime
+    ) -> Mapping[Any, Any]:
+        if lease.scope_id != self._scope_id:
+            raise JobLeaseLostError(lease.job_id)
+        row = (
+            (
+                await conn.execute(
+                    text("SELECT * FROM jobs WHERE id = :id AND scope_id = :scope FOR UPDATE"),
+                    {"id": lease.job_id, "scope": self._scope_id},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if (
+            row is None
+            or row["status"] != JobStatus.running.value
+            or row["lease_token"] != lease.token
+            or row["lease_expires_at"] is None
+            or row["lease_expires_at"] <= now
+        ):
+            raise JobLeaseLostError(lease.job_id)
+        return row
+
+    async def heartbeat(self, lease: JobLease, now: datetime) -> bool:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            await self._locked_owned_row(conn, lease, now)
+            cancel_requested_at = (
+                await conn.execute(
+                    text(
+                        "UPDATE jobs SET heartbeat_at = :now, "
+                        "lease_expires_at = :expires, updated_at = :now "
+                        "WHERE id = :id AND scope_id = :scope AND lease_token = :token "
+                        "RETURNING cancel_requested_at"
+                    ),
+                    {
+                        "now": now,
+                        "expires": now + timedelta(seconds=lease.lease_seconds),
+                        "id": lease.job_id,
+                        "scope": self._scope_id,
+                        "token": lease.token,
+                    },
+                )
+            ).scalar_one()
+        return cancel_requested_at is not None
+
+    async def progress(
+        self,
+        lease: JobLease,
+        *,
+        current: int,
+        total: int | None,
+        message: str | None,
+        now: datetime,
+    ) -> JobProgressResult:
+        _validate_progress(current, total)
+        safe_message = (
+            None if message is None else _validated_storage_text(message, field="progress_message")
+        )
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            locked = await self._locked_owned_row(conn, lease, now)
+            if current < int(locked["progress_current"]):
+                raise JobValidationError(
+                    "progress_regression",
+                    "progress current cannot decrease within one attempt",
+                )
+            row = (
+                (
+                    await conn.execute(
+                        text(
+                            "UPDATE jobs SET progress_current = :current, "
+                            "progress_total = :total, progress_message = :message, "
+                            "progress_updated_at = :now, heartbeat_at = :now, "
+                            "lease_expires_at = :expires, updated_at = :now "
+                            "WHERE id = :id AND scope_id = :scope "
+                            "AND status = 'running' AND lease_token = :token "
+                            "RETURNING *"
+                        ),
+                        {
+                            "current": current,
+                            "total": total,
+                            "message": safe_message,
+                            "now": now,
+                            "expires": now + timedelta(seconds=lease.lease_seconds),
+                            "id": lease.job_id,
+                            "scope": self._scope_id,
+                            "token": lease.token,
+                        },
+                    )
+                )
+                .mappings()
+                .one()
+            )
+        record = _to_job_record(row)
+        return JobProgressResult(
+            record=record,
+            cancel_requested=record.cancel_requested_at is not None,
+        )
+
+    async def requeue(
+        self, lease: JobLease, error: JobError, retry_at: datetime, now: datetime
+    ) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
+        retry_at = _normalized_utc_timestamp(retry_at, field="retry_at")
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            locked = await self._locked_owned_row(conn, lease, now)
+            if int(locked["attempt"]) >= int(locked["max_attempts"]):
+                raise JobValidationError(
+                    "attempts_exhausted", "job has no retry attempts remaining"
+                )
+            row = (
+                (
+                    await conn.execute(
+                        text(
+                            "UPDATE jobs SET status = 'queued', "
+                            "next_attempt_at = :retry_at, lease_token = NULL, "
+                            "lease_expires_at = NULL, heartbeat_at = NULL, "
+                            "error_kind = :error_kind, error_message = :error_message, "
+                            "updated_at = :now "
+                            "WHERE id = :id AND scope_id = :scope "
+                            "AND status = 'running' AND lease_token = :token "
+                            "RETURNING *"
+                        ),
+                        {
+                            "retry_at": retry_at,
+                            "error_kind": error.kind,
+                            "error_message": self._limits.error_message(error.message),
+                            "now": now,
+                            "id": lease.job_id,
+                            "scope": self._scope_id,
+                            "token": lease.token,
+                        },
+                    )
+                )
+                .mappings()
+                .one()
+            )
+        return _to_job_record(row)
 
 
 def retry_delay_seconds(attempt: int, base_seconds: int, max_seconds: int) -> int:
