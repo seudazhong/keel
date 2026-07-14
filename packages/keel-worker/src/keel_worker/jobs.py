@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from time import perf_counter
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 from keel_core.jobs import (
     JobCancellationRequested,
@@ -35,7 +35,8 @@ JobHandler = Callable[["JobContext", dict[str, Any]], Awaitable[JobResult]]
 JobClock = Callable[[], datetime]
 EnqueueJob = Callable[..., Awaitable[None]]
 JobStatusSink = Callable[[JobStatus], None]
-type AsyncOperation[T] = Callable[[], Awaitable[T]]
+T = TypeVar("T")
+AsyncOperation = Callable[[], Awaitable[T]]
 _MISSING = object()
 
 
@@ -178,7 +179,9 @@ async def _transition_or_current(
         return await _authoritative_status(store, job_id)
 
 
-async def _without_exception_context[T](operation: AsyncOperation[T]) -> T:
+async def _without_exception_context(  # noqa: UP047 - supports declared mypy>=1.11
+    operation: AsyncOperation[T],
+) -> T:
     try:
         return await operation()
     except BaseException as exc:
