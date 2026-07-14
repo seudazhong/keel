@@ -34,6 +34,7 @@ JobHandler = Callable[["JobContext", dict[str, Any]], Awaitable[JobResult]]
 JobClock = Callable[[], datetime]
 EnqueueJob = Callable[..., Awaitable[None]]
 JobStatusSink = Callable[[JobStatus], None]
+StatusOperation = Callable[[], Awaitable[tuple[str, JobStatus | None]]]
 
 
 def _normalized_kind(kind: str) -> str:
@@ -161,10 +162,10 @@ async def _transition_or_current(
 
 
 async def _without_exception_context(
-    operation: Awaitable[tuple[str, JobStatus | None]],
+    operation: StatusOperation,
 ) -> tuple[str, JobStatus | None]:
     try:
-        return await operation
+        return await operation()
     except BaseException as exc:
         if isinstance(exc, asyncio.CancelledError):
             raise asyncio.CancelledError from None
@@ -326,7 +327,7 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
             raise asyncio.CancelledError from None
         except JobCancellationRequested:
             status_value, status = await _without_exception_context(
-                _transition_or_current(
+                lambda: _transition_or_current(
                     store,
                     job_id,
                     store.finish_cancelled(lease, clock()),
@@ -336,34 +337,37 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                 final_status = status
             return status_value
         except PermanentJobError as exc:
+            job_error = JobError(exc.code, exc.public_message)
             status_value, status = await _without_exception_context(
-                _transition_or_current(
+                lambda: _transition_or_current(
                     store,
                     job_id,
-                    store.fail_terminal(lease, JobError(exc.code, exc.public_message), clock()),
+                    store.fail_terminal(lease, job_error, clock()),
                 )
             )
             if status is not None:
                 final_status = status
             return status_value
         except JobValidationError as exc:
+            job_error = JobError(exc.code, exc.public_message)
             status_value, status = await _without_exception_context(
-                _transition_or_current(
+                lambda: _transition_or_current(
                     store,
                     job_id,
-                    store.fail_terminal(lease, JobError(exc.code, exc.public_message), clock()),
+                    store.fail_terminal(lease, job_error, clock()),
                 )
             )
             if status is not None:
                 final_status = status
             return status_value
         except RetryableJobError as exc:
+            job_error = JobError(exc.code, exc.public_message)
             status_value, status = await _without_exception_context(
-                _retry_or_fail(
+                lambda: _retry_or_fail(
                     ctx=ctx,
                     store=store,
                     lease=lease,
-                    error=JobError(exc.code, exc.public_message),
+                    error=job_error,
                     now=clock(),
                     on_status=set_final_status,
                 )
@@ -373,7 +377,7 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
             return status_value
         except JobLeaseLostError:
             status_value, status = await _without_exception_context(
-                _authoritative_status(store, job_id)
+                lambda: _authoritative_status(store, job_id)
             )
             if status is not None:
                 final_status = status
@@ -389,7 +393,7 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                 _safe_exception_frames(exc),
             )
             status_value, status = await _without_exception_context(
-                _retry_or_fail(
+                lambda: _retry_or_fail(
                     ctx=ctx,
                     store=store,
                     lease=lease,

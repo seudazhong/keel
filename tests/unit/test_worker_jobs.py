@@ -536,6 +536,40 @@ async def test_finalization_error_suppresses_original_handler_secret(
     assert "DO-NOT-LEAK" not in formatted
 
 
+async def test_finalization_clock_error_suppresses_original_handler_secret() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    calls = 0
+
+    def failing_clock() -> datetime:
+        nonlocal calls
+        calls += 1
+        if calls >= 3:
+            raise RuntimeError("clock unavailable")
+        return _NOW
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise RuntimeError(f"token={payload['secret']}")
+
+    registry.register(JobDefinition("test.echo", handler, max_attempts=1, lease_seconds=60))
+    job_id = await _enqueued_job(
+        store,
+        key="secret-clock-context",
+        max_attempts=1,
+        payload={"secret": "DO-NOT-LEAK"},
+    )
+    ctx = _ctx(store, registry, _Clock(_NOW), [])
+    ctx["job_clock"] = failing_clock
+
+    with pytest.raises(RuntimeError) as caught:
+        await run_job(ctx, "web:local", job_id)
+    formatted = "".join(
+        traceback.format_exception(type(caught.value), caught.value, caught.value.__traceback__)
+    )
+    assert "clock unavailable" in formatted
+    assert "DO-NOT-LEAK" not in formatted
+
+
 @pytest.mark.parametrize(
     "error_kind",
     ["permanent", "validation", "retryable", "unknown", "cancelled"],
