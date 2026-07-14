@@ -2615,6 +2615,11 @@ Copilot-Session: e6e934ad-91c1-41c3-a46e-521cd446cb49"
 - `enqueue_once()` first returns an existing `(scope_id, kind, idempotency_key)` winner before
   validating retry payload/target fields; for a new key it validates the target in the same
   transaction, inserts with `ON CONFLICT ... DO NOTHING`, and selects a concurrent winner.
+- Same-key calls first acquire a transaction-scoped advisory lock, so an uncommitted winner
+  serializes duplicates before payload/target validation.
+- Advisory lock identity hashes canonical JSON `[scope, kind, idempotency_key]`; delimiter
+  concatenation is forbidden because identity fields may contain control characters.
+- Explicit `now` is validated before dedupe; invalid get/list identities return safe misses.
 - `dispatchable()` and `exhausted()` exactly match design §9.3.
 - Consumes migration 0009 and `JobLimits`; no Redis dependency.
 
@@ -2816,12 +2821,29 @@ Expected: collection fails because `PostgresJobStore` is not defined.
   identity validation into:
 
 ```python
+import hashlib
 from collections.abc import Mapping
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
+
+
+def _optional_read_identity(value: str, *, field: str, code: str) -> str | None:
+    try:
+        return _validated_identity(value, field=field, code=code)
+    except JobValidationError:
+        return None
+
+
+def _job_dedupe_lock_id(scope_id: str, kind: str, idempotency_key: str) -> int:
+    encoded = json.dumps(
+        [scope_id, kind, idempotency_key],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    return int.from_bytes(hashlib.sha256(encoded).digest()[:8], "big", signed=True)
 
 
 def _validate_enqueue_fields(
@@ -2923,8 +2945,21 @@ class PostgresJobStore:
         kind, idempotency_key = _validate_enqueue_fields(
             kind, idempotency_key, max_attempts
         )
+        timestamp = (
+            _normalized_utc_timestamp(now, field="now")
+            if now is not None
+            else _utcnow()
+        )
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            await conn.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {
+                    "lock_id": _job_dedupe_lock_id(
+                        self._scope_id, kind, idempotency_key
+                    )
+                },
+            )
             existing_sql = text(
                 "SELECT * FROM jobs WHERE scope_id = :scope "
                 "AND kind = :kind AND idempotency_key = :key"
@@ -2964,11 +2999,6 @@ class PostgresJobStore:
                         "target_session_not_found",
                         "target session does not exist in the current scope",
                     )
-            timestamp = (
-                _normalized_utc_timestamp(now, field="now")
-                if now is not None
-                else _utcnow()
-            )
             job_id = f"job_{uuid.uuid4().hex}"
             inserted = (
                 (
