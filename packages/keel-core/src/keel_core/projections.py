@@ -28,6 +28,9 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
     """
     messages: list[dict[str, Any]] = []
     pending_assistant: dict[str, Any] | None = None
+    deferred_assistants: list[dict[str, Any]] = []
+    open_tool_call_ids: set[str] = set()
+    active_run_ids: set[str] = set()
 
     def append_message(message: dict[str, Any]) -> None:
         is_plain_assistant = message.get("role") == "assistant" and "tool_calls" not in message
@@ -47,23 +50,50 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
     def flush() -> None:
         nonlocal pending_assistant
         if pending_assistant is not None:
+            for tool_call in pending_assistant.get("tool_calls", []):
+                call_id = str(tool_call.get("id", ""))
+                if call_id:
+                    open_tool_call_ids.add(call_id)
             append_message(pending_assistant)
             pending_assistant = None
 
+    def flush_deferred() -> None:
+        if pending_assistant is not None or open_tool_call_ids or active_run_ids:
+            return
+        while deferred_assistants:
+            append_message(deferred_assistants.pop(0))
+
     for event in events:
         role = event.payload.get("role")
-        if event.type is EventType.message_token and role in ("user", "assistant", "system"):
+        if event.type is EventType.run_started and event.run_id is not None:
+            active_run_ids.add(event.run_id)
+        elif event.type in (EventType.run_ended, EventType.run_suspended):
+            flush()
+            if event.run_id is not None:
+                active_run_ids.discard(event.run_id)
+            flush_deferred()
+        elif event.type is EventType.run_resumed and event.run_id is not None:
+            active_run_ids.add(event.run_id)
+        elif event.type is EventType.message_token and role in ("user", "assistant", "system"):
             if event.payload.get("partial"):
                 continue  # streaming-only delta; the whole message lands at turn end
             if role in ("user", "system"):
                 flush()
+                flush_deferred()
                 append_message({"role": role, "content": str(event.payload.get("text", ""))})
             else:  # assistant text — may be joined by tool calls in the same turn
-                flush()
-                pending_assistant = {
+                message = {
                     "role": "assistant",
                     "content": str(event.payload.get("text", "")),
                 }
+                if event.payload.get("job_id") and (
+                    pending_assistant is not None or open_tool_call_ids or active_run_ids
+                ):
+                    deferred_assistants.append(message)
+                    continue
+                flush()
+                flush_deferred()
+                pending_assistant = message
         elif event.type is EventType.tool_call:
             if pending_assistant is None:
                 pending_assistant = {"role": "assistant", "content": ""}
@@ -79,13 +109,17 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
             )
         elif event.type is EventType.tool_result:
             flush()  # the assistant tool_calls message must precede the tool results
+            call_id = str(event.payload.get("call_id", ""))
             append_message(
                 {
                     "role": "tool",
-                    "tool_call_id": str(event.payload.get("call_id", "")),
+                    "tool_call_id": call_id,
                     "content": str(event.payload.get("output", "")),
                 }
             )
+            open_tool_call_ids.discard(call_id)
+            flush_deferred()
 
     flush()
+    flush_deferred()
     return messages

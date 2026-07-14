@@ -134,6 +134,69 @@ def test_plain_assistant_does_not_merge_across_tool_call_or_tool_result() -> Non
     assert messages[2]["content"] == "background result"
 
 
+def test_job_injection_between_assistant_text_and_tool_call_is_deferred() -> None:
+    events = [
+        _event(1, EventType.message_token, {"role": "assistant", "text": "checking"}),
+        _event(
+            2,
+            EventType.message_token,
+            {"role": "assistant", "text": "background result", "job_id": "job_1"},
+        ),
+        _event(3, EventType.tool_call, {"tool": "read", "call_id": "c1", "args": {}}),
+        _event(4, EventType.tool_result, {"call_id": "c1", "ok": True, "output": "body"}),
+    ]
+
+    messages = project_messages(events)
+    assert [message["role"] for message in messages] == ["assistant", "tool", "assistant"]
+    assert messages[0]["content"] == "checking"
+    assert messages[0]["tool_calls"][0]["id"] == "c1"
+    assert messages[2]["content"] == "background result"
+
+
+def test_job_injection_between_tool_call_and_result_is_deferred() -> None:
+    events = [
+        _event(1, EventType.tool_call, {"tool": "read", "call_id": "c1", "args": {}}),
+        _event(
+            2,
+            EventType.message_token,
+            {"role": "assistant", "text": "background result", "job_id": "job_1"},
+        ),
+        _event(3, EventType.tool_result, {"call_id": "c1", "ok": True, "output": "body"}),
+    ]
+
+    messages = project_messages(events)
+    assert [message["role"] for message in messages] == ["assistant", "tool", "assistant"]
+    assert messages[0]["tool_calls"][0]["id"] == "c1"
+    assert messages[1]["tool_call_id"] == "c1"
+    assert messages[2]["content"] == "background result"
+
+
+def test_job_injection_during_run_is_deferred_until_run_thread_completes() -> None:
+    events = [
+        _event(1, EventType.message_token, {"role": "user", "text": "read"}),
+        _event(2, EventType.run_started, {}),
+        _event(
+            3,
+            EventType.message_token,
+            {"role": "assistant", "text": "background result", "job_id": "job_1"},
+        ),
+        _event(4, EventType.tool_call, {"tool": "read", "call_id": "c1", "args": {}}),
+        _event(5, EventType.tool_result, {"call_id": "c1", "ok": True, "output": "body"}),
+        _event(6, EventType.message_token, {"role": "assistant", "text": "read complete"}),
+        _event(7, EventType.run_ended, {"reason": "completed"}),
+    ]
+
+    messages = project_messages(events)
+    assert [message["role"] for message in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert messages[1]["tool_calls"][0]["id"] == "c1"
+    assert messages[3]["content"] == "read complete\n\nbackground result"
+
+
 @pytest.mark.parametrize(
     "model",
     ["openai/gpt-4o-mini", "anthropic/claude-3-5-sonnet-20241022"],
