@@ -18,6 +18,7 @@ from typing import Any
 
 from arq import cron
 from arq.connections import RedisSettings
+from arq.worker import func
 
 from keel_core import __version__
 from keel_core.config import Settings, get_settings, load_env_file
@@ -292,7 +293,17 @@ def _redis_settings() -> RedisSettings:
 class WorkerSettings:
     """arq worker configuration (referenced by the ``arq`` CLI)."""
 
-    functions = [run_agent, resume_run, scheduler_tick, run_job, dispatch_jobs]
+    functions = [
+        run_agent,
+        resume_run,
+        scheduler_tick,
+        func(
+            run_job,
+            timeout=get_settings().job_execution_timeout_seconds,
+            max_tries=1,
+        ),
+        dispatch_jobs,
+    ]
     cron_jobs = [
         cron(scheduler_tick, second={0, 30}),
         cron(dispatch_jobs, second={0, 30}),

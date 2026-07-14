@@ -60,7 +60,8 @@ class Settings(BaseSettings):
 
     # Durable background jobs (ADR-0010).
     job_lease_seconds: int = Field(default=300, gt=0)
-    job_dispatch_limit: int = Field(default=100, gt=0)
+    job_execution_timeout_seconds: int = Field(default=3600, gt=0)
+    job_dispatch_limit: int = Field(default=100, gt=0, le=100)
     job_retry_base_seconds: int = Field(default=5, gt=0)
     job_retry_max_seconds: int = Field(default=300, gt=0)
     job_payload_max_bytes: int = Field(default=65_536, gt=0)

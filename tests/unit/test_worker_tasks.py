@@ -6,8 +6,10 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from arq.worker import Function
 
 from keel_core.approvals import InMemoryApprovalStore
+from keel_core.config import get_settings
 from keel_core.digest import digest_session_id
 from keel_core.protocols import ProviderChunk, ToolCall
 from keel_core.state import InMemoryEventStore
@@ -187,7 +189,15 @@ async def test_run_agent_rejects_unknown_agent_id() -> None:
 
 
 def test_worker_registers_job_functions_and_dispatch_cron() -> None:
-    assert run_job in WorkerSettings.functions
+    run_job_function = next(
+        function
+        for function in WorkerSettings.functions
+        if isinstance(function, Function) and function.coroutine is run_job
+    )
+    assert run_job_function.name == "run_job"
+    assert run_job_function.timeout_s == get_settings().job_execution_timeout_seconds == 3600
+    assert run_job_function.max_tries == 1
+    assert run_job not in WorkerSettings.functions
     assert dispatch_jobs in WorkerSettings.functions
     dispatch_cron = next(job for job in WorkerSettings.cron_jobs if job.coroutine is dispatch_jobs)
     assert dispatch_cron.second == {0, 30}

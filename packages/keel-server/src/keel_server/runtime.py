@@ -2,8 +2,9 @@
 
 Wires the keel-core loop into the FastAPI server. A run executes as an asyncio
 task whose events are appended to a **durable** store (authoritative ``seq``) and
-fanned out to a **Redis stream**; the SSE endpoint tails Redis. Tool approvals are
-resolved out-of-band over HTTP via an async handshake: the loop emits
+fanned out to a **Redis stream**; the SSE endpoint merges durable replay/polling
+with Redis-only live partials. Tool approvals are resolved out-of-band over HTTP via
+an async handshake: the loop emits
 ``approval.requested`` and awaits a future that ``POST /v1/approvals/{id}`` resolves.
 """
 
@@ -12,9 +13,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import cast
 
 import redis.asyncio as redis
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -125,9 +127,18 @@ class CompositeEventStore:
     always come from the durable store.
     """
 
-    def __init__(self, durable: EventStore, fanout: RedisEventStore) -> None:
+    def __init__(
+        self,
+        durable: EventStore,
+        fanout: RedisEventStore,
+        *,
+        poll_interval: float = 0.1,
+    ) -> None:
+        if poll_interval <= 0:
+            raise ValueError("poll_interval must be positive")
         self._durable = durable
         self._fanout = fanout
+        self._poll_interval = poll_interval
 
     async def append(self, event: Event) -> None:
         # Streaming-only partial deltas relay to Redis but never touch the durable
@@ -140,6 +151,94 @@ class CompositeEventStore:
 
     def read(self, session_id: SessionId, after: int | None = None) -> AsyncIterator[Event]:
         return self._durable.read(session_id, after)
+
+    def tail(self, session_id: SessionId, after: int | None = None) -> AsyncIterator[Event]:
+        """Replay authoritative events, then merge durable polling with Redis live events."""
+        return self._tail(session_id, after)
+
+    async def _durable_events(
+        self,
+        session_id: SessionId,
+        after: int,
+        *,
+        through: int | None = None,
+    ) -> list[Event]:
+        events = [
+            event
+            async for event in self._durable.read(session_id, after)
+            if event.seq > after and (through is None or event.seq <= through)
+        ]
+        return sorted(events, key=lambda event: event.seq)
+
+    async def _tail(
+        self,
+        session_id: SessionId,
+        after: int | None,
+    ) -> AsyncIterator[Event]:
+        cursor = max(after or 0, 0)
+        fanout_events = self._fanout.tail(session_id, cursor)
+
+        async def next_fanout_event() -> Event:
+            return await fanout_events.__anext__()
+
+        fanout_task: asyncio.Task[Event] | None = asyncio.create_task(next_fanout_event())
+        poll_task: asyncio.Task[None] | None = None
+
+        try:
+            for event in await self._durable_events(session_id, cursor):
+                cursor = event.seq
+                yield event
+
+            poll_task = asyncio.create_task(asyncio.sleep(self._poll_interval))
+            while True:
+                assert poll_task is not None
+                waiters = [cast(asyncio.Future[object], poll_task)]
+                if fanout_task is not None:
+                    waiters.append(cast(asyncio.Future[object], fanout_task))
+                await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+
+                fanout_event: Event | None = None
+                if fanout_task is not None and fanout_task.done():
+                    try:
+                        fanout_event = fanout_task.result()
+                    except StopAsyncIteration:
+                        fanout_task = None
+                    else:
+                        fanout_task = asyncio.create_task(next_fanout_event())
+
+                poll_due = poll_task.done()
+                if poll_due:
+                    poll_task = None
+
+                if fanout_event is not None and fanout_event.seq == 0:
+                    yield fanout_event
+
+                completed_seq = (
+                    fanout_event.seq
+                    if fanout_event is not None and fanout_event.seq > cursor
+                    else None
+                )
+                if completed_seq is not None or poll_due:
+                    for event in await self._durable_events(
+                        session_id,
+                        cursor,
+                        through=completed_seq,
+                    ):
+                        cursor = event.seq
+                        yield event
+
+                if poll_task is None:
+                    poll_task = asyncio.create_task(asyncio.sleep(self._poll_interval))
+        finally:
+            tasks = [task for task in (fanout_task, poll_task) if task is not None]
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            close = getattr(fanout_events, "aclose", None)
+            if close is not None:
+                await cast(Callable[[], Awaitable[None]], close)()
 
 
 class ApprovalRegistry:
@@ -408,7 +507,7 @@ class AgentRuntime:
 
     def tail(self, session_id: SessionId, after: int | None = None) -> AsyncIterator[Event]:
         """Live event stream for a session (replay from ``after`` then follow)."""
-        return self._fanout.tail(session_id, after)
+        return self._store().tail(session_id, after)
 
     async def _emit(
         self,

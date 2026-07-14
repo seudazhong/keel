@@ -115,6 +115,7 @@ def test_job_defaults() -> None:
 
     settings = Settings()
     assert settings.job_lease_seconds == 300
+    assert settings.job_execution_timeout_seconds == 3600
     assert settings.job_dispatch_limit == 100
     assert settings.job_retry_base_seconds == 5
     assert settings.job_retry_max_seconds == 300
@@ -126,6 +127,7 @@ def test_job_defaults() -> None:
 
 def test_job_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KEEL_JOB_LEASE_SECONDS", "45")
+    monkeypatch.setenv("KEEL_JOB_EXECUTION_TIMEOUT_SECONDS", "7200")
     monkeypatch.setenv("KEEL_JOB_DISPATCH_LIMIT", "17")
     monkeypatch.setenv("KEEL_JOB_RETRY_BASE_SECONDS", "2")
 
@@ -133,6 +135,7 @@ def test_job_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
 
     settings = Settings()
     assert settings.job_lease_seconds == 45
+    assert settings.job_execution_timeout_seconds == 7200
     assert settings.job_dispatch_limit == 17
     assert settings.job_retry_base_seconds == 2
 
@@ -145,4 +148,17 @@ def test_job_settings_reject_non_positive_values() -> None:
     with pytest.raises(ValidationError):
         Settings(job_lease_seconds=0)
     with pytest.raises(ValidationError):
+        Settings(job_execution_timeout_seconds=0)
+    with pytest.raises(ValidationError):
         Settings(job_result_max_bytes=-1)
+
+
+def test_job_dispatch_limit_rejects_values_outside_store_bounds() -> None:
+    from pydantic import ValidationError
+
+    from keel_core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(job_dispatch_limit=0)
+    with pytest.raises(ValidationError):
+        Settings(job_dispatch_limit=101)

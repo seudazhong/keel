@@ -7,14 +7,17 @@ pauses on an HTTP-resolved approval before executing.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from keel_core.events import EventType
+from keel_core.events import Event, EventType
+from keel_core.jobs import JobResult, PostgresJobStore
 from keel_core.protocols import ProviderChunk, ToolCall
 from keel_core.testing import ScriptedProviderGateway
 from keel_core.types import FinishReason
@@ -142,3 +145,54 @@ async def test_web_streams_token_deltas_over_redis(
     ]
     assert len(durable_assistant) == 1
     assert not durable_assistant[0].payload.get("partial")
+
+
+async def test_web_tail_delivers_durable_only_event_appended_after_follow_starts(
+    migrated_db: AsyncEngine, redis_client: aioredis.Redis, tmp_path: Path
+) -> None:
+    runtime = AgentRuntime(
+        redis_client=redis_client,
+        engine=migrated_db,
+        model="test/model",
+        workspace=tmp_path,
+    )
+    session_id = f"web-durable-tail-{uuid.uuid4().hex}"
+    durable = runtime._durable()
+    seed = Event(
+        type=EventType.message_token,
+        seq=0,
+        session_id=session_id,
+        scope_id=runtime.scope_id,
+        ts=datetime.now(UTC),
+        payload={"role": "user", "text": "start"},
+    )
+    await durable.append(seed)
+    now = datetime.now(UTC)
+    jobs = PostgresJobStore(migrated_db, runtime.scope_id)
+    job, _ = await jobs.enqueue_once(
+        kind="test.web-tail",
+        payload={},
+        target_session_id=session_id,
+        idempotency_key=uuid.uuid4().hex,
+        max_attempts=1,
+        now=now,
+    )
+    lease = await jobs.claim(job.id, now, 60)
+    assert lease is not None
+
+    stream = runtime.tail(session_id, seed.seq)
+    pending = asyncio.create_task(anext(stream))
+    await asyncio.sleep(0.05)
+
+    completed = await jobs.succeed(
+        lease,
+        JobResult(data={"ok": True}, message="job complete"),
+        datetime.now(UTC),
+    )
+
+    event = await asyncio.wait_for(pending, timeout=1.0)
+    assert event.seq == seed.seq + 1
+    assert event.payload["job_id"] == completed.id
+    assert event.payload["job_status"] == "succeeded"
+    assert event.payload["text"] == "job complete"
+    await stream.aclose()  # type: ignore[attr-defined]
