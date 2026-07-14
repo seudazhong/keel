@@ -4575,10 +4575,17 @@ Copilot-Session: e6e934ad-91c1-41c3-a46e-521cd446cb49"
 - Advisory pre-read finds the kind/terminal state and lease duration; `claim()` remains the
   atomic authority.
 - Unknown kind is a permanent terminal `unknown_job_kind`; no import/eval/dynamic load.
-- `asyncio.CancelledError` is re-raised with the row still running.
+- `asyncio.CancelledError` is re-raised as a fresh message-free exception with the DB row
+  left running/queued as appropriate.
 - Retryable and unknown exceptions requeue while attempts remain, otherwise fail terminal.
 - Delayed retry calls `enqueue("run_job", scope_id, job_id, _defer_until=retry_at)` best effort.
-- Span `job.execute` sets only id/kind/scope/attempt/status; logs contain only safe metadata.
+- Every transition/finalizer/status-recovery operation is constructed and awaited inside an
+  exception-context isolation helper (`raise ... from None`), including `clock()`.
+- Lease loss from any error path returns the authoritative current store status.
+- Requeue updates telemetry to `queued` before awaiting the best-effort deferred enqueue.
+- Logs contain only exception type + bounded frame locations, never raw exception values.
+- Span `job.execute` sets only id/kind/scope/attempt/status and uses
+  `record_exception=False`, `set_status_on_exception=False`.
 
 - [ ] **Step 1: Write RED run tests** — add `asyncio`, `logging`, and `Any`; add the Settings
   import; replace the existing job imports with the combined blocks below; then append the tests:
