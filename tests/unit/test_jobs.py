@@ -85,6 +85,7 @@ def test_limits_validate_json_bytes_and_clip_public_text() -> None:
     limits = JobLimits(
         payload_max_bytes=12,
         result_max_bytes=12,
+        progress_message_max_chars=3,
         result_message_max_chars=5,
         error_message_max_chars=4,
     )
@@ -102,6 +103,7 @@ def test_limits_validate_json_bytes_and_clip_public_text() -> None:
         limits.validate_payload({"bad": float("nan")})
     assert limits.result_message("123456") == "12345"
     assert limits.error_message("12345") == "1234"
+    assert limits.progress_message("12345") == "123"
 
 
 def test_limits_require_postgres_safe_json_and_return_a_detached_value() -> None:
@@ -168,12 +170,14 @@ def test_job_limits_are_built_from_settings() -> None:
     settings = Settings(
         job_payload_max_bytes=101,
         job_result_max_bytes=102,
+        job_progress_message_max_chars=105,
         job_result_message_max_chars=103,
         job_error_message_max_chars=104,
     )
     assert JobLimits.from_settings(settings) == JobLimits(
         payload_max_bytes=101,
         result_max_bytes=102,
+        progress_message_max_chars=105,
         result_message_max_chars=103,
         error_message_max_chars=104,
     )
@@ -250,6 +254,7 @@ async def test_in_memory_enqueue_once_dedupes_and_first_request_wins() -> None:
         ("test.echo", "request", True, "invalid_max_attempts"),
         ("test.echo", "request", 1.5, "invalid_max_attempts"),
         ("test.echo", "request", float("nan"), "invalid_max_attempts"),
+        ("test.echo", "request", 2**31, "invalid_max_attempts"),
     ],
 )
 async def test_in_memory_enqueue_rejects_invalid_identity_and_attempt_policy(
@@ -336,6 +341,15 @@ async def test_in_memory_rejects_storage_invalid_identities() -> None:
             payload={},
             target_session_id="bad\x00target",
             idempotency_key="target",
+            max_attempts=3,
+            now=_NOW,
+        )
+    with pytest.raises(JobValidationError, match="invalid_idempotency_key"):
+        await store.enqueue_once(
+            kind="test.echo",
+            payload={},
+            target_session_id=None,
+            idempotency_key="x" * 513,
             max_attempts=3,
             now=_NOW,
         )
@@ -576,6 +590,19 @@ async def test_progress_is_monotonic_bounded_and_refreshes_lease() -> None:
             message="bad\x00message",
             now=_NOW + timedelta(seconds=6),
         )
+
+    bounded_store = InMemoryJobStore("web:local", limits=JobLimits(progress_message_max_chars=5))
+    bounded_id = await _queued(bounded_store, "bounded-progress")
+    bounded_lease = await bounded_store.claim(bounded_id, _NOW, 60)
+    assert bounded_lease is not None
+    bounded = await bounded_store.progress(
+        bounded_lease,
+        current=1,
+        total=1,
+        message="123456789",
+        now=_NOW + timedelta(seconds=1),
+    )
+    assert bounded.record.progress_message == "12345"
 
 
 async def test_lease_updates_report_cancel_and_normalize_timestamps_to_utc() -> None:

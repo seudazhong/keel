@@ -253,7 +253,9 @@ async def test_postgres_enqueue_validates_identities_and_utc_timestamps(
     for kwargs, code in [
         ({"kind": "bad\x00kind"}, "invalid_kind"),
         ({"idempotency_key": "bad\ud800key"}, "invalid_idempotency_key"),
+        ({"idempotency_key": "x" * 513}, "invalid_idempotency_key"),
         ({"target_session_id": "bad\x00target"}, "invalid_target_session_id"),
+        ({"max_attempts": 2**31}, "invalid_max_attempts"),
     ]:
         values = {
             "kind": "test.echo",
@@ -658,6 +660,23 @@ async def test_postgres_progress_is_monotonic_bigint_bounded_and_storage_safe(
     assert unchanged is not None
     assert unchanged.progress_current == 4
     assert unchanged.lease_expires_at == _NOW + timedelta(seconds=65)
+
+    bounded_store = PostgresJobStore(
+        migrated_db,
+        "scope:progress-bounded",
+        limits=JobLimits(progress_message_max_chars=5),
+    )
+    bounded_id = await _pg_job(bounded_store, "progress-bounded")
+    bounded_lease = await bounded_store.claim(bounded_id, _NOW, 60)
+    assert bounded_lease is not None
+    bounded = await bounded_store.progress(
+        bounded_lease,
+        current=1,
+        total=1,
+        message="123456789",
+        now=_NOW + timedelta(seconds=1),
+    )
+    assert bounded.record.progress_message == "12345"
 
 
 async def test_postgres_expired_owner_cannot_extend_or_requeue_lease(

@@ -121,6 +121,7 @@ def test_job_defaults() -> None:
     assert settings.job_retry_max_seconds == 300
     assert settings.job_payload_max_bytes == 65_536
     assert settings.job_result_max_bytes == 65_536
+    assert settings.job_progress_message_max_chars == 1_000
     assert settings.job_result_message_max_chars == 8_000
     assert settings.job_error_message_max_chars == 2_000
 
@@ -130,6 +131,7 @@ def test_job_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("KEEL_JOB_EXECUTION_TIMEOUT_SECONDS", "7200")
     monkeypatch.setenv("KEEL_JOB_DISPATCH_LIMIT", "17")
     monkeypatch.setenv("KEEL_JOB_RETRY_BASE_SECONDS", "2")
+    monkeypatch.setenv("KEEL_JOB_PROGRESS_MESSAGE_MAX_CHARS", "123")
 
     from keel_core.config import Settings
 
@@ -138,6 +140,7 @@ def test_job_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.job_execution_timeout_seconds == 7200
     assert settings.job_dispatch_limit == 17
     assert settings.job_retry_base_seconds == 2
+    assert settings.job_progress_message_max_chars == 123
 
 
 def test_job_settings_reject_non_positive_values() -> None:

@@ -227,13 +227,16 @@ class CompositeEventStore:
                     except (TypeError, ValueError):
                         watermark = cursor
                     if watermark < cursor:
-                        continue  # a later durable message already superseded this partial
-                    for event in await self._durable_events(session_id, cursor, through=watermark):
-                        cursor = event.seq
-                        yield event
-                    payload = dict(fanout_event.payload)
-                    payload.pop("_durable_after_seq", None)
-                    yield fanout_event.model_copy(update={"payload": payload})
+                        fanout_event = None  # a later durable message superseded this partial
+                    else:
+                        for event in await self._durable_events(
+                            session_id, cursor, through=watermark
+                        ):
+                            cursor = event.seq
+                            yield event
+                        payload = dict(fanout_event.payload)
+                        payload.pop("_durable_after_seq", None)
+                        yield fanout_event.model_copy(update={"payload": payload})
 
                 completed_seq = (
                     fanout_event.seq

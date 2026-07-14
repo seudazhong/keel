@@ -130,6 +130,7 @@ def test_job_definition_rejects_non_callable_handlers(handler: object) -> None:
         ("max_attempts", True),
         ("max_attempts", 1.5),
         ("max_attempts", float("nan")),
+        ("max_attempts", 2**31),
         ("lease_seconds", 0),
         ("lease_seconds", -1),
         ("lease_seconds", True),

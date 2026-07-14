@@ -30,6 +30,7 @@ from keel_core.jobs import (
 from keel_core.observability import get_tracer
 
 logger = logging.getLogger("keel.worker.jobs")
+_PG_INTEGER_MAX = 2**31 - 1
 
 JobHandler = Callable[["JobContext", dict[str, Any]], Awaitable[JobResult]]
 JobClock = Callable[[], datetime]
@@ -69,9 +70,9 @@ class JobDefinition:
         if (
             isinstance(self.max_attempts, bool)
             or not isinstance(self.max_attempts, int)
-            or self.max_attempts < 1
+            or not 1 <= self.max_attempts <= _PG_INTEGER_MAX
         ):
-            raise ValueError("max_attempts must be at least 1")
+            raise ValueError(f"max_attempts must be between 1 and {_PG_INTEGER_MAX}")
         if (
             isinstance(self.lease_seconds, bool)
             or not isinstance(self.lease_seconds, int)

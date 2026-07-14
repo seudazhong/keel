@@ -24,6 +24,8 @@ from keel_core.state import InMemoryEventStore, append_event_in_transaction
 
 _MAX_JSON_DEPTH = 100
 _MAX_ERROR_CODE_CHARS = 128
+_MAX_IDENTITY_BYTES = 512
+_PG_INTEGER_MAX = 2**31 - 1
 _PG_BIGINT_MAX = 2**63 - 1
 
 
@@ -198,6 +200,7 @@ def _validated_json_object(value: dict[str, Any], *, field: str, max_bytes: int)
 class JobLimits:
     payload_max_bytes: int = 65_536
     result_max_bytes: int = 65_536
+    progress_message_max_chars: int = 1_000
     result_message_max_chars: int = 8_000
     error_message_max_chars: int = 2_000
 
@@ -206,6 +209,7 @@ class JobLimits:
             min(
                 self.payload_max_bytes,
                 self.result_max_bytes,
+                self.progress_message_max_chars,
                 self.result_message_max_chars,
                 self.error_message_max_chars,
             )
@@ -218,6 +222,7 @@ class JobLimits:
         return cls(
             payload_max_bytes=settings.job_payload_max_bytes,
             result_max_bytes=settings.job_result_max_bytes,
+            progress_message_max_chars=settings.job_progress_message_max_chars,
             result_message_max_chars=settings.job_result_message_max_chars,
             error_message_max_chars=settings.job_error_message_max_chars,
         )
@@ -239,6 +244,11 @@ class JobLimits:
         if not normalized:
             raise JobValidationError("storage_text_invalid", "error_message must not be blank")
         return normalized[: self.error_message_max_chars]
+
+    def progress_message(self, value: str) -> str:
+        return _validated_storage_text(value, field="progress_message")[
+            : self.progress_message_max_chars
+        ]
 
 
 @dataclass(frozen=True)
@@ -384,9 +394,12 @@ def _validated_identity(value: str, *, field: str, code: str) -> str:
     if not normalized:
         raise JobValidationError(code, f"{field} must not be empty")
     try:
-        return _ensure_storage_safe_text(normalized, field=field)
+        safe = _ensure_storage_safe_text(normalized, field=field)
     except ValueError as exc:
         raise JobValidationError(code, f"{field} must be storage-safe UTF-8 text") from exc
+    if len(safe.encode()) > _MAX_IDENTITY_BYTES:
+        raise JobValidationError(code, f"{field} must not exceed {_MAX_IDENTITY_BYTES} UTF-8 bytes")
+    return safe
 
 
 def _normalized_utc_timestamp(value: datetime, *, field: str = "timestamp") -> datetime:
@@ -453,8 +466,15 @@ def _validate_enqueue_fields(kind: str, idempotency_key: str, max_attempts: int)
         field="idempotency_key",
         code="invalid_idempotency_key",
     )
-    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
-        raise JobValidationError("invalid_max_attempts", "max_attempts must be at least 1")
+    if (
+        isinstance(max_attempts, bool)
+        or not isinstance(max_attempts, int)
+        or not 1 <= max_attempts <= _PG_INTEGER_MAX
+    ):
+        raise JobValidationError(
+            "invalid_max_attempts",
+            f"max_attempts must be between 1 and {_PG_INTEGER_MAX}",
+        )
     return kind, idempotency_key
 
 
@@ -815,9 +835,7 @@ class InMemoryJobStore:
         now: datetime,
     ) -> JobProgressResult:
         _validate_progress(current, total)
-        safe_message = (
-            None if message is None else _validated_storage_text(message, field="progress_message")
-        )
+        safe_message = None if message is None else self._limits.progress_message(message)
         now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
             row = self._owned(lease, now)
@@ -1251,9 +1269,7 @@ class PostgresJobStore:
         now: datetime,
     ) -> JobProgressResult:
         _validate_progress(current, total)
-        safe_message = (
-            None if message is None else _validated_storage_text(message, field="progress_message")
-        )
+        safe_message = None if message is None else self._limits.progress_message(message)
         now = _normalized_utc_timestamp(now, field="now")
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
