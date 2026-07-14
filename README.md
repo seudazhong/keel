@@ -9,7 +9,11 @@
 The design follows the project's own field manual, *How to Develop an AI Agent*: **a stable "keel" (the core runtime) with narrow seams onto which surfaces, tools, and providers bolt.**
 
 ## Status
-🚧 **M0 — Foundations (in progress).** The product & architecture specs are complete, and the repo now also contains a **bootable M0 skeleton**: a uv monorepo, `docker compose --profile dev` stack, frozen `keel-core` contracts, CI, and the risk-first spikes (S1–S5). Implementation follows the milestones in the PRD.
+🚧 **M3 — Knowledge & quality (in progress).** M0 is complete; the main M1 product
+surfaces are usable; M2 autonomy foundations are partially complete; and the M3
+Memory/Quality track (semantic recall, consolidation, deterministic evals) is complete.
+The next execution slice is durable background jobs followed by RAG/Knowledge Base.
+See the living [`docs/STATUS.md`](./docs/STATUS.md) snapshot.
 
 ## Documentation
 | Doc | What |
@@ -19,6 +23,7 @@ The design follows the project's own field manual, *How to Develop an AI Agent*:
 | [`docs/adr/`](./docs/adr) | Architecture Decision Records (language, datastore, runtime, frontend, sandbox, scheduler, embeddings, deployment, **product form**) |
 | [`docs/DESIGN-REVIEW.md`](./docs/DESIGN-REVIEW.md) | Critical design review — gaps, risks, resolved open questions, invariant acceptance checklist |
 | [`docs/IMPLEMENTATION-PLAN.md`](./docs/IMPLEMENTATION-PLAN.md) | Phased plan (M0–M4) — workstreams, sequencing, exit criteria |
+| [`docs/STATUS.md`](./docs/STATUS.md) | Living implementation status — completed capabilities, milestone gaps, current execution order |
 | [`docs/INVARIANTS.md`](./docs/INVARIANTS.md) | The ten non-negotiable invariant acceptance specs (merge-blocking gates) |
 | [`docs/diagrams/`](./docs/diagrams) | Mermaid architecture diagrams — C4, agent loop, sequences, ER, deployment |
 

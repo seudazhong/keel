@@ -1,6 +1,6 @@
 # Keel — Implementation Plan
 
-> **Status:** Draft v1.0 · **Date:** 2026-07-06 · **Maps to:** PRD §11 milestones, ARCHITECTURE §19 · **Inputs:** [`DESIGN-REVIEW.md`](./DESIGN-REVIEW.md)
+> **Status:** Plan of record v1.0 · **Date:** 2026-07-06 · **Current execution status:** [`STATUS.md`](./STATUS.md) · **Maps to:** PRD §11 milestones, ARCHITECTURE §19 · **Inputs:** [`DESIGN-REVIEW.md`](./DESIGN-REVIEW.md)
 > A phased, milestone-aligned plan of record. **No code in this document** — it sequences the work, fixes exit criteria, and names the gating acceptance tests. Deliverables map to the PRD's M0–M4.
 
 ---
