@@ -28,6 +28,7 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
     """
     messages: list[dict[str, Any]] = []
     pending_assistant: dict[str, Any] | None = None
+    pending_assistant_is_job = False
     deferred_assistants: list[dict[str, Any]] = []
     open_tool_call_ids: set[str] = set()
     active_run_ids: set[str] = set()
@@ -48,7 +49,7 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
         messages.append(message)
 
     def flush() -> None:
-        nonlocal pending_assistant
+        nonlocal pending_assistant, pending_assistant_is_job
         if pending_assistant is not None:
             for tool_call in pending_assistant.get("tool_calls", []):
                 call_id = str(tool_call.get("id", ""))
@@ -56,6 +57,14 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
                     open_tool_call_ids.add(call_id)
             append_message(pending_assistant)
             pending_assistant = None
+            pending_assistant_is_job = False
+
+    def defer_pending_job() -> None:
+        nonlocal pending_assistant, pending_assistant_is_job
+        if pending_assistant is not None and pending_assistant_is_job:
+            deferred_assistants.append(pending_assistant)
+            pending_assistant = None
+            pending_assistant_is_job = False
 
     def flush_deferred() -> None:
         if pending_assistant is not None or open_tool_call_ids or active_run_ids:
@@ -66,6 +75,12 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
     for event in events:
         role = event.payload.get("role")
         if event.type is EventType.run_started and event.run_id is not None:
+            if pending_assistant_is_job:
+                defer_pending_job()
+            else:
+                flush()
+            if active_run_ids and event.run_id not in active_run_ids:
+                active_run_ids.clear()
             active_run_ids.add(event.run_id)
         elif event.type in (EventType.run_ended, EventType.run_suspended):
             flush()
@@ -73,6 +88,12 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
                 active_run_ids.discard(event.run_id)
             flush_deferred()
         elif event.type is EventType.run_resumed and event.run_id is not None:
+            if pending_assistant_is_job:
+                defer_pending_job()
+            else:
+                flush()
+            if active_run_ids and event.run_id not in active_run_ids:
+                active_run_ids.clear()
             active_run_ids.add(event.run_id)
         elif event.type is EventType.message_token and role in ("user", "assistant", "system"):
             if event.payload.get("partial"):
@@ -94,9 +115,12 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
                 flush()
                 flush_deferred()
                 pending_assistant = message
+                pending_assistant_is_job = bool(event.payload.get("job_id"))
         elif event.type is EventType.tool_call:
+            defer_pending_job()
             if pending_assistant is None:
                 pending_assistant = {"role": "assistant", "content": ""}
+                pending_assistant_is_job = False
             pending_assistant.setdefault("tool_calls", []).append(
                 {
                     "id": str(event.payload.get("call_id", "")),

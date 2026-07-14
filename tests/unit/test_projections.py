@@ -197,6 +197,79 @@ def test_job_injection_during_run_is_deferred_until_run_thread_completes() -> No
     assert messages[3]["content"] == "read complete\n\nbackground result"
 
 
+def test_job_injection_immediately_before_run_start_cannot_absorb_tool_calls() -> None:
+    events = [
+        _event(1, EventType.message_token, {"role": "user", "text": "read"}),
+        _event(
+            2,
+            EventType.message_token,
+            {"role": "assistant", "text": "background result", "job_id": "job_1"},
+        ),
+        _event(3, EventType.run_started, {}),
+        _event(4, EventType.tool_call, {"tool": "read", "call_id": "c1", "args": {}}),
+        _event(5, EventType.tool_result, {"call_id": "c1", "ok": True, "output": "body"}),
+        _event(6, EventType.run_ended, {"reason": "completed"}),
+    ]
+
+    messages = project_messages(events)
+    assert [message["role"] for message in messages] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert messages[1]["tool_calls"][0]["id"] == "c1"
+    assert messages[3]["content"] == "background result"
+
+
+def test_new_run_reconciles_orphaned_active_run_without_losing_job_result() -> None:
+    events = [
+        _event(1, EventType.run_started, {}),
+        _event(
+            2,
+            EventType.message_token,
+            {"role": "assistant", "text": "background result", "job_id": "job_1"},
+        ),
+        Event(
+            type=EventType.run_started,
+            seq=3,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={},
+        ),
+        Event(
+            type=EventType.message_token,
+            seq=4,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={"role": "assistant", "text": "second run complete"},
+        ),
+        Event(
+            type=EventType.run_ended,
+            seq=5,
+            session_id="s1",
+            scope_id="u:1",
+            run_id="r2",
+            ts=datetime.now(UTC),
+            payload={"reason": "completed"},
+        ),
+        _event(6, EventType.message_token, {"role": "user", "text": "continue"}),
+    ]
+
+    messages = project_messages(events)
+    assert messages == [
+        {
+            "role": "assistant",
+            "content": "second run complete\n\nbackground result",
+        },
+        {"role": "user", "content": "continue"},
+    ]
+
+
 @pytest.mark.parametrize(
     "model",
     ["openai/gpt-4o-mini", "anthropic/claude-3-5-sonnet-20241022"],
