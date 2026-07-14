@@ -224,12 +224,16 @@ class JobLimits:
         return _validated_json_object(result, field="result", max_bytes=self.result_max_bytes)
 
     def result_message(self, value: str) -> str:
-        return _validated_storage_text(value, field="result_message")[
-            : self.result_message_max_chars
-        ]
+        normalized = _validated_storage_text(value, field="result_message").strip()
+        if not normalized:
+            raise JobValidationError("storage_text_invalid", "result_message must not be blank")
+        return normalized[: self.result_message_max_chars]
 
     def error_message(self, value: str) -> str:
-        return _validated_storage_text(value, field="error_message")[: self.error_message_max_chars]
+        normalized = _validated_storage_text(value, field="error_message").strip()
+        if not normalized:
+            raise JobValidationError("storage_text_invalid", "error_message must not be blank")
+        return normalized[: self.error_message_max_chars]
 
 
 @dataclass(frozen=True)
@@ -822,6 +826,11 @@ class InMemoryJobStore:
         now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
             row = self._owned(lease, now)
+            if row.cancel_requested_at is None:
+                raise JobValidationError(
+                    "cancellation_not_requested",
+                    "job cancellation was not requested",
+                )
             return await self._finalize_locked(row, status=JobStatus.cancelled, now=now)
 
     async def fail_exhausted(self, job_id: str, now: datetime) -> JobRecord | None:
