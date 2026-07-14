@@ -840,8 +840,11 @@ class InMemoryJobStore:
 
     async def request_cancel(self, job_id: str, now: datetime) -> JobRecord | None:
         now = _normalized_utc_timestamp(now, field="now")
+        safe_job_id = _optional_read_identity(job_id, field="job_id", code="invalid_job_id")
+        if safe_job_id is None:
+            return None
         async with self._lock:
-            row = self._rows.get(job_id)
+            row = self._rows.get(safe_job_id)
             if row is None:
                 return None
             if row.status is JobStatus.queued:
@@ -852,7 +855,7 @@ class InMemoryJobStore:
                     cancel_requested_at=row.cancel_requested_at or now,
                     updated_at=now,
                 )
-                self._rows[job_id] = updated
+                self._rows[safe_job_id] = updated
                 return _copy_record(updated)
             return _copy_record(row)
 
@@ -1441,6 +1444,9 @@ class PostgresJobStore:
 
     async def request_cancel(self, job_id: str, now: datetime) -> JobRecord | None:
         now = _normalized_utc_timestamp(now, field="now")
+        safe_job_id = _optional_read_identity(job_id, field="job_id", code="invalid_job_id")
+        if safe_job_id is None:
+            return None
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             locked = cast(
@@ -1448,7 +1454,7 @@ class PostgresJobStore:
                 (
                     await conn.execute(
                         text("SELECT * FROM jobs WHERE id = :id AND scope_id = :scope FOR UPDATE"),
-                        {"id": job_id, "scope": self._scope_id},
+                        {"id": safe_job_id, "scope": self._scope_id},
                     )
                 )
                 .mappings()
@@ -1460,7 +1466,7 @@ class PostgresJobStore:
             if record.status is JobStatus.queued:
                 return await self._finalize_in_transaction(
                     conn,
-                    job_id=job_id,
+                    job_id=safe_job_id,
                     status=JobStatus.cancelled,
                     now=now,
                     locked=locked,
@@ -1477,7 +1483,7 @@ class PostgresJobStore:
                             ),
                             {
                                 "now": now,
-                                "id": job_id,
+                                "id": safe_job_id,
                                 "scope": self._scope_id,
                             },
                         )

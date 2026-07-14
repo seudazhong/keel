@@ -831,6 +831,7 @@ async def test_postgres_queued_cancel_is_atomic_and_idempotent(
     assert first.injected_event_seq is not None
     assert second == first
     assert await store.request_cancel("missing", _NOW) is None
+    assert await store.request_cancel("bad\x00id", _NOW) is None
     events = await _job_events(migrated_db, scope, session_id, job_id)
     assert len(events) == 1
     assert events[0].type is EventType.message_token

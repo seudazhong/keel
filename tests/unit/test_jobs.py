@@ -654,6 +654,7 @@ async def test_queued_cancel_is_terminal_idempotent_and_injects_once() -> None:
     assert cancelled.finished_at == _NOW + timedelta(seconds=1)
     assert again == cancelled
     assert await store.request_cancel("missing", _NOW) is None
+    assert await store.request_cancel("bad\x00id", _NOW) is None
     injected = [
         event for event in events.snapshot("target") if event.payload.get("job_id") == job.id
     ]
