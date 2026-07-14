@@ -10,6 +10,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -56,6 +57,16 @@ class Settings(BaseSettings):
     # embedding is within this cosine distance (calibrated from live replay, max
     # observed 0.0468). 0 disables the semantic pass; exact content-hash dedupe stays.
     consolidation_semantic_dedupe_distance: float = 0.05
+
+    # Durable background jobs (ADR-0010).
+    job_lease_seconds: int = Field(default=300, gt=0)
+    job_dispatch_limit: int = Field(default=100, gt=0)
+    job_retry_base_seconds: int = Field(default=5, gt=0)
+    job_retry_max_seconds: int = Field(default=300, gt=0)
+    job_payload_max_bytes: int = Field(default=65_536, gt=0)
+    job_result_max_bytes: int = Field(default=65_536, gt=0)
+    job_result_message_max_chars: int = Field(default=8_000, gt=0)
+    job_error_message_max_chars: int = Field(default=2_000, gt=0)
 
     # RBAC (B3): comma-separated ``key:role`` pairs (roles: viewer|operator|admin).
     # Empty -> open single-user mode (every request is an implicit admin).
