@@ -453,7 +453,7 @@ def _validate_enqueue_fields(kind: str, idempotency_key: str, max_attempts: int)
         field="idempotency_key",
         code="invalid_idempotency_key",
     )
-    if max_attempts < 1:
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
         raise JobValidationError("invalid_max_attempts", "max_attempts must be at least 1")
     return kind, idempotency_key
 
@@ -746,7 +746,11 @@ class InMemoryJobStore:
             return [row.id for row in rows[:limit]]
 
     async def claim(self, job_id: str, now: datetime, lease_seconds: int) -> JobLease | None:
-        if lease_seconds < 1:
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or lease_seconds < 1
+        ):
             raise ValueError("lease_seconds must be positive")
         now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
@@ -1134,7 +1138,11 @@ class PostgresJobStore:
         return [str(value) for value in rows]
 
     async def claim(self, job_id: str, now: datetime, lease_seconds: int) -> JobLease | None:
-        if lease_seconds < 1:
+        if (
+            isinstance(lease_seconds, bool)
+            or not isinstance(lease_seconds, int)
+            or lease_seconds < 1
+        ):
             raise ValueError("lease_seconds must be positive")
         now = _normalized_utc_timestamp(now, field="now")
         token = uuid.uuid4().hex
@@ -1565,6 +1573,7 @@ class PostgresJobStore:
 
 
 def retry_delay_seconds(attempt: int, base_seconds: int, max_seconds: int) -> int:
-    if attempt < 1 or base_seconds < 1 or max_seconds < 1:
+    values = (attempt, base_seconds, max_seconds)
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in values):
         raise ValueError("attempt, base_seconds and max_seconds must be positive")
     return min(base_seconds * int(2 ** (attempt - 1)), max_seconds)

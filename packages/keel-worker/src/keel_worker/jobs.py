@@ -43,9 +43,19 @@ class JobDefinition:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", _normalized_kind(self.kind))
-        if self.max_attempts < 1:
+        if not callable(self.handler):
+            raise ValueError("handler must be callable")
+        if (
+            isinstance(self.max_attempts, bool)
+            or not isinstance(self.max_attempts, int)
+            or self.max_attempts < 1
+        ):
             raise ValueError("max_attempts must be at least 1")
-        if self.lease_seconds < 1:
+        if (
+            isinstance(self.lease_seconds, bool)
+            or not isinstance(self.lease_seconds, int)
+            or self.lease_seconds < 1
+        ):
             raise ValueError("lease_seconds must be at least 1")
 
 

@@ -201,6 +201,9 @@ def test_retry_delay_rejects_non_positive_inputs() -> None:
         retry_delay_seconds(0, 5, 300)
     with pytest.raises(ValueError):
         retry_delay_seconds(1, 0, 300)
+    for invalid in (True, 1.5, float("nan")):
+        with pytest.raises(ValueError):
+            retry_delay_seconds(invalid, 5, 300)  # type: ignore[arg-type]
 
 
 def test_dedupe_lock_key_encoding_is_unambiguous() -> None:
@@ -244,12 +247,15 @@ async def test_in_memory_enqueue_once_dedupes_and_first_request_wins() -> None:
         (" ", "request", 3, "invalid_kind"),
         ("test.echo", " ", 3, "invalid_idempotency_key"),
         ("test.echo", "request", 0, "invalid_max_attempts"),
+        ("test.echo", "request", True, "invalid_max_attempts"),
+        ("test.echo", "request", 1.5, "invalid_max_attempts"),
+        ("test.echo", "request", float("nan"), "invalid_max_attempts"),
     ],
 )
 async def test_in_memory_enqueue_rejects_invalid_identity_and_attempt_policy(
     kind: str,
     key: str,
-    max_attempts: int,
+    max_attempts: object,
     error_code: str,
 ) -> None:
     store = InMemoryJobStore("web:local")
@@ -259,7 +265,7 @@ async def test_in_memory_enqueue_rejects_invalid_identity_and_attempt_policy(
             payload={},
             target_session_id=None,
             idempotency_key=key,
-            max_attempts=max_attempts,
+            max_attempts=max_attempts,  # type: ignore[arg-type]
             now=_NOW,
         )
 
@@ -616,6 +622,9 @@ async def test_lease_operations_reject_invalid_duration_and_naive_timestamps() -
     job_id = await _queued(store, "naive")
     with pytest.raises(ValueError, match="lease_seconds"):
         await store.claim(job_id, _NOW, 0)
+    for invalid in (True, 1.5, float("nan")):
+        with pytest.raises(ValueError, match="lease_seconds"):
+            await store.claim(job_id, _NOW, invalid)  # type: ignore[arg-type]
     with pytest.raises(JobValidationError, match="timezone_required"):
         await store.claim(job_id, datetime(2026, 7, 14, 9, 0), 60)
 

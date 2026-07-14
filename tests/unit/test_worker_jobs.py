@@ -61,19 +61,31 @@ def test_job_definition_rejects_nonblank_storage_unsafe_kinds(kind: str) -> None
         JobDefinition(kind=kind, handler=_handler)
 
 
+@pytest.mark.parametrize("handler", [None, 42, "not-callable"])
+def test_job_definition_rejects_non_callable_handlers(handler: object) -> None:
+    with pytest.raises(ValueError, match="handler"):
+        JobDefinition(kind="test.bad", handler=handler)  # type: ignore[arg-type]
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
         ("max_attempts", 0),
         ("max_attempts", -1),
+        ("max_attempts", True),
+        ("max_attempts", 1.5),
+        ("max_attempts", float("nan")),
         ("lease_seconds", 0),
         ("lease_seconds", -1),
+        ("lease_seconds", True),
+        ("lease_seconds", 1.5),
+        ("lease_seconds", float("nan")),
     ],
 )
-def test_job_definition_requires_positive_limits(field: str, value: int) -> None:
+def test_job_definition_requires_positive_integer_limits(field: str, value: object) -> None:
     kwargs = {field: value}
     with pytest.raises(ValueError, match=field):
-        JobDefinition(kind="test.bad", handler=_handler, **kwargs)
+        JobDefinition(kind="test.bad", handler=_handler, **kwargs)  # type: ignore[arg-type]
 
 
 async def test_job_context_progress_updates_record_and_exposes_identity() -> None:
