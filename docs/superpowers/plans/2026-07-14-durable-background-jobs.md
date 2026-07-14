@@ -695,10 +695,20 @@ class JobLimits:
         )
 
     def result_message(self, value: str) -> str:
-        return value[: self.result_message_max_chars]
+        normalized = _validated_storage_text(value, field="result_message").strip()
+        if not normalized:
+            raise JobValidationError(
+                "storage_text_invalid", "result_message must not be blank"
+            )
+        return normalized[: self.result_message_max_chars]
 
     def error_message(self, value: str) -> str:
-        return value[: self.error_message_max_chars]
+        normalized = _validated_storage_text(value, field="error_message").strip()
+        if not normalized:
+            raise JobValidationError(
+                "storage_text_invalid", "error_message must not be blank"
+            )
+        return normalized[: self.error_message_max_chars]
 
 
 @dataclass(frozen=True)
@@ -2285,6 +2295,7 @@ async def test_terminal_finalizers_inject_exactly_once(terminal: str) -> None:
             lease, JobError("bad_input", "safe"), _NOW
         )
     else:
+        await store.request_cancel(job.id, _NOW)
         result = await store.finish_cancelled(lease, _NOW)
 
     assert result.status.value == terminal
@@ -2529,8 +2540,14 @@ def _injection_event(
             )
 
     async def finish_cancelled(self, lease: JobLease, now: datetime) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
             row = self._owned(lease, now)
+            if row.cancel_requested_at is None:
+                raise JobValidationError(
+                    "cancellation_not_requested",
+                    "job cancellation was not requested",
+                )
             return await self._finalize_locked(
                 row, status=JobStatus.cancelled, now=now
             )
@@ -3653,6 +3670,7 @@ async def test_postgres_terminal_transition_injects_one_assistant_event(
             lease, JobError("embedding_timeout", "safe public error"), _NOW
         )
     else:
+        await store.request_cancel(job_id, _NOW)
         row = await store.finish_cancelled(lease, _NOW)
 
     assert row.status.value == terminal
@@ -3786,8 +3804,18 @@ from keel_core.state import append_event_in_transaction
             if (
                 current.status is not JobStatus.running
                 or current.lease_token != lease_token
+                or current.lease_expires_at is None
+                or current.lease_expires_at <= now
             ):
                 raise JobLeaseLostError(job_id)
+            if (
+                status is JobStatus.cancelled
+                and current.cancel_requested_at is None
+            ):
+                raise JobValidationError(
+                    "cancellation_not_requested",
+                    "job cancellation was not requested",
+                )
         elif current.status is not JobStatus.queued:
             raise JobLeaseLostError(job_id)
 
