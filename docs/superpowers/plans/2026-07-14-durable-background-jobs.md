@@ -1382,6 +1382,10 @@ Copilot-Session: e6e934ad-91c1-41c3-a46e-521cd446cb49"
   a non-serializable/oversized payload or a different/missing target. Normalize and validate
   the dedupe identity first, but return an existing row before validating retry-only
   payload/target fields.
+- Scope/kind/idempotency/target identifiers are stripped and storage-safe UTF-8/NUL-free;
+  target validation remains after existing-winner lookup.
+- Every explicit datetime must be timezone-aware and is normalized to UTC before storage
+  or comparison.
 - `list()` is newest-first and validates `1 <= limit <= 100`.
 - `dispatchable()` returns due queued jobs and expired-running jobs with attempts left;
   `exhausted()` returns expired-running jobs at the ceiling. Running-row cases become
@@ -1391,7 +1395,7 @@ Copilot-Session: e6e934ad-91c1-41c3-a46e-521cd446cb49"
   `tests/unit/test_jobs.py` and append:
 
 ```python
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 
 from keel_core.events import Event, EventType
 from keel_core.jobs import InMemoryJobStore, JobStatus
@@ -1481,6 +1485,29 @@ async def test_in_memory_enqueue_validates_target_session_and_scope() -> None:
         max_attempts=3,
         now=_NOW,
     )
+
+
+async def test_in_memory_rejects_storage_invalid_identities() -> None:
+    with pytest.raises(ValueError, match="scope_id"):
+    InMemoryJobStore("bad\x00scope")
+    # Also assert invalid kind, idempotency key and target-session text are rejected
+    # with their stable JobValidationError codes.
+
+
+async def test_in_memory_normalizes_aware_timestamps_and_rejects_naive_values() -> None:
+    store = InMemoryJobStore("web:local")
+    local_time = datetime(2026, 7, 14, 17, 0, tzinfo=timezone(timedelta(hours=8)))
+    row, _ = await store.enqueue_once(
+    kind="test.echo",
+    payload={},
+    target_session_id=None,
+    idempotency_key="aware",
+    max_attempts=3,
+    now=local_time,
+    )
+    assert row.created_at == _NOW
+    with pytest.raises(JobValidationError, match="timezone_required"):
+    await store.dispatchable(datetime(2026, 7, 14, 9, 0), 100)
     assert accepted.target_session_id == "target"
 
     with pytest.raises(JobValidationError, match="target_session_not_found"):
@@ -1588,6 +1615,26 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def _validated_identity(value: str, *, field: str, code: str) -> str:
+    if not isinstance(value, str):
+        raise JobValidationError(code, f"{field} must be storage-safe text")
+    normalized = value.strip()
+    if not normalized:
+        raise JobValidationError(code, f"{field} must not be empty")
+    try:
+        return _ensure_storage_safe_text(normalized, field=field)
+    except ValueError as exc:
+        raise JobValidationError(code, f"{field} must be storage-safe UTF-8 text") from exc
+
+
+def _normalized_utc_timestamp(value: datetime, *, field: str = "timestamp") -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise JobValidationError(
+            "timezone_required", f"{field} must include a timezone offset"
+        )
+    return value.astimezone(UTC)
+
+
 def _copy_record(record: JobRecord) -> JobRecord:
     return replace(
         record,
@@ -1622,9 +1669,12 @@ class InMemoryJobStore:
         events: InMemoryEventStore | None = None,
         limits: JobLimits | None = None,
     ) -> None:
-        if not scope_id.strip():
-            raise ValueError("scope_id must not be empty")
-        self._scope_id = scope_id
+        try:
+            self._scope_id = _validated_identity(
+                scope_id, field="scope_id", code="invalid_scope_id"
+            )
+        except JobValidationError as exc:
+            raise ValueError(exc.public_message) from exc
         self._events = events
         self._limits = limits or JobLimits()
         self._rows: dict[str, JobRecord] = {}
@@ -1649,33 +1699,41 @@ class InMemoryJobStore:
         max_attempts: int,
         now: datetime | None = None,
     ) -> tuple[JobRecord, bool]:
-        kind = kind.strip()
-        idempotency_key = idempotency_key.strip()
-        if not kind:
-            raise JobValidationError("invalid_kind", "kind must not be empty")
-        if not idempotency_key:
-            raise JobValidationError(
-                "invalid_idempotency_key", "idempotency_key must not be empty"
-            )
+        kind = _validated_identity(kind, field="kind", code="invalid_kind")
+        idempotency_key = _validated_identity(
+            idempotency_key,
+            field="idempotency_key",
+            code="invalid_idempotency_key",
+        )
         if max_attempts < 1:
             raise JobValidationError(
                 "invalid_max_attempts", "max_attempts must be at least 1"
             )
-        timestamp = now or _utcnow()
+        timestamp = (
+            _normalized_utc_timestamp(now, field="now")
+            if now is not None
+            else _utcnow()
+        )
         key = (self._scope_id, kind, idempotency_key)
         async with self._lock:
             existing_id = self._dedupe.get(key)
             if existing_id is not None:
                 return _copy_record(self._rows[existing_id]), False
             safe_payload = copy.deepcopy(self._limits.validate_payload(payload))
-            if target_session_id is not None and (
-                self._events is None
-                or not self._events.has_session(target_session_id, self._scope_id)
-            ):
-                raise JobValidationError(
-                    "target_session_not_found",
-                    "target session does not exist in the current scope",
+            safe_target_session_id = None
+            if target_session_id is not None:
+                safe_target_session_id = _validated_identity(
+                    target_session_id,
+                    field="target_session_id",
+                    code="invalid_target_session_id",
                 )
+                if self._events is None or not self._events.has_session(
+                    safe_target_session_id, self._scope_id
+                ):
+                    raise JobValidationError(
+                        "target_session_not_found",
+                        "target session does not exist in the current scope",
+                    )
             job_id = f"job_{uuid.uuid4().hex}"
             record = JobRecord(
                 id=job_id,
@@ -1683,7 +1741,7 @@ class InMemoryJobStore:
                 kind=kind,
                 status=JobStatus.queued,
                 payload=safe_payload,
-                target_session_id=target_session_id,
+                target_session_id=safe_target_session_id,
                 idempotency_key=idempotency_key,
                 attempt=0,
                 max_attempts=max_attempts,
@@ -1739,6 +1797,7 @@ class InMemoryJobStore:
 ```python
     async def dispatchable(self, now: datetime, limit: int) -> list[str]:
         _validate_limit(limit)
+        now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
             rows = [
                 row
@@ -1761,6 +1820,7 @@ class InMemoryJobStore:
 
     async def exhausted(self, now: datetime, limit: int) -> list[str]:
         _validate_limit(limit)
+        now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
             rows = [
                 row
@@ -2730,14 +2790,12 @@ _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 def _validate_enqueue_fields(
     kind: str, idempotency_key: str, max_attempts: int
 ) -> tuple[str, str]:
-    kind = kind.strip()
-    idempotency_key = idempotency_key.strip()
-    if not kind:
-        raise JobValidationError("invalid_kind", "kind must not be empty")
-    if not idempotency_key:
-        raise JobValidationError(
-            "invalid_idempotency_key", "idempotency_key must not be empty"
-        )
+    kind = _validated_identity(kind, field="kind", code="invalid_kind")
+    idempotency_key = _validated_identity(
+        idempotency_key,
+        field="idempotency_key",
+        code="invalid_idempotency_key",
+    )
     if max_attempts < 1:
         raise JobValidationError(
             "invalid_max_attempts", "max_attempts must be at least 1"
@@ -2801,10 +2859,14 @@ class PostgresJobStore:
         *,
         limits: JobLimits | None = None,
     ) -> None:
-        if not scope_id.strip():
-            raise ValueError("scope_id must not be empty")
+        try:
+            normalized_scope = _validated_identity(
+                scope_id, field="scope_id", code="invalid_scope_id"
+            )
+        except JobValidationError as exc:
+            raise ValueError(exc.public_message) from exc
         self._engine = engine
-        self._scope_id = scope_id
+        self._scope_id = normalized_scope
         self._limits = limits or JobLimits()
 
     @property
@@ -2844,14 +2906,20 @@ class PostgresJobStore:
                 return _to_job_record(existing), False
 
             safe_payload = self._limits.validate_payload(payload)
+            safe_target_session_id = None
             if target_session_id is not None:
+                safe_target_session_id = _validated_identity(
+                    target_session_id,
+                    field="target_session_id",
+                    code="invalid_target_session_id",
+                )
                 exists = (
                     await conn.execute(
                         text(
                             "SELECT 1 FROM sessions "
                             "WHERE id = :session AND scope_id = :scope"
                         ),
-                        {"session": target_session_id, "scope": self._scope_id},
+                        {"session": safe_target_session_id, "scope": self._scope_id},
                     )
                 ).one_or_none()
                 if exists is None:
@@ -2859,7 +2927,11 @@ class PostgresJobStore:
                         "target_session_not_found",
                         "target session does not exist in the current scope",
                     )
-            timestamp = now or _utcnow()
+            timestamp = (
+                _normalized_utc_timestamp(now, field="now")
+                if now is not None
+                else _utcnow()
+            )
             job_id = f"job_{uuid.uuid4().hex}"
             inserted = (
                 (
@@ -2879,7 +2951,7 @@ class PostgresJobStore:
                             "scope": self._scope_id,
                             "kind": kind,
                             "payload": json.dumps(safe_payload, ensure_ascii=False),
-                            "target": target_session_id,
+                            "target": safe_target_session_id,
                             "key": idempotency_key,
                             "max_attempts": max_attempts,
                             "now": timestamp,
@@ -2952,6 +3024,7 @@ class PostgresJobStore:
 ```python
     async def dispatchable(self, now: datetime, limit: int) -> list[str]:
         _validate_limit(limit)
+        now = _normalized_utc_timestamp(now, field="now")
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             rows = (
@@ -2970,6 +3043,7 @@ class PostgresJobStore:
 
     async def exhausted(self, now: datetime, limit: int) -> list[str]:
         _validate_limit(limit)
+        now = _normalized_utc_timestamp(now, field="now")
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             rows = (
