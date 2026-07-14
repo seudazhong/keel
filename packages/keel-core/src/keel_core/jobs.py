@@ -466,7 +466,12 @@ def _optional_read_identity(value: str, *, field: str, code: str) -> str | None:
 
 
 def _job_dedupe_lock_id(scope_id: str, kind: str, idempotency_key: str) -> int:
-    digest = hashlib.sha256(f"{scope_id}\x1f{kind}\x1f{idempotency_key}".encode()).digest()
+    encoded = json.dumps(
+        [scope_id, kind, idempotency_key],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode()
+    digest = hashlib.sha256(encoded).digest()
     return int.from_bytes(digest[:8], byteorder="big", signed=True)
 
 

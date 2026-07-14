@@ -20,6 +20,7 @@ from keel_core.jobs import (
     JobValidationError,
     PermanentJobError,
     RetryableJobError,
+    _job_dedupe_lock_id,
     retry_delay_seconds,
 )
 from keel_core.state import InMemoryEventStore
@@ -200,6 +201,12 @@ def test_retry_delay_rejects_non_positive_inputs() -> None:
         retry_delay_seconds(0, 5, 300)
     with pytest.raises(ValueError):
         retry_delay_seconds(1, 0, 300)
+
+
+def test_dedupe_lock_key_encoding_is_unambiguous() -> None:
+    assert _job_dedupe_lock_id("scope:a", "kind\x1fx", "key") != (
+        _job_dedupe_lock_id("scope:a\x1fkind", "x", "key")
+    )
 
 
 async def test_in_memory_enqueue_once_dedupes_and_first_request_wins() -> None:
