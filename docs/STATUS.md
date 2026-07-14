@@ -1,7 +1,7 @@
 # Keel 当前状态与里程碑
 
 > **快照日期：** 2026-07-14  
-> **代码基线：** `main@e1d9fd1`  
+> **代码基线：** `feat/durable-background-jobs@34c9c72`（待最终验证/合并）  
 > **路线来源：** [`PRD.md`](./PRD.md) §11、[`ARCHITECTURE.md`](./ARCHITECTURE.md) §19、
 > [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md)
 
@@ -15,8 +15,8 @@ Keel 当前处于 **M3（Knowledge & quality）中段**：
 
 - M0 已完成。
 - M1 的主要产品能力已经可用，但仍有少量正式 KPI/exit-evidence 债务。
-- M2 已完成调度、审批、RBAC、基础 provider failover 与 Telegram 等切片，但通用
-  background jobs、N-worker scale-out、per-task routing 和 WeCom 尚未完成。
+- M2 已完成调度、durable background jobs、审批、RBAC、基础 provider failover 与
+  Telegram 等切片；N-worker scale-out、per-task routing 和 WeCom 尚未完成。
 - M3 的 **Memory/Quality 主线**已经完成；完整 RAG/KB、Plugin SDK/hooks、
   event upcasters、retention/erasure 与 Tauri Desktop 尚未完成。
 
@@ -35,6 +35,13 @@ Keel 当前处于 **M3（Knowledge & quality）中段**：
 - Gmail OAuth、真实 inbox read/send、token revoke/purge。
 - Durable approvals、RBAC/API keys、admin overview。
 - Cron/interval/one-shot schedules、daily digest、daily memory consolidation。
+- Durable background jobs：
+  - Postgres/RLS lifecycle source of truth；
+  - at-least-once arq delivery + DB lease/reclaim；
+  - durable progress、cooperative cancellation、bounded retry；
+  - crash/duplicate-delivery recovery；
+  - terminal assistant result injection exactly once；
+  - list/detail/cancel API + RBAC。
 
 ### Memory、search 与 quality
 
@@ -65,6 +72,8 @@ Keel 当前处于 **M3（Knowledge & quality）中段**：
   - weighted overall：**0.982**；
   - replay 不回退到 live provider。
 - Integration/eval destructive fixtures 只允许显式 `keel_test`/`keel_eval`。
+- Durable Jobs acceptance：真实 Postgres + Redis/arq，覆盖丢投递、重复投递、retry、
+  worker crash/reclaim、attempt exhaustion、cancel 与 exactly-once injection。
 
 ## 4. Milestone 状态
 
@@ -72,7 +81,7 @@ Keel 当前处于 **M3（Knowledge & quality）中段**：
 |---|---|---|---|
 | **M0 Foundations** | 完成 | monorepo、compose、CI、contracts、migrations、S1-S5 | 无阻塞项 |
 | **M1 Core that talks** | 功能性完成 | loop、providers、tools、memory、search、CLI/Web/IM、connectors、skills/MCP、observability | 通用 task-suite/KPI 证据、SDK 使用体验收尾 |
-| **M2 Autonomy & scale** | 部分完成 | schedules、digest、durable approvals、RBAC、admin overview、Telegram、基础 failover | durable background jobs、progress/cancel/result injection、N-worker demo、per-task routing、WeCom |
+| **M2 Autonomy & scale** | 部分完成 | schedules、durable background jobs、digest、durable approvals、RBAC、admin overview、Telegram、基础 failover | N-worker demo、per-task routing、WeCom |
 | **M3 Knowledge & quality** | 进行中 | retrieval foundation、memory consolidation、memory evals | RAG/KB、event upcasters、retention/erasure、Plugin SDK/hooks、Tauri Desktop |
 | **M4 Hardening** | 未正式开始 | 已有部分 security/DB safety 基础 | security review、perf、backup/DR、multi-tenant groundwork、docs/examples |
 
@@ -110,9 +119,9 @@ Keel 当前处于 **M3（Knowledge & quality）中段**：
 
 ## 6. 执行顺序
 
-### 1. Durable background jobs（M2 prerequisite）
+### 1. Durable background jobs（已完成）
 
-先补 RAG ingestion 所依赖的通用执行底座：
+RAG ingestion 所依赖的通用执行底座已经落地：
 
 - durable job row 与 scope/RLS；
 - enqueue + lease/claim；
@@ -124,8 +133,8 @@ Keel 当前处于 **M3（Knowledge & quality）中段**：
 - list/detail/cancel API；
 - crash/retry/idempotency acceptance tests。
 
-第一版不同时追求 N-worker benchmark、完整 Jobs UI 或所有 job kinds；第一个真实 consumer
-将是 RAG document ingest/reindex。
+第一版没有引入 N-worker benchmark、完整 Jobs UI 或假的 production job kind；第一个真实
+consumer 将是 RAG document ingest/reindex。
 
 ### 2. RAG/KB vertical slice
 
@@ -153,5 +162,5 @@ Security review、performance、backup/restore drill、multi-tenant groundwork �
 
 ## 7. 当前下一步
 
-立即进入 **Durable Background Jobs 设计**。设计通过后按 TDD 实现，再开始 RAG/KB。
-
+完成 durable background jobs 的最终分支验证与合并，然后立即进入
+**RAG/Knowledge Base 设计**。
