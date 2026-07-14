@@ -75,7 +75,10 @@ def _validated_storage_text(value: str, *, field: str) -> str:
     return value
 
 
-def _normalize_json_value(value: Any, *, field: str) -> Any:
+def _normalize_json_value(
+    value: Any, *, field: str, seen_containers: set[int] | None = None
+) -> Any:
+    seen = seen_containers if seen_containers is not None else set()
     if value is None or isinstance(value, bool | int):
         return value
     if isinstance(value, float):
@@ -87,20 +90,42 @@ def _normalize_json_value(value: Any, *, field: str) -> Any:
     if isinstance(value, str):
         return _validated_storage_text(value, field=field)
     if isinstance(value, list):
-        return [
-            _normalize_json_value(item, field=f"{field}[{index}]")
-            for index, item in enumerate(value)
-        ]
-    if isinstance(value, dict):
-        normalized: dict[str, Any] = {}
-        for key, item in value.items():
-            if not isinstance(key, str):
-                raise JobValidationError(
-                    "json_native_required", f"{field} object keys must be strings"
+        identity = id(value)
+        if identity in seen:
+            raise JobValidationError("json_cycle", f"{field} must not contain cyclic references")
+        seen.add(identity)
+        try:
+            return [
+                _normalize_json_value(
+                    item,
+                    field=f"{field} array item",
+                    seen_containers=seen,
                 )
-            safe_key = _validated_storage_text(key, field=f"{field} key")
-            normalized[safe_key] = _normalize_json_value(item, field=f"{field}.{safe_key}")
-        return normalized
+                for item in value
+            ]
+        finally:
+            seen.remove(identity)
+    if isinstance(value, dict):
+        identity = id(value)
+        if identity in seen:
+            raise JobValidationError("json_cycle", f"{field} must not contain cyclic references")
+        seen.add(identity)
+        normalized: dict[str, Any] = {}
+        try:
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise JobValidationError(
+                        "json_native_required", f"{field} object keys must be strings"
+                    )
+                safe_key = _validated_storage_text(key, field=f"{field} object key")
+                normalized[safe_key] = _normalize_json_value(
+                    item,
+                    field=f"{field} object value",
+                    seen_containers=seen,
+                )
+            return normalized
+        finally:
+            seen.remove(identity)
     raise JobValidationError(
         "json_native_required",
         f"{field} must contain only JSON-native objects, arrays, and scalar values",

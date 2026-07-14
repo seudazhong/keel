@@ -104,6 +104,20 @@ def test_limits_require_postgres_safe_json_and_return_a_detached_value() -> None
         limits.result_message("bad\x00message")
 
 
+def test_limits_reject_cycles_without_echoing_payload_keys() -> None:
+    limits = JobLimits()
+    cyclic: dict[str, object] = {}
+    cyclic["self"] = cyclic
+    with pytest.raises(JobValidationError, match="json_cycle"):
+        limits.validate_payload(cyclic)
+
+    secret_key = "secret-token-" + ("x" * 5_000) + "\nnext-line"
+    with pytest.raises(JobValidationError) as caught:
+        limits.validate_payload({secret_key: object()})
+    assert secret_key not in caught.value.public_message
+    assert len(caught.value.public_message) < 200
+
+
 def test_job_limits_are_built_from_settings() -> None:
     settings = Settings(
         job_payload_max_bytes=101,
