@@ -75,12 +75,33 @@ def test_limits_validate_json_bytes_and_clip_public_text() -> None:
         limits.validate_result({"long": "value"})
     with pytest.raises(JobValidationError, match="json_object_required"):
         limits.validate_payload(["not", "an", "object"])  # type: ignore[arg-type]
-    with pytest.raises(JobValidationError, match="json_serializable"):
+    with pytest.raises(JobValidationError, match="json_native_required"):
         limits.validate_result({"bad": object()})
     with pytest.raises(JobValidationError, match="json_serializable"):
         limits.validate_payload({"bad": float("nan")})
     assert limits.result_message("123456") == "12345"
     assert limits.error_message("12345") == "1234"
+
+
+def test_limits_require_postgres_safe_json_and_return_a_detached_value() -> None:
+    limits = JobLimits()
+    source = {"items": [{"name": "safe"}]}
+    normalized = limits.validate_payload(source)
+    assert normalized == source
+    assert normalized is not source
+    assert normalized["items"] is not source["items"]
+
+    source["items"][0]["name"] = "mutated"
+    assert normalized == {"items": [{"name": "safe"}]}
+
+    with pytest.raises(JobValidationError, match="json_native_required"):
+        limits.validate_payload({"bad": (1, 2)})
+    with pytest.raises(JobValidationError, match="json_native_required"):
+        limits.validate_payload({1: "bad"})  # type: ignore[dict-item]
+    with pytest.raises(JobValidationError, match="storage_text_invalid"):
+        limits.validate_payload({"bad": "\x00"})
+    with pytest.raises(JobValidationError, match="storage_text_invalid"):
+        limits.result_message("bad\x00message")
 
 
 def test_job_limits_are_built_from_settings() -> None:

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import builtins
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from keel_core.config import Settings
 
@@ -60,18 +61,65 @@ class JobCancellationRequested(Exception):
     """Internal cooperative-cancellation signal raised at a checkpoint."""
 
 
+def _validated_storage_text(value: str, *, field: str) -> str:
+    if not isinstance(value, str) or "\x00" in value:
+        raise JobValidationError(
+            "storage_text_invalid", f"{field} must be valid text without NUL characters"
+        )
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise JobValidationError(
+            "storage_text_invalid", f"{field} must be valid UTF-8 text"
+        ) from exc
+    return value
+
+
+def _normalize_json_value(value: Any, *, field: str) -> Any:
+    if value is None or isinstance(value, bool | int):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise JobValidationError(
+                "json_serializable", f"{field} must contain only finite JSON numbers"
+            )
+        return value
+    if isinstance(value, str):
+        return _validated_storage_text(value, field=field)
+    if isinstance(value, list):
+        return [
+            _normalize_json_value(item, field=f"{field}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise JobValidationError(
+                    "json_native_required", f"{field} object keys must be strings"
+                )
+            safe_key = _validated_storage_text(key, field=f"{field} key")
+            normalized[safe_key] = _normalize_json_value(item, field=f"{field}.{safe_key}")
+        return normalized
+    raise JobValidationError(
+        "json_native_required",
+        f"{field} must contain only JSON-native objects, arrays, and scalar values",
+    )
+
+
 def _validated_json_object(value: dict[str, Any], *, field: str, max_bytes: int) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise JobValidationError("json_object_required", f"{field} must be a JSON object")
+    normalized = cast(dict[str, Any], _normalize_json_value(value, field=field))
     try:
         encoded = json.dumps(
-            value,
+            normalized,
             ensure_ascii=False,
             sort_keys=True,
             separators=(",", ":"),
             allow_nan=False,
         ).encode("utf-8")
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, UnicodeError) as exc:
         raise JobValidationError(
             "json_serializable", f"{field} must contain only JSON-serializable values"
         ) from exc
@@ -79,7 +127,7 @@ def _validated_json_object(value: dict[str, Any], *, field: str, max_bytes: int)
         raise JobValidationError(
             f"{field}_too_large", f"{field} exceeds {max_bytes} UTF-8 JSON bytes"
         )
-    return value
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -117,10 +165,12 @@ class JobLimits:
         return _validated_json_object(result, field="result", max_bytes=self.result_max_bytes)
 
     def result_message(self, value: str) -> str:
-        return value[: self.result_message_max_chars]
+        return _validated_storage_text(value, field="result_message")[
+            : self.result_message_max_chars
+        ]
 
     def error_message(self, value: str) -> str:
-        return value[: self.error_message_max_chars]
+        return _validated_storage_text(value, field="error_message")[: self.error_message_max_chars]
 
 
 @dataclass(frozen=True)
