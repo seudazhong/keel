@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import builtins
+import copy
 import json
 import math
-from dataclasses import dataclass
-from datetime import datetime
+import uuid
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Protocol, cast
 
 from keel_core.config import Settings
+from keel_core.state import InMemoryEventStore
 
 _MAX_JSON_DEPTH = 100
 _MAX_ERROR_CODE_CHARS = 128
@@ -356,6 +360,177 @@ class JobStore(Protocol):
 
     async def finish_cancelled(self, lease: JobLease, now: datetime) -> JobRecord: ...
     async def fail_exhausted(self, job_id: str, now: datetime) -> JobRecord | None: ...
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
+
+
+def _copy_record(record: JobRecord) -> JobRecord:
+    return replace(
+        record,
+        payload=copy.deepcopy(record.payload),
+        result=copy.deepcopy(record.result),
+    )
+
+
+def _validate_limit(limit: int) -> None:
+    if not 1 <= limit <= 100:
+        raise ValueError("limit must be between 1 and 100")
+
+
+def _validate_progress(current: int, total: int | None) -> None:
+    if current < 0 or (total is not None and (total < 0 or current > total)):
+        raise JobValidationError(
+            "invalid_progress",
+            "progress requires current >= 0 and current <= total when total is set",
+        )
+
+
+class InMemoryJobStore:
+    """Deterministic scope-bound JobStore for unit tests and the lite profile."""
+
+    def __init__(
+        self,
+        scope_id: str,
+        *,
+        events: InMemoryEventStore | None = None,
+        limits: JobLimits | None = None,
+    ) -> None:
+        if not scope_id.strip():
+            raise ValueError("scope_id must not be empty")
+        self._scope_id = scope_id
+        self._events = events
+        self._limits = limits or JobLimits()
+        self._rows: dict[str, JobRecord] = {}
+        self._dedupe: dict[tuple[str, str, str], str] = {}
+        self._lock = asyncio.Lock()
+
+    @property
+    def scope_id(self) -> str:
+        return self._scope_id
+
+    async def enqueue_once(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        target_session_id: str | None,
+        idempotency_key: str,
+        max_attempts: int,
+        now: datetime | None = None,
+    ) -> tuple[JobRecord, bool]:
+        kind = kind.strip()
+        idempotency_key = idempotency_key.strip()
+        if not kind:
+            raise JobValidationError("invalid_kind", "kind must not be empty")
+        if not idempotency_key:
+            raise JobValidationError("invalid_idempotency_key", "idempotency_key must not be empty")
+        if max_attempts < 1:
+            raise JobValidationError("invalid_max_attempts", "max_attempts must be at least 1")
+        timestamp = now or _utcnow()
+        key = (self._scope_id, kind, idempotency_key)
+        async with self._lock:
+            existing_id = self._dedupe.get(key)
+            if existing_id is not None:
+                return _copy_record(self._rows[existing_id]), False
+            safe_payload = copy.deepcopy(self._limits.validate_payload(payload))
+            if target_session_id is not None and (
+                self._events is None
+                or not self._events.has_session(target_session_id, self._scope_id)
+            ):
+                raise JobValidationError(
+                    "target_session_not_found",
+                    "target session does not exist in the current scope",
+                )
+            job_id = f"job_{uuid.uuid4().hex}"
+            record = JobRecord(
+                id=job_id,
+                scope_id=self._scope_id,
+                kind=kind,
+                status=JobStatus.queued,
+                payload=safe_payload,
+                target_session_id=target_session_id,
+                idempotency_key=idempotency_key,
+                attempt=0,
+                max_attempts=max_attempts,
+                next_attempt_at=timestamp,
+                lease_token=None,
+                lease_expires_at=None,
+                heartbeat_at=None,
+                cancel_requested_at=None,
+                progress_current=0,
+                progress_total=None,
+                progress_message=None,
+                progress_updated_at=None,
+                result=None,
+                result_message=None,
+                error_kind=None,
+                error_message=None,
+                injected_event_seq=None,
+                created_at=timestamp,
+                updated_at=timestamp,
+                started_at=None,
+                finished_at=None,
+            )
+            self._rows[job_id] = record
+            self._dedupe[key] = job_id
+            return _copy_record(record), True
+
+    async def get(self, job_id: str) -> JobRecord | None:
+        async with self._lock:
+            record = self._rows.get(job_id)
+            return None if record is None else _copy_record(record)
+
+    async def list(
+        self,
+        *,
+        status: JobStatus | None = None,
+        kind: str | None = None,
+        limit: int = 50,
+    ) -> builtins.list[JobRecord]:
+        _validate_limit(limit)
+        async with self._lock:
+            rows = [
+                row
+                for row in self._rows.values()
+                if (status is None or row.status is status) and (kind is None or row.kind == kind)
+            ]
+            rows.sort(key=lambda row: (row.created_at, row.id), reverse=True)
+            return [_copy_record(row) for row in rows[:limit]]
+
+    async def dispatchable(self, now: datetime, limit: int) -> builtins.list[str]:
+        _validate_limit(limit)
+        async with self._lock:
+            rows = [
+                row
+                for row in self._rows.values()
+                if row.attempt < row.max_attempts
+                and (
+                    (row.status is JobStatus.queued and row.next_attempt_at <= now)
+                    or (
+                        row.status is JobStatus.running
+                        and row.lease_expires_at is not None
+                        and row.lease_expires_at <= now
+                    )
+                )
+            ]
+            rows.sort(key=lambda row: (row.next_attempt_at, row.created_at, row.id))
+            return [row.id for row in rows[:limit]]
+
+    async def exhausted(self, now: datetime, limit: int) -> builtins.list[str]:
+        _validate_limit(limit)
+        async with self._lock:
+            rows = [
+                row
+                for row in self._rows.values()
+                if row.status is JobStatus.running
+                and row.lease_expires_at is not None
+                and row.lease_expires_at <= now
+                and row.attempt >= row.max_attempts
+            ]
+            rows.sort(key=lambda row: (row.lease_expires_at, row.created_at, row.id))
+            return [row.id for row in rows[:limit]]
 
 
 def retry_delay_seconds(attempt: int, base_seconds: int, max_seconds: int) -> int:

@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from keel_core.config import Settings
+from keel_core.events import Event, EventType
 from keel_core.jobs import (
+    InMemoryJobStore,
     JobError,
     JobLease,
     JobLimits,
@@ -18,6 +21,22 @@ from keel_core.jobs import (
     RetryableJobError,
     retry_delay_seconds,
 )
+from keel_core.state import InMemoryEventStore
+
+_NOW = datetime(2026, 7, 14, 9, 0, tzinfo=UTC)
+
+
+async def _session(events: InMemoryEventStore, session_id: str, scope: str) -> None:
+    await events.append(
+        Event(
+            type=EventType.message_token,
+            seq=0,
+            session_id=session_id,
+            scope_id=scope,
+            ts=_NOW,
+            payload={"role": "user", "text": "seed"},
+        )
+    )
 
 
 def test_job_contracts_are_frozen_and_typed() -> None:
@@ -180,3 +199,151 @@ def test_retry_delay_rejects_non_positive_inputs() -> None:
         retry_delay_seconds(0, 5, 300)
     with pytest.raises(ValueError):
         retry_delay_seconds(1, 0, 300)
+
+
+async def test_in_memory_enqueue_once_dedupes_and_first_request_wins() -> None:
+    store = InMemoryJobStore("web:local")
+    first, created = await store.enqueue_once(
+        kind="test.echo",
+        payload={"value": 1},
+        target_session_id=None,
+        idempotency_key="request-1",
+        max_attempts=3,
+        now=_NOW,
+    )
+    duplicate, duplicate_created = await store.enqueue_once(
+        kind="test.echo",
+        payload={"bad": object()},
+        target_session_id="missing-on-retry",
+        idempotency_key="request-1",
+        max_attempts=1,
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    assert created is True
+    assert duplicate_created is False
+    assert duplicate.id == first.id
+    assert duplicate.payload == {"value": 1}
+    assert duplicate.max_attempts == 3
+    assert first.status is JobStatus.queued
+    assert first.attempt == 0
+    assert first.next_attempt_at == _NOW
+
+
+@pytest.mark.parametrize(
+    ("kind", "key", "max_attempts", "error_code"),
+    [
+        (" ", "request", 3, "invalid_kind"),
+        ("test.echo", " ", 3, "invalid_idempotency_key"),
+        ("test.echo", "request", 0, "invalid_max_attempts"),
+    ],
+)
+async def test_in_memory_enqueue_rejects_invalid_identity_and_attempt_policy(
+    kind: str,
+    key: str,
+    max_attempts: int,
+    error_code: str,
+) -> None:
+    store = InMemoryJobStore("web:local")
+    with pytest.raises(JobValidationError, match=error_code):
+        await store.enqueue_once(
+            kind=kind,
+            payload={},
+            target_session_id=None,
+            idempotency_key=key,
+            max_attempts=max_attempts,
+            now=_NOW,
+        )
+
+
+async def test_in_memory_enqueue_validates_target_session_and_scope() -> None:
+    events = InMemoryEventStore()
+    await _session(events, "target", "web:local")
+    store = InMemoryJobStore("web:local", events=events)
+
+    accepted, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id="target",
+        idempotency_key="accepted",
+        max_attempts=3,
+        now=_NOW,
+    )
+    assert accepted.target_session_id == "target"
+
+    with pytest.raises(JobValidationError, match="target_session_not_found"):
+        await store.enqueue_once(
+            kind="test.echo",
+            payload={},
+            target_session_id="missing",
+            idempotency_key="missing",
+            max_attempts=3,
+            now=_NOW,
+        )
+
+    other_scope = InMemoryJobStore("scope:other", events=events)
+    with pytest.raises(JobValidationError, match="target_session_not_found"):
+        await other_scope.enqueue_once(
+            kind="test.echo",
+            payload={},
+            target_session_id="target",
+            idempotency_key="cross-scope",
+            max_attempts=3,
+            now=_NOW,
+        )
+
+
+async def test_in_memory_get_and_list_are_copied_filtered_and_newest_first() -> None:
+    store = InMemoryJobStore("web:local")
+    older, _ = await store.enqueue_once(
+        kind="test.a",
+        payload={"nested": {"value": 1}},
+        target_session_id=None,
+        idempotency_key="older",
+        max_attempts=3,
+        now=_NOW,
+    )
+    newer, _ = await store.enqueue_once(
+        kind="test.b",
+        payload={},
+        target_session_id=None,
+        idempotency_key="newer",
+        max_attempts=3,
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    fetched = await store.get(older.id)
+    assert fetched is not None
+    fetched.payload["nested"]["value"] = 99
+    assert (await store.get(older.id)).payload == {"nested": {"value": 1}}  # type: ignore[union-attr]
+    assert [row.id for row in await store.list()] == [newer.id, older.id]
+    assert [row.id for row in await store.list(kind="test.a")] == [older.id]
+    assert await store.list(status=JobStatus.running) == []
+    with pytest.raises(ValueError, match="limit"):
+        await store.list(limit=0)
+    with pytest.raises(ValueError, match="limit"):
+        await store.list(limit=101)
+
+
+async def test_in_memory_dispatch_selection_respects_due_time_and_limit() -> None:
+    store = InMemoryJobStore("web:local")
+    due, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id=None,
+        idempotency_key="due",
+        max_attempts=3,
+        now=_NOW,
+    )
+    later, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id=None,
+        idempotency_key="later",
+        max_attempts=3,
+        now=_NOW + timedelta(minutes=5),
+    )
+
+    assert await store.dispatchable(_NOW, 1) == [due.id]
+    assert later.id not in await store.dispatchable(_NOW, 100)
+    assert await store.exhausted(_NOW, 100) == []
