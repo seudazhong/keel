@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import traceback
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from time import perf_counter
 from typing import Any, cast
 
@@ -15,6 +17,7 @@ from keel_core.jobs import (
     JobError,
     JobLease,
     JobLeaseLostError,
+    JobRecord,
     JobResult,
     JobStatus,
     JobStore,
@@ -136,6 +139,35 @@ async def _current_status(store: JobStore, job_id: str) -> str:
     return "missing" if row is None else row.status.value
 
 
+async def _authoritative_status(store: JobStore, job_id: str) -> tuple[str, JobStatus | None]:
+    status_value = await _current_status(store, job_id)
+    try:
+        return status_value, JobStatus(status_value)
+    except ValueError:
+        return status_value, None
+
+
+async def _transition_or_current(
+    store: JobStore,
+    job_id: str,
+    transition: Awaitable[JobRecord],
+) -> tuple[str, JobStatus | None]:
+    try:
+        row = await transition
+        return row.status.value, row.status
+    except JobLeaseLostError:
+        return await _authoritative_status(store, job_id)
+
+
+def _safe_exception_frames(exc: BaseException) -> str:
+    frames = traceback.extract_tb(exc.__traceback__, limit=8)
+    if not frames:
+        return "<no-frame>"
+    return " > ".join(
+        f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}" for frame in frames
+    )
+
+
 async def _retry_or_fail(
     *,
     ctx: dict[str, Any],
@@ -143,10 +175,13 @@ async def _retry_or_fail(
     lease: JobLease,
     error: JobError,
     now: datetime,
-) -> JobStatus:
+) -> tuple[str, JobStatus | None]:
     if lease.attempt >= lease.max_attempts:
-        row = await store.fail_terminal(lease, error, now)
-        return row.status
+        return await _transition_or_current(
+            store,
+            lease.job_id,
+            store.fail_terminal(lease, error, now),
+        )
     settings = ctx["job_settings"]
     retry_at = now + timedelta(
         seconds=retry_delay_seconds(
@@ -155,7 +190,13 @@ async def _retry_or_fail(
             settings.job_retry_max_seconds,
         )
     )
-    row = await store.requeue(lease, error, retry_at, now)
+    status_value, status = await _transition_or_current(
+        store,
+        lease.job_id,
+        store.requeue(lease, error, retry_at, now),
+    )
+    if status is not JobStatus.queued:
+        return status_value, status
     try:
         enqueue: EnqueueJob = ctx["enqueue"]
         await enqueue(
@@ -164,16 +205,17 @@ async def _retry_or_fail(
             lease.job_id,
             _defer_until=retry_at,
         )
-    except Exception:
+    except Exception as exc:
         logger.warning(
-            "job retry enqueue failed scope=%s job=%s kind=%s attempt=%d",
+            "job retry enqueue failed scope=%s job=%s kind=%s attempt=%d error_type=%s frames=%s",
             lease.scope_id,
             lease.job_id,
             lease.kind,
             lease.attempt,
-            exc_info=True,
+            type(exc).__name__,
+            _safe_exception_frames(exc),
         )
-    return row.status
+    return status_value, status
 
 
 async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
@@ -225,16 +267,21 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
         span.set_attribute("job.attempt", lease.attempt)
         try:
             if definition is None:
-                row = await store.fail_terminal(
-                    lease,
-                    JobError(
-                        "unknown_job_kind",
-                        "job kind is not registered on this worker",
+                status_value, status = await _transition_or_current(
+                    store,
+                    job_id,
+                    store.fail_terminal(
+                        lease,
+                        JobError(
+                            "unknown_job_kind",
+                            "job kind is not registered on this worker",
+                        ),
+                        clock(),
                     ),
-                    clock(),
                 )
-                final_status = row.status
-                return row.status.value
+                if status is not None:
+                    final_status = status
+                return status_value
             context = JobContext(store, lease, clock=clock)
             await context.checkpoint()
             result = await definition.handler(context, lease.payload)
@@ -243,48 +290,70 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                     "invalid_job_result",
                     "job handler must return JobResult",
                 )
-            row = await store.succeed(lease, result, clock())
-            final_status = row.status
-            return row.status.value
+            status_value, status = await _transition_or_current(
+                store,
+                job_id,
+                store.succeed(lease, result, clock()),
+            )
+            if status is not None:
+                final_status = status
+            return status_value
         except asyncio.CancelledError:
             raise
         except JobCancellationRequested:
-            row = await store.finish_cancelled(lease, clock())
-            final_status = row.status
-            return row.status.value
+            status_value, status = await _transition_or_current(
+                store,
+                job_id,
+                store.finish_cancelled(lease, clock()),
+            )
+            if status is not None:
+                final_status = status
+            return status_value
         except PermanentJobError as exc:
-            row = await store.fail_terminal(lease, JobError(exc.code, exc.public_message), clock())
-            final_status = row.status
-            return row.status.value
+            status_value, status = await _transition_or_current(
+                store,
+                job_id,
+                store.fail_terminal(lease, JobError(exc.code, exc.public_message), clock()),
+            )
+            if status is not None:
+                final_status = status
+            return status_value
         except JobValidationError as exc:
-            row = await store.fail_terminal(lease, JobError(exc.code, exc.public_message), clock())
-            final_status = row.status
-            return row.status.value
+            status_value, status = await _transition_or_current(
+                store,
+                job_id,
+                store.fail_terminal(lease, JobError(exc.code, exc.public_message), clock()),
+            )
+            if status is not None:
+                final_status = status
+            return status_value
         except RetryableJobError as exc:
-            final_status = await _retry_or_fail(
+            status_value, status = await _retry_or_fail(
                 ctx=ctx,
                 store=store,
                 lease=lease,
                 error=JobError(exc.code, exc.public_message),
                 now=clock(),
             )
-            return final_status.value
-        except JobLeaseLostError:
-            status_value = await _current_status(store, job_id)
-            try:
-                final_status = JobStatus(status_value)
-            except ValueError:
-                pass
+            if status is not None:
+                final_status = status
             return status_value
-        except Exception:
-            logger.exception(
-                "job handler raised scope=%s job=%s kind=%s attempt=%d",
+        except JobLeaseLostError:
+            status_value, status = await _authoritative_status(store, job_id)
+            if status is not None:
+                final_status = status
+            return status_value
+        except Exception as exc:
+            logger.error(
+                "job handler raised scope=%s job=%s kind=%s attempt=%d error_type=%s frames=%s",
                 lease.scope_id,
                 lease.job_id,
                 lease.kind,
                 lease.attempt,
+                type(exc).__name__,
+                _safe_exception_frames(exc),
             )
-            final_status = await _retry_or_fail(
+            status_value, status = await _retry_or_fail(
                 ctx=ctx,
                 store=store,
                 lease=lease,
@@ -294,7 +363,9 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                 ),
                 now=clock(),
             )
-            return final_status.value
+            if status is not None:
+                final_status = status
+            return status_value
         finally:
             span.set_attribute("job.status", final_status.value)
             logger.info(

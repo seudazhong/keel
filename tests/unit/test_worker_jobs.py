@@ -444,7 +444,9 @@ async def test_run_job_retryable_error_fails_terminal_on_last_attempt() -> None:
     assert enqueued == []
 
 
-async def test_run_job_retry_enqueue_is_best_effort() -> None:
+async def test_run_job_retry_enqueue_is_best_effort(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     store = InMemoryJobStore("web:local")
     registry = JobRegistry()
 
@@ -452,18 +454,89 @@ async def test_run_job_retry_enqueue_is_best_effort() -> None:
         raise RetryableJobError("provider_timeout", "Provider timed out.")
 
     async def failed_enqueue(name: str, *args: object, **options: object) -> None:
-        raise RuntimeError("queue unavailable")
+        raise RuntimeError("queue-token=DO-NOT-LOG")
 
     registry.register(JobDefinition("test.echo", handler, lease_seconds=60))
     job_id = await _enqueued_job(store, key="retry-enqueue")
     ctx = _ctx(store, registry, _Clock(_NOW), [])
     ctx["enqueue"] = failed_enqueue
+    caplog.set_level("WARNING", logger="keel.worker.jobs")
 
     result = await run_job(ctx, "web:local", job_id)
 
     row = await store.get(job_id)
     assert result == JobStatus.queued.value
     assert row is not None and row.next_attempt_at == _NOW + timedelta(seconds=5)
+    assert "DO-NOT-LOG" not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+async def test_run_job_failure_logs_do_not_include_exception_secrets(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise RuntimeError(f"token={payload['secret']}")
+
+    registry.register(JobDefinition("test.echo", handler, max_attempts=1, lease_seconds=60))
+    job_id = await _enqueued_job(
+        store,
+        key="secret-error",
+        max_attempts=1,
+        payload={"secret": "DO-NOT-LOG"},
+    )
+    caplog.set_level("ERROR", logger="keel.worker.jobs")
+
+    assert (
+        await run_job(
+            _ctx(store, registry, _Clock(_NOW), []),
+            "web:local",
+            job_id,
+        )
+        == JobStatus.failed.value
+    )
+    assert "DO-NOT-LOG" not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "error_kind",
+    ["permanent", "validation", "retryable", "unknown", "cancelled"],
+)
+async def test_run_job_returns_authoritative_status_when_lease_expires_during_error_path(
+    error_kind: str,
+) -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    clock = _Clock(_NOW)
+    job_id = await _enqueued_job(store, key=f"late-{error_kind}")
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        if error_kind == "cancelled":
+            await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+        clock.value = _NOW + timedelta(seconds=61)
+        if error_kind == "permanent":
+            raise PermanentJobError("late", "late")
+        if error_kind == "validation":
+            raise JobValidationError("late", "late")
+        if error_kind == "retryable":
+            raise RetryableJobError("late", "late")
+        if error_kind == "cancelled":
+            raise JobCancellationRequested
+        raise RuntimeError("late")
+
+    registry.register(JobDefinition("test.echo", handler, lease_seconds=60))
+
+    assert (
+        await run_job(
+            _ctx(store, registry, clock, []),
+            "web:local",
+            job_id,
+        )
+        == JobStatus.running.value
+    )
 
 
 async def test_run_job_unknown_exception_retries_then_fails_terminal() -> None:
