@@ -4104,6 +4104,15 @@ Copilot-Session: e6e934ad-91c1-41c3-a46e-521cd446cb49"
   `{"role": "assistant", "content": ...}` and neither carries `tool_calls`.
 - It joins content with exactly `"\n\n"`.
 - It never alters source events or crosses user/system/tool messages.
+- Every job-injected assistant message enters one FIFO deferred queue.
+- Active/suspended tool threads are owned by `run_id`; same-ID resume preserves them, while a
+  replacement run reconciles and removes unmatched tool protocol.
+- Late assistant/tool/lifecycle events from superseded runs are ignored; user/system boundaries
+  remain visible.
+- Deferred user/system boundaries preserve order. Jobs after a later user remain deferred until
+  that user's run completes, so they cannot become the user's immediate answer.
+- Multiple tool calls remain open until every matching result arrives; unknown/late results never
+  emit orphan `role="tool"` messages.
 - Consumed by the existing `loop._build_request()` for both OpenAI-compatible and Anthropic
   model IDs.
 
@@ -4206,7 +4215,8 @@ reassigned by the store; assertions intentionally depend only on order/content.
 
 Expected: adjacent assistant test fails because two separate assistant dictionaries are emitted.
 
-- [ ] **Step 3: Add a model-message append helper** inside `project_messages()`:
+- [ ] **Step 3: Add the model-message append helper and run-aware deferred state machine**
+  inside `project_messages()`:
 
 ```python
     def append_message(message: dict[str, Any]) -> None:
@@ -4232,6 +4242,34 @@ Change `flush()` from `messages.append(pending_assistant)` to
 `append_message(pending_assistant)`. Change direct user/system and tool-result appends to
 `append_message(...)` too, so every boundary decision has one path. Do not merge an assistant
 dictionary after `tool_calls` have been attached.
+
+Then add explicit state for:
+
+```python
+deferred_messages: list[dict[str, Any]]
+open_tool_call_ids: set[str]
+open_tool_thread_start: int | None
+open_tool_run_id: str | None
+active_run_ids: set[str]
+superseded_run_ids: set[str]
+pending_assistant_run_id: str | None
+```
+
+Required behavior:
+
+1. Job-injected assistant events are FIFO-deferred while a run/tool thread may consume them.
+2. A same-ID `run.resumed` retains its suspended tool thread.
+3. A different `run.started` drops unmatched stale tool protocol, preserves non-empty assistant
+   text, marks the old run superseded, and releases the queued user boundary before the new run.
+4. Events carrying a superseded `run_id` are ignored except user/system message boundaries.
+5. A tool result is appended only when its `call_id` is currently open.
+6. At run end, flush through the last deferred user/system boundary but retain trailing job
+   messages for that boundary's later run.
+7. At a clean run end with no later user boundary, flush all deferred jobs in FIFO order.
+
+Add RED/GREEN cases for injection before run start, between assistant/tool-call, between
+tool-call/result, suspended-run replacement, late superseded results, orphaned runs, multiple
+pre-run jobs, and job-after-later-user ordering.
 
 - [ ] **Step 4: Run GREEN**
 
