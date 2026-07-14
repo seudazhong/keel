@@ -18,6 +18,7 @@ from keel_core.state import InMemoryEventStore
 
 _MAX_JSON_DEPTH = 100
 _MAX_ERROR_CODE_CHARS = 128
+_PG_BIGINT_MAX = 2**63 - 1
 
 
 def _ensure_storage_safe_text(value: str, *, field: str) -> str:
@@ -398,10 +399,18 @@ def _validate_limit(limit: int) -> None:
 
 
 def _validate_progress(current: int, total: int | None) -> None:
-    if current < 0 or (total is not None and (total < 0 or current > total)):
+    invalid_current = (
+        isinstance(current, bool)
+        or not isinstance(current, int)
+        or not 0 <= current <= _PG_BIGINT_MAX
+    )
+    invalid_total = total is not None and (
+        isinstance(total, bool) or not isinstance(total, int) or not 0 <= total <= _PG_BIGINT_MAX
+    )
+    if invalid_current or invalid_total or (total is not None and current > total):
         raise JobValidationError(
             "invalid_progress",
-            "progress requires current >= 0 and current <= total when total is set",
+            "progress requires PostgreSQL bigint integers with current <= total",
         )
 
 
@@ -431,13 +440,15 @@ class InMemoryJobStore:
     def scope_id(self) -> str:
         return self._scope_id
 
-    def _owned(self, lease: JobLease) -> JobRecord:
+    def _owned(self, lease: JobLease, now: datetime) -> JobRecord:
         row = self._rows.get(lease.job_id)
         if (
             row is None
             or lease.scope_id != self._scope_id
             or row.status is not JobStatus.running
             or row.lease_token != lease.token
+            or row.lease_expires_at is None
+            or row.lease_expires_at <= now
         ):
             raise JobLeaseLostError(lease.job_id)
         return row
@@ -618,7 +629,7 @@ class InMemoryJobStore:
     async def heartbeat(self, lease: JobLease, now: datetime) -> bool:
         now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
-            row = self._owned(lease)
+            row = self._owned(lease, now)
             updated = replace(
                 row,
                 heartbeat_at=now,
@@ -638,9 +649,12 @@ class InMemoryJobStore:
         now: datetime,
     ) -> JobProgressResult:
         _validate_progress(current, total)
+        safe_message = (
+            None if message is None else _validated_storage_text(message, field="progress_message")
+        )
         now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
-            row = self._owned(lease)
+            row = self._owned(lease, now)
             if current < row.progress_current:
                 raise JobValidationError(
                     "progress_regression",
@@ -650,7 +664,7 @@ class InMemoryJobStore:
                 row,
                 progress_current=current,
                 progress_total=total,
-                progress_message=message,
+                progress_message=safe_message,
                 progress_updated_at=now,
                 heartbeat_at=now,
                 lease_expires_at=now + timedelta(seconds=lease.lease_seconds),

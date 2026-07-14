@@ -489,6 +489,25 @@ async def test_heartbeat_refreshes_lease_and_stale_token_is_rejected() -> None:
         )
 
 
+async def test_expired_owner_cannot_resurrect_a_lease() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _queued(store, "expired-owner", max_attempts=1)
+    lease = await store.claim(job_id, _NOW, 10)
+    assert lease is not None
+
+    with pytest.raises(JobLeaseLostError):
+        await store.heartbeat(lease, _NOW + timedelta(seconds=10))
+    with pytest.raises(JobLeaseLostError):
+        await store.progress(
+            lease,
+            current=1,
+            total=1,
+            message="too late",
+            now=_NOW + timedelta(seconds=11),
+        )
+    assert await store.exhausted(_NOW + timedelta(seconds=11), 100) == [job_id]
+
+
 async def test_progress_is_monotonic_bounded_and_refreshes_lease() -> None:
     store = InMemoryJobStore("web:local")
     job_id = await _queued(store, "progress")
@@ -519,6 +538,28 @@ async def test_progress_is_monotonic_bounded_and_refreshes_lease() -> None:
     with pytest.raises(JobValidationError, match="invalid_progress"):
         await store.progress(
             lease, current=-1, total=None, message=None, now=_NOW + timedelta(seconds=6)
+        )
+    for current, total in [
+        (True, None),
+        (1.5, 2),
+        (2**63, None),
+        (1, 2**63),
+    ]:
+        with pytest.raises(JobValidationError, match="invalid_progress"):
+            await store.progress(  # type: ignore[arg-type]
+                lease,
+                current=current,
+                total=total,
+                message=None,
+                now=_NOW + timedelta(seconds=6),
+            )
+    with pytest.raises(JobValidationError, match="storage_text_invalid"):
+        await store.progress(
+            lease,
+            current=5,
+            total=10,
+            message="bad\x00message",
+            now=_NOW + timedelta(seconds=6),
         )
 
 
