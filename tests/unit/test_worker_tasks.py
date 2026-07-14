@@ -15,7 +15,15 @@ from keel_core.testing import ScriptedProviderGateway
 from keel_core.types import FinishReason, StopReason
 from keel_scheduler.atmostonce import InMemoryClaimStore
 from keel_scheduler.store import InMemoryScheduleStore, ScheduleRow
-from keel_worker.main import resume_run, run_agent, scheduler_tick
+from keel_worker.jobs import JobRegistry, dispatch_jobs, run_job
+from keel_worker.main import (
+    WorkerSettings,
+    _empty_job_registry,
+    _enqueue_arq,
+    resume_run,
+    run_agent,
+    scheduler_tick,
+)
 
 _NOW = datetime(2026, 7, 7, 9, 0, tzinfo=UTC)
 
@@ -176,3 +184,40 @@ async def test_run_agent_rejects_unknown_agent_id() -> None:
     )
     ctx: dict[str, Any] = {"schedules": InMemoryScheduleStore([row])}
     assert await run_agent(ctx, "weird") == "unsupported"
+
+
+def test_worker_registers_job_functions_and_dispatch_cron() -> None:
+    assert run_job in WorkerSettings.functions
+    assert dispatch_jobs in WorkerSettings.functions
+    dispatch_cron = next(job for job in WorkerSettings.cron_jobs if job.coroutine is dispatch_jobs)
+    assert dispatch_cron.second == {0, 30}
+
+
+def test_production_job_registry_is_empty() -> None:
+    registry = _empty_job_registry()
+    assert isinstance(registry, JobRegistry)
+    assert registry.kinds() == ()
+
+
+async def test_worker_enqueue_adapter_forwards_arq_options() -> None:
+    seen: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    class Pool:
+        async def enqueue_job(self, name: str, *args: object, **options: object) -> None:
+            seen.append((name, args, options))
+
+    defer_until = _NOW + timedelta(seconds=5)
+    await _enqueue_arq(
+        Pool(),
+        "run_job",
+        "web:local",
+        "job_1",
+        _defer_until=defer_until,
+    )
+    assert seen == [
+        (
+            "run_job",
+            ("web:local", "job_1"),
+            {"_defer_until": defer_until},
+        )
+    ]

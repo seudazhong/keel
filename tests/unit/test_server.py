@@ -6,9 +6,14 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import create_async_engine
 
+from keel_core.config import Settings
 from keel_core.events import Event, EventType
-from keel_server.app import create_app
+from keel_core.jobs import InMemoryJobStore, PostgresJobStore
+from keel_server.app import _build_job_store, _enqueue_arq, create_app
+
+_NOW = datetime(2026, 7, 14, 9, 0, tzinfo=UTC)
 
 
 class _FakeRuntime:
@@ -147,3 +152,30 @@ def test_telegram_webhook_503_without_gateway() -> None:
     client = TestClient(create_app())  # lifespan not run -> no gateway configured
     resp = client.post("/v1/gateway/telegram", json={"message": {}})
     assert resp.status_code == 503
+
+
+async def test_server_builds_scope_bound_job_store_for_both_profiles() -> None:
+    settings = Settings()
+    memory = _build_job_store(None, "web:local", settings)
+    assert isinstance(memory, InMemoryJobStore)
+    assert memory.scope_id == "web:local"
+
+    engine = create_async_engine("postgresql+psycopg://localhost:5432/keel_test")
+    assert engine.url.database == "keel_test"
+    try:
+        postgres = _build_job_store(engine, "web:local", settings)
+        assert isinstance(postgres, PostgresJobStore)
+        assert postgres.scope_id == "web:local"
+    finally:
+        await engine.dispose()
+
+
+async def test_server_enqueue_adapter_forwards_keyword_options() -> None:
+    seen: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    class Pool:
+        async def enqueue_job(self, name: str, *args: object, **options: object) -> None:
+            seen.append((name, args, options))
+
+    await _enqueue_arq(Pool(), "run_job", "web:local", "job_1", _defer_until=_NOW)
+    assert seen == [("run_job", ("web:local", "job_1"), {"_defer_until": _NOW})]

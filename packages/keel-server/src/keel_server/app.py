@@ -13,16 +13,24 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core import __version__
 from keel_core.api import HealthResponse, ReadinessResponse
 from keel_core.approvals import InMemoryApprovalStore, PostgresApprovalStore
-from keel_core.config import get_settings, load_env_file
+from keel_core.config import Settings, get_settings, load_env_file
 from keel_core.db import make_async_engine, make_redis
+from keel_core.jobs import (
+    InMemoryJobStore,
+    JobLimits,
+    JobStore,
+    PostgresJobStore,
+)
 from keel_core.providers import LiteLLMGateway
 from keel_server.api import gateway as gateway_api
 from keel_server.api import oauth as oauth_api
@@ -34,6 +42,23 @@ from keel_server.webui import INDEX_HTML, pages_router
 
 logger = logging.getLogger("keel.server")
 
+_DURABLE_SCOPE = "web:local"
+
+
+def _build_job_store(
+    engine: AsyncEngine | None,
+    scope_id: str,
+    settings: Settings,
+) -> JobStore:
+    limits = JobLimits.from_settings(settings)
+    if engine is None:
+        return InMemoryJobStore(scope_id, limits=limits)
+    return PostgresJobStore(engine, scope_id, limits=limits)
+
+
+async def _enqueue_arq(pool: Any, name: str, *args: object, **options: object) -> None:
+    await pool.enqueue_job(name, *args, **options)
+
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -44,9 +69,12 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = make_async_engine(settings) if settings.event_store == "postgres" else None
     app.state.redis = redis_client
     app.state.engine = engine
+    app.state.durable_scope = _DURABLE_SCOPE
+    app.state.jobs = _build_job_store(engine, _DURABLE_SCOPE, settings)
     app.state.runtime = AgentRuntime(
         redis_client=redis_client,
         engine=engine,
+        scope_id=_DURABLE_SCOPE,
         model=settings.default_model,
         workspace=Path.cwd(),
         embedding_model=settings.embedding_model,
@@ -59,10 +87,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     # Durable approvals raised by unattended (scheduled) runs — the Approvals page +
     # API read this; approving enqueues a resume_run onto the worker's arq queue (G5).
-    app.state.durable_scope = "web:local"
     app.state.api_keys = parse_api_keys(settings.api_keys)  # RBAC: empty -> open mode
     app.state.durable_approvals = (
-        PostgresApprovalStore(engine, "web:local")
+        PostgresApprovalStore(engine, _DURABLE_SCOPE)
         if engine is not None
         else InMemoryApprovalStore()
     )
@@ -75,8 +102,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         arq_pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
         app.state.arq = arq_pool
 
-        async def _enqueue(name: str, *args: object) -> None:
-            await arq_pool.enqueue_job(name, *args)
+        async def _enqueue(name: str, *args: object, **options: object) -> None:
+            await _enqueue_arq(arq_pool, name, *args, **options)
 
         app.state.enqueue = _enqueue
     except Exception:  # noqa: BLE001 - resume enqueue is best-effort; the page still renders

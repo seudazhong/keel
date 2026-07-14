@@ -39,16 +39,27 @@ from keel_core.digest import (
     digest_permissions,
     digest_registry,
 )
+from keel_core.jobs import JobLimits, PostgresJobStore
 from keel_core.loop import ToolRegistry, admit, resume, run
 from keel_core.memory import PostgresMemoryStore
 from keel_core.observability import configure_logging, configure_tracing
 from keel_core.state import PostgresEventStore
 from keel_scheduler.store import ScheduleRow, due_tick
+from keel_worker.jobs import JobRegistry, dispatch_jobs, run_job
 
 logger = logging.getLogger("keel.worker")
 
 # The autonomy slice operates on a single scope (matches the web server's default).
-_SLICE_SCOPE = "web:local"
+_DURABLE_SCOPE = "web:local"
+
+
+def _empty_job_registry() -> JobRegistry:
+    # Intentionally empty until the RAG slice registers the first real kind.
+    return JobRegistry()
+
+
+async def _enqueue_arq(redis: Any, name: str, *args: object, **options: object) -> None:
+    await redis.enqueue_job(name, *args, **options)
 
 
 def _digest_registry(ctx: dict[str, Any], settings: Settings, scope_id: str) -> ToolRegistry:
@@ -240,10 +251,18 @@ async def startup(ctx: dict[str, Any]) -> None:
     engine = create_async_engine(settings.database_url)
     redis = ctx["redis"]
     ctx["engine"] = engine
-    ctx["store"] = PostgresEventStore(engine, _SLICE_SCOPE)
-    ctx["approvals"] = PostgresApprovalStore(engine, _SLICE_SCOPE)
-    ctx["schedules"] = PostgresScheduleStore(engine, _SLICE_SCOPE)
-    ctx["claim"] = PostgresClaimStore(engine, _SLICE_SCOPE)
+    ctx["durable_scope"] = _DURABLE_SCOPE
+    ctx["job_settings"] = settings
+    ctx["jobs"] = PostgresJobStore(
+        engine,
+        _DURABLE_SCOPE,
+        limits=JobLimits.from_settings(settings),
+    )
+    ctx["job_registry"] = _empty_job_registry()
+    ctx["store"] = PostgresEventStore(engine, _DURABLE_SCOPE)
+    ctx["approvals"] = PostgresApprovalStore(engine, _DURABLE_SCOPE)
+    ctx["schedules"] = PostgresScheduleStore(engine, _DURABLE_SCOPE)
+    ctx["claim"] = PostgresClaimStore(engine, _DURABLE_SCOPE)
     ctx["provider"] = LiteLLMGateway()
     ctx["embedder"] = LiteLLMEmbedder(
         settings.embedding_model,
@@ -251,7 +270,11 @@ async def startup(ctx: dict[str, Any]) -> None:
         send_dimensions=settings.embedding_send_dimensions,
         timeout_seconds=settings.embedding_timeout_seconds,
     )
-    ctx["enqueue"] = lambda name, *args: redis.enqueue_job(name, *args)
+
+    async def enqueue(name: str, *args: object, **options: object) -> None:
+        await _enqueue_arq(redis, name, *args, **options)
+
+    ctx["enqueue"] = enqueue
     logger.info("keel-worker %s starting", __version__)
 
 
@@ -269,8 +292,11 @@ def _redis_settings() -> RedisSettings:
 class WorkerSettings:
     """arq worker configuration (referenced by the ``arq`` CLI)."""
 
-    functions = [run_agent, resume_run, scheduler_tick]
-    cron_jobs = [cron(scheduler_tick, second={0, 30})]  # tick twice a minute
+    functions = [run_agent, resume_run, scheduler_tick, run_job, dispatch_jobs]
+    cron_jobs = [
+        cron(scheduler_tick, second={0, 30}),
+        cron(dispatch_jobs, second={0, 30}),
+    ]
     on_startup = startup
     on_shutdown = shutdown
     redis_settings = _redis_settings()
