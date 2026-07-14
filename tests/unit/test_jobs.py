@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -13,6 +13,7 @@ from keel_core.jobs import (
     InMemoryJobStore,
     JobError,
     JobLease,
+    JobLeaseLostError,
     JobLimits,
     JobResult,
     JobStatus,
@@ -408,3 +409,175 @@ async def test_in_memory_dispatch_selection_respects_due_time_and_limit() -> Non
     assert await store.dispatchable(_NOW, 1) == [due.id]
     assert later.id not in await store.dispatchable(_NOW, 100)
     assert await store.exhausted(_NOW, 100) == []
+
+
+async def _queued(
+    store: InMemoryJobStore,
+    key: str,
+    *,
+    max_attempts: int = 3,
+) -> str:
+    row, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id=None,
+        idempotency_key=key,
+        max_attempts=max_attempts,
+        now=_NOW,
+    )
+    return row.id
+
+
+async def test_claim_is_exclusive_and_reclaim_replaces_token_and_resets_progress() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _queued(store, "claim")
+    first = await store.claim(job_id, _NOW, 60)
+    assert first is not None
+    assert first.attempt == 1
+    assert await store.claim(job_id, _NOW, 60) is None
+
+    await store.progress(
+        first,
+        current=3,
+        total=10,
+        message="first attempt",
+        now=_NOW + timedelta(seconds=10),
+    )
+    second = await store.claim(job_id, _NOW + timedelta(seconds=71), 60)
+    assert second is not None
+    assert second.attempt == 2
+    assert second.token != first.token
+    record = await store.get(job_id)
+    assert record is not None
+    assert record.progress_current == 0
+    assert record.progress_total is None
+    assert record.started_at == _NOW
+
+
+async def test_claim_attempt_ceiling_is_enforced_inside_store() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _queued(store, "ceiling", max_attempts=1)
+    lease = await store.claim(job_id, _NOW, 10)
+    assert lease is not None
+    assert await store.claim(job_id, _NOW + timedelta(seconds=11), 10) is None
+    assert await store.dispatchable(_NOW + timedelta(seconds=11), 100) == []
+    assert await store.exhausted(_NOW + timedelta(seconds=11), 100) == [job_id]
+
+
+async def test_heartbeat_refreshes_lease_and_stale_token_is_rejected() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _queued(store, "heartbeat")
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+    assert await store.heartbeat(lease, _NOW + timedelta(seconds=30)) is False
+    record = await store.get(job_id)
+    assert record is not None
+    assert record.heartbeat_at == _NOW + timedelta(seconds=30)
+    assert record.lease_expires_at == _NOW + timedelta(seconds=90)
+
+    reclaimed = await store.claim(job_id, _NOW + timedelta(seconds=91), 60)
+    assert reclaimed is not None
+    with pytest.raises(JobLeaseLostError):
+        await store.heartbeat(lease, _NOW + timedelta(seconds=92))
+    with pytest.raises(JobLeaseLostError):
+        await store.progress(
+            lease,
+            current=1,
+            total=None,
+            message=None,
+            now=_NOW + timedelta(seconds=92),
+        )
+
+
+async def test_progress_is_monotonic_bounded_and_refreshes_lease() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _queued(store, "progress")
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+
+    updated = await store.progress(
+        lease,
+        current=4,
+        total=10,
+        message="embedding batch 2",
+        now=_NOW + timedelta(seconds=5),
+    )
+    assert updated.record.progress_current == 4
+    assert updated.record.progress_total == 10
+    assert updated.record.progress_message == "embedding batch 2"
+    assert updated.record.lease_expires_at == _NOW + timedelta(seconds=65)
+    assert updated.cancel_requested is False
+
+    with pytest.raises(JobValidationError, match="progress_regression"):
+        await store.progress(
+            lease, current=3, total=10, message=None, now=_NOW + timedelta(seconds=6)
+        )
+    with pytest.raises(JobValidationError, match="invalid_progress"):
+        await store.progress(
+            lease, current=11, total=10, message=None, now=_NOW + timedelta(seconds=6)
+        )
+    with pytest.raises(JobValidationError, match="invalid_progress"):
+        await store.progress(
+            lease, current=-1, total=None, message=None, now=_NOW + timedelta(seconds=6)
+        )
+
+
+async def test_lease_updates_report_cancel_and_normalize_timestamps_to_utc() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _queued(store, "cancel-aware")
+    local_zone = timezone(timedelta(hours=8))
+    lease = await store.claim(job_id, _NOW.astimezone(local_zone), 60)
+    assert lease is not None
+    claimed = await store.get(job_id)
+    assert claimed is not None
+    assert claimed.heartbeat_at is not None and claimed.heartbeat_at.tzinfo is UTC
+    assert claimed.lease_expires_at is not None and claimed.lease_expires_at.tzinfo is UTC
+
+    async with store._lock:
+        store._rows[job_id] = replace(
+            store._rows[job_id],
+            cancel_requested_at=_NOW + timedelta(seconds=1),
+        )
+
+    heartbeat_at = (_NOW + timedelta(seconds=2)).astimezone(local_zone)
+    assert await store.heartbeat(lease, heartbeat_at) is True
+    heartbeat_record = await store.get(job_id)
+    assert heartbeat_record is not None
+    assert heartbeat_record.heartbeat_at is not None
+    assert heartbeat_record.heartbeat_at.tzinfo is UTC
+
+    progress_at = (_NOW + timedelta(seconds=3)).astimezone(local_zone)
+    progress = await store.progress(
+        lease,
+        current=1,
+        total=None,
+        message=None,
+        now=progress_at,
+    )
+    assert progress.cancel_requested is True
+    assert progress.record.progress_updated_at is not None
+    assert progress.record.progress_updated_at.tzinfo is UTC
+    assert progress.record.lease_expires_at is not None
+    assert progress.record.lease_expires_at.tzinfo is UTC
+
+
+async def test_lease_operations_reject_invalid_duration_and_naive_timestamps() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _queued(store, "naive")
+    with pytest.raises(ValueError, match="lease_seconds"):
+        await store.claim(job_id, _NOW, 0)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.claim(job_id, datetime(2026, 7, 14, 9, 0), 60)
+
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.heartbeat(lease, datetime(2026, 7, 14, 9, 1))
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.progress(
+            lease,
+            current=1,
+            total=None,
+            message=None,
+            now=datetime(2026, 7, 14, 9, 1),
+        )

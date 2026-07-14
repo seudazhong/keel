@@ -9,7 +9,7 @@ import json
 import math
 import uuid
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol, cast
 
@@ -431,6 +431,17 @@ class InMemoryJobStore:
     def scope_id(self) -> str:
         return self._scope_id
 
+    def _owned(self, lease: JobLease) -> JobRecord:
+        row = self._rows.get(lease.job_id)
+        if (
+            row is None
+            or lease.scope_id != self._scope_id
+            or row.status is not JobStatus.running
+            or row.lease_token != lease.token
+        ):
+            raise JobLeaseLostError(lease.job_id)
+        return row
+
     async def enqueue_once(
         self,
         *,
@@ -560,6 +571,96 @@ class InMemoryJobStore:
             ]
             rows.sort(key=lambda row: (row.lease_expires_at, row.created_at, row.id))
             return [row.id for row in rows[:limit]]
+
+    async def claim(self, job_id: str, now: datetime, lease_seconds: int) -> JobLease | None:
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._lock:
+            row = self._rows.get(job_id)
+            if row is None or row.attempt >= row.max_attempts:
+                return None
+            due_queued = row.status is JobStatus.queued and row.next_attempt_at <= now
+            expired_running = (
+                row.status is JobStatus.running
+                and row.lease_expires_at is not None
+                and row.lease_expires_at <= now
+            )
+            if not (due_queued or expired_running):
+                return None
+            token = uuid.uuid4().hex
+            claimed = replace(
+                row,
+                status=JobStatus.running,
+                attempt=row.attempt + 1,
+                lease_token=token,
+                lease_expires_at=now + timedelta(seconds=lease_seconds),
+                heartbeat_at=now,
+                progress_current=0,
+                progress_total=None,
+                progress_message=None,
+                progress_updated_at=None,
+                updated_at=now,
+                started_at=row.started_at or now,
+            )
+            self._rows[job_id] = claimed
+            return JobLease(
+                job_id=job_id,
+                scope_id=self._scope_id,
+                token=token,
+                kind=claimed.kind,
+                payload=copy.deepcopy(claimed.payload),
+                attempt=claimed.attempt,
+                max_attempts=claimed.max_attempts,
+                lease_seconds=lease_seconds,
+            )
+
+    async def heartbeat(self, lease: JobLease, now: datetime) -> bool:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._lock:
+            row = self._owned(lease)
+            updated = replace(
+                row,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=lease.lease_seconds),
+                updated_at=now,
+            )
+            self._rows[row.id] = updated
+            return updated.cancel_requested_at is not None
+
+    async def progress(
+        self,
+        lease: JobLease,
+        *,
+        current: int,
+        total: int | None,
+        message: str | None,
+        now: datetime,
+    ) -> JobProgressResult:
+        _validate_progress(current, total)
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._lock:
+            row = self._owned(lease)
+            if current < row.progress_current:
+                raise JobValidationError(
+                    "progress_regression",
+                    "progress current cannot decrease within one attempt",
+                )
+            updated = replace(
+                row,
+                progress_current=current,
+                progress_total=total,
+                progress_message=message,
+                progress_updated_at=now,
+                heartbeat_at=now,
+                lease_expires_at=now + timedelta(seconds=lease.lease_seconds),
+                updated_at=now,
+            )
+            self._rows[row.id] = updated
+            return JobProgressResult(
+                record=_copy_record(updated),
+                cancel_requested=updated.cancel_requested_at is not None,
+            )
 
 
 def retry_delay_seconds(attempt: int, base_seconds: int, max_seconds: int) -> int:
