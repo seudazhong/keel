@@ -15,6 +15,7 @@ from keel_core.jobs import (
     JobStatus,
     JobValidationError,
     PostgresJobStore,
+    _job_dedupe_lock_id,
 )
 from keel_core.loop import admit
 from keel_core.state import PostgresEventStore
@@ -165,6 +166,52 @@ async def test_postgres_existing_dedupe_precedes_retry_payload_and_target_valida
     assert duplicate.max_attempts == 3
 
 
+async def test_postgres_uncommitted_winner_serializes_duplicate_before_validation(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope, kind, key = "jobs:uncommitted", "test.echo", "request-1"
+    conn = await migrated_db.connect()
+    tx = await conn.begin()
+    try:
+        await conn.execute(
+            text("SELECT set_config('app.scope_id', :scope, true)"), {"scope": scope}
+        )
+        await conn.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_id)"),
+            {"lock_id": _job_dedupe_lock_id(scope, kind, key)},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO jobs "
+                "(id, scope_id, kind, payload, idempotency_key, max_attempts, "
+                "next_attempt_at, created_at, updated_at) VALUES "
+                "('held-winner', :scope, :kind, '{}'::jsonb, :key, 3, :now, :now, :now)"
+            ),
+            {"scope": scope, "kind": kind, "key": key, "now": _NOW},
+        )
+
+        duplicate_task = asyncio.create_task(
+            PostgresJobStore(migrated_db, scope).enqueue_once(
+                kind=kind,
+                payload={"bad": object()},
+                target_session_id="missing-on-retry",
+                idempotency_key=key,
+                max_attempts=3,
+                now=_NOW,
+            )
+        )
+        await asyncio.sleep(0.05)
+        assert duplicate_task.done() is False
+        await tx.commit()
+        duplicate, created = await duplicate_task
+        assert created is False
+        assert duplicate.id == "held-winner"
+    finally:
+        if tx.is_active:
+            await tx.rollback()
+        await conn.close()
+
+
 async def test_postgres_enqueue_target_must_exist_in_bound_scope(
     migrated_db: AsyncEngine,
 ) -> None:
@@ -239,9 +286,20 @@ async def test_postgres_enqueue_validates_identities_and_utc_timestamps(
             now=datetime(2026, 7, 14, 9, 0),
         )
     with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.enqueue_once(
+            kind="test.echo",
+            payload={"ignored": True},
+            target_session_id="missing-on-retry",
+            idempotency_key="aware",
+            max_attempts=1,
+            now=datetime(2026, 7, 14, 9, 0),
+        )
+    with pytest.raises(JobValidationError, match="timezone_required"):
         await store.dispatchable(datetime(2026, 7, 14, 9, 0), 100)
     with pytest.raises(JobValidationError, match="timezone_required"):
         await store.exhausted(datetime(2026, 7, 14, 9, 0), 100)
+    assert await store.get("bad\x00id") is None
+    assert await store.list(kind="bad\x00kind") == []
 
 
 async def test_postgres_payload_is_bounded_and_records_are_detached(

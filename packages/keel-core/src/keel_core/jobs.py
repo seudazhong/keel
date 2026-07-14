@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import builtins
 import copy
+import hashlib
 import json
 import math
 import uuid
@@ -457,6 +458,18 @@ def _validate_enqueue_fields(kind: str, idempotency_key: str, max_attempts: int)
     return kind, idempotency_key
 
 
+def _optional_read_identity(value: str, *, field: str, code: str) -> str | None:
+    try:
+        return _validated_identity(value, field=field, code=code)
+    except JobValidationError:
+        return None
+
+
+def _job_dedupe_lock_id(scope_id: str, kind: str, idempotency_key: str) -> int:
+    digest = hashlib.sha256(f"{scope_id}\x1f{kind}\x1f{idempotency_key}".encode()).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+
 def _to_job_record(row: Mapping[Any, Any]) -> JobRecord:
     payload = row["payload"] if isinstance(row["payload"], dict) else {}
     result = row["result"] if isinstance(row["result"], dict) else None
@@ -664,8 +677,11 @@ class InMemoryJobStore:
             return _copy_record(record), True
 
     async def get(self, job_id: str) -> JobRecord | None:
+        safe_job_id = _optional_read_identity(job_id, field="job_id", code="invalid_job_id")
+        if safe_job_id is None:
+            return None
         async with self._lock:
-            record = self._rows.get(job_id)
+            record = self._rows.get(safe_job_id)
             return None if record is None else _copy_record(record)
 
     async def list(
@@ -676,6 +692,10 @@ class InMemoryJobStore:
         limit: int = 50,
     ) -> builtins.list[JobRecord]:
         _validate_limit(limit)
+        if kind is not None:
+            kind = _optional_read_identity(kind, field="kind", code="invalid_kind")
+            if kind is None:
+                return []
         async with self._lock:
             rows = [
                 row
@@ -939,8 +959,13 @@ class PostgresJobStore:
         now: datetime | None = None,
     ) -> tuple[JobRecord, bool]:
         kind, idempotency_key = _validate_enqueue_fields(kind, idempotency_key, max_attempts)
+        timestamp = _normalized_utc_timestamp(now, field="now") if now is not None else _utcnow()
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            await conn.execute(
+                text("SELECT pg_advisory_xact_lock(:lock_id)"),
+                {"lock_id": _job_dedupe_lock_id(self._scope_id, kind, idempotency_key)},
+            )
             existing_sql = text(
                 "SELECT * FROM jobs WHERE scope_id = :scope "
                 "AND kind = :kind AND idempotency_key = :key"
@@ -973,9 +998,6 @@ class PostgresJobStore:
                         "target_session_not_found",
                         "target session does not exist in the current scope",
                     )
-            timestamp = (
-                _normalized_utc_timestamp(now, field="now") if now is not None else _utcnow()
-            )
             job_id = f"job_{uuid.uuid4().hex}"
             inserted = (
                 (
@@ -1011,13 +1033,16 @@ class PostgresJobStore:
             return _to_job_record(existing), False
 
     async def get(self, job_id: str) -> JobRecord | None:
+        safe_job_id = _optional_read_identity(job_id, field="job_id", code="invalid_job_id")
+        if safe_job_id is None:
+            return None
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             row = (
                 (
                     await conn.execute(
                         text("SELECT * FROM jobs WHERE id = :id AND scope_id = :scope"),
-                        {"id": job_id, "scope": self._scope_id},
+                        {"id": safe_job_id, "scope": self._scope_id},
                     )
                 )
                 .mappings()
@@ -1033,6 +1058,10 @@ class PostgresJobStore:
         limit: int = 50,
     ) -> builtins.list[JobRecord]:
         _validate_limit(limit)
+        if kind is not None:
+            kind = _optional_read_identity(kind, field="kind", code="invalid_kind")
+            if kind is None:
+                return []
         clauses = ["scope_id = :scope"]
         params: dict[str, Any] = {"scope": self._scope_id, "limit": limit}
         if status is not None:

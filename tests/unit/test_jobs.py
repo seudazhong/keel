@@ -385,6 +385,8 @@ async def test_in_memory_get_and_list_are_copied_filtered_and_newest_first() -> 
         await store.list(limit=0)
     with pytest.raises(ValueError, match="limit"):
         await store.list(limit=101)
+    assert await store.get("bad\x00id") is None
+    assert await store.list(kind="bad\x00kind") == []
 
 
 async def test_in_memory_dispatch_selection_respects_due_time_and_limit() -> None:
