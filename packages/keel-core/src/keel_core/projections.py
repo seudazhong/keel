@@ -29,10 +29,25 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     pending_assistant: dict[str, Any] | None = None
 
+    def append_message(message: dict[str, Any]) -> None:
+        is_plain_assistant = message.get("role") == "assistant" and "tool_calls" not in message
+        previous = messages[-1] if messages else None
+        if (
+            is_plain_assistant
+            and previous is not None
+            and previous.get("role") == "assistant"
+            and "tool_calls" not in previous
+        ):
+            previous["content"] = (
+                f"{str(previous.get('content', ''))}\n\n{str(message.get('content', ''))}"
+            )
+            return
+        messages.append(message)
+
     def flush() -> None:
         nonlocal pending_assistant
         if pending_assistant is not None:
-            messages.append(pending_assistant)
+            append_message(pending_assistant)
             pending_assistant = None
 
     for event in events:
@@ -42,7 +57,7 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
                 continue  # streaming-only delta; the whole message lands at turn end
             if role in ("user", "system"):
                 flush()
-                messages.append({"role": role, "content": str(event.payload.get("text", ""))})
+                append_message({"role": role, "content": str(event.payload.get("text", ""))})
             else:  # assistant text — may be joined by tool calls in the same turn
                 flush()
                 pending_assistant = {
@@ -64,7 +79,7 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
             )
         elif event.type is EventType.tool_result:
             flush()  # the assistant tool_calls message must precede the tool results
-            messages.append(
+            append_message(
                 {
                     "role": "tool",
                     "tool_call_id": str(event.payload.get("call_id", "")),

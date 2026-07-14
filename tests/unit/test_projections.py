@@ -4,8 +4,14 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
+from keel_core.agents import AgentSpec, Scope
 from keel_core.events import Event, EventType
+from keel_core.loop import ToolRegistry, _build_request
 from keel_core.projections import project_messages
+from keel_core.state import InMemoryEventStore
+from keel_core.types import ScopeKind
 
 
 def _event(seq: int, etype: EventType, payload: dict[str, object]) -> Event:
@@ -82,3 +88,80 @@ def test_assistant_text_and_tool_call_merge_in_one_turn() -> None:
     assert messages[0]["content"] == "Let me check."
     assert messages[0]["tool_calls"][0]["id"] == "c9"  # merged, not a separate message
     assert messages[1]["role"] == "tool"
+
+
+def test_adjacent_plain_assistant_events_coalesce_only_in_projection() -> None:
+    events = [
+        _event(1, EventType.message_token, {"role": "user", "text": "start"}),
+        _event(2, EventType.message_token, {"role": "assistant", "text": "answer"}),
+        _event(
+            3,
+            EventType.message_token,
+            {
+                "role": "assistant",
+                "text": "background result",
+                "job_id": "job_1",
+                "partial": False,
+            },
+        ),
+        _event(4, EventType.message_token, {"role": "user", "text": "continue"}),
+    ]
+    assert len(events) == 4
+    assert project_messages(events) == [
+        {"role": "user", "content": "start"},
+        {
+            "role": "assistant",
+            "content": "answer\n\nbackground result",
+        },
+        {"role": "user", "content": "continue"},
+    ]
+
+
+def test_plain_assistant_does_not_merge_across_tool_call_or_tool_result() -> None:
+    events = [
+        _event(1, EventType.message_token, {"role": "assistant", "text": "checking"}),
+        _event(2, EventType.tool_call, {"tool": "read", "call_id": "c1", "args": {}}),
+        _event(3, EventType.tool_result, {"call_id": "c1", "ok": True, "output": "body"}),
+        _event(
+            4,
+            EventType.message_token,
+            {"role": "assistant", "text": "background result"},
+        ),
+    ]
+    messages = project_messages(events)
+    assert [message["role"] for message in messages] == ["assistant", "tool", "assistant"]
+    assert messages[0]["tool_calls"][0]["id"] == "c1"
+    assert messages[2]["content"] == "background result"
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["openai/gpt-4o-mini", "anthropic/claude-3-5-sonnet-20241022"],
+)
+async def test_next_provider_request_has_no_adjacent_assistant_roles(model: str) -> None:
+    store = InMemoryEventStore()
+    for event in [
+        _event(1, EventType.message_token, {"role": "user", "text": "start"}),
+        _event(2, EventType.message_token, {"role": "assistant", "text": "answer"}),
+        _event(
+            3,
+            EventType.message_token,
+            {"role": "assistant", "text": "background result", "job_id": "job_1"},
+        ),
+        _event(4, EventType.message_token, {"role": "user", "text": "continue"}),
+    ]:
+        await store.append(event)
+    agent = AgentSpec(
+        id="projection-test",
+        name="Projection Test",
+        model=model,
+        scope=Scope(id="u:1", kind=ScopeKind.personal),
+    )
+
+    request = await _build_request(agent, store, "s1", ToolRegistry())
+    assert [message["role"] for message in request.messages] == [
+        "user",
+        "assistant",
+        "user",
+    ]
+    assert request.messages[1]["content"] == "answer\n\nbackground result"
