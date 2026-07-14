@@ -3585,6 +3585,8 @@ Copilot-Session: e6e934ad-91c1-41c3-a46e-521cd446cb49"
   `injected_event_seq`, updates terminal fields, and commits once.
 - Duplicate normal finalization raises `JobLeaseLostError`; duplicate exhaustion returns `None`;
   terminal cancel is idempotent.
+- `request_cancel()` validates the user-controlled job ID with `_optional_read_identity()`;
+  malformed values return `None` before any psycopg bind.
 
 - [ ] **Step 1: Write RED finalizer tests** — append:
 
@@ -3928,6 +3930,12 @@ success binds serialized JSON. Do not pass Python `None` through a JSON cast.
 
 ```python
     async def request_cancel(self, job_id: str, now: datetime) -> JobRecord | None:
+        now = _normalized_utc_timestamp(now, field="now")
+        safe_job_id = _optional_read_identity(
+            job_id, field="job_id", code="invalid_job_id"
+        )
+        if safe_job_id is None:
+            return None
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             locked = (
@@ -3937,7 +3945,7 @@ success binds serialized JSON. Do not pass Python `None` through a JSON cast.
                             "SELECT * FROM jobs WHERE id = :id AND scope_id = :scope "
                             "FOR UPDATE"
                         ),
-                        {"id": job_id, "scope": self._scope_id},
+                        {"id": safe_job_id, "scope": self._scope_id},
                     )
                 )
                 .mappings()
@@ -3949,7 +3957,7 @@ success binds serialized JSON. Do not pass Python `None` through a JSON cast.
             if record.status is JobStatus.queued:
                 return await self._finalize_in_transaction(
                     conn,
-                    job_id=job_id,
+                    job_id=safe_job_id,
                     status=JobStatus.cancelled,
                     now=now,
                     locked=locked,
@@ -3966,7 +3974,7 @@ success binds serialized JSON. Do not pass Python `None` through a JSON cast.
                             ),
                             {
                                 "now": now,
-                                "id": job_id,
+                                "id": safe_job_id,
                                 "scope": self._scope_id,
                             },
                         )
