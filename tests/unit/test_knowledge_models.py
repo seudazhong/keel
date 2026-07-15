@@ -12,10 +12,15 @@ from keel_core.knowledge import (
     ChunkDraft,
     CreateKnowledgeBaseCommand,
     CreateKnowledgeDocumentCommand,
+    KnowledgeBaseCreate,
+    KnowledgeChunkReplacementResult,
+    KnowledgeChunkWrite,
     KnowledgeCitation,
+    KnowledgeDocumentVersionCreate,
     KnowledgeEmbeddingMismatch,
     KnowledgeHit,
     KnowledgeOperation,
+    KnowledgePurgeResult,
     KnowledgeSearchMode,
     KnowledgeSearchStatus,
     KnowledgeSourceType,
@@ -122,17 +127,104 @@ def test_content_sha256_is_exact_and_rejects_storage_unsafe_text() -> None:
 
 
 def test_index_fingerprint_changes_with_every_index_input() -> None:
-    base = index_fingerprint("a" * 64, "keel-char-v1", "fake/embed", 16, 1600, 200)
+    base = index_fingerprint(
+        "a" * 64,
+        KnowledgeSourceType.markdown,
+        "keel-char-v1",
+        "fake/embed",
+        16,
+        1600,
+        200,
+    )
     alternatives = (
-        index_fingerprint("b" * 64, "keel-char-v1", "fake/embed", 16, 1600, 200),
-        index_fingerprint("a" * 64, "keel-char-v2", "fake/embed", 16, 1600, 200),
-        index_fingerprint("a" * 64, "keel-char-v1", "other/embed", 16, 1600, 200),
-        index_fingerprint("a" * 64, "keel-char-v1", "fake/embed", 32, 1600, 200),
-        index_fingerprint("a" * 64, "keel-char-v1", "fake/embed", 16, 1700, 200),
-        index_fingerprint("a" * 64, "keel-char-v1", "fake/embed", 16, 1600, 100),
+        index_fingerprint(
+            "b" * 64,
+            KnowledgeSourceType.markdown,
+            "keel-char-v1",
+            "fake/embed",
+            16,
+            1600,
+            200,
+        ),
+        index_fingerprint(
+            "a" * 64,
+            KnowledgeSourceType.text,
+            "keel-char-v1",
+            "fake/embed",
+            16,
+            1600,
+            200,
+        ),
+        index_fingerprint(
+            "a" * 64,
+            KnowledgeSourceType.markdown,
+            "keel-char-v2",
+            "fake/embed",
+            16,
+            1600,
+            200,
+        ),
+        index_fingerprint(
+            "a" * 64,
+            KnowledgeSourceType.markdown,
+            "keel-char-v1",
+            "other/embed",
+            16,
+            1600,
+            200,
+        ),
+        index_fingerprint(
+            "a" * 64,
+            KnowledgeSourceType.markdown,
+            "keel-char-v1",
+            "fake/embed",
+            32,
+            1600,
+            200,
+        ),
+        index_fingerprint(
+            "a" * 64,
+            KnowledgeSourceType.markdown,
+            "keel-char-v1",
+            "fake/embed",
+            16,
+            1700,
+            200,
+        ),
+        index_fingerprint(
+            "a" * 64,
+            KnowledgeSourceType.markdown,
+            "keel-char-v1",
+            "fake/embed",
+            16,
+            1600,
+            100,
+        ),
     )
     assert len(base) == 64
     assert all(base != candidate for candidate in alternatives)
+
+
+def test_index_fingerprint_uses_unambiguous_canonical_json() -> None:
+    first = index_fingerprint(
+        "a" * 64,
+        KnowledgeSourceType.text,
+        "chunker|model",
+        "embed",
+        16,
+        1600,
+        200,
+    )
+    second = index_fingerprint(
+        "a" * 64,
+        KnowledgeSourceType.text,
+        "chunker",
+        "model|embed",
+        16,
+        1600,
+        200,
+    )
+    assert first != second
 
 
 def test_request_fingerprint_is_canonical_and_path_bound() -> None:
@@ -246,6 +338,63 @@ def test_chunk_draft_is_frozen_and_validates_offsets() -> None:
             char_end=1,
             content_hash=content_sha256("hello"),
             heading_path=(),
+        )
+
+
+def test_frozen_dataclass_integer_fields_are_strict() -> None:
+    digest = content_sha256("hello")
+    kb_id = new_knowledge_base_id()
+
+    with pytest.raises(ValueError, match="integer"):
+        ChunkDraft(
+            ordinal=0.5,  # type: ignore[arg-type]
+            text="hello",
+            char_start=0,
+            char_end=5,
+            content_hash=digest,
+            heading_path=(),
+        )
+    with pytest.raises(ValueError, match="integer"):
+        KnowledgeBaseCreate(
+            name="Docs",
+            description=None,
+            embedding_model="fake/embed",
+            embedding_dim=True,
+        )
+    with pytest.raises(ValueError, match="integer"):
+        KnowledgeDocumentVersionCreate(
+            kb_id=kb_id,
+            title="Guide",
+            source_type=KnowledgeSourceType.text,
+            content="hello",
+            mime_type="text/plain",
+            chunking_version="keel-char-v1",
+            target_chars=1600.5,  # type: ignore[arg-type]
+            overlap_chars=200,
+        )
+    with pytest.raises(ValueError, match="integer"):
+        KnowledgeChunkWrite(
+            ordinal=0,
+            text="hello",
+            char_start=0,
+            char_end=5.0,  # type: ignore[arg-type]
+            content_hash=digest,
+            heading_path=(),
+            metadata={},
+            model="fake/embed",
+            dim=3,
+            embedding=(1.0, 0.0, 0.0),
+        )
+    with pytest.raises(ValueError, match="integer"):
+        KnowledgeChunkReplacementResult(
+            document_version_id=new_knowledge_version_id(),
+            chunk_count=1.0,  # type: ignore[arg-type]
+        )
+    with pytest.raises(ValueError, match="integer"):
+        KnowledgePurgeResult(
+            documents_purged=0,
+            versions_purged=False,
+            chunks_removed=0,
         )
 
 

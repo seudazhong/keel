@@ -463,9 +463,33 @@ git commit -m "feat(jobs): add knowledge lifecycle hooks" -m "Co-authored-by: Co
 
 ```python
 def test_index_fingerprint_changes_with_every_index_input() -> None:
-    base = index_fingerprint("a" * 64, "keel-char-v1", "fake/embed", 16, 1600, 200)
-    assert base != index_fingerprint("b" * 64, "keel-char-v1", "fake/embed", 16, 1600, 200)
-    assert base != index_fingerprint("a" * 64, "keel-char-v2", "fake/embed", 16, 1600, 200)
+    base = index_fingerprint(
+        "a" * 64,
+        KnowledgeSourceType.markdown,
+        "keel-char-v1",
+        "fake/embed",
+        16,
+        1600,
+        200,
+    )
+    assert base != index_fingerprint(
+        "b" * 64,
+        KnowledgeSourceType.markdown,
+        "keel-char-v1",
+        "fake/embed",
+        16,
+        1600,
+        200,
+    )
+    assert base != index_fingerprint(
+        "a" * 64,
+        KnowledgeSourceType.text,
+        "keel-char-v1",
+        "fake/embed",
+        16,
+        1600,
+        200,
+    )
 
 
 def test_knowledge_settings_reject_overlap_at_or_above_target() -> None:

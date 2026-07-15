@@ -12,23 +12,29 @@ from keel_core.knowledge import (
     InMemoryKnowledgeStore,
     KnowledgeBaseCreate,
     KnowledgeBaseStatus,
+    KnowledgeBaseTombstone,
     KnowledgeChunkReplacement,
     KnowledgeChunkWrite,
     KnowledgeConflict,
     KnowledgeDocumentReindex,
     KnowledgeDocumentStatus,
+    KnowledgeDocumentTombstone,
     KnowledgeDocumentVersionCreate,
     KnowledgeEmbeddingMismatch,
     KnowledgeIdempotencyAttach,
     KnowledgeIdempotencyBegin,
     KnowledgeOperation,
-    KnowledgeResourceKind,
     KnowledgeSourceType,
     KnowledgeStore,
+    KnowledgeValidationError,
     KnowledgeVersionCancellation,
     KnowledgeVersionFailure,
     KnowledgeVersionStatus,
     content_sha256,
+    new_knowledge_base_id,
+    new_knowledge_document_id,
+    new_knowledge_idempotency_id,
+    new_knowledge_version_id,
     request_fingerprint,
 )
 
@@ -58,17 +64,19 @@ def _version_command(
     *,
     document_id: str | None = None,
     title: str = "Guide.md",
+    source_type: KnowledgeSourceType = KnowledgeSourceType.markdown,
     target_chars: int = 1600,
     overlap_chars: int = 200,
 ) -> KnowledgeDocumentVersionCreate:
+    mime_type = "text/markdown" if source_type is KnowledgeSourceType.markdown else "text/plain"
     return KnowledgeDocumentVersionCreate(
         kb_id=kb_id,
         document_id=document_id,
         title=title,
-        source_type=KnowledgeSourceType.markdown,
+        source_type=source_type,
         source_uri="https://example.test/guide",
         content=content,
-        mime_type="text/markdown",
+        mime_type=mime_type,
         chunking_version="keel-char-v1",
         target_chars=target_chars,
         overlap_chars=overlap_chars,
@@ -230,6 +238,32 @@ async def test_versions_are_monotonic_and_reuse_only_current_live_fingerprints()
     )
     assert not cancelled_retry.reused
     assert cancelled_retry.version.version == 7
+
+
+async def test_source_type_change_with_identical_bytes_creates_new_version() -> None:
+    store = InMemoryKnowledgeStore("web:local")
+    base = await _base(store)
+    markdown = await store.create_document_version(_version_command(base.id, "same"), now=_NOW)
+
+    text = await store.create_document_version(
+        _version_command(
+            base.id,
+            "same",
+            document_id=markdown.document.id,
+            source_type=KnowledgeSourceType.text,
+        ),
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    assert not text.reused
+    assert text.version.version == 2
+    assert text.version.id != markdown.version.id
+    assert text.version.mime_type == "text/plain"
+    assert text.document.source_type is KnowledgeSourceType.text
+    stored = await store.get_document(base.id, markdown.document.id)
+    assert stored is not None
+    assert stored.source_type is KnowledgeSourceType.text
+    assert stored.desired_version_id == text.version.id
 
 
 async def test_concurrent_version_allocation_is_monotonic() -> None:
@@ -511,56 +545,397 @@ async def test_purge_retains_minimal_tombstones_and_removes_sensitive_data() -> 
     )
 
 
-async def test_idempotency_replays_same_ids_conflicts_on_new_input_and_attaches_job() -> None:
+def _idempotency(
+    operation: KnowledgeOperation,
+    key: str,
+    *,
+    method: str,
+    path_ids: dict[str, str],
+    body: dict[str, object] | None,
+) -> KnowledgeIdempotencyBegin:
+    return KnowledgeIdempotencyBegin(
+        operation=operation,
+        idempotency_key=key,
+        request_fingerprint=request_fingerprint(method, operation, path_ids, body),
+    )
+
+
+async def test_atomic_idempotent_mutations_replay_exact_resources_and_ledgers() -> None:
     store = InMemoryKnowledgeStore("web:local")
-    base = await _base(store)
-    created = await store.create_document_version(_version_command(base.id, "A"), now=_NOW)
-    fingerprint = request_fingerprint(
-        "POST",
-        KnowledgeOperation.create_document,
-        {"kb_id": base.id},
-        {"content_sha256": created.version.content_sha256},
+    base_command = KnowledgeBaseCreate(
+        name="Docs",
+        description="Product documentation",
+        embedding_model="fake/embed",
+        embedding_dim=3,
+        base_id=new_knowledge_base_id(),
     )
-    begin = KnowledgeIdempotencyBegin(
-        operation=KnowledgeOperation.create_document,
-        idempotency_key="request-1",
-        request_fingerprint=fingerprint,
-        resource_kind=KnowledgeResourceKind.document,
-        resource_id=created.document.id,
-        document_version_id=created.version.id,
+    base_begin = _idempotency(
+        KnowledgeOperation.create_base,
+        "create-base",
+        method="POST",
+        path_ids={},
+        body={"name": base_command.name, "description": base_command.description},
     )
-    first = await store.begin_idempotent_request(begin, now=_NOW)
-    replay = await store.begin_idempotent_request(
-        replace(
-            begin,
-            resource_id="doc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            document_version_id="kbv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        ),
+    base_first = await store.create_base_idempotent(base_command, base_begin, now=_NOW)
+    base_replay = await store.create_base_idempotent(
+        replace(base_command, base_id=new_knowledge_base_id()),
+        replace(base_begin, ledger_id=new_knowledge_idempotency_id()),
         now=_NOW + timedelta(seconds=1),
     )
-    assert not first.replayed
-    assert replay.replayed
-    assert replay.record.id == first.record.id
-    assert replay.record.resource_id == created.document.id
-    assert replay.record.document_version_id == created.version.id
+    assert not base_first.replayed
+    assert base_replay.replayed
+    assert base_replay.resource.id == base_first.resource.id
+    assert base_replay.ledger.id == base_first.ledger.id
+    assert base_first.ledger.resource_id == base_first.resource.id
+    assert (
+        await store.get_idempotent_request(KnowledgeOperation.create_base, "create-base")
+        == base_first.ledger
+    )
+
+    create_command = replace(
+        _version_command(base_first.resource.id, "A"),
+        new_document_id=new_knowledge_document_id(),
+        document_version_id=new_knowledge_version_id(),
+    )
+    create_begin = _idempotency(
+        KnowledgeOperation.create_document,
+        "create-document",
+        method="POST",
+        path_ids={"kb_id": base_first.resource.id},
+        body={"content_sha256": content_sha256(create_command.content)},
+    )
+    create_first = await store.create_document_version_idempotent(
+        create_command,
+        create_begin,
+        now=_NOW + timedelta(seconds=2),
+    )
+    create_replay = await store.create_document_version_idempotent(
+        replace(
+            create_command,
+            new_document_id=new_knowledge_document_id(),
+            document_version_id=new_knowledge_version_id(),
+        ),
+        create_begin,
+        now=_NOW + timedelta(seconds=3),
+    )
+    assert not create_first.replayed
+    assert create_replay.replayed
+    assert create_replay.resource.document.id == create_first.resource.document.id
+    assert create_replay.resource.version.id == create_first.resource.version.id
+    assert create_replay.ledger.id == create_first.ledger.id
+    assert create_first.ledger.resource_id == create_first.resource.document.id
+    assert create_first.ledger.document_version_id == create_first.resource.version.id
+
+    update_command = replace(
+        _version_command(
+            base_first.resource.id,
+            "B",
+            document_id=create_first.resource.document.id,
+        ),
+        document_version_id=new_knowledge_version_id(),
+    )
+    update_begin = _idempotency(
+        KnowledgeOperation.update_document,
+        "update-document",
+        method="PUT",
+        path_ids={
+            "kb_id": base_first.resource.id,
+            "document_id": create_first.resource.document.id,
+        },
+        body={"content_sha256": content_sha256(update_command.content)},
+    )
+    update_first = await store.update_document_version_idempotent(
+        update_command,
+        update_begin,
+        now=_NOW + timedelta(seconds=4),
+    )
+    update_replay = await store.update_document_version_idempotent(
+        replace(update_command, document_version_id=new_knowledge_version_id()),
+        update_begin,
+        now=_NOW + timedelta(seconds=5),
+    )
+    assert not update_first.replayed
+    assert update_replay.replayed
+    assert update_replay.resource.version.id == update_first.resource.version.id
+    assert update_replay.ledger.id == update_first.ledger.id
+    assert update_first.ledger.resource_id == update_first.resource.document.id
+    assert update_first.ledger.document_version_id == update_first.resource.version.id
+
+    await _index_and_activate(
+        store,
+        base_first.resource.id,
+        create_first.resource.document.id,
+        update_first.resource.version.id,
+        now=_NOW + timedelta(seconds=6),
+    )
+    reindex_command = KnowledgeDocumentReindex(
+        kb_id=base_first.resource.id,
+        document_id=create_first.resource.document.id,
+        chunking_version="keel-char-v2",
+        target_chars=1600,
+        overlap_chars=200,
+        document_version_id=new_knowledge_version_id(),
+    )
+    reindex_begin = _idempotency(
+        KnowledgeOperation.reindex_document,
+        "reindex-document",
+        method="POST",
+        path_ids={
+            "kb_id": base_first.resource.id,
+            "document_id": create_first.resource.document.id,
+        },
+        body={"chunking_version": "keel-char-v2"},
+    )
+    reindex_first = await store.reindex_document_idempotent(
+        reindex_command,
+        reindex_begin,
+        now=_NOW + timedelta(seconds=7),
+    )
+    reindex_replay = await store.reindex_document_idempotent(
+        replace(reindex_command, document_version_id=new_knowledge_version_id()),
+        reindex_begin,
+        now=_NOW + timedelta(seconds=8),
+    )
+    assert not reindex_first.replayed
+    assert reindex_replay.replayed
+    assert reindex_replay.resource.version.id == reindex_first.resource.version.id
+    assert reindex_replay.ledger.id == reindex_first.ledger.id
+    assert reindex_first.ledger.resource_id == reindex_first.resource.document.id
+    assert reindex_first.ledger.document_version_id == reindex_first.resource.version.id
+
+    document_tombstone = KnowledgeDocumentTombstone(
+        kb_id=base_first.resource.id,
+        document_id=create_first.resource.document.id,
+    )
+    document_delete_begin = _idempotency(
+        KnowledgeOperation.delete_document,
+        "delete-document",
+        method="DELETE",
+        path_ids={
+            "kb_id": base_first.resource.id,
+            "document_id": create_first.resource.document.id,
+        },
+        body=None,
+    )
+    document_delete_first = await store.tombstone_document_idempotent(
+        document_tombstone,
+        document_delete_begin,
+        now=_NOW + timedelta(seconds=9),
+    )
+    document_delete_replay = await store.tombstone_document_idempotent(
+        document_tombstone,
+        document_delete_begin,
+        now=_NOW + timedelta(seconds=10),
+    )
+    assert not document_delete_first.replayed
+    assert document_delete_replay.replayed
+    assert document_delete_replay.resource.id == document_delete_first.resource.id
+    assert document_delete_replay.ledger.id == document_delete_first.ledger.id
+    assert document_delete_first.ledger.resource_id == document_delete_first.resource.id
+    assert document_delete_first.ledger.document_version_id is None
+
+    base_tombstone = KnowledgeBaseTombstone(kb_id=base_first.resource.id)
+    base_delete_begin = _idempotency(
+        KnowledgeOperation.delete_base,
+        "delete-base",
+        method="DELETE",
+        path_ids={"kb_id": base_first.resource.id},
+        body=None,
+    )
+    base_delete_first = await store.tombstone_base_idempotent(
+        base_tombstone,
+        base_delete_begin,
+        now=_NOW + timedelta(seconds=11),
+    )
+    base_delete_replay = await store.tombstone_base_idempotent(
+        base_tombstone,
+        base_delete_begin,
+        now=_NOW + timedelta(seconds=12),
+    )
+    assert not base_delete_first.replayed
+    assert base_delete_replay.replayed
+    assert base_delete_replay.resource.id == base_delete_first.resource.id
+    assert base_delete_replay.ledger.id == base_delete_first.ledger.id
+    assert base_delete_first.ledger.resource_id == base_delete_first.resource.id
+    assert base_delete_first.ledger.document_version_id is None
+
+
+async def test_failed_atomic_resource_mutation_does_not_create_ledger() -> None:
+    store = InMemoryKnowledgeStore("web:local")
+    await _base(store)
+    begin = _idempotency(
+        KnowledgeOperation.create_base,
+        "failed-create-base",
+        method="POST",
+        path_ids={},
+        body={"name": "Docs"},
+    )
+
+    with pytest.raises(KnowledgeConflict, match="knowledge_base_name_conflict"):
+        await store.create_base_idempotent(
+            KnowledgeBaseCreate(
+                name="Docs",
+                description=None,
+                embedding_model="fake/embed",
+                embedding_dim=3,
+            ),
+            begin,
+            now=_NOW + timedelta(seconds=1),
+        )
+
+    assert await store.get_idempotent_request(begin.operation, begin.idempotency_key) is None
+    assert len(await store.list_bases()) == 1
+
+
+async def test_concurrent_atomic_create_replays_one_resource_and_ledger() -> None:
+    store = InMemoryKnowledgeStore("web:local")
+    base = await _base(store)
+    begin = _idempotency(
+        KnowledgeOperation.create_document,
+        "concurrent-create",
+        method="POST",
+        path_ids={"kb_id": base.id},
+        body={"content_sha256": content_sha256("same")},
+    )
+    commands = [
+        replace(
+            _version_command(base.id, "same"),
+            new_document_id=new_knowledge_document_id(),
+            document_version_id=new_knowledge_version_id(),
+        )
+        for _ in range(2)
+    ]
+
+    first, second = await asyncio.gather(
+        *(
+            store.create_document_version_idempotent(command, begin, now=_NOW)
+            for command in commands
+        )
+    )
+
+    assert sorted((first.replayed, second.replayed)) == [False, True]
+    assert first.resource.document.id == second.resource.document.id
+    assert first.resource.version.id == second.resource.version.id
+    assert first.ledger.id == second.ledger.id
+    assert len(await store.list_documents(base.id)) == 1
+    assert len(await store.list_versions(base.id, first.resource.document.id)) == 1
+
+
+async def test_idempotency_conflicts_never_partially_mutate_resources() -> None:
+    store = InMemoryKnowledgeStore("web:local")
+    assert store.document_max_bytes == 1_048_576
+    base = await _base(store)
+    created = await store.create_document_version(_version_command(base.id, "A"), now=_NOW)
+
+    update_begin = _idempotency(
+        KnowledgeOperation.update_document,
+        "conflicting-update",
+        method="PUT",
+        path_ids={"kb_id": base.id, "document_id": created.document.id},
+        body={"content_sha256": content_sha256("B")},
+    )
+    await store.update_document_version_idempotent(
+        _version_command(base.id, "B", document_id=created.document.id),
+        update_begin,
+        now=_NOW + timedelta(seconds=1),
+    )
+    before_versions = await store.list_versions(base.id, created.document.id)
+    before_document = await store.get_document(base.id, created.document.id)
 
     with pytest.raises(KnowledgeConflict, match="idempotency_key_reused"):
-        await store.begin_idempotent_request(
-            replace(begin, request_fingerprint="f" * 64),
+        await store.update_document_version_idempotent(
+            _version_command(
+                base.id,
+                "C",
+                document_id=created.document.id,
+                title="Mutated title",
+            ),
+            replace(update_begin, request_fingerprint="f" * 64),
             now=_NOW + timedelta(seconds=2),
         )
+
+    assert await store.list_versions(base.id, created.document.id) == before_versions
+    assert await store.get_document(base.id, created.document.id) == before_document
+
+    other = await store.create_document_version(
+        _version_command(base.id, "other", title="Other"),
+        now=_NOW + timedelta(seconds=3),
+    )
+    delete_begin = _idempotency(
+        KnowledgeOperation.delete_document,
+        "conflicting-delete",
+        method="DELETE",
+        path_ids={"kb_id": base.id, "document_id": created.document.id},
+        body=None,
+    )
+    await store.tombstone_document_idempotent(
+        KnowledgeDocumentTombstone(kb_id=base.id, document_id=created.document.id),
+        delete_begin,
+        now=_NOW + timedelta(seconds=4),
+    )
+    with pytest.raises(KnowledgeConflict, match="idempotency_key_reused"):
+        await store.tombstone_document_idempotent(
+            KnowledgeDocumentTombstone(kb_id=base.id, document_id=other.document.id),
+            replace(delete_begin, request_fingerprint="e" * 64),
+            now=_NOW + timedelta(seconds=5),
+        )
+    untouched = await store.get_document(base.id, other.document.id)
+    assert untouched is not None
+    assert untouched.status is KnowledgeDocumentStatus.pending
+
+    other_base = await _base(store, name="Other base", now=_NOW + timedelta(seconds=6))
+    base_delete_begin = _idempotency(
+        KnowledgeOperation.delete_base,
+        "conflicting-base-delete",
+        method="DELETE",
+        path_ids={"kb_id": base.id},
+        body=None,
+    )
+    await store.tombstone_base_idempotent(
+        KnowledgeBaseTombstone(kb_id=base.id),
+        base_delete_begin,
+        now=_NOW + timedelta(seconds=7),
+    )
+    with pytest.raises(KnowledgeConflict, match="idempotency_key_reused"):
+        await store.tombstone_base_idempotent(
+            KnowledgeBaseTombstone(kb_id=other_base.id),
+            replace(base_delete_begin, request_fingerprint="d" * 64),
+            now=_NOW + timedelta(seconds=8),
+        )
+    untouched_base = await store.get_base(other_base.id)
+    assert untouched_base is not None
+    assert untouched_base.status is KnowledgeBaseStatus.active
+
+
+async def test_atomic_version_job_attachment_recovers_after_commit() -> None:
+    store = InMemoryKnowledgeStore("web:local")
+    base = await _base(store)
+    command = _version_command(base.id, "A")
+    begin = _idempotency(
+        KnowledgeOperation.create_document,
+        "request-1",
+        method="POST",
+        path_ids={"kb_id": base.id},
+        body={"content_sha256": content_sha256(command.content)},
+    )
+    first = await store.create_document_version_idempotent(command, begin, now=_NOW)
+    assert first.ledger.job_id is None
 
     attached = await store.attach_idempotent_job(
         KnowledgeIdempotencyAttach(
             operation=begin.operation,
             idempotency_key=begin.idempotency_key,
-            request_fingerprint=fingerprint,
+            request_fingerprint=begin.request_fingerprint,
             job_id="job_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ),
-        now=_NOW + timedelta(seconds=3),
+        now=_NOW + timedelta(seconds=1),
     )
     assert attached.job_id == "job_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-    version = await store.get_version(base.id, created.document.id, created.version.id)
+    version = await store.get_version(
+        base.id,
+        first.resource.document.id,
+        first.resource.version.id,
+    )
     assert version is not None
     assert version.ingest_job_id == attached.job_id
     assert (
@@ -568,18 +943,66 @@ async def test_idempotency_replays_same_ids_conflicts_on_new_input_and_attaches_
             KnowledgeIdempotencyAttach(
                 operation=begin.operation,
                 idempotency_key=begin.idempotency_key,
-                request_fingerprint=fingerprint,
+                request_fingerprint=begin.request_fingerprint,
                 job_id=attached.job_id,
             ),
-            now=_NOW + timedelta(seconds=4),
+            now=_NOW + timedelta(seconds=2),
         )
     ).job_id == attached.job_id
-    attached_replay = await store.begin_idempotent_request(
+    attached_replay = await store.create_document_version_idempotent(
+        command,
         begin,
-        now=_NOW + timedelta(seconds=5),
+        now=_NOW + timedelta(seconds=3),
     )
     assert attached_replay.replayed
-    assert attached_replay.record.job_id == attached.job_id
+    assert attached_replay.ledger.job_id == attached.job_id
+
+
+async def test_document_byte_limit_is_strict_bounded_and_reindex_safe() -> None:
+    for invalid in (True, 1.0, 0, -1):
+        with pytest.raises((KnowledgeValidationError, ValueError), match="positive integer"):
+            InMemoryKnowledgeStore(  # type: ignore[arg-type]
+                "web:local",
+                document_max_bytes=invalid,
+            )
+
+    store = InMemoryKnowledgeStore("web:local")
+    base = await _base(store)
+    boundary = "é" * 524_288
+    accepted = await store.create_document_version(
+        _version_command(base.id, boundary),
+        now=_NOW,
+    )
+    assert accepted.version.content == boundary
+
+    oversized = boundary + "x"
+    with pytest.raises(KnowledgeValidationError, match="content_too_large") as caught:
+        await store.create_document_version(
+            _version_command(base.id, oversized),
+            now=_NOW + timedelta(seconds=1),
+        )
+    assert oversized[:100] not in caught.value.public_message
+    assert len(await store.list_documents(base.id)) == 1
+
+    await _index_and_activate(
+        store,
+        base.id,
+        accepted.document.id,
+        accepted.version.id,
+        now=_NOW + timedelta(seconds=2),
+    )
+    store._document_max_bytes = 1
+    reindexed = await store.reindex_document(
+        KnowledgeDocumentReindex(
+            kb_id=base.id,
+            document_id=accepted.document.id,
+            chunking_version="keel-char-v2",
+            target_chars=1600,
+            overlap_chars=200,
+        ),
+        now=_NOW + timedelta(seconds=3),
+    )
+    assert reindexed.version.content == boundary
 
 
 async def test_first_ingest_failure_is_safe_and_marks_document_failed() -> None:

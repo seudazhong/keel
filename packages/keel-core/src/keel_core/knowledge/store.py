@@ -9,30 +9,36 @@ from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
 from .models import (
+    DEFAULT_KNOWLEDGE_DOCUMENT_MAX_BYTES,
     KnowledgeActivationResult,
     KnowledgeBaseCreate,
+    KnowledgeBaseIdempotencyResult,
     KnowledgeBaseRecord,
     KnowledgeBaseStatus,
+    KnowledgeBaseTombstone,
     KnowledgeChunkRecord,
     KnowledgeChunkReplacement,
     KnowledgeChunkReplacementResult,
     KnowledgeConflict,
+    KnowledgeDocumentIdempotencyResult,
     KnowledgeDocumentRecord,
     KnowledgeDocumentReindex,
     KnowledgeDocumentStatus,
+    KnowledgeDocumentTombstone,
     KnowledgeDocumentVersionCreate,
+    KnowledgeDocumentVersionIdempotencyResult,
     KnowledgeDocumentVersionRecord,
     KnowledgeDocumentVersionResult,
     KnowledgeEmbeddingMismatch,
     KnowledgeIdempotencyAttach,
     KnowledgeIdempotencyBegin,
     KnowledgeIdempotencyRecord,
-    KnowledgeIdempotencyResult,
     KnowledgeIndexingResult,
     KnowledgeNotFound,
     KnowledgeOperation,
     KnowledgePublicCode,
     KnowledgePurgeResult,
+    KnowledgeResourceKind,
     KnowledgeValidationError,
     KnowledgeVersionCancellation,
     KnowledgeVersionFailure,
@@ -44,6 +50,7 @@ from .models import (
     new_knowledge_document_id,
     new_knowledge_idempotency_id,
     new_knowledge_version_id,
+    validate_document_max_bytes,
     validate_idempotency_key,
     validate_knowledge_base_id,
     validate_knowledge_document_id,
@@ -97,12 +104,23 @@ class KnowledgeStore(Protocol):
     @property
     def scope_id(self) -> str: ...
 
+    @property
+    def document_max_bytes(self) -> int: ...
+
     async def create_base(
         self,
         command: KnowledgeBaseCreate,
         *,
         now: datetime | None = None,
     ) -> KnowledgeBaseRecord: ...
+
+    async def create_base_idempotent(
+        self,
+        command: KnowledgeBaseCreate,
+        idempotency: KnowledgeIdempotencyBegin,
+        *,
+        now: datetime | None = None,
+    ) -> KnowledgeBaseIdempotencyResult: ...
 
     async def list_bases(
         self,
@@ -119,12 +137,36 @@ class KnowledgeStore(Protocol):
         now: datetime | None = None,
     ) -> KnowledgeDocumentVersionResult: ...
 
+    async def create_document_version_idempotent(
+        self,
+        command: KnowledgeDocumentVersionCreate,
+        idempotency: KnowledgeIdempotencyBegin,
+        *,
+        now: datetime | None = None,
+    ) -> KnowledgeDocumentVersionIdempotencyResult: ...
+
+    async def update_document_version_idempotent(
+        self,
+        command: KnowledgeDocumentVersionCreate,
+        idempotency: KnowledgeIdempotencyBegin,
+        *,
+        now: datetime | None = None,
+    ) -> KnowledgeDocumentVersionIdempotencyResult: ...
+
     async def reindex_document(
         self,
         command: KnowledgeDocumentReindex,
         *,
         now: datetime | None = None,
     ) -> KnowledgeDocumentVersionResult: ...
+
+    async def reindex_document_idempotent(
+        self,
+        command: KnowledgeDocumentReindex,
+        idempotency: KnowledgeIdempotencyBegin,
+        *,
+        now: datetime | None = None,
+    ) -> KnowledgeDocumentVersionIdempotencyResult: ...
 
     async def get_document(
         self,
@@ -216,12 +258,28 @@ class KnowledgeStore(Protocol):
         now: datetime | None = None,
     ) -> KnowledgeDocumentRecord: ...
 
+    async def tombstone_document_idempotent(
+        self,
+        command: KnowledgeDocumentTombstone,
+        idempotency: KnowledgeIdempotencyBegin,
+        *,
+        now: datetime | None = None,
+    ) -> KnowledgeDocumentIdempotencyResult: ...
+
     async def tombstone_base(
         self,
         kb_id: str,
         *,
         now: datetime | None = None,
     ) -> KnowledgeBaseRecord: ...
+
+    async def tombstone_base_idempotent(
+        self,
+        command: KnowledgeBaseTombstone,
+        idempotency: KnowledgeIdempotencyBegin,
+        *,
+        now: datetime | None = None,
+    ) -> KnowledgeBaseIdempotencyResult: ...
 
     async def purge_document(
         self,
@@ -237,13 +295,6 @@ class KnowledgeStore(Protocol):
         *,
         now: datetime | None = None,
     ) -> KnowledgePurgeResult: ...
-
-    async def begin_idempotent_request(
-        self,
-        command: KnowledgeIdempotencyBegin,
-        *,
-        now: datetime | None = None,
-    ) -> KnowledgeIdempotencyResult: ...
 
     async def get_idempotent_request(
         self,
@@ -262,8 +313,14 @@ class KnowledgeStore(Protocol):
 class InMemoryKnowledgeStore:
     """Scope-bound lifecycle store with detached reads and serialized mutations."""
 
-    def __init__(self, scope_id: str) -> None:
+    def __init__(
+        self,
+        scope_id: str,
+        *,
+        document_max_bytes: int = DEFAULT_KNOWLEDGE_DOCUMENT_MAX_BYTES,
+    ) -> None:
         self._scope_id = validate_scope_id(scope_id)
+        self._document_max_bytes = validate_document_max_bytes(document_max_bytes)
         self._bases: dict[str, KnowledgeBaseRecord] = {}
         self._documents: dict[str, KnowledgeDocumentRecord] = {}
         self._versions: dict[str, KnowledgeDocumentVersionRecord] = {}
@@ -274,6 +331,10 @@ class InMemoryKnowledgeStore:
     @property
     def scope_id(self) -> str:
         return self._scope_id
+
+    @property
+    def document_max_bytes(self) -> int:
+        return self._document_max_bytes
 
     def _base_locked(self, kb_id: str) -> KnowledgeBaseRecord:
         validated = validate_knowledge_base_id(kb_id)
@@ -385,6 +446,7 @@ class InMemoryKnowledgeStore:
         self,
         document: KnowledgeDocumentRecord,
         fingerprint: str,
+        mime_type: str,
     ) -> KnowledgeDocumentVersionRecord | None:
         seen: set[str] = set()
         for version_id in (document.desired_version_id, document.active_version_id):
@@ -395,15 +457,225 @@ class InMemoryKnowledgeStore:
             if (
                 version is not None
                 and version.index_fingerprint == fingerprint
+                and version.mime_type == mime_type
                 and version.status in _CURRENT_FINGERPRINT_STATUSES
             ):
                 return version
         return None
 
+    def _validate_document_size(self, content: str) -> None:
+        if len(content.encode("utf-8")) > self._document_max_bytes:
+            raise KnowledgeValidationError(
+                KnowledgePublicCode.content_too_large,
+                "Document content exceeds the configured size limit.",
+            )
+
+    def _create_base_locked(
+        self,
+        command: KnowledgeBaseCreate,
+        timestamp: datetime,
+    ) -> KnowledgeBaseRecord:
+        if any(
+            base.status is KnowledgeBaseStatus.active and base.name == command.name
+            for base in self._bases.values()
+        ):
+            raise KnowledgeConflict(
+                KnowledgePublicCode.knowledge_base_name_conflict,
+                "An active Knowledge Base already uses this name.",
+            )
+        base_id = command.base_id or new_knowledge_base_id()
+        if base_id in self._bases:
+            raise KnowledgeConflict(
+                KnowledgePublicCode.knowledge_conflict,
+                "Knowledge Base identifier already exists.",
+            )
+        record = KnowledgeBaseRecord(
+            id=base_id,
+            scope_id=self._scope_id,
+            name=command.name,
+            description=command.description,
+            embedding_model=command.embedding_model,
+            embedding_dim=command.embedding_dim,
+            status=KnowledgeBaseStatus.active,
+            created_at=timestamp,
+            updated_at=timestamp,
+            deleted_at=None,
+        )
+        self._bases[record.id] = record
+        return _copy(record)
+
+    def _prepare_idempotency_locked(
+        self,
+        command: KnowledgeIdempotencyBegin,
+        expected_operation: KnowledgeOperation,
+    ) -> tuple[KnowledgeIdempotencyRecord | None, str | None]:
+        if command.operation is not expected_operation:
+            raise KnowledgeValidationError(
+                KnowledgePublicCode.invalid_input,
+                "Idempotency operation does not match the Knowledge mutation.",
+            )
+        key = (command.operation, command.idempotency_key)
+        existing = self._idempotency.get(key)
+        if existing is not None:
+            if existing.request_fingerprint != command.request_fingerprint:
+                raise KnowledgeConflict(
+                    KnowledgePublicCode.idempotency_key_reused,
+                    "Idempotency key was already used for different input.",
+                )
+            return existing, None
+        ledger_id = command.ledger_id
+        if ledger_id is not None:
+            if any(record.id == ledger_id for record in self._idempotency.values()):
+                raise KnowledgeConflict(
+                    KnowledgePublicCode.knowledge_conflict,
+                    "Knowledge idempotency identifier already exists.",
+                )
+            return None, ledger_id
+        ledger_id = new_knowledge_idempotency_id()
+        while any(record.id == ledger_id for record in self._idempotency.values()):
+            ledger_id = new_knowledge_idempotency_id()
+        return None, ledger_id
+
+    def _record_idempotency_locked(
+        self,
+        command: KnowledgeIdempotencyBegin,
+        ledger_id: str,
+        *,
+        resource_kind: KnowledgeResourceKind,
+        resource_id: str,
+        document_version_id: str | None,
+        timestamp: datetime,
+    ) -> KnowledgeIdempotencyRecord:
+        record = KnowledgeIdempotencyRecord(
+            id=ledger_id,
+            scope_id=self._scope_id,
+            operation=command.operation,
+            idempotency_key=command.idempotency_key,
+            request_fingerprint=command.request_fingerprint,
+            resource_kind=resource_kind,
+            resource_id=resource_id,
+            document_version_id=document_version_id,
+            job_id=None,
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+        self._idempotency[(record.operation, record.idempotency_key)] = record
+        return record
+
+    @staticmethod
+    def _validate_ledger_resource(
+        record: KnowledgeIdempotencyRecord,
+        *,
+        operation: KnowledgeOperation,
+        resource_kind: KnowledgeResourceKind,
+        resource_id: str,
+        document_version_id: str | None,
+    ) -> None:
+        if (
+            record.operation is not operation
+            or record.resource_kind is not resource_kind
+            or record.resource_id != resource_id
+            or record.document_version_id != document_version_id
+        ):
+            raise KnowledgeConflict(
+                KnowledgePublicCode.knowledge_conflict,
+                "Knowledge idempotency ledger is inconsistent.",
+            )
+
+    def _base_from_ledger_locked(
+        self,
+        record: KnowledgeIdempotencyRecord,
+        operation: KnowledgeOperation,
+        *,
+        expected_kb_id: str | None = None,
+    ) -> KnowledgeBaseRecord:
+        base = self._bases.get(record.resource_id)
+        if base is None or (expected_kb_id is not None and base.id != expected_kb_id):
+            raise KnowledgeConflict(
+                KnowledgePublicCode.knowledge_conflict,
+                "Knowledge idempotency ledger is inconsistent.",
+            )
+        self._validate_ledger_resource(
+            record,
+            operation=operation,
+            resource_kind=KnowledgeResourceKind.base,
+            resource_id=base.id,
+            document_version_id=None,
+        )
+        return _copy(base)
+
+    def _document_from_ledger_locked(
+        self,
+        record: KnowledgeIdempotencyRecord,
+        operation: KnowledgeOperation,
+        *,
+        expected_kb_id: str,
+        expected_document_id: str,
+    ) -> KnowledgeDocumentRecord:
+        document = self._documents.get(record.resource_id)
+        if (
+            document is None
+            or document.kb_id != expected_kb_id
+            or document.id != expected_document_id
+        ):
+            raise KnowledgeConflict(
+                KnowledgePublicCode.knowledge_conflict,
+                "Knowledge idempotency ledger is inconsistent.",
+            )
+        self._validate_ledger_resource(
+            record,
+            operation=operation,
+            resource_kind=KnowledgeResourceKind.document,
+            resource_id=document.id,
+            document_version_id=None,
+        )
+        return _copy(document)
+
+    def _document_version_from_ledger_locked(
+        self,
+        record: KnowledgeIdempotencyRecord,
+        operation: KnowledgeOperation,
+        *,
+        expected_kb_id: str,
+        expected_document_id: str | None,
+    ) -> KnowledgeDocumentVersionResult:
+        document = self._documents.get(record.resource_id)
+        version = (
+            None
+            if record.document_version_id is None
+            else self._versions.get(record.document_version_id)
+        )
+        if (
+            document is None
+            or version is None
+            or document.kb_id != expected_kb_id
+            or version.kb_id != expected_kb_id
+            or version.document_id != document.id
+            or (expected_document_id is not None and document.id != expected_document_id)
+        ):
+            raise KnowledgeConflict(
+                KnowledgePublicCode.knowledge_conflict,
+                "Knowledge idempotency ledger is inconsistent.",
+            )
+        self._validate_ledger_resource(
+            record,
+            operation=operation,
+            resource_kind=KnowledgeResourceKind.document,
+            resource_id=document.id,
+            document_version_id=version.id,
+        )
+        return KnowledgeDocumentVersionResult(
+            document=_copy(document),
+            version=_copy(version),
+            reused=True,
+        )
+
     def _create_document_version_locked(
         self,
         command: KnowledgeDocumentVersionCreate,
         timestamp: datetime,
+        *,
+        enforce_content_limit: bool = True,
     ) -> KnowledgeDocumentVersionResult:
         base = self._base_locked(command.kb_id)
         if base.status is not KnowledgeBaseStatus.active:
@@ -412,8 +684,11 @@ class InMemoryKnowledgeStore:
                 "Knowledge Base is deleted.",
             )
         digest = content_sha256(command.content)
+        if enforce_content_limit:
+            self._validate_document_size(command.content)
         fingerprint = index_fingerprint(
             digest,
+            command.source_type,
             command.chunking_version,
             base.embedding_model,
             base.embedding_dim,
@@ -438,7 +713,11 @@ class InMemoryKnowledgeStore:
                     KnowledgePublicCode.knowledge_document_deleted,
                     "Knowledge document is deleted.",
                 )
-            reusable = self._find_current_fingerprint_locked(document, fingerprint)
+            reusable = self._find_current_fingerprint_locked(
+                document,
+                fingerprint,
+                command.mime_type,
+            )
             if reusable is not None:
                 document = replace(
                     document,
@@ -551,34 +830,52 @@ class InMemoryKnowledgeStore:
     ) -> KnowledgeBaseRecord:
         timestamp = _timestamp(now)
         async with self._lock:
-            if any(
-                base.status is KnowledgeBaseStatus.active and base.name == command.name
-                for base in self._bases.values()
-            ):
-                raise KnowledgeConflict(
-                    KnowledgePublicCode.knowledge_base_name_conflict,
-                    "An active Knowledge Base already uses this name.",
-                )
-            base_id = command.base_id or new_knowledge_base_id()
-            if base_id in self._bases:
-                raise KnowledgeConflict(
-                    KnowledgePublicCode.knowledge_conflict,
-                    "Knowledge Base identifier already exists.",
-                )
-            record = KnowledgeBaseRecord(
-                id=base_id,
-                scope_id=self._scope_id,
-                name=command.name,
-                description=command.description,
-                embedding_model=command.embedding_model,
-                embedding_dim=command.embedding_dim,
-                status=KnowledgeBaseStatus.active,
-                created_at=timestamp,
-                updated_at=timestamp,
-                deleted_at=None,
+            return self._create_base_locked(command, timestamp)
+
+    async def create_base_idempotent(
+        self,
+        command: KnowledgeBaseCreate,
+        idempotency: KnowledgeIdempotencyBegin,
+        *,
+        now: datetime | None = None,
+    ) -> KnowledgeBaseIdempotencyResult:
+        timestamp = _timestamp(now)
+        async with self._lock:
+            existing, ledger_id = self._prepare_idempotency_locked(
+                idempotency,
+                KnowledgeOperation.create_base,
             )
-            self._bases[record.id] = record
-            return _copy(record)
+            if existing is not None:
+                return KnowledgeBaseIdempotencyResult(
+                    resource=self._base_from_ledger_locked(
+                        existing,
+                        KnowledgeOperation.create_base,
+                    ),
+                    ledger=_copy(existing),
+                    replayed=True,
+                )
+            assert ledger_id is not None
+            base = self._create_base_locked(command, timestamp)
+            ledger = self._record_idempotency_locked(
+                idempotency,
+                ledger_id,
+                resource_kind=KnowledgeResourceKind.base,
+                resource_id=base.id,
+                document_version_id=None,
+                timestamp=timestamp,
+            )
+            self._validate_ledger_resource(
+                ledger,
+                operation=KnowledgeOperation.create_base,
+                resource_kind=KnowledgeResourceKind.base,
+                resource_id=base.id,
+                document_version_id=None,
+            )
+            return KnowledgeBaseIdempotencyResult(
+                resource=base,
+                ledger=_copy(ledger),
+                replayed=False,
+            )
 
     async def list_bases(
         self,
@@ -610,6 +907,160 @@ class InMemoryKnowledgeStore:
         async with self._lock:
             return self._create_document_version_locked(command, timestamp)
 
+    async def create_document_version_idempotent(
+        self,
+        command: KnowledgeDocumentVersionCreate,
+        idempotency: KnowledgeIdempotencyBegin,
+        *,
+        now: datetime | None = None,
+    ) -> KnowledgeDocumentVersionIdempotencyResult:
+        if command.document_id is not None:
+            raise KnowledgeValidationError(
+                KnowledgePublicCode.invalid_input,
+                "Create document mutation cannot target an existing document.",
+            )
+        timestamp = _timestamp(now)
+        async with self._lock:
+            existing, ledger_id = self._prepare_idempotency_locked(
+                idempotency,
+                KnowledgeOperation.create_document,
+            )
+            if existing is not None:
+                return KnowledgeDocumentVersionIdempotencyResult(
+                    resource=self._document_version_from_ledger_locked(
+                        existing,
+                        KnowledgeOperation.create_document,
+                        expected_kb_id=command.kb_id,
+                        expected_document_id=None,
+                    ),
+                    ledger=_copy(existing),
+                    replayed=True,
+                )
+            assert ledger_id is not None
+            resource = self._create_document_version_locked(command, timestamp)
+            ledger = self._record_idempotency_locked(
+                idempotency,
+                ledger_id,
+                resource_kind=KnowledgeResourceKind.document,
+                resource_id=resource.document.id,
+                document_version_id=resource.version.id,
+                timestamp=timestamp,
+            )
+            self._validate_ledger_resource(
+                ledger,
+                operation=KnowledgeOperation.create_document,
+                resource_kind=KnowledgeResourceKind.document,
+                resource_id=resource.document.id,
+                document_version_id=resource.version.id,
+            )
+            return KnowledgeDocumentVersionIdempotencyResult(
+                resource=resource,
+                ledger=_copy(ledger),
+                replayed=False,
+            )
+
+    async def update_document_version_idempotent(
+        self,
+        command: KnowledgeDocumentVersionCreate,
+        idempotency: KnowledgeIdempotencyBegin,
+        *,
+        now: datetime | None = None,
+    ) -> KnowledgeDocumentVersionIdempotencyResult:
+        if command.document_id is None:
+            raise KnowledgeValidationError(
+                KnowledgePublicCode.invalid_input,
+                "Update document mutation must target an existing document.",
+            )
+        timestamp = _timestamp(now)
+        async with self._lock:
+            existing, ledger_id = self._prepare_idempotency_locked(
+                idempotency,
+                KnowledgeOperation.update_document,
+            )
+            if existing is not None:
+                return KnowledgeDocumentVersionIdempotencyResult(
+                    resource=self._document_version_from_ledger_locked(
+                        existing,
+                        KnowledgeOperation.update_document,
+                        expected_kb_id=command.kb_id,
+                        expected_document_id=command.document_id,
+                    ),
+                    ledger=_copy(existing),
+                    replayed=True,
+                )
+            assert ledger_id is not None
+            resource = self._create_document_version_locked(command, timestamp)
+            ledger = self._record_idempotency_locked(
+                idempotency,
+                ledger_id,
+                resource_kind=KnowledgeResourceKind.document,
+                resource_id=resource.document.id,
+                document_version_id=resource.version.id,
+                timestamp=timestamp,
+            )
+            self._validate_ledger_resource(
+                ledger,
+                operation=KnowledgeOperation.update_document,
+                resource_kind=KnowledgeResourceKind.document,
+                resource_id=resource.document.id,
+                document_version_id=resource.version.id,
+            )
+            return KnowledgeDocumentVersionIdempotencyResult(
+                resource=resource,
+                ledger=_copy(ledger),
+                replayed=False,
+            )
+
+    def _reindex_document_locked(
+        self,
+        command: KnowledgeDocumentReindex,
+        timestamp: datetime,
+    ) -> KnowledgeDocumentVersionResult:
+        base = self._base_locked(command.kb_id)
+        if base.status is not KnowledgeBaseStatus.active:
+            raise KnowledgeConflict(
+                KnowledgePublicCode.knowledge_base_deleted,
+                "Knowledge Base is deleted.",
+            )
+        document = self._document_locked(base.id, command.document_id)
+        if document.status is KnowledgeDocumentStatus.deleted:
+            raise KnowledgeConflict(
+                KnowledgePublicCode.knowledge_document_deleted,
+                "Knowledge document is deleted.",
+            )
+        if document.active_version_id is None:
+            raise KnowledgeConflict(
+                KnowledgePublicCode.no_active_version,
+                "Knowledge document has no active version to reindex.",
+            )
+        active = self._version_locked(
+            base.id,
+            document.id,
+            document.active_version_id,
+        )
+        if active.status is not KnowledgeVersionStatus.active or active.content is None:
+            raise KnowledgeConflict(
+                KnowledgePublicCode.no_active_version,
+                "Knowledge document has no active version to reindex.",
+            )
+        return self._create_document_version_locked(
+            KnowledgeDocumentVersionCreate(
+                kb_id=base.id,
+                document_id=document.id,
+                title=document.title,
+                source_type=document.source_type,
+                source_uri=document.source_uri,
+                content=active.content,
+                mime_type=active.mime_type,
+                chunking_version=command.chunking_version,
+                target_chars=command.target_chars,
+                overlap_chars=command.overlap_chars,
+                document_version_id=command.document_version_id,
+            ),
+            timestamp,
+            enforce_content_limit=False,
+        )
+
     async def reindex_document(
         self,
         command: KnowledgeDocumentReindex,
@@ -618,48 +1069,53 @@ class InMemoryKnowledgeStore:
     ) -> KnowledgeDocumentVersionResult:
         timestamp = _timestamp(now)
         async with self._lock:
-            base = self._base_locked(command.kb_id)
-            if base.status is not KnowledgeBaseStatus.active:
-                raise KnowledgeConflict(
-                    KnowledgePublicCode.knowledge_base_deleted,
-                    "Knowledge Base is deleted.",
-                )
-            document = self._document_locked(base.id, command.document_id)
-            if document.status is KnowledgeDocumentStatus.deleted:
-                raise KnowledgeConflict(
-                    KnowledgePublicCode.knowledge_document_deleted,
-                    "Knowledge document is deleted.",
-                )
-            if document.active_version_id is None:
-                raise KnowledgeConflict(
-                    KnowledgePublicCode.no_active_version,
-                    "Knowledge document has no active version to reindex.",
-                )
-            active = self._version_locked(
-                base.id,
-                document.id,
-                document.active_version_id,
+            return self._reindex_document_locked(command, timestamp)
+
+    async def reindex_document_idempotent(
+        self,
+        command: KnowledgeDocumentReindex,
+        idempotency: KnowledgeIdempotencyBegin,
+        *,
+        now: datetime | None = None,
+    ) -> KnowledgeDocumentVersionIdempotencyResult:
+        timestamp = _timestamp(now)
+        async with self._lock:
+            existing, ledger_id = self._prepare_idempotency_locked(
+                idempotency,
+                KnowledgeOperation.reindex_document,
             )
-            if active.status is not KnowledgeVersionStatus.active or active.content is None:
-                raise KnowledgeConflict(
-                    KnowledgePublicCode.no_active_version,
-                    "Knowledge document has no active version to reindex.",
+            if existing is not None:
+                return KnowledgeDocumentVersionIdempotencyResult(
+                    resource=self._document_version_from_ledger_locked(
+                        existing,
+                        KnowledgeOperation.reindex_document,
+                        expected_kb_id=command.kb_id,
+                        expected_document_id=command.document_id,
+                    ),
+                    ledger=_copy(existing),
+                    replayed=True,
                 )
-            return self._create_document_version_locked(
-                KnowledgeDocumentVersionCreate(
-                    kb_id=base.id,
-                    document_id=document.id,
-                    title=document.title,
-                    source_type=document.source_type,
-                    source_uri=document.source_uri,
-                    content=active.content,
-                    mime_type=active.mime_type,
-                    chunking_version=command.chunking_version,
-                    target_chars=command.target_chars,
-                    overlap_chars=command.overlap_chars,
-                    document_version_id=command.document_version_id,
-                ),
-                timestamp,
+            assert ledger_id is not None
+            resource = self._reindex_document_locked(command, timestamp)
+            ledger = self._record_idempotency_locked(
+                idempotency,
+                ledger_id,
+                resource_kind=KnowledgeResourceKind.document,
+                resource_id=resource.document.id,
+                document_version_id=resource.version.id,
+                timestamp=timestamp,
+            )
+            self._validate_ledger_resource(
+                ledger,
+                operation=KnowledgeOperation.reindex_document,
+                resource_kind=KnowledgeResourceKind.document,
+                resource_id=resource.document.id,
+                document_version_id=resource.version.id,
+            )
+            return KnowledgeDocumentVersionIdempotencyResult(
+                resource=resource,
+                ledger=_copy(ledger),
+                replayed=False,
             )
 
     async def get_document(
@@ -1083,6 +1539,26 @@ class InMemoryKnowledgeStore:
                 timestamp=timestamp,
             )
 
+    def _tombstone_document_locked(
+        self,
+        kb_id: str,
+        document_id: str,
+        timestamp: datetime,
+    ) -> KnowledgeDocumentRecord:
+        self._base_locked(kb_id)
+        document = self._document_locked(kb_id, document_id)
+        if document.status is not KnowledgeDocumentStatus.deleted:
+            document = replace(
+                document,
+                status=KnowledgeDocumentStatus.deleted,
+                desired_version_id=None,
+                active_version_id=None,
+                updated_at=timestamp,
+                deleted_at=timestamp,
+            )
+            self._documents[document.id] = document
+        return _copy(document)
+
     async def tombstone_document(
         self,
         kb_id: str,
@@ -1092,19 +1568,74 @@ class InMemoryKnowledgeStore:
     ) -> KnowledgeDocumentRecord:
         timestamp = _timestamp(now)
         async with self._lock:
-            self._base_locked(kb_id)
-            document = self._document_locked(kb_id, document_id)
-            if document.status is not KnowledgeDocumentStatus.deleted:
-                document = replace(
-                    document,
-                    status=KnowledgeDocumentStatus.deleted,
-                    desired_version_id=None,
-                    active_version_id=None,
-                    updated_at=timestamp,
-                    deleted_at=timestamp,
+            return self._tombstone_document_locked(kb_id, document_id, timestamp)
+
+    async def tombstone_document_idempotent(
+        self,
+        command: KnowledgeDocumentTombstone,
+        idempotency: KnowledgeIdempotencyBegin,
+        *,
+        now: datetime | None = None,
+    ) -> KnowledgeDocumentIdempotencyResult:
+        timestamp = _timestamp(now)
+        async with self._lock:
+            existing, ledger_id = self._prepare_idempotency_locked(
+                idempotency,
+                KnowledgeOperation.delete_document,
+            )
+            if existing is not None:
+                return KnowledgeDocumentIdempotencyResult(
+                    resource=self._document_from_ledger_locked(
+                        existing,
+                        KnowledgeOperation.delete_document,
+                        expected_kb_id=command.kb_id,
+                        expected_document_id=command.document_id,
+                    ),
+                    ledger=_copy(existing),
+                    replayed=True,
                 )
-                self._documents[document.id] = document
-            return _copy(document)
+            assert ledger_id is not None
+            document = self._tombstone_document_locked(
+                command.kb_id,
+                command.document_id,
+                timestamp,
+            )
+            ledger = self._record_idempotency_locked(
+                idempotency,
+                ledger_id,
+                resource_kind=KnowledgeResourceKind.document,
+                resource_id=document.id,
+                document_version_id=None,
+                timestamp=timestamp,
+            )
+            self._validate_ledger_resource(
+                ledger,
+                operation=KnowledgeOperation.delete_document,
+                resource_kind=KnowledgeResourceKind.document,
+                resource_id=document.id,
+                document_version_id=None,
+            )
+            return KnowledgeDocumentIdempotencyResult(
+                resource=document,
+                ledger=_copy(ledger),
+                replayed=False,
+            )
+
+    def _tombstone_base_locked(
+        self,
+        kb_id: str,
+        timestamp: datetime,
+    ) -> KnowledgeBaseRecord:
+        base = self._base_locked(kb_id)
+        if base.status is not KnowledgeBaseStatus.deleted:
+            base = replace(
+                base,
+                status=KnowledgeBaseStatus.deleted,
+                updated_at=timestamp,
+                deleted_at=timestamp,
+            )
+            self._bases[base.id] = base
+        return _copy(base)
 
     async def tombstone_base(
         self,
@@ -1114,16 +1645,53 @@ class InMemoryKnowledgeStore:
     ) -> KnowledgeBaseRecord:
         timestamp = _timestamp(now)
         async with self._lock:
-            base = self._base_locked(kb_id)
-            if base.status is not KnowledgeBaseStatus.deleted:
-                base = replace(
-                    base,
-                    status=KnowledgeBaseStatus.deleted,
-                    updated_at=timestamp,
-                    deleted_at=timestamp,
+            return self._tombstone_base_locked(kb_id, timestamp)
+
+    async def tombstone_base_idempotent(
+        self,
+        command: KnowledgeBaseTombstone,
+        idempotency: KnowledgeIdempotencyBegin,
+        *,
+        now: datetime | None = None,
+    ) -> KnowledgeBaseIdempotencyResult:
+        timestamp = _timestamp(now)
+        async with self._lock:
+            existing, ledger_id = self._prepare_idempotency_locked(
+                idempotency,
+                KnowledgeOperation.delete_base,
+            )
+            if existing is not None:
+                return KnowledgeBaseIdempotencyResult(
+                    resource=self._base_from_ledger_locked(
+                        existing,
+                        KnowledgeOperation.delete_base,
+                        expected_kb_id=command.kb_id,
+                    ),
+                    ledger=_copy(existing),
+                    replayed=True,
                 )
-                self._bases[base.id] = base
-            return _copy(base)
+            assert ledger_id is not None
+            base = self._tombstone_base_locked(command.kb_id, timestamp)
+            ledger = self._record_idempotency_locked(
+                idempotency,
+                ledger_id,
+                resource_kind=KnowledgeResourceKind.base,
+                resource_id=base.id,
+                document_version_id=None,
+                timestamp=timestamp,
+            )
+            self._validate_ledger_resource(
+                ledger,
+                operation=KnowledgeOperation.delete_base,
+                resource_kind=KnowledgeResourceKind.base,
+                resource_id=base.id,
+                document_version_id=None,
+            )
+            return KnowledgeBaseIdempotencyResult(
+                resource=base,
+                ledger=_copy(ledger),
+                replayed=False,
+            )
 
     async def purge_document(
         self,
@@ -1179,45 +1747,6 @@ class InMemoryKnowledgeStore:
                 chunks_removed=chunks_removed,
             )
 
-    async def begin_idempotent_request(
-        self,
-        command: KnowledgeIdempotencyBegin,
-        *,
-        now: datetime | None = None,
-    ) -> KnowledgeIdempotencyResult:
-        timestamp = _timestamp(now)
-        key = (command.operation, command.idempotency_key)
-        async with self._lock:
-            existing = self._idempotency.get(key)
-            if existing is not None:
-                if existing.request_fingerprint != command.request_fingerprint:
-                    raise KnowledgeConflict(
-                        KnowledgePublicCode.idempotency_key_reused,
-                        "Idempotency key was already used for different input.",
-                    )
-                return KnowledgeIdempotencyResult(record=_copy(existing), replayed=True)
-            ledger_id = command.ledger_id or new_knowledge_idempotency_id()
-            if any(record.id == ledger_id for record in self._idempotency.values()):
-                raise KnowledgeConflict(
-                    KnowledgePublicCode.knowledge_conflict,
-                    "Knowledge idempotency identifier already exists.",
-                )
-            record = KnowledgeIdempotencyRecord(
-                id=ledger_id,
-                scope_id=self._scope_id,
-                operation=command.operation,
-                idempotency_key=command.idempotency_key,
-                request_fingerprint=command.request_fingerprint,
-                resource_kind=command.resource_kind,
-                resource_id=command.resource_id,
-                document_version_id=command.document_version_id,
-                job_id=None,
-                created_at=timestamp,
-                updated_at=timestamp,
-            )
-            self._idempotency[key] = record
-            return KnowledgeIdempotencyResult(record=_copy(record), replayed=False)
-
     async def get_idempotent_request(
         self,
         operation: KnowledgeOperation,
@@ -1260,10 +1789,10 @@ class InMemoryKnowledgeStore:
                 )
             if record.document_version_id is not None:
                 version = self._versions.get(record.document_version_id)
-                if version is None:
-                    raise KnowledgeNotFound(
-                        KnowledgePublicCode.knowledge_version_not_found,
-                        "Knowledge document version was not found.",
+                if version is None or version.document_id != record.resource_id:
+                    raise KnowledgeConflict(
+                        KnowledgePublicCode.knowledge_conflict,
+                        "Knowledge idempotency ledger is inconsistent.",
                     )
                 if version.ingest_job_id is not None and version.ingest_job_id != command.job_id:
                     raise KnowledgeConflict(

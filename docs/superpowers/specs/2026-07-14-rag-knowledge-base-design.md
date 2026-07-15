@@ -458,14 +458,15 @@ chunking_version = "keel-char-v1"
 `index_fingerprint`：
 
 ```text
-SHA-256(
-  content_sha256 |
-  chunking_version |
-  embedding_model |
-  embedding_dim |
-  target_chars |
-  overlap_chars
-)
+SHA-256(canonical compact sorted JSON {
+  "content_sha256": content_sha256,
+  "source_type": source_type,
+  "chunking_version": chunking_version,
+  "embedding_model": embedding_model,
+  "embedding_dim": embedding_dim,
+  "target_chars": target_chars,
+  "overlap_chars": overlap_chars
+})
 ```
 
 `index_fingerprint` 不是永久唯一键。只有当 fingerprint 等于当前
@@ -752,9 +753,14 @@ cleanup 不被 job terminal transition 绕过。
 ```python
 class KnowledgeStore:
     async def create_base(...)
+    async def create_base_idempotent(command, idempotency, ...)
     async def list_bases(...)
     async def get_base(...)
     async def create_document_version(...)
+    async def create_document_version_idempotent(command, idempotency, ...)
+    async def update_document_version_idempotent(command, idempotency, ...)
+    async def reindex_document(...)
+    async def reindex_document_idempotent(command, idempotency, ...)
     async def get_document(...)
     async def list_documents(...)
     async def mark_indexing(...)
@@ -763,10 +769,12 @@ class KnowledgeStore:
     async def mark_version_failed(...)
     async def mark_version_cancelled(...)
     async def tombstone_document(...)
+    async def tombstone_document_idempotent(command, idempotency, ...)
     async def tombstone_base(...)
+    async def tombstone_base_idempotent(command, idempotency, ...)
     async def purge_document(...)
     async def purge_base(...)
-    async def begin_idempotent_request(...)
+    async def get_idempotent_request(...)
     async def attach_idempotent_job(...)
 ```
 

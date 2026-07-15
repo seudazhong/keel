@@ -33,6 +33,7 @@ _MAX_IDENTITY_BYTES = 512
 _PUBLIC_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _CITATION_ID_RE = re.compile(r"^cite_[1-9][0-9]*$")
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+DEFAULT_KNOWLEDGE_DOCUMENT_MAX_BYTES = 1_048_576
 
 type KnowledgeBaseId = str
 type KnowledgeDocumentId = str
@@ -116,6 +117,7 @@ class KnowledgePublicCode(StrEnum):
     invalid_scope_id = "invalid_scope_id"
     invalid_input = "invalid_knowledge_input"
     content_invalid = "content_invalid"
+    content_too_large = "content_too_large"
     fingerprint_invalid = "fingerprint_invalid"
     knowledge_not_found = "knowledge_not_found"
     knowledge_base_not_found = "knowledge_base_not_found"
@@ -196,6 +198,16 @@ def _validate_timestamp(value: datetime | None, *, field: str) -> None:
 def _require_enum[T: StrEnum](value: object, enum_type: type[T], *, field: str) -> T:
     if not isinstance(value, enum_type):
         raise ValueError(f"{field} must be a {enum_type.__name__}")
+    return value
+
+
+def _strict_int(value: object, *, field: str, minimum: int | None = None) -> int:
+    if type(value) is not int:
+        raise ValueError(f"{field} must be an integer")
+    if minimum is not None and value < minimum:
+        if minimum == 1:
+            raise ValueError(f"{field} must be a positive integer")
+        raise ValueError(f"{field} must be an integer greater than or equal to {minimum}")
     return value
 
 
@@ -350,6 +362,16 @@ def validate_idempotency_key(value: object) -> str:
     return safe
 
 
+def validate_document_max_bytes(value: object) -> int:
+    try:
+        return _strict_int(value, field="document_max_bytes", minimum=1)
+    except ValueError as exc:
+        raise KnowledgeValidationError(
+            KnowledgePublicCode.invalid_input,
+            "Document maximum size must be a positive integer.",
+        ) from exc
+
+
 def content_sha256(content: str) -> str:
     try:
         safe = _storage_safe_text(content, field="content", allow_empty=True)
@@ -363,6 +385,7 @@ def content_sha256(content: str) -> str:
 
 def index_fingerprint(
     content_digest: str,
+    source_type: KnowledgeSourceType,
     chunking_version: str,
     embedding_model: str,
     embedding_dim: int,
@@ -371,38 +394,36 @@ def index_fingerprint(
 ) -> str:
     try:
         digest = _validate_hash(content_digest, field="content_sha256")
+        source = _require_enum(source_type, KnowledgeSourceType, field="source_type")
         chunker = _required_text(chunking_version, field="chunking_version")
         model = _required_text(embedding_model, field="embedding_model")
+        dim = _strict_int(embedding_dim, field="embedding_dim", minimum=1)
+        target = _strict_int(target_chars, field="target_chars", minimum=1)
+        overlap = _strict_int(overlap_chars, field="overlap_chars", minimum=0)
     except ValueError as exc:
         raise KnowledgeValidationError(
             KnowledgePublicCode.fingerprint_invalid,
             "Index fingerprint input is invalid.",
         ) from exc
-    if (
-        not isinstance(embedding_dim, int)
-        or isinstance(embedding_dim, bool)
-        or embedding_dim <= 0
-        or not isinstance(target_chars, int)
-        or isinstance(target_chars, bool)
-        or target_chars <= 0
-        or not isinstance(overlap_chars, int)
-        or isinstance(overlap_chars, bool)
-        or overlap_chars < 0
-        or overlap_chars >= target_chars
-    ):
+    if overlap >= target:
         raise KnowledgeValidationError(
             KnowledgePublicCode.fingerprint_invalid,
             "Index fingerprint input is invalid.",
         )
-    serialized = "|".join(
-        (
-            digest,
-            chunker,
-            model,
-            str(embedding_dim),
-            str(target_chars),
-            str(overlap_chars),
-        )
+    serialized = json.dumps(
+        {
+            "chunking_version": chunker,
+            "content_sha256": digest,
+            "embedding_dim": dim,
+            "embedding_model": model,
+            "overlap_chars": overlap,
+            "source_type": source.value,
+            "target_chars": target,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
     )
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
@@ -753,11 +774,10 @@ class ChunkDraft:
     heading_path: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if isinstance(self.ordinal, bool) or self.ordinal < 0:
-            raise ValueError("ordinal must be a non-negative integer")
+        _strict_int(self.ordinal, field="ordinal", minimum=0)
         _storage_safe_text(self.text, field="text", allow_empty=True)
-        if self.char_start < 0:
-            raise ValueError("char_start must be non-negative")
+        _strict_int(self.char_start, field="char_start", minimum=0)
+        _strict_int(self.char_end, field="char_end", minimum=0)
         if self.char_end < self.char_start:
             raise ValueError("char_end must be greater than or equal to char_start")
         _validate_hash(self.content_hash, field="content_hash")
@@ -788,8 +808,7 @@ class KnowledgeBaseRecord:
         _required_text(self.name, field="name")
         _optional_text(self.description, field="description")
         _required_text(self.embedding_model, field="embedding_model")
-        if isinstance(self.embedding_dim, bool) or self.embedding_dim <= 0:
-            raise ValueError("embedding_dim must be positive")
+        _strict_int(self.embedding_dim, field="embedding_dim", minimum=1)
         _require_enum(self.status, KnowledgeBaseStatus, field="status")
         _validate_timestamp(self.created_at, field="created_at")
         _validate_timestamp(self.updated_at, field="updated_at")
@@ -864,8 +883,7 @@ class KnowledgeDocumentVersionRecord:
         validate_scope_id(self.scope_id)
         validate_knowledge_base_id(self.kb_id)
         validate_knowledge_document_id(self.document_id)
-        if isinstance(self.version, bool) or self.version < 1:
-            raise ValueError("version must be a positive integer")
+        _strict_int(self.version, field="version", minimum=1)
         if self.content is not None:
             _storage_safe_text(self.content, field="content", allow_empty=True)
         _validate_hash(self.content_sha256, field="content_sha256")
@@ -916,10 +934,11 @@ class KnowledgeChunkRecord:
         validate_knowledge_base_id(self.kb_id)
         validate_knowledge_document_id(self.document_id)
         validate_knowledge_version_id(self.document_version_id)
-        if isinstance(self.ordinal, bool) or self.ordinal < 0:
-            raise ValueError("ordinal must be a non-negative integer")
+        _strict_int(self.ordinal, field="ordinal", minimum=0)
         _storage_safe_text(self.text, field="text", allow_empty=True)
-        if self.char_start < 0 or self.char_end < self.char_start:
+        _strict_int(self.char_start, field="char_start", minimum=0)
+        _strict_int(self.char_end, field="char_end", minimum=0)
+        if self.char_end < self.char_start:
             raise ValueError("chunk offsets are invalid")
         _validate_hash(self.content_hash, field="content_hash")
         if self.content_hash != content_sha256(self.text):
@@ -928,7 +947,8 @@ class KnowledgeChunkRecord:
             _required_text(heading, field="heading")
         _canonical_json_value(self.metadata)
         _required_text(self.model, field="model")
-        if isinstance(self.dim, bool) or self.dim <= 0 or len(self.embedding) != self.dim:
+        _strict_int(self.dim, field="dim", minimum=1)
+        if len(self.embedding) != self.dim:
             raise ValueError("embedding dimension is invalid")
         if any(not math.isfinite(value) for value in self.embedding):
             raise ValueError("embedding values must be finite")
@@ -1001,8 +1021,7 @@ class KnowledgeBaseCreate:
             "embedding_model",
             _required_text(self.embedding_model, field="embedding_model"),
         )
-        if isinstance(self.embedding_dim, bool) or self.embedding_dim <= 0:
-            raise ValueError("embedding_dim must be positive")
+        _strict_int(self.embedding_dim, field="embedding_dim", minimum=1)
         if self.base_id is not None:
             validate_knowledge_base_id(self.base_id)
 
@@ -1063,13 +1082,9 @@ class KnowledgeDocumentVersionCreate:
             "chunking_version",
             _required_text(self.chunking_version, field="chunking_version"),
         )
-        if (
-            isinstance(self.target_chars, bool)
-            or self.target_chars <= 0
-            or isinstance(self.overlap_chars, bool)
-            or self.overlap_chars < 0
-            or self.overlap_chars >= self.target_chars
-        ):
+        _strict_int(self.target_chars, field="target_chars", minimum=1)
+        _strict_int(self.overlap_chars, field="overlap_chars", minimum=0)
+        if self.overlap_chars >= self.target_chars:
             raise ValueError("chunk overlap must be non-negative and less than target")
 
 
@@ -1092,14 +1107,28 @@ class KnowledgeDocumentReindex:
             "chunking_version",
             _required_text(self.chunking_version, field="chunking_version"),
         )
-        if (
-            isinstance(self.target_chars, bool)
-            or self.target_chars <= 0
-            or isinstance(self.overlap_chars, bool)
-            or self.overlap_chars < 0
-            or self.overlap_chars >= self.target_chars
-        ):
+        _strict_int(self.target_chars, field="target_chars", minimum=1)
+        _strict_int(self.overlap_chars, field="overlap_chars", minimum=0)
+        if self.overlap_chars >= self.target_chars:
             raise ValueError("chunk overlap must be non-negative and less than target")
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeDocumentTombstone:
+    kb_id: KnowledgeBaseId
+    document_id: KnowledgeDocumentId
+
+    def __post_init__(self) -> None:
+        validate_knowledge_base_id(self.kb_id)
+        validate_knowledge_document_id(self.document_id)
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeBaseTombstone:
+    kb_id: KnowledgeBaseId
+
+    def __post_init__(self) -> None:
+        validate_knowledge_base_id(self.kb_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1119,10 +1148,11 @@ class KnowledgeChunkWrite:
     def __post_init__(self) -> None:
         if self.chunk_id is not None:
             validate_knowledge_chunk_id(self.chunk_id)
-        if isinstance(self.ordinal, bool) or self.ordinal < 0:
-            raise ValueError("ordinal must be a non-negative integer")
+        _strict_int(self.ordinal, field="ordinal", minimum=0)
         _storage_safe_text(self.text, field="text", allow_empty=True)
-        if self.char_start < 0 or self.char_end < self.char_start:
+        _strict_int(self.char_start, field="char_start", minimum=0)
+        _strict_int(self.char_end, field="char_end", minimum=0)
+        if self.char_end < self.char_start:
             raise ValueError("chunk offsets are invalid")
         _validate_hash(self.content_hash, field="content_hash")
         if self.content_hash != content_sha256(self.text):
@@ -1131,7 +1161,8 @@ class KnowledgeChunkWrite:
             _required_text(heading, field="heading")
         _canonical_json_value(self.metadata)
         _required_text(self.model, field="model")
-        if isinstance(self.dim, bool) or self.dim <= 0 or len(self.embedding) != self.dim:
+        _strict_int(self.dim, field="dim", minimum=1)
+        if len(self.embedding) != self.dim:
             raise ValueError("embedding dimension is invalid")
         if any(not math.isfinite(value) for value in self.embedding):
             raise ValueError("embedding values must be finite")
@@ -1215,9 +1246,6 @@ class KnowledgeIdempotencyBegin:
     operation: KnowledgeOperation
     idempotency_key: str
     request_fingerprint: str
-    resource_kind: KnowledgeResourceKind
-    resource_id: str
-    document_version_id: KnowledgeVersionId | None = None
     ledger_id: KnowledgeIdempotencyId | None = None
 
     def __post_init__(self) -> None:
@@ -1228,28 +1256,8 @@ class KnowledgeIdempotencyBegin:
             validate_idempotency_key(self.idempotency_key),
         )
         _validate_hash(self.request_fingerprint, field="request_fingerprint")
-        _require_enum(self.resource_kind, KnowledgeResourceKind, field="resource_kind")
-        if self.resource_kind is KnowledgeResourceKind.base:
-            validate_knowledge_base_id(self.resource_id)
-        else:
-            validate_knowledge_document_id(self.resource_id)
-        if self.document_version_id is not None:
-            validate_knowledge_version_id(self.document_version_id)
         if self.ledger_id is not None:
             validate_knowledge_idempotency_id(self.ledger_id)
-        base_operation = self.operation in {
-            KnowledgeOperation.create_base,
-            KnowledgeOperation.delete_base,
-        }
-        if base_operation != (self.resource_kind is KnowledgeResourceKind.base):
-            raise ValueError("operation and resource_kind are inconsistent")
-        version_operation = self.operation in {
-            KnowledgeOperation.create_document,
-            KnowledgeOperation.update_document,
-            KnowledgeOperation.reindex_document,
-        }
-        if version_operation != (self.document_version_id is not None):
-            raise ValueError("operation and document_version_id are inconsistent")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1306,6 +1314,10 @@ class KnowledgeChunkReplacementResult:
     document_version_id: KnowledgeVersionId
     chunk_count: int
 
+    def __post_init__(self) -> None:
+        validate_knowledge_version_id(self.document_version_id)
+        _strict_int(self.chunk_count, field="chunk_count", minimum=0)
+
 
 @dataclass(frozen=True, slots=True)
 class KnowledgePurgeResult:
@@ -1313,10 +1325,30 @@ class KnowledgePurgeResult:
     versions_purged: int
     chunks_removed: int
 
+    def __post_init__(self) -> None:
+        _strict_int(self.documents_purged, field="documents_purged", minimum=0)
+        _strict_int(self.versions_purged, field="versions_purged", minimum=0)
+        _strict_int(self.chunks_removed, field="chunks_removed", minimum=0)
+
 
 @dataclass(frozen=True, slots=True)
-class KnowledgeIdempotencyResult:
-    record: KnowledgeIdempotencyRecord
+class KnowledgeBaseIdempotencyResult:
+    resource: KnowledgeBaseRecord
+    ledger: KnowledgeIdempotencyRecord
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeDocumentVersionIdempotencyResult:
+    resource: KnowledgeDocumentVersionResult
+    ledger: KnowledgeIdempotencyRecord
+    replayed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeDocumentIdempotencyResult:
+    resource: KnowledgeDocumentRecord
+    ledger: KnowledgeIdempotencyRecord
     replayed: bool
 
 
@@ -1324,12 +1356,15 @@ __all__ = [
     "ChunkDraft",
     "CreateKnowledgeBaseCommand",
     "CreateKnowledgeDocumentCommand",
+    "DEFAULT_KNOWLEDGE_DOCUMENT_MAX_BYTES",
     "DeleteKnowledgeCommand",
     "KnowledgeActivationResult",
     "KnowledgeBaseCreate",
     "KnowledgeBaseId",
+    "KnowledgeBaseIdempotencyResult",
     "KnowledgeBaseRecord",
     "KnowledgeBaseStatus",
+    "KnowledgeBaseTombstone",
     "KnowledgeChunkId",
     "KnowledgeChunkRecord",
     "KnowledgeChunkReplacement",
@@ -1338,11 +1373,14 @@ __all__ = [
     "KnowledgeCitation",
     "KnowledgeConflict",
     "KnowledgeDocumentId",
+    "KnowledgeDocumentIdempotencyResult",
     "KnowledgeDocumentRecord",
     "KnowledgeDocumentReindex",
     "KnowledgeDocumentStatus",
+    "KnowledgeDocumentTombstone",
     "KnowledgeDocumentVersionId",
     "KnowledgeDocumentVersionCreate",
+    "KnowledgeDocumentVersionIdempotencyResult",
     "KnowledgeDocumentVersionRecord",
     "KnowledgeDocumentVersionResult",
     "KnowledgeEmbeddingMismatch",
@@ -1354,7 +1392,6 @@ __all__ = [
     "KnowledgeIdempotencyBegin",
     "KnowledgeIdempotencyId",
     "KnowledgeIdempotencyRecord",
-    "KnowledgeIdempotencyResult",
     "KnowledgeIndexingResult",
     "KnowledgeNotFound",
     "KnowledgeOperation",
@@ -1384,6 +1421,7 @@ __all__ = [
     "new_knowledge_version_id",
     "request_fingerprint",
     "validate_idempotency_key",
+    "validate_document_max_bytes",
     "validate_knowledge_base_id",
     "validate_knowledge_chunk_id",
     "validate_knowledge_document_id",
