@@ -543,6 +543,16 @@ Knowledge ingest 的 partial chunks/domain status 不能被通用 job terminal t
 ALTER TABLE jobs
 ADD COLUMN cancel_mode text NOT NULL DEFAULT 'immediate'
 CHECK (cancel_mode IN ('immediate', 'cooperative', 'disabled'));
+
+ALTER TABLE jobs
+ADD COLUMN terminal_intent text
+    CHECK (terminal_intent IN ('failed', 'cancelled')),
+ADD COLUMN terminal_intent_at timestamptz,
+ADD CONSTRAINT ck_jobs_terminal_intent_timestamp
+    CHECK (
+        (terminal_intent IS NULL AND terminal_intent_at IS NULL)
+        OR (terminal_intent IS NOT NULL AND terminal_intent_at IS NOT NULL)
+    );
 ```
 
 语义：
@@ -554,6 +564,21 @@ CHECK (cancel_mode IN ('immediate', 'cooperative', 'disabled'));
 
 `JobRecord`、`enqueue_once()` 与 Jobs API additive 暴露 `cancel_mode`；现有调用默认
 `immediate`，行为不变。
+
+`terminal_intent` 是 hook 与 job terminal transition 之间的持久化协议：
+
+- worker 持有有效 lease 时先原子 reserve `failed` 或 `cancelled` intent，再执行
+  对应 hook；
+- failure intent 同时写入 bounded `error_kind/error_message`；
+- intent 一旦写入不可切换；running failed-intent job 的后续 cancel 返回
+  `409 job_finalizing`，已 terminal job 仍幂等返回当前 record；
+- claim/normal dispatch 不得 reclaim intent row；
+- lease 在 hook 中过期时，原 worker 用 fresh clock finalization 失去 lease；dispatcher
+  之后只重放同一种 hook 并完成同一 intent；
+- max-attempt lease expiry 通过 row lock 原子 reserve exhaustion intent：只有
+  expiry 前已持久化的 cancel request 才选择 cancelled，否则选择 failed；
+- hook/domain commit 后、job terminal commit 前 crash 只会重复同一种幂等 hook，
+  terminal event injection 仍由原有 transaction exactly once 完成。
 
 `JobDefinition` 增加可选 hooks：
 
@@ -569,14 +594,13 @@ class JobDefinition:
     on_failed: JobFailedHook | None = None
 ```
 
-- worker 在 `finish_cancelled` / `fail_terminal` **之前**调用对应 hook；
-- lease-expiry attempt exhaustion 若已有 `cancel_requested_at`，先调用
-  `on_cancelled`，再用 additive `finish_cancelled_exhausted(job_id, now)` 原子写
-  cancelled；否则先调用 `on_failed`，再 `fail_exhausted`；
+- worker reserve terminal intent 后、`finalize_terminal` **之前**调用对应 hook；
+- lease-expiry recovery 先读取/原子 reserve immutable intent，再调用唯一对应 hook，
+  最后 `finalize_exhausted`；
 - hooks 必须 idempotent、scope-bound、不得记录 payload/raw content；
 - hook 成功后 worker crash：下一次重复 hook，再做 terminal transition；
-- hook 失败：job 保持 non-terminal，保留 cancel request 或 expired lease，后续
-  dispatcher 重试；不得先 terminal 再 best-effort cleanup；
+- hook 失败：job 保持 running + reserved intent，后续 dispatcher 重试；不得先
+  terminal 再 best-effort cleanup；
 - `JobContext` additive 暴露 `max_attempts`，便于 handler/error tests，但 Knowledge
   correctness 依赖 terminal hooks，而不是仅依赖 handler catch。
 

@@ -92,8 +92,8 @@
 
 | File | Change |
 |---|---|
-| `packages/keel-core/src/keel_core/jobs.py` | `CancelMode`, `JobRecord.cancel_mode`, cooperative/disabled cancel behavior, exhaustion cancellation finalizer. |
-| `packages/keel-worker/src/keel_worker/jobs.py` | `JobContext.max_attempts`, `JobDefinition` terminal hooks, hook-before-terminal orchestration. |
+| `packages/keel-core/src/keel_core/jobs.py` | `CancelMode`, immutable `JobTerminalIntent`, cooperative/disabled cancel behavior, reserve/finalize protocol, exhaustion recovery. |
+| `packages/keel-worker/src/keel_worker/jobs.py` | `JobContext.max_attempts`, `JobDefinition` hooks, intent-before-hook and fresh-clock finalization orchestration. |
 | `packages/keel-core/src/keel_core/protocols.py` | Add generic `Citation` and `ToolResult.citations`. |
 | `packages/keel-core/src/keel_core/events.py` | Add citations to strict `ToolResultPayload`. |
 | `packages/keel-core/src/keel_core/loop.py` | Persist citations in normal and resumed `tool.result` events. |
@@ -121,6 +121,11 @@ class CancelMode(StrEnum):
     disabled = "disabled"
 
 
+class JobTerminalIntent(StrEnum):
+    failed = "failed"
+    cancelled = "cancelled"
+
+
 class JobStore(Protocol):
     async def enqueue_once(
         self,
@@ -134,9 +139,18 @@ class JobStore(Protocol):
         now: datetime | None = None,
     ) -> tuple[JobRecord, bool]: ...
 
-    async def finish_cancelled_exhausted(
-        self, job_id: str, now: datetime
-    ) -> JobRecord | None: ...
+    async def reserve_terminal(
+        self,
+        lease: JobLease,
+        intent: JobTerminalIntent,
+        *,
+        now: datetime,
+        error: JobError | None = None,
+    ) -> JobRecord: ...
+
+    async def finalize_terminal(self, lease: JobLease, now: datetime) -> JobRecord: ...
+    async def reserve_exhausted(self, job_id: str, now: datetime) -> JobRecord | None: ...
+    async def finalize_exhausted(self, job_id: str, now: datetime) -> JobRecord | None: ...
 ```
 
 ```python
@@ -316,7 +330,9 @@ def knowledge_job_definitions(
 - Test: `tests/integration/test_knowledge_schema.py`
 
 **Interfaces:**
-- Produces `CancelMode`, `JobRecord.cancel_mode`, `enqueue_once(..., cancel_mode=...)`, `finish_cancelled_exhausted()`, `JobDefinition.on_cancelled/on_failed`, and all SQL tables required by later tasks.
+- Produces `CancelMode`, `JobTerminalIntent`, `JobRecord.cancel_mode/terminal_intent`,
+  `enqueue_once(..., cancel_mode=...)`, reserve/finalize methods,
+  `JobDefinition.on_cancelled/on_failed`, and all SQL tables required by later tasks.
 
 - [ ] **Step 1: Write failing unit tests for cancel modes and terminal hooks**
 
@@ -378,7 +394,13 @@ class CancelMode(StrEnum):
     disabled = "disabled"
 ```
 
-Queued cooperative cancellation sets `cancel_requested_at` and makes `next_attempt_at <= now`; disabled cancellation raises `JobValidationError("job_not_cancellable", ...)`. Before every defined-kind cancelled/failed terminal transition, load the authoritative `JobRecord`, await the hook, and only then call the store finalizer. Hook failure must leave the job non-terminal. Exhausted jobs with `cancel_requested_at` use `finish_cancelled_exhausted`; other exhausted jobs use `on_failed` then `fail_exhausted`.
+Queued cooperative cancellation sets `cancel_requested_at` and makes `next_attempt_at <= now`;
+disabled cancellation raises `JobValidationError("job_not_cancellable", ...)`. Before every
+hook-bearing cancelled/failed transition, atomically reserve immutable terminal intent, call only
+that intent's hook, obtain a fresh clock value, and finalize only while the lease remains valid.
+Hook failure leaves the job running with intent. Expired intent rows are not reclaimed; dispatcher
+replays the same hook and finalizes exactly once. Exhaustion reserves failed/cancelled under row
+lock based on whether cancellation was persisted before exact expiry.
 
 - [ ] **Step 4: Write the complete 0010 migration**
 
@@ -388,6 +410,11 @@ Create every table/check/index/FK/RLS policy from design §§6 and 10.0, includi
 ALTER TABLE jobs
 ADD COLUMN cancel_mode text NOT NULL DEFAULT 'immediate'
 CHECK (cancel_mode IN ('immediate', 'cooperative', 'disabled'));
+
+ALTER TABLE jobs
+ADD COLUMN terminal_intent text
+    CHECK (terminal_intent IN ('failed', 'cancelled')),
+ADD COLUMN terminal_intent_at timestamptz;
 ```
 
 The downgrade drops Knowledge tables in FK order, then drops `jobs.cancel_mode`.
