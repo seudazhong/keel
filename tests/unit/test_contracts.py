@@ -6,9 +6,9 @@ from datetime import UTC, datetime
 
 from keel_core.agents import AgentSpec, Scope
 from keel_core.errors import CrossScopeError
-from keel_core.events import Event, EventType, RunEndedPayload
-from keel_core.protocols import Tool, ToolContext, ToolResult
-from keel_core.types import ScopeKind, StopReason, TrustLevel
+from keel_core.events import Event, EventType, RunEndedPayload, ToolResultPayload
+from keel_core.protocols import Citation, Tool, ToolContext, ToolResult
+from keel_core.types import ContentTaint, ScopeKind, StopReason, TrustLevel
 
 # --- event vocabulary v0 -------------------------------------------------------
 
@@ -85,6 +85,25 @@ class _EchoTool:
 
 def test_tool_is_runtime_checkable() -> None:
     assert isinstance(_EchoTool(), Tool)
+
+
+def test_tool_result_supports_structured_citations_additively() -> None:
+    citation = Citation(
+        id="cite_1",
+        label="Guide.md#chunk-1",
+        source="knowledge",
+        metadata={"chunk_id": "kbc_1"},
+    )
+    result = ToolResult(
+        ok=True,
+        output="[1] Guide.md#chunk-1\nInstall Keel.",
+        citations=[citation],
+        taint=ContentTaint.tainted,
+    )
+
+    assert result.citations == [citation]
+    assert ToolResult(ok=True).citations == []
+    assert ToolResultPayload(call_id="c1", ok=True).citations == []
 
 
 def test_cross_scope_error_carries_scopes() -> None:

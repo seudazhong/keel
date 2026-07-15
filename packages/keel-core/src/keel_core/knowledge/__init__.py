@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from .jobs import (
+    KNOWLEDGE_DELETE_CANCEL_MODE,
     KNOWLEDGE_DELETE_KIND,
+    KNOWLEDGE_DELETE_MAX_ATTEMPTS,
+    KNOWLEDGE_INGEST_CANCEL_MODE,
     KNOWLEDGE_INGEST_KIND,
+    KNOWLEDGE_INGEST_MAX_ATTEMPTS,
     KnowledgeDeletePayload,
     KnowledgeIngestPayload,
     KnowledgeJobContext,
@@ -92,7 +96,15 @@ from .models import (
     validate_scope_id,
 )
 from .search import KnowledgeSearcher
+from .service import (
+    KNOWLEDGE_CHUNKING_VERSION,
+    KnowledgeBaseDeleteJobResult,
+    KnowledgeDocumentDeleteJobResult,
+    KnowledgeDocumentJobResult,
+    KnowledgeService,
+)
 from .store import InMemoryKnowledgeStore, KnowledgeStore, PostgresKnowledgeStore
+from .tools import KnowledgeSearchTool
 
 __all__ = [
     "ChunkDraft",
@@ -103,6 +115,7 @@ __all__ = [
     "InMemoryKnowledgeStore",
     "KnowledgeActivationResult",
     "KnowledgeBaseCreate",
+    "KnowledgeBaseDeleteJobResult",
     "KnowledgeBaseId",
     "KnowledgeBaseIdempotencyResult",
     "KnowledgeBaseRecord",
@@ -116,6 +129,7 @@ __all__ = [
     "KnowledgeCitation",
     "KnowledgeConflict",
     "KnowledgeDocumentId",
+    "KnowledgeDocumentDeleteJobResult",
     "KnowledgeDocumentIdempotencyResult",
     "KnowledgeDocumentRecord",
     "KnowledgeDocumentReindex",
@@ -126,6 +140,7 @@ __all__ = [
     "KnowledgeDocumentVersionIdempotencyResult",
     "KnowledgeDocumentVersionRecord",
     "KnowledgeDocumentVersionResult",
+    "KnowledgeDocumentJobResult",
     "KnowledgeDeletePayload",
     "KnowledgeEmbeddingMismatch",
     "KnowledgeError",
@@ -149,12 +164,19 @@ __all__ = [
     "KnowledgeSearchMode",
     "KnowledgeSearcher",
     "KnowledgeSearchStatus",
+    "KnowledgeSearchTool",
+    "KnowledgeService",
     "KnowledgeSourceType",
     "KnowledgeStorageError",
     "KnowledgeStore",
     "PostgresKnowledgeStore",
+    "KNOWLEDGE_CHUNKING_VERSION",
+    "KNOWLEDGE_DELETE_CANCEL_MODE",
     "KNOWLEDGE_DELETE_KIND",
+    "KNOWLEDGE_DELETE_MAX_ATTEMPTS",
+    "KNOWLEDGE_INGEST_CANCEL_MODE",
     "KNOWLEDGE_INGEST_KIND",
+    "KNOWLEDGE_INGEST_MAX_ATTEMPTS",
     "KnowledgeValidationError",
     "KnowledgeVersionCancellation",
     "KnowledgeVersionFailure",

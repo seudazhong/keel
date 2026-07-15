@@ -59,6 +59,16 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+def _tool_result_payload(call_id: str, result: ToolResult) -> dict[str, object]:
+    return {
+        "call_id": call_id,
+        "ok": result.ok,
+        "output": result.output,
+        "taint": str(result.taint),
+        "citations": [citation.model_dump() for citation in result.citations],
+    }
+
+
 # Live-observation seams: an in-process surface (CLI now, IM adapter later) renders
 # the canonical event stream without polling. Both are optional and side-effect-only.
 EventObserver = Callable[[Event], None]
@@ -377,14 +387,14 @@ async def _run_tools(
     for call, is_known in zip(calls, known, strict=True):
         if is_known:
             result = next(results)
-            payload: dict[str, object] = {
-                "call_id": call.id,
-                "ok": result.ok,
-                "output": result.output,
-                "taint": str(result.taint),
-            }
+            payload = _tool_result_payload(call.id, result)
         else:
-            payload = {"call_id": call.id, "ok": False, "error": "unknown tool"}
+            payload = {
+                "call_id": call.id,
+                "ok": False,
+                "error": "unknown tool",
+                "citations": [],
+            }
         await _emit(store, EventType.tool_result, session_id, scope_id, run_id, payload)
     return []
 
@@ -675,14 +685,14 @@ async def resume(
                 if tool is not None
                 else ToolResult(ok=False, output="unknown tool")
             )
-            payload: dict[str, object] = {
-                "call_id": call.id,
-                "ok": result.ok,
-                "output": result.output,
-                "taint": str(result.taint),
-            }
+            payload = _tool_result_payload(call.id, result)
         else:
-            payload = {"call_id": call.id, "ok": False, "output": "approval denied"}
+            payload = {
+                "call_id": call.id,
+                "ok": False,
+                "output": "approval denied",
+                "citations": [],
+            }
         await _emit(store, EventType.tool_result, session_id, scope_id, run_id, payload)
 
     emit_delta: Callable[[str], Awaitable[None]] | None = None
