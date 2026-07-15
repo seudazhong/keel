@@ -1,6 +1,6 @@
 # Durable Background Jobs Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Execution:** Work through the checklist task-by-task and run the narrowest applicable validation before advancing.
 
 **Goal:** Add a scope-bound, Postgres-backed durable background-job substrate with at-least-once arq delivery, DB leases, progress, cooperative cancellation, bounded retry, exactly-once assistant result injection, and read/cancel APIs, without registering a production job kind yet.
 
@@ -11,7 +11,7 @@
 ## Global Constraints
 
 These constraints come from the approved design
-`docs/superpowers/specs/2026-07-14-durable-background-jobs-design.md` and
+`docs/designs/2026-07-14-durable-background-jobs-design.md` and
 ADR-0010. **Every task implicitly includes them.**
 
 - **Postgres is authoritative.** Redis/arq delivery may be lost or duplicated; a `jobs` row is the lifecycle source of truth.
@@ -6768,12 +6768,10 @@ writing-plans checklist.
 
 ## Appendix C: Execution Handoff
 
-Plan saved at `docs/superpowers/plans/2026-07-14-durable-background-jobs.md`.
+Plan saved at `docs/plans/2026-07-14-durable-background-jobs.md`.
 
-1. **Subagent-Driven (recommended):** use `superpowers:subagent-driven-development`; dispatch one
-   fresh subagent per task and review RED/GREEN evidence before advancing.
-2. **Inline:** use `superpowers:executing-plans`; execute in dependency order with review
-   checkpoints after Tasks 3, 6, 9, 13, 16, and 18.
+Execute tasks in dependency order. Independent tasks may use isolated worktrees; review
+RED/GREEN evidence before advancing, with checkpoints after Tasks 3, 6, 9, 13, 16, and 18.
 
 Tasks 1, 4–6, 10–14 are service-free unit work. Tasks 2–3, 7–9, 15–18 require an explicitly
 isolated `keel_test`; Tasks 16 and 18 also require test Redis. Do not start RAG/KB implementation

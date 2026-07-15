@@ -1,6 +1,6 @@
 # Keel Memory Consolidation Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Execution:** Work through the checklist task-by-task and run the narrowest applicable validation before advancing.
 
 **Goal:** A scheduled, unattended `memory-consolidator` agent reads recent trusted Web conversations in bounded batches and distills durable knowledge into (a) **proposals** for the persona/human Core blocks (human-approved, never auto-applied) and (b) **archival** memory rows with provenance and dedupe — advancing a leased global cursor only when the run genuinely succeeds.
 
@@ -3615,8 +3615,5 @@ helper) was applied everywhere it is referenced.
 
 ## Execution
 
-Plan complete and saved. Two execution options per the writing-plans skill:
-
-1. **Subagent-Driven (recommended)** — dispatch a fresh subagent per task via
-   `superpowers:subagent-driven-development`, with a two-stage review between tasks.
-2. **Inline Execution** — batch execution with review checkpoints via `superpowers:executing-plans`.
+Plan complete and saved. Execute tasks in dependency order, using isolated worktrees where
+parallel ownership is useful and review checkpoints between dependent batches.

@@ -4,11 +4,11 @@
 > **日期：** 2026-07-14  
 > **Milestone：** M2 prerequisite for M3 RAG/Knowledge Base  
 > **相关文档：**
-> [`STATUS.md`](../../STATUS.md)、
-> [`IMPLEMENTATION-PLAN.md`](../../IMPLEMENTATION-PLAN.md) M2/M3、
-> [`PRD.md`](../../PRD.md) FR-A3、
-> [`ARCHITECTURE.md`](../../ARCHITECTURE.md)、
-> [`0006-scheduler-and-queue.md`](../../adr/0006-scheduler-and-queue.md)、
+> [`STATUS.md`](../STATUS.md)、
+> [`IMPLEMENTATION-PLAN.md`](../IMPLEMENTATION-PLAN.md) M2/M3、
+> [`PRD.md`](../PRD.md) FR-A3、
+> [`ARCHITECTURE.md`](../ARCHITECTURE.md)、
+> [`0006-scheduler-and-queue.md`](../adr/0006-scheduler-and-queue.md)、
 > [`2026-07-07-keel-autonomy-slice-design.md`](./2026-07-07-keel-autonomy-slice-design.md)
 
 ## 1. 目标

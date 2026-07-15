@@ -1,6 +1,6 @@
 # Semantic Session Search Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Execution:** Work through the checklist task-by-task and run the narrowest applicable validation before advancing.
 
 **Goal:** Upgrade historical-session search to a scope-bound lexical + semantic RRF pipeline, with background message indexing, search-time catch-up, and identical ranking for the agent `session_search` tool and Sessions API.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python, FastAPI, SQLAlchemy async, Postgres 16 + pgvector + pg_trgm, LiteLLM/Ollama `bge-m3`, pytest, Alembic.
 
-**Spec:** `docs/superpowers/specs/2026-07-11-semantic-session-search-design.md`
+**Design:** `docs/designs/2026-07-11-semantic-session-search-design.md`
 
 ## Global Constraints
 

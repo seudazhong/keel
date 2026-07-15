@@ -51,5 +51,5 @@ Thumbs.db
 # Transient Playwright MCP artifacts (console logs, page snapshots, screenshots)
 .playwright-mcp/
 
-# Superpowers-managed feature worktrees
+# Local feature worktrees
 .worktrees/

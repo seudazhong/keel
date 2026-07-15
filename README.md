@@ -25,6 +25,8 @@ See the living [`docs/STATUS.md`](./docs/STATUS.md) snapshot.
 | [`docs/IMPLEMENTATION-PLAN.md`](./docs/IMPLEMENTATION-PLAN.md) | Phased plan (M0–M4) — workstreams, sequencing, exit criteria |
 | [`docs/STATUS.md`](./docs/STATUS.md) | Living implementation status — completed capabilities, milestone gaps, current execution order |
 | [`docs/INVARIANTS.md`](./docs/INVARIANTS.md) | The ten non-negotiable invariant acceptance specs (merge-blocking gates) |
+| [`docs/designs/`](./docs/designs) | Reviewed feature designs and product/UX specifications |
+| [`docs/plans/`](./docs/plans) | Executable implementation plans and validation checklists |
 | [`docs/diagrams/`](./docs/diagrams) | Mermaid architecture diagrams — C4, agent loop, sequences, ER, deployment |
 
 ## What Keel will do (highlights)
