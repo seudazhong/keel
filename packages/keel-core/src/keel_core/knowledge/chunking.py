@@ -51,8 +51,8 @@ class _Unit:
     is_fence: bool = False
 
     @property
-    def body_length(self) -> int:
-        return self.body_end - self.start
+    def emitted_length(self) -> int:
+        return self.end - self.start
 
 
 @dataclass(frozen=True, slots=True)
@@ -408,7 +408,7 @@ def _pack_units(
             )
             continue
 
-        if unit.is_fence and unit.body_length > target:
+        if unit.is_fence and unit.emitted_length > target:
             if current:
                 yield _span_for_units(current)
                 current = []
@@ -431,9 +431,8 @@ def _pack_units(
 
 
 def _requires_hard_split(unit: _Unit, target: int) -> bool:
-    if unit.is_fence:
-        return unit.body_length > target * _FENCE_HARD_LIMIT_MULTIPLIER
-    return unit.body_length > target
+    hard_limit = target * _FENCE_HARD_LIMIT_MULTIPLIER if unit.is_fence else target
+    return unit.emitted_length > hard_limit
 
 
 def _span_for_units(units: list[_Unit]) -> _ChunkSpan:
@@ -473,20 +472,29 @@ def _hard_split(
 ) -> Iterator[_ChunkSpan]:
     step = target - overlap
     start = unit.start
-    while start < unit.body_end:
+    next_non_whitespace = _NON_WHITESPACE_RE.search(content, start, unit.body_end)
+    while start < unit.body_end and next_non_whitespace is not None:
         body_end = min(start + target, unit.body_end)
         end = min(start + target, unit.end)
+        next_position = next_non_whitespace.start()
 
-        if _NON_WHITESPACE_RE.search(content, start, end) is not None:
-            yield _ChunkSpan(
-                start=start,
-                end=end,
-                heading_path=unit.heading_path,
-            )
+        if next_position >= end:
+            minimum_start = next_position - target + 1
+            skipped_steps = (minimum_start - start + step - 1) // step
+            start += skipped_steps * step
+            continue
+
+        yield _ChunkSpan(
+            start=start,
+            end=end,
+            heading_path=unit.heading_path,
+        )
 
         if body_end == unit.body_end:
             break
         start += step
+        if next_position < start:
+            next_non_whitespace = _NON_WHITESPACE_RE.search(content, start, unit.body_end)
 
 
 __all__ = ["chunk_document", "normalize_document_text"]

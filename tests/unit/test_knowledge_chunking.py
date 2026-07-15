@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import re
 import tracemalloc
 from collections.abc import Sequence
+from types import SimpleNamespace
 
 import pytest
 
+import keel_core.knowledge.chunking as chunking_module
 from keel_core.knowledge.chunking import chunk_document, normalize_document_text
 from keel_core.knowledge.models import (
     ChunkDraft,
@@ -304,6 +307,37 @@ def test_hard_split_omits_trailing_separator_that_would_exceed_target() -> None:
     _assert_valid_chunks(content, chunks)
 
 
+def test_unicode_blank_separator_triggers_bounded_plain_hard_split() -> None:
+    content = "A\n" + ("\u2003" * 10_000) + "\nTail"
+    target = 10
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.text,
+        target_chars=target,
+        overlap_chars=0,
+    )
+
+    assert [chunk.text.strip() for chunk in chunks] == ["A", "Tail"]
+    assert max(len(chunk.text) for chunk in chunks) <= target
+    _assert_valid_chunks(content, chunks)
+
+
+def test_unicode_blank_separator_cannot_expand_tiny_fence_past_hard_limit() -> None:
+    fence = "```\nx\n```"
+    content = fence + "\n" + ("\u2003" * 10_000) + "\nTail"
+    target = 10
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.markdown,
+        target_chars=target,
+        overlap_chars=0,
+    )
+
+    assert [chunk.text.strip() for chunk in chunks] == [fence, "Tail"]
+    assert max(len(chunk.text) for chunk in chunks) <= target
+    _assert_valid_chunks(content, chunks)
+
+
 def test_hard_split_near_mib_whitespace_gap_has_bounded_memory() -> None:
     content = "A" + (" " * (1024 * 1024 - 2)) + "B"
     target = 1_600
@@ -326,6 +360,46 @@ def test_hard_split_near_mib_whitespace_gap_has_bounded_memory() -> None:
     assert chunks[0].text.startswith("A")
     assert chunks[-1].char_end == len(content)
     assert chunks[-1].text.endswith("B")
+    _assert_valid_chunks(content, chunks)
+
+
+def test_hard_split_near_total_overlap_jumps_mib_whitespace_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    content = "A" + (" " * (1024 * 1024 - 2)) + "B"
+    target = 1_600
+    search_ranges: list[tuple[int, int]] = []
+    original_search = chunking_module._NON_WHITESPACE_RE.search
+
+    def bounded_search(value: str, start: int, end: int) -> re.Match[str] | None:
+        search_ranges.append((start, end))
+        assert len(search_ranges) <= 4
+        return original_search(value, start, end)
+
+    monkeypatch.setattr(
+        chunking_module,
+        "_NON_WHITESPACE_RE",
+        SimpleNamespace(search=bounded_search),
+    )
+
+    tracemalloc.start()
+    try:
+        chunks = chunk_document(
+            content,
+            KnowledgeSourceType.text,
+            target_chars=target,
+            overlap_chars=target - 1,
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert len(search_ranges) <= 4
+    assert peak < 32 * 1024 * 1024
+    assert [(chunk.char_start, chunk.char_end) for chunk in chunks] == [
+        (0, target),
+        (len(content) - target, len(content)),
+    ]
     _assert_valid_chunks(content, chunks)
 
 
