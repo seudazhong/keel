@@ -18,6 +18,7 @@ from keel_core.jobs import (
     JobLimits,
     JobResult,
     JobStatus,
+    JobTerminalIntent,
     JobValidationError,
     PostgresJobStore,
     _job_dedupe_lock_id,
@@ -56,6 +57,8 @@ async def test_jobs_migration_has_required_columns_checks_and_indexes(
     assert columns["scope_id"] == ("text", "NO")
     assert columns["payload"] == ("jsonb", "NO")
     assert columns["cancel_mode"] == ("text", "NO")
+    assert columns["terminal_intent"] == ("text", "YES")
+    assert columns["terminal_intent_at"] == ("timestamp with time zone", "YES")
     assert columns["attempt"] == ("integer", "NO")
     assert columns["lease_expires_at"] == ("timestamp with time zone", "YES")
     assert columns["progress_current"] == ("bigint", "NO")
@@ -83,6 +86,8 @@ async def test_jobs_migration_has_required_columns_checks_and_indexes(
         }
     assert "queued" in checks and "cancelled" in checks
     assert all(mode.value in checks for mode in CancelMode)
+    assert "terminal_intent" in checks
+    assert all(intent.value in checks for intent in JobTerminalIntent)
     assert "attempt >= 0" in checks
     assert "max_attempts >= 1" in checks
     assert {
@@ -1000,6 +1005,99 @@ async def test_postgres_running_cancel_freezes_at_final_attempt_lease_expiry(
     assert await store.get(cancelled_id) == requested
 
 
+async def test_postgres_failed_terminal_intent_is_bounded_immutable_and_not_reclaimable(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(
+        migrated_db,
+        "scope:terminal-intent:failed",
+        limits=JobLimits(error_message_max_chars=4),
+    )
+    job_id = await _pg_job(
+        store,
+        "failed-intent",
+        max_attempts=2,
+        cancel_mode=CancelMode.cooperative,
+    )
+    lease = await store.claim(job_id, _NOW, 10)
+    assert lease is not None
+    requested = await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+    assert requested is not None
+
+    reserved = await store.reserve_terminal(
+        lease,
+        JobTerminalIntent.failed,
+        now=_NOW + timedelta(seconds=2),
+        error=JobError("provider_timeout", "safe public message"),
+    )
+
+    assert reserved.status is JobStatus.running
+    assert reserved.terminal_intent is JobTerminalIntent.failed
+    assert reserved.terminal_intent_at == _NOW + timedelta(seconds=2)
+    assert reserved.error_kind == "provider_timeout"
+    assert reserved.error_message == "safe"
+    with pytest.raises(JobValidationError) as caught:
+        await store.request_cancel(job_id, _NOW + timedelta(seconds=3))
+    assert caught.value.code == "job_finalizing"
+    assert await store.get(job_id) == reserved
+    assert await store.dispatchable(_NOW + timedelta(seconds=10), 100) == []
+    assert await store.claim(job_id, _NOW + timedelta(seconds=10), 10) is None
+    assert await store.exhausted(_NOW + timedelta(seconds=10), 100) == [job_id]
+
+
+async def test_postgres_reserve_exhausted_atomically_freezes_exact_expiry(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:terminal-intent:exhausted")
+    cancelled_id = await _pg_job(
+        store,
+        "reserve-cancelled",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+    assert await store.claim(cancelled_id, _NOW, 10) is not None
+    await store.request_cancel(cancelled_id, _NOW + timedelta(seconds=9))
+
+    cancelled = await asyncio.gather(
+        store.reserve_exhausted(cancelled_id, _NOW + timedelta(seconds=10)),
+        store.reserve_exhausted(cancelled_id, _NOW + timedelta(seconds=10)),
+    )
+
+    assert all(row is not None for row in cancelled)
+    assert {row.terminal_intent for row in cancelled if row is not None} == {
+        JobTerminalIntent.cancelled
+    }
+    assert {row.terminal_intent_at for row in cancelled if row is not None} == {
+        _NOW + timedelta(seconds=10)
+    }
+
+    failed_id = await _pg_job(
+        store,
+        "reserve-failed",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+    assert await store.claim(failed_id, _NOW, 10) is not None
+    with pytest.raises(JobValidationError) as caught:
+        await store.request_cancel(failed_id, _NOW + timedelta(seconds=10))
+    assert caught.value.code == "job_finalizing"
+
+    failed = await asyncio.gather(
+        store.reserve_exhausted(failed_id, _NOW + timedelta(seconds=10)),
+        store.reserve_exhausted(failed_id, _NOW + timedelta(seconds=10)),
+    )
+
+    assert all(row is not None for row in failed)
+    assert {row.terminal_intent for row in failed if row is not None} == {JobTerminalIntent.failed}
+    assert {row.error_kind for row in failed if row is not None} == {"attempts_exhausted"}
+    with pytest.raises(JobValidationError) as after:
+        await store.request_cancel(failed_id, _NOW + timedelta(seconds=11))
+    assert after.value.code == "job_finalizing"
+    final = await store.get(failed_id)
+    assert final is not None
+    assert final.cancel_requested_at is None
+
+
 async def test_postgres_reclaimed_stale_lease_cannot_complete(
     migrated_db: AsyncEngine,
 ) -> None:
@@ -1107,7 +1205,12 @@ async def test_postgres_terminal_transition_injects_one_assistant_event(
             JobResult(data={}, message="duplicate"),
             terminal_at + timedelta(seconds=1),
         )
-    assert await store.request_cancel(job_id, terminal_at + timedelta(seconds=2)) == row
+    if terminal == "failed":
+        with pytest.raises(JobValidationError) as caught:
+            await store.request_cancel(job_id, terminal_at + timedelta(seconds=2))
+        assert caught.value.code == "job_finalizing"
+    else:
+        assert await store.request_cancel(job_id, terminal_at + timedelta(seconds=2)) == row
     assert len(await _job_events(migrated_db, scope, session_id, job_id)) == 1
 
 

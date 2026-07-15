@@ -47,6 +47,11 @@ class JobStatus(StrEnum):
     cancelled = "cancelled"
 
 
+class JobTerminalIntent(StrEnum):
+    failed = "failed"
+    cancelled = "cancelled"
+
+
 class CancelMode(StrEnum):
     immediate = "immediate"
     cooperative = "cooperative"
@@ -274,6 +279,8 @@ class JobRecord:
     lease_expires_at: datetime | None
     heartbeat_at: datetime | None
     cancel_requested_at: datetime | None
+    terminal_intent: JobTerminalIntent | None
+    terminal_intent_at: datetime | None
     progress_current: int
     progress_total: int | None
     progress_message: str | None
@@ -379,6 +386,19 @@ class JobStore(Protocol):
 
     async def request_cancel(self, job_id: str, now: datetime) -> JobRecord | None: ...
 
+    async def reserve_terminal(
+        self,
+        lease: JobLease,
+        intent: JobTerminalIntent,
+        *,
+        now: datetime,
+        error: JobError | None = None,
+    ) -> JobRecord: ...
+
+    async def finalize_terminal(self, lease: JobLease, now: datetime) -> JobRecord: ...
+    async def reserve_exhausted(self, job_id: str, now: datetime) -> JobRecord | None: ...
+    async def finalize_exhausted(self, job_id: str, now: datetime) -> JobRecord | None: ...
+
     async def requeue(
         self, lease: JobLease, error: JobError, retry_at: datetime, now: datetime
     ) -> JobRecord: ...
@@ -403,6 +423,34 @@ def _final_attempt_lease_expired(row: JobRecord, now: datetime) -> bool:
         and row.lease_expires_at is not None
         and row.lease_expires_at <= now
     )
+
+
+def _cancel_precedes_lease_expiry(row: JobRecord) -> bool:
+    return (
+        row.cancel_requested_at is not None
+        and row.lease_expires_at is not None
+        and row.cancel_requested_at < row.lease_expires_at
+    )
+
+
+def _attempts_exhausted_error() -> JobError:
+    return JobError(
+        "attempts_exhausted",
+        "job attempts were exhausted after worker lease expiry",
+    )
+
+
+def _reserved_failure_error(row: JobRecord) -> JobError:
+    if (
+        row.terminal_intent is not JobTerminalIntent.failed
+        or row.error_kind is None
+        or row.error_message is None
+    ):
+        raise JobValidationError(
+            "terminal_intent_invalid",
+            "failed terminal intent requires a persisted job error",
+        )
+    return JobError(row.error_kind, row.error_message)
 
 
 def _validated_identity(value: str, *, field: str, code: str) -> str:
@@ -511,6 +559,21 @@ def _validated_cancel_mode(value: object) -> CancelMode:
         ) from exc
 
 
+def _validated_terminal_intent(value: object) -> JobTerminalIntent:
+    if not isinstance(value, str):
+        raise JobValidationError(
+            "invalid_terminal_intent",
+            "terminal intent must be failed or cancelled",
+        )
+    try:
+        return JobTerminalIntent(value)
+    except (TypeError, ValueError) as exc:
+        raise JobValidationError(
+            "invalid_terminal_intent",
+            "terminal intent must be failed or cancelled",
+        ) from exc
+
+
 def _optional_read_identity(value: str, *, field: str, code: str) -> str | None:
     try:
         return _validated_identity(value, field=field, code=code)
@@ -547,6 +610,12 @@ def _to_job_record(row: Mapping[Any, Any]) -> JobRecord:
         lease_expires_at=row["lease_expires_at"],
         heartbeat_at=row["heartbeat_at"],
         cancel_requested_at=row["cancel_requested_at"],
+        terminal_intent=(
+            None
+            if row["terminal_intent"] is None
+            else JobTerminalIntent(str(row["terminal_intent"]))
+        ),
+        terminal_intent_at=row["terminal_intent_at"],
         progress_current=int(row["progress_current"]),
         progress_total=None if row["progress_total"] is None else int(row["progress_total"]),
         progress_message=row["progress_message"],
@@ -607,7 +676,13 @@ class InMemoryJobStore:
     def scope_id(self) -> str:
         return self._scope_id
 
-    def _owned(self, lease: JobLease, now: datetime) -> JobRecord:
+    def _owned(
+        self,
+        lease: JobLease,
+        now: datetime,
+        *,
+        allow_terminal_intent: bool = False,
+    ) -> JobRecord:
         row = self._rows.get(lease.job_id)
         if (
             row is None
@@ -618,7 +693,92 @@ class InMemoryJobStore:
             or row.lease_expires_at <= now
         ):
             raise JobLeaseLostError(lease.job_id)
+        if row.terminal_intent is not None and not allow_terminal_intent:
+            raise JobLeaseLostError(lease.job_id)
         return row
+
+    def _reserve_terminal_locked(
+        self,
+        row: JobRecord,
+        intent: JobTerminalIntent,
+        *,
+        now: datetime,
+        error: JobError | None = None,
+        require_cancel_request: bool = True,
+    ) -> JobRecord:
+        if row.terminal_intent is not None:
+            return row
+        if intent is JobTerminalIntent.cancelled:
+            if require_cancel_request and row.cancel_requested_at is None:
+                raise JobValidationError(
+                    "cancellation_not_requested",
+                    "job cancellation was not requested",
+                )
+            updated = replace(
+                row,
+                terminal_intent=intent,
+                terminal_intent_at=now,
+                updated_at=now,
+            )
+        else:
+            if error is None:
+                raise JobValidationError(
+                    "terminal_error_required",
+                    "failed terminal intent requires a job error",
+                )
+            safe_error = JobError(error.kind, self._limits.error_message(error.message))
+            updated = replace(
+                row,
+                terminal_intent=intent,
+                terminal_intent_at=now,
+                error_kind=safe_error.kind,
+                error_message=safe_error.message,
+                updated_at=now,
+            )
+        self._rows[row.id] = updated
+        return updated
+
+    def _reserve_exhausted_locked(self, row: JobRecord, now: datetime) -> JobRecord | None:
+        if (
+            row.status is not JobStatus.running
+            or row.lease_expires_at is None
+            or row.lease_expires_at > now
+        ):
+            return None
+        if row.terminal_intent is not None:
+            return row
+        if row.attempt < row.max_attempts:
+            return None
+        if _cancel_precedes_lease_expiry(row):
+            return self._reserve_terminal_locked(
+                row,
+                JobTerminalIntent.cancelled,
+                now=now,
+            )
+        return self._reserve_terminal_locked(
+            row,
+            JobTerminalIntent.failed,
+            now=now,
+            error=_attempts_exhausted_error(),
+        )
+
+    async def _finalize_reserved_locked(self, row: JobRecord, now: datetime) -> JobRecord:
+        if row.terminal_intent is None:
+            raise JobValidationError(
+                "terminal_intent_missing",
+                "job terminal intent has not been reserved",
+            )
+        error = (
+            _reserved_failure_error(row)
+            if row.terminal_intent is JobTerminalIntent.failed
+            else None
+        )
+        return await self._finalize_locked(
+            row,
+            status=JobStatus(row.terminal_intent.value),
+            now=now,
+            error=error,
+        )
 
     async def _finalize_locked(
         self,
@@ -720,6 +880,8 @@ class InMemoryJobStore:
                 lease_expires_at=None,
                 heartbeat_at=None,
                 cancel_requested_at=None,
+                terminal_intent=None,
+                terminal_intent_at=None,
                 progress_current=0,
                 progress_total=None,
                 progress_message=None,
@@ -774,7 +936,8 @@ class InMemoryJobStore:
             rows = [
                 row
                 for row in self._rows.values()
-                if row.attempt < row.max_attempts
+                if row.terminal_intent is None
+                and row.attempt < row.max_attempts
                 and (
                     (row.status is JobStatus.queued and row.next_attempt_at <= now)
                     or (
@@ -797,7 +960,7 @@ class InMemoryJobStore:
                 if row.status is JobStatus.running
                 and row.lease_expires_at is not None
                 and row.lease_expires_at <= now
-                and row.attempt >= row.max_attempts
+                and (row.terminal_intent is not None or row.attempt >= row.max_attempts)
             ]
             rows.sort(key=lambda row: (row.lease_expires_at, row.created_at, row.id))
             return [row.id for row in rows[:limit]]
@@ -812,7 +975,7 @@ class InMemoryJobStore:
         now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
             row = self._rows.get(job_id)
-            if row is None or row.attempt >= row.max_attempts:
+            if row is None or row.terminal_intent is not None or row.attempt >= row.max_attempts:
                 return None
             due_queued = row.status is JobStatus.queued and row.next_attempt_at <= now
             expired_running = (
@@ -906,17 +1069,24 @@ class InMemoryJobStore:
             row = self._rows.get(safe_job_id)
             if row is None:
                 return None
-            if _final_attempt_lease_expired(row, now):
-                if row.cancel_requested_at is not None:
-                    return _copy_record(row)
-                raise JobValidationError(
-                    "job_finalizing",
-                    "job is finalizing and cannot be cancelled",
-                )
             if row.cancel_mode is CancelMode.disabled:
                 raise JobValidationError(
                     "job_not_cancellable",
                     "job does not allow cancellation",
+                )
+            if row.terminal_intent is JobTerminalIntent.cancelled:
+                return _copy_record(row)
+            if row.terminal_intent is JobTerminalIntent.failed:
+                raise JobValidationError(
+                    "job_finalizing",
+                    "job is finalizing and cannot be cancelled",
+                )
+            if _final_attempt_lease_expired(row, now):
+                if _cancel_precedes_lease_expiry(row):
+                    return _copy_record(row)
+                raise JobValidationError(
+                    "job_finalizing",
+                    "job is finalizing and cannot be cancelled",
                 )
             if row.status is JobStatus.queued:
                 if row.cancel_mode is CancelMode.cooperative:
@@ -928,7 +1098,13 @@ class InMemoryJobStore:
                     )
                     self._rows[safe_job_id] = updated
                     return _copy_record(updated)
-                return await self._finalize_locked(row, status=JobStatus.cancelled, now=now)
+                reserved = self._reserve_terminal_locked(
+                    row,
+                    JobTerminalIntent.cancelled,
+                    now=now,
+                    require_cancel_request=False,
+                )
+                return await self._finalize_reserved_locked(reserved, now)
             if row.status is JobStatus.running:
                 updated = replace(
                     row,
@@ -938,6 +1114,55 @@ class InMemoryJobStore:
                 self._rows[safe_job_id] = updated
                 return _copy_record(updated)
             return _copy_record(row)
+
+    async def reserve_terminal(
+        self,
+        lease: JobLease,
+        intent: JobTerminalIntent,
+        *,
+        now: datetime,
+        error: JobError | None = None,
+    ) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
+        intent = _validated_terminal_intent(intent)
+        async with self._lock:
+            row = self._owned(lease, now, allow_terminal_intent=True)
+            reserved = self._reserve_terminal_locked(
+                row,
+                intent,
+                now=now,
+                error=error,
+            )
+            return _copy_record(reserved)
+
+    async def finalize_terminal(self, lease: JobLease, now: datetime) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._lock:
+            row = self._owned(lease, now, allow_terminal_intent=True)
+            return await self._finalize_reserved_locked(row, now)
+
+    async def reserve_exhausted(self, job_id: str, now: datetime) -> JobRecord | None:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._lock:
+            row = self._rows.get(job_id)
+            if row is None:
+                return None
+            reserved = self._reserve_exhausted_locked(row, now)
+            return None if reserved is None else _copy_record(reserved)
+
+    async def finalize_exhausted(self, job_id: str, now: datetime) -> JobRecord | None:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._lock:
+            row = self._rows.get(job_id)
+            if (
+                row is None
+                or row.status is not JobStatus.running
+                or row.lease_expires_at is None
+                or row.lease_expires_at > now
+                or row.terminal_intent is None
+            ):
+                return None
+            return await self._finalize_reserved_locked(row, now)
 
     async def requeue(
         self, lease: JobLease, error: JobError, retry_at: datetime, now: datetime
@@ -975,61 +1200,47 @@ class InMemoryJobStore:
     async def fail_terminal(self, lease: JobLease, error: JobError, now: datetime) -> JobRecord:
         now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
-            row = self._owned(lease, now)
-            return await self._finalize_locked(row, status=JobStatus.failed, now=now, error=error)
+            row = self._owned(lease, now, allow_terminal_intent=True)
+            reserved = self._reserve_terminal_locked(
+                row,
+                JobTerminalIntent.failed,
+                now=now,
+                error=error,
+            )
+            return await self._finalize_reserved_locked(reserved, now)
 
     async def finish_cancelled(self, lease: JobLease, now: datetime) -> JobRecord:
         now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
-            row = self._owned(lease, now)
-            if row.cancel_requested_at is None:
-                raise JobValidationError(
-                    "cancellation_not_requested",
-                    "job cancellation was not requested",
-                )
-            return await self._finalize_locked(row, status=JobStatus.cancelled, now=now)
+            row = self._owned(lease, now, allow_terminal_intent=True)
+            reserved = self._reserve_terminal_locked(
+                row,
+                JobTerminalIntent.cancelled,
+                now=now,
+            )
+            return await self._finalize_reserved_locked(reserved, now)
 
     async def fail_exhausted(self, job_id: str, now: datetime) -> JobRecord | None:
         now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
             row = self._rows.get(job_id)
-            if (
-                row is None
-                or row.status is not JobStatus.running
-                or row.lease_expires_at is None
-                or row.lease_expires_at > now
-                or row.attempt < row.max_attempts
-                or row.cancel_requested_at is not None
-            ):
+            if row is None:
                 return None
-            return await self._finalize_locked(
-                row,
-                status=JobStatus.failed,
-                now=now,
-                error=JobError(
-                    "attempts_exhausted",
-                    "job attempts were exhausted after worker lease expiry",
-                ),
-            )
+            reserved = self._reserve_exhausted_locked(row, now)
+            if reserved is None or reserved.terminal_intent is not JobTerminalIntent.failed:
+                return None
+            return await self._finalize_reserved_locked(reserved, now)
 
     async def finish_cancelled_exhausted(self, job_id: str, now: datetime) -> JobRecord | None:
         now = _normalized_utc_timestamp(now, field="now")
         async with self._lock:
             row = self._rows.get(job_id)
-            if (
-                row is None
-                or row.status is not JobStatus.running
-                or row.lease_expires_at is None
-                or row.lease_expires_at > now
-                or row.attempt < row.max_attempts
-                or row.cancel_requested_at is None
-            ):
+            if row is None:
                 return None
-            return await self._finalize_locked(
-                row,
-                status=JobStatus.cancelled,
-                now=now,
-            )
+            reserved = self._reserve_exhausted_locked(row, now)
+            if reserved is None or reserved.terminal_intent is not JobTerminalIntent.cancelled:
+                return None
+            return await self._finalize_reserved_locked(reserved, now)
 
 
 class PostgresJobStore:
@@ -1201,6 +1412,7 @@ class PostgresJobStore:
                     await conn.execute(
                         text(
                             "SELECT id FROM jobs WHERE scope_id = :scope "
+                            "AND terminal_intent IS NULL "
                             "AND attempt < max_attempts AND ("
                             "  (status = 'queued' AND next_attempt_at <= :now) OR "
                             "  (status = 'running' AND lease_expires_at <= :now)"
@@ -1225,7 +1437,7 @@ class PostgresJobStore:
                         text(
                             "SELECT id FROM jobs WHERE scope_id = :scope "
                             "AND status = 'running' AND lease_expires_at <= :now "
-                            "AND attempt >= max_attempts "
+                            "AND (terminal_intent IS NOT NULL OR attempt >= max_attempts) "
                             "ORDER BY lease_expires_at, created_at, id LIMIT :limit"
                         ),
                         {"scope": self._scope_id, "now": now, "limit": limit},
@@ -1260,6 +1472,7 @@ class PostgresJobStore:
                             "progress_updated_at = NULL, updated_at = :now, "
                             "started_at = COALESCE(started_at, :now) "
                             "WHERE id = :id AND scope_id = :scope "
+                            "AND terminal_intent IS NULL "
                             "AND attempt < max_attempts AND ("
                             "  (status = 'queued' AND next_attempt_at <= :now) OR "
                             "  (status = 'running' AND lease_expires_at <= :now)"
@@ -1292,7 +1505,12 @@ class PostgresJobStore:
         )
 
     async def _locked_owned_row(
-        self, conn: AsyncConnection, lease: JobLease, now: datetime
+        self,
+        conn: AsyncConnection,
+        lease: JobLease,
+        now: datetime,
+        *,
+        allow_terminal_intent: bool = False,
     ) -> Mapping[Any, Any]:
         if lease.scope_id != self._scope_id:
             raise JobLeaseLostError(lease.job_id)
@@ -1312,9 +1530,141 @@ class PostgresJobStore:
             or row["lease_token"] != lease.token
             or row["lease_expires_at"] is None
             or row["lease_expires_at"] <= now
+            or (row["terminal_intent"] is not None and not allow_terminal_intent)
         ):
             raise JobLeaseLostError(lease.job_id)
         return row
+
+    async def _reserve_terminal_in_transaction(
+        self,
+        conn: AsyncConnection,
+        locked: Mapping[Any, Any],
+        intent: JobTerminalIntent,
+        *,
+        now: datetime,
+        error: JobError | None = None,
+        require_cancel_request: bool = True,
+    ) -> Mapping[Any, Any]:
+        current = _to_job_record(locked)
+        if current.terminal_intent is not None:
+            return locked
+        if intent is JobTerminalIntent.cancelled:
+            if require_cancel_request and current.cancel_requested_at is None:
+                raise JobValidationError(
+                    "cancellation_not_requested",
+                    "job cancellation was not requested",
+                )
+            sql = text(
+                "UPDATE jobs SET terminal_intent = :intent, "
+                "terminal_intent_at = :now, updated_at = :now "
+                "WHERE id = :id AND scope_id = :scope RETURNING *"
+            )
+            params = {
+                "intent": intent.value,
+                "now": now,
+                "id": current.id,
+                "scope": self._scope_id,
+            }
+        else:
+            if error is None:
+                raise JobValidationError(
+                    "terminal_error_required",
+                    "failed terminal intent requires a job error",
+                )
+            safe_error = JobError(error.kind, self._limits.error_message(error.message))
+            sql = text(
+                "UPDATE jobs SET terminal_intent = :intent, "
+                "terminal_intent_at = :now, error_kind = :error_kind, "
+                "error_message = :error_message, updated_at = :now "
+                "WHERE id = :id AND scope_id = :scope RETURNING *"
+            )
+            params = {
+                "intent": intent.value,
+                "error_kind": safe_error.kind,
+                "error_message": safe_error.message,
+                "now": now,
+                "id": current.id,
+                "scope": self._scope_id,
+            }
+        return (await conn.execute(sql, params)).mappings().one()
+
+    async def _reserve_exhausted_in_transaction(
+        self,
+        conn: AsyncConnection,
+        job_id: str,
+        now: datetime,
+        *,
+        locked: Mapping[Any, Any] | None = None,
+    ) -> Mapping[Any, Any] | None:
+        if locked is None:
+            locked = (
+                (
+                    await conn.execute(
+                        text("SELECT * FROM jobs WHERE id = :id AND scope_id = :scope FOR UPDATE"),
+                        {"id": job_id, "scope": self._scope_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if locked is None:
+            return None
+        current = _to_job_record(locked)
+        if (
+            current.status is not JobStatus.running
+            or current.lease_expires_at is None
+            or current.lease_expires_at > now
+        ):
+            return None
+        if current.terminal_intent is not None:
+            return locked
+        if current.attempt < current.max_attempts:
+            return None
+        if _cancel_precedes_lease_expiry(current):
+            return await self._reserve_terminal_in_transaction(
+                conn,
+                locked,
+                JobTerminalIntent.cancelled,
+                now=now,
+            )
+        return await self._reserve_terminal_in_transaction(
+            conn,
+            locked,
+            JobTerminalIntent.failed,
+            now=now,
+            error=_attempts_exhausted_error(),
+        )
+
+    async def _finalize_reserved_in_transaction(
+        self,
+        conn: AsyncConnection,
+        locked: Mapping[Any, Any],
+        *,
+        now: datetime,
+        lease_token: str | None = None,
+        expired_intent: bool = False,
+    ) -> JobRecord | None:
+        current = _to_job_record(locked)
+        if current.terminal_intent is None:
+            raise JobValidationError(
+                "terminal_intent_missing",
+                "job terminal intent has not been reserved",
+            )
+        error = (
+            _reserved_failure_error(current)
+            if current.terminal_intent is JobTerminalIntent.failed
+            else None
+        )
+        return await self._finalize_in_transaction(
+            conn,
+            job_id=current.id,
+            status=JobStatus(current.terminal_intent.value),
+            now=now,
+            lease_token=lease_token,
+            error=error,
+            expired_intent=expired_intent,
+            locked=locked,
+        )
 
     async def heartbeat(self, lease: JobLease, now: datetime) -> bool:
         now = _normalized_utc_timestamp(now, field="now")
@@ -1446,7 +1796,7 @@ class PostgresJobStore:
         lease_token: str | None = None,
         result: JobResult | None = None,
         error: JobError | None = None,
-        exhaustion_cancel_requested: bool | None = None,
+        expired_intent: bool = False,
         locked: Mapping[str, Any] | None = None,
     ) -> JobRecord | None:
         if locked is None:
@@ -1464,13 +1814,12 @@ class PostgresJobStore:
         if locked is None:
             return None
         current = _to_job_record(locked)
-        if exhaustion_cancel_requested is not None:
+        if expired_intent:
             if (
                 current.status is not JobStatus.running
                 or current.lease_expires_at is None
                 or current.lease_expires_at > now
-                or current.attempt < current.max_attempts
-                or (current.cancel_requested_at is not None) is not exhaustion_cancel_requested
+                or current.terminal_intent is None
             ):
                 return None
         elif lease_token is not None:
@@ -1481,12 +1830,16 @@ class PostgresJobStore:
                 or current.lease_expires_at <= now
             ):
                 raise JobLeaseLostError(job_id)
-            if status is JobStatus.cancelled and current.cancel_requested_at is None:
-                raise JobValidationError(
-                    "cancellation_not_requested",
-                    "job cancellation was not requested",
-                )
         elif current.status is not JobStatus.queued:
+            raise JobLeaseLostError(job_id)
+        if status in {JobStatus.failed, JobStatus.cancelled}:
+            expected_intent = JobTerminalIntent(status.value)
+            if current.terminal_intent is not expected_intent:
+                raise JobValidationError(
+                    "terminal_intent_missing",
+                    "job terminal intent has not been reserved",
+                )
+        elif current.terminal_intent is not None:
             raise JobLeaseLostError(job_id)
 
         safe_result = None if result is None else self._limits.validate_result(result.data)
@@ -1571,17 +1924,24 @@ class PostgresJobStore:
             if locked is None:
                 return None
             record = _to_job_record(locked)
-            if _final_attempt_lease_expired(record, now):
-                if record.cancel_requested_at is not None:
-                    return record
-                raise JobValidationError(
-                    "job_finalizing",
-                    "job is finalizing and cannot be cancelled",
-                )
             if record.cancel_mode is CancelMode.disabled:
                 raise JobValidationError(
                     "job_not_cancellable",
                     "job does not allow cancellation",
+                )
+            if record.terminal_intent is JobTerminalIntent.cancelled:
+                return record
+            if record.terminal_intent is JobTerminalIntent.failed:
+                raise JobValidationError(
+                    "job_finalizing",
+                    "job is finalizing and cannot be cancelled",
+                )
+            if _final_attempt_lease_expired(record, now):
+                if _cancel_precedes_lease_expiry(record):
+                    return record
+                raise JobValidationError(
+                    "job_finalizing",
+                    "job is finalizing and cannot be cancelled",
                 )
             if record.status is JobStatus.queued:
                 if record.cancel_mode is CancelMode.cooperative:
@@ -1606,12 +1966,17 @@ class PostgresJobStore:
                         .one()
                     )
                     return _to_job_record(row)
-                return await self._finalize_in_transaction(
+                reserved = await self._reserve_terminal_in_transaction(
                     conn,
-                    job_id=safe_job_id,
-                    status=JobStatus.cancelled,
+                    locked,
+                    JobTerminalIntent.cancelled,
                     now=now,
-                    locked=locked,
+                    require_cancel_request=False,
+                )
+                return await self._finalize_reserved_in_transaction(
+                    conn,
+                    reserved,
+                    now=now,
                 )
             if record.status is JobStatus.running:
                 row = (
@@ -1635,6 +2000,95 @@ class PostgresJobStore:
                 )
                 return _to_job_record(row)
             return record
+
+    async def reserve_terminal(
+        self,
+        lease: JobLease,
+        intent: JobTerminalIntent,
+        *,
+        now: datetime,
+        error: JobError | None = None,
+    ) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
+        intent = _validated_terminal_intent(intent)
+        if lease.scope_id != self._scope_id:
+            raise JobLeaseLostError(lease.job_id)
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            locked = await self._locked_owned_row(
+                conn,
+                lease,
+                now,
+                allow_terminal_intent=True,
+            )
+            reserved = await self._reserve_terminal_in_transaction(
+                conn,
+                locked,
+                intent,
+                now=now,
+                error=error,
+            )
+        return _to_job_record(reserved)
+
+    async def finalize_terminal(self, lease: JobLease, now: datetime) -> JobRecord:
+        now = _normalized_utc_timestamp(now, field="now")
+        if lease.scope_id != self._scope_id:
+            raise JobLeaseLostError(lease.job_id)
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            locked = await self._locked_owned_row(
+                conn,
+                lease,
+                now,
+                allow_terminal_intent=True,
+            )
+            row = await self._finalize_reserved_in_transaction(
+                conn,
+                locked,
+                now=now,
+                lease_token=lease.token,
+            )
+        if row is None:
+            raise JobLeaseLostError(lease.job_id)
+        return row
+
+    async def reserve_exhausted(self, job_id: str, now: datetime) -> JobRecord | None:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            reserved = await self._reserve_exhausted_in_transaction(conn, job_id, now)
+        return None if reserved is None else _to_job_record(reserved)
+
+    async def finalize_exhausted(self, job_id: str, now: datetime) -> JobRecord | None:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            locked = (
+                (
+                    await conn.execute(
+                        text("SELECT * FROM jobs WHERE id = :id AND scope_id = :scope FOR UPDATE"),
+                        {"id": job_id, "scope": self._scope_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if locked is None:
+                return None
+            current = _to_job_record(locked)
+            if (
+                current.status is not JobStatus.running
+                or current.lease_expires_at is None
+                or current.lease_expires_at > now
+                or current.terminal_intent is None
+            ):
+                return None
+            return await self._finalize_reserved_in_transaction(
+                conn,
+                locked,
+                now=now,
+                expired_intent=True,
+            )
 
     async def succeed(self, lease: JobLease, result: JobResult, now: datetime) -> JobRecord:
         now = _normalized_utc_timestamp(now, field="now")
@@ -1660,13 +2114,24 @@ class PostgresJobStore:
             raise JobLeaseLostError(lease.job_id)
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            row = await self._finalize_in_transaction(
+            locked = await self._locked_owned_row(
                 conn,
-                job_id=lease.job_id,
-                status=JobStatus.failed,
+                lease,
+                now,
+                allow_terminal_intent=True,
+            )
+            reserved = await self._reserve_terminal_in_transaction(
+                conn,
+                locked,
+                JobTerminalIntent.failed,
+                now=now,
+                error=error,
+            )
+            row = await self._finalize_reserved_in_transaction(
+                conn,
+                reserved,
                 now=now,
                 lease_token=lease.token,
-                error=error,
             )
         if row is None:
             raise JobLeaseLostError(lease.job_id)
@@ -1678,10 +2143,21 @@ class PostgresJobStore:
             raise JobLeaseLostError(lease.job_id)
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            row = await self._finalize_in_transaction(
+            locked = await self._locked_owned_row(
                 conn,
-                job_id=lease.job_id,
-                status=JobStatus.cancelled,
+                lease,
+                now,
+                allow_terminal_intent=True,
+            )
+            reserved = await self._reserve_terminal_in_transaction(
+                conn,
+                locked,
+                JobTerminalIntent.cancelled,
+                now=now,
+            )
+            row = await self._finalize_reserved_in_transaction(
+                conn,
+                reserved,
                 now=now,
                 lease_token=lease.token,
             )
@@ -1693,28 +2169,34 @@ class PostgresJobStore:
         now = _normalized_utc_timestamp(now, field="now")
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            return await self._finalize_in_transaction(
+            reserved = await self._reserve_exhausted_in_transaction(conn, job_id, now)
+            if (
+                reserved is None
+                or _to_job_record(reserved).terminal_intent is not JobTerminalIntent.failed
+            ):
+                return None
+            return await self._finalize_reserved_in_transaction(
                 conn,
-                job_id=job_id,
-                status=JobStatus.failed,
+                reserved,
                 now=now,
-                error=JobError(
-                    "attempts_exhausted",
-                    "job attempts were exhausted after worker lease expiry",
-                ),
-                exhaustion_cancel_requested=False,
+                expired_intent=True,
             )
 
     async def finish_cancelled_exhausted(self, job_id: str, now: datetime) -> JobRecord | None:
         now = _normalized_utc_timestamp(now, field="now")
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            return await self._finalize_in_transaction(
+            reserved = await self._reserve_exhausted_in_transaction(conn, job_id, now)
+            if (
+                reserved is None
+                or _to_job_record(reserved).terminal_intent is not JobTerminalIntent.cancelled
+            ):
+                return None
+            return await self._finalize_reserved_in_transaction(
                 conn,
-                job_id=job_id,
-                status=JobStatus.cancelled,
+                reserved,
                 now=now,
-                exhaustion_cancel_requested=True,
+                expired_intent=True,
             )
 
 

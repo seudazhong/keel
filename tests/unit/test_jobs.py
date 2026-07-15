@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta, timezone
 
@@ -18,6 +19,7 @@ from keel_core.jobs import (
     JobLimits,
     JobResult,
     JobStatus,
+    JobTerminalIntent,
     JobValidationError,
     PermanentJobError,
     RetryableJobError,
@@ -65,6 +67,7 @@ def test_job_contracts_are_frozen_and_typed() -> None:
         "cooperative",
         "disabled",
     }
+    assert {intent.value for intent in JobTerminalIntent} == {"failed", "cancelled"}
 
 
 def test_public_handler_errors_keep_code_and_safe_message() -> None:
@@ -817,6 +820,92 @@ async def test_running_cancel_freezes_at_final_attempt_lease_expiry() -> None:
     assert await store.get(cancelled_id) == requested
 
 
+async def test_failed_terminal_intent_is_bounded_immutable_and_not_reclaimable() -> None:
+    store = InMemoryJobStore(
+        "web:local",
+        limits=JobLimits(error_message_max_chars=4),
+    )
+    job_id = await _queued(
+        store,
+        "failed-intent",
+        max_attempts=2,
+        cancel_mode=CancelMode.cooperative,
+    )
+    lease = await store.claim(job_id, _NOW, 10)
+    assert lease is not None
+    requested = await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+    assert requested is not None
+
+    reserved = await store.reserve_terminal(
+        lease,
+        JobTerminalIntent.failed,
+        now=_NOW + timedelta(seconds=2),
+        error=JobError("provider_timeout", "safe public message"),
+    )
+
+    assert reserved.status is JobStatus.running
+    assert reserved.terminal_intent is JobTerminalIntent.failed
+    assert reserved.terminal_intent_at == _NOW + timedelta(seconds=2)
+    assert reserved.error_kind == "provider_timeout"
+    assert reserved.error_message == "safe"
+    with pytest.raises(JobValidationError) as caught:
+        await store.request_cancel(job_id, _NOW + timedelta(seconds=3))
+    assert caught.value.code == "job_finalizing"
+    assert await store.get(job_id) == reserved
+    assert await store.dispatchable(_NOW + timedelta(seconds=10), 100) == []
+    assert await store.claim(job_id, _NOW + timedelta(seconds=10), 10) is None
+    assert await store.exhausted(_NOW + timedelta(seconds=10), 100) == [job_id]
+
+
+async def test_reserve_exhausted_atomically_freezes_the_exact_expiry_outcome() -> None:
+    store = InMemoryJobStore("web:local")
+    cancelled_id = await _queued(
+        store,
+        "reserve-cancelled-exhausted",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+    assert await store.claim(cancelled_id, _NOW, 10) is not None
+    await store.request_cancel(cancelled_id, _NOW + timedelta(seconds=9))
+
+    cancelled = await asyncio.gather(
+        store.reserve_exhausted(cancelled_id, _NOW + timedelta(seconds=10)),
+        store.reserve_exhausted(cancelled_id, _NOW + timedelta(seconds=10)),
+    )
+
+    assert all(row is not None for row in cancelled)
+    assert {row.terminal_intent for row in cancelled if row is not None} == {
+        JobTerminalIntent.cancelled
+    }
+    assert {row.terminal_intent_at for row in cancelled if row is not None} == {
+        _NOW + timedelta(seconds=10)
+    }
+    assert await store.request_cancel(cancelled_id, _NOW + timedelta(seconds=11)) == cancelled[0]
+
+    failed_id = await _queued(
+        store,
+        "reserve-failed-exhausted",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+    assert await store.claim(failed_id, _NOW, 10) is not None
+    with pytest.raises(JobValidationError) as caught:
+        await store.request_cancel(failed_id, _NOW + timedelta(seconds=10))
+    assert caught.value.code == "job_finalizing"
+
+    failed = await asyncio.gather(
+        store.reserve_exhausted(failed_id, _NOW + timedelta(seconds=10)),
+        store.reserve_exhausted(failed_id, _NOW + timedelta(seconds=11)),
+    )
+
+    assert all(row is not None for row in failed)
+    assert {row.terminal_intent for row in failed if row is not None} == {JobTerminalIntent.failed}
+    assert {row.terminal_intent_at for row in failed if row is not None} == {
+        _NOW + timedelta(seconds=10)
+    }
+    assert {row.error_kind for row in failed if row is not None} == {"attempts_exhausted"}
+
+
 async def test_observed_running_cancel_finishes_cancelled() -> None:
     store = InMemoryJobStore("web:local")
     job_id = await _queued(store, "cancel-observed")
@@ -969,7 +1058,12 @@ async def test_terminal_finalizers_inject_exactly_once_and_freeze_the_job(
             JobResult(data={}, message="again"),
             _NOW + timedelta(seconds=1),
         )
-    assert await store.request_cancel(job.id, _NOW + timedelta(seconds=2)) == result
+    if terminal == "failed":
+        with pytest.raises(JobValidationError) as caught:
+            await store.request_cancel(job.id, _NOW + timedelta(seconds=2))
+        assert caught.value.code == "job_finalizing"
+    else:
+        assert await store.request_cancel(job.id, _NOW + timedelta(seconds=2)) == result
     assert await store.get(job.id) == result
     injected = [
         event for event in events.snapshot("target") if event.payload.get("job_id") == job.id

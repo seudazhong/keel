@@ -31,6 +31,19 @@ def upgrade() -> None:
             CHECK (cancel_mode IN ('immediate', 'cooperative', 'disabled'))
         """
     )
+    op.execute(
+        """
+        ALTER TABLE jobs
+        ADD COLUMN terminal_intent text
+            CHECK (terminal_intent IN ('failed', 'cancelled')),
+        ADD COLUMN terminal_intent_at timestamptz,
+        ADD CONSTRAINT ck_jobs_terminal_intent_timestamp
+            CHECK (
+                (terminal_intent IS NULL AND terminal_intent_at IS NULL)
+                OR (terminal_intent IS NOT NULL AND terminal_intent_at IS NOT NULL)
+            )
+        """
+    )
 
     op.execute(
         """
@@ -224,4 +237,7 @@ def downgrade() -> None:
     op.execute("DROP TABLE IF EXISTS kb_document_versions")
     op.execute("DROP TABLE IF EXISTS kb_documents")
     op.execute("DROP TABLE IF EXISTS knowledge_bases")
+    op.execute("ALTER TABLE jobs DROP CONSTRAINT IF EXISTS ck_jobs_terminal_intent_timestamp")
+    op.execute("ALTER TABLE jobs DROP COLUMN IF EXISTS terminal_intent_at")
+    op.execute("ALTER TABLE jobs DROP COLUMN IF EXISTS terminal_intent")
     op.execute("ALTER TABLE jobs DROP COLUMN IF EXISTS cancel_mode")

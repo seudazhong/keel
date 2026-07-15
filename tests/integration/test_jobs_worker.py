@@ -23,8 +23,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from keel_core.config import Settings
 from keel_core.events import Event, EventType
 from keel_core.jobs import (
+    CancelMode,
+    JobError,
+    JobRecord,
     JobResult,
     JobStatus,
+    JobTerminalIntent,
     PermanentJobError,
     PostgresJobStore,
     RetryableJobError,
@@ -78,6 +82,7 @@ async def _job(
     target_session_id: str | None = None,
     max_attempts: int = 3,
     payload: dict[str, Any] | None = None,
+    cancel_mode: CancelMode = CancelMode.immediate,
 ) -> str:
     row, _ = await store.enqueue_once(
         kind="test.acceptance",
@@ -85,6 +90,7 @@ async def _job(
         target_session_id=target_session_id,
         idempotency_key=key,
         max_attempts=max_attempts,
+        cancel_mode=cancel_mode,
         now=_NOW,
     )
     return row.id
@@ -383,6 +389,7 @@ async def test_retryable_handler_uses_fresh_arq_workers_and_dispatcher_recovery(
             *args,
             _job_id=arq_job_id,
             _queue_name=queue_name,
+            _expires=timedelta(days=3650),
             **options,
         )
         assert delivery is not None
@@ -669,6 +676,197 @@ async def test_crash_at_attempt_ceiling_is_atomically_failed_and_injected(
     assert await dispatch_jobs(ctx) == 0
     assert await run_job(ctx, scope, job_id) == JobStatus.failed.value
     assert len(await _job_events(migrated_db, scope, session_id, job_id)) == 1
+
+
+async def test_failed_intent_beats_preexpiry_cancel_across_hook_expiry(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = f"accept:intent:failed:{uuid.uuid4().hex}"
+    session_id = f"target:{uuid.uuid4().hex}"
+    await _target(migrated_db, scope, session_id)
+    store = PostgresJobStore(migrated_db, scope)
+    registry = JobRegistry()
+    clock = _Clock()
+    hooks: list[str] = []
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        await store.request_cancel(context.job_id, _NOW + timedelta(seconds=1))
+        raise PermanentJobError("permanent", "Permanent failure.")
+
+    async def on_failed(row: JobRecord, error: JobError) -> None:
+        hooks.append(f"failed:{error.kind}")
+        if len(hooks) == 1:
+            clock.advance(11)
+
+    async def on_cancelled(row: JobRecord) -> None:
+        hooks.append("cancelled")
+
+    registry.register(
+        JobDefinition(
+            "test.acceptance",
+            handler,
+            max_attempts=2,
+            lease_seconds=10,
+            on_failed=on_failed,
+            on_cancelled=on_cancelled,
+        )
+    )
+    job_id = await _job(
+        store,
+        key="failed-intent-cancel-race",
+        target_session_id=session_id,
+        max_attempts=2,
+        cancel_mode=CancelMode.cooperative,
+    )
+    ctx = _ctx(store, registry, clock, _noop_enqueue)
+
+    assert await run_job(ctx, scope, job_id) == JobStatus.running.value
+    reserved = await store.get(job_id)
+    assert reserved is not None
+    assert reserved.terminal_intent is JobTerminalIntent.failed
+    assert reserved.error_kind == "permanent"
+
+    assert await dispatch_jobs(ctx) == 1
+    failed = await store.get(job_id)
+    assert failed is not None
+    assert failed.status is JobStatus.failed
+    assert hooks == ["failed:permanent", "failed:permanent"]
+    _assert_injection(
+        await _job_events(migrated_db, scope, session_id, job_id),
+        job_id=job_id,
+        status=JobStatus.failed,
+    )
+
+
+async def test_cancelled_intent_crosses_expiry_without_failed_hook(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = f"accept:intent:cancelled:{uuid.uuid4().hex}"
+    session_id = f"target:{uuid.uuid4().hex}"
+    await _target(migrated_db, scope, session_id)
+    store = PostgresJobStore(migrated_db, scope)
+    registry = JobRegistry()
+    clock = _Clock()
+    hooks: list[str] = []
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise AssertionError("cancelled job handler must not run")
+
+    async def on_cancelled(row: JobRecord) -> None:
+        hooks.append("cancelled")
+        if len(hooks) == 1:
+            clock.advance(11)
+
+    async def on_failed(row: JobRecord, error: JobError) -> None:
+        hooks.append(f"failed:{error.kind}")
+
+    registry.register(
+        JobDefinition(
+            "test.acceptance",
+            handler,
+            max_attempts=2,
+            lease_seconds=10,
+            on_failed=on_failed,
+            on_cancelled=on_cancelled,
+        )
+    )
+    job_id = await _job(
+        store,
+        key="cancelled-intent-expiry",
+        target_session_id=session_id,
+        max_attempts=2,
+        cancel_mode=CancelMode.cooperative,
+    )
+    await store.request_cancel(job_id, _NOW)
+    ctx = _ctx(store, registry, clock, _noop_enqueue)
+
+    assert await run_job(ctx, scope, job_id) == JobStatus.running.value
+    reserved = await store.get(job_id)
+    assert reserved is not None
+    assert reserved.terminal_intent is JobTerminalIntent.cancelled
+
+    assert await dispatch_jobs(ctx) == 1
+    cancelled = await store.get(job_id)
+    assert cancelled is not None
+    assert cancelled.status is JobStatus.cancelled
+    assert hooks == ["cancelled", "cancelled"]
+    _assert_injection(
+        await _job_events(migrated_db, scope, session_id, job_id),
+        job_id=job_id,
+        status=JobStatus.cancelled,
+    )
+
+
+async def test_hook_crash_reservation_is_replayed_by_concurrent_dispatchers_once(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = f"accept:intent:crash:{uuid.uuid4().hex}"
+    session_id = f"target:{uuid.uuid4().hex}"
+    await _target(migrated_db, scope, session_id)
+    store = PostgresJobStore(migrated_db, scope)
+    registry = JobRegistry()
+    clock = _Clock()
+    failed_calls = 0
+    cancelled_calls = 0
+    dispatcher_hooks = 0
+    both_dispatchers_reserved = asyncio.Event()
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise PermanentJobError("permanent", "Permanent failure.")
+
+    async def on_failed(row: JobRecord, error: JobError) -> None:
+        nonlocal dispatcher_hooks, failed_calls
+        failed_calls += 1
+        if failed_calls == 1:
+            raise RuntimeError("worker crashed in hook")
+        dispatcher_hooks += 1
+        if dispatcher_hooks == 2:
+            both_dispatchers_reserved.set()
+        await asyncio.wait_for(both_dispatchers_reserved.wait(), timeout=5)
+
+    async def on_cancelled(row: JobRecord) -> None:
+        nonlocal cancelled_calls
+        cancelled_calls += 1
+
+    registry.register(
+        JobDefinition(
+            "test.acceptance",
+            handler,
+            max_attempts=3,
+            lease_seconds=10,
+            on_failed=on_failed,
+            on_cancelled=on_cancelled,
+        )
+    )
+    job_id = await _job(
+        store,
+        key="hook-crash-reservation",
+        target_session_id=session_id,
+        max_attempts=3,
+    )
+    ctx = _ctx(store, registry, clock, _noop_enqueue)
+
+    with pytest.raises(RuntimeError, match="worker crashed in hook"):
+        await run_job(ctx, scope, job_id)
+    reserved = await store.get(job_id)
+    assert reserved is not None
+    assert reserved.terminal_intent is JobTerminalIntent.failed
+    assert reserved.error_kind == "permanent"
+
+    clock.advance(11)
+    finalized = await asyncio.gather(dispatch_jobs(ctx), dispatch_jobs(ctx))
+
+    assert sum(finalized) == 1
+    failed = await store.get(job_id)
+    assert failed is not None
+    assert failed.status is JobStatus.failed
+    assert failed_calls == 3
+    assert cancelled_calls == 0
+    _assert_injection(
+        await _job_events(migrated_db, scope, session_id, job_id),
+        job_id=job_id,
+        status=JobStatus.failed,
+    )
 
 
 async def test_cooperative_cancel_injects_once_without_provider_run_and_projects_next_turn(

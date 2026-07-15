@@ -22,6 +22,7 @@ from keel_core.jobs import (
     JobResult,
     JobStatus,
     JobStore,
+    JobTerminalIntent,
     JobValidationError,
     PermanentJobError,
     RetryableJobError,
@@ -189,23 +190,6 @@ async def _transition_or_current(
         return await _authoritative_status(store, job_id)
 
 
-async def _lease_hook_record(
-    store: JobStore,
-    lease: JobLease,
-    now: datetime,
-) -> JobRecord | None:
-    row = await store.get(lease.job_id)
-    if (
-        row is None
-        or row.status is not JobStatus.running
-        or row.lease_token != lease.token
-        or row.lease_expires_at is None
-        or row.lease_expires_at <= now
-    ):
-        return None
-    return row
-
-
 async def _call_cancelled_hook(
     definition: JobDefinition | None,
     row: JobRecord,
@@ -223,20 +207,49 @@ async def _call_failed_hook(
         await definition.on_failed(row, error)
 
 
+async def _call_reserved_hook(
+    definition: JobDefinition | None,
+    row: JobRecord,
+) -> None:
+    if row.terminal_intent is JobTerminalIntent.cancelled:
+        await _call_cancelled_hook(definition, row)
+        return
+    if (
+        row.terminal_intent is JobTerminalIntent.failed
+        and row.error_kind is not None
+        and row.error_message is not None
+    ):
+        await _call_failed_hook(
+            definition,
+            row,
+            JobError(row.error_kind, row.error_message),
+        )
+        return
+    raise JobValidationError(
+        "terminal_intent_invalid",
+        "reserved job terminal intent is incomplete",
+    )
+
+
 async def _finish_cancelled(
     store: JobStore,
     definition: JobDefinition,
     lease: JobLease,
     clock: JobClock,
 ) -> tuple[str, JobStatus | None]:
-    if definition.on_cancelled is not None:
-        row = await _lease_hook_record(store, lease, clock())
-        if row is not None:
-            await _call_cancelled_hook(definition, row)
+    try:
+        reserved = await store.reserve_terminal(
+            lease,
+            JobTerminalIntent.cancelled,
+            now=clock(),
+        )
+    except JobLeaseLostError:
+        return await _authoritative_status(store, lease.job_id)
+    await _call_reserved_hook(definition, reserved)
     return await _transition_or_current(
         store,
         lease.job_id,
-        store.finish_cancelled(lease, clock()),
+        store.finalize_terminal(lease, clock()),
     )
 
 
@@ -247,14 +260,20 @@ async def _fail_terminal(
     error: JobError,
     clock: JobClock,
 ) -> tuple[str, JobStatus | None]:
-    if definition.on_failed is not None:
-        row = await _lease_hook_record(store, lease, clock())
-        if row is not None:
-            await _call_failed_hook(definition, row, error)
+    try:
+        reserved = await store.reserve_terminal(
+            lease,
+            JobTerminalIntent.failed,
+            now=clock(),
+            error=error,
+        )
+    except JobLeaseLostError:
+        return await _authoritative_status(store, lease.job_id)
+    await _call_reserved_hook(definition, reserved)
     return await _transition_or_current(
         store,
         lease.job_id,
-        store.fail_terminal(lease, error, clock()),
+        store.finalize_terminal(lease, clock()),
     )
 
 
@@ -554,7 +573,8 @@ async def dispatch_jobs(ctx: dict[str, Any]) -> int:
 
     settings = ctx["job_settings"]
     registry: JobRegistry = ctx["job_registry"]
-    now = _clock(ctx)()
+    clock = _clock(ctx)
+    now = clock()
     limit = settings.job_dispatch_limit
     enqueue: EnqueueJob = ctx["enqueue"]
     processed = 0
@@ -576,24 +596,16 @@ async def dispatch_jobs(ctx: dict[str, Any]) -> int:
     exhausted_ids = await _without_exception_context(lambda: store.exhausted(now, limit))
     for job_id in exhausted_ids:
         try:
-            row = await _without_exception_context(partial(store.get, job_id))
-            if row is None:
+            reserved = await _without_exception_context(
+                partial(store.reserve_exhausted, job_id, clock())
+            )
+            if reserved is None:
                 continue
-            definition = registry.get(row.kind)
-            if row.cancel_requested_at is not None:
-                await _without_exception_context(partial(_call_cancelled_hook, definition, row))
-                finalized = await _without_exception_context(
-                    partial(store.finish_cancelled_exhausted, job_id, now)
-                )
-            else:
-                error = JobError(
-                    "attempts_exhausted",
-                    "job attempts were exhausted after worker lease expiry",
-                )
-                await _without_exception_context(partial(_call_failed_hook, definition, row, error))
-                finalized = await _without_exception_context(
-                    partial(store.fail_exhausted, job_id, now)
-                )
+            definition = registry.get(reserved.kind)
+            await _without_exception_context(partial(_call_reserved_hook, definition, reserved))
+            finalized = await _without_exception_context(
+                partial(store.finalize_exhausted, job_id, clock())
+            )
             if finalized is not None:
                 processed += 1
         except Exception as exc:

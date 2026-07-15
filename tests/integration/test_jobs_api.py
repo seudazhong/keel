@@ -12,7 +12,13 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from keel_core.jobs import CancelMode, JobStatus, PostgresJobStore
+from keel_core.jobs import (
+    CancelMode,
+    JobError,
+    JobStatus,
+    JobTerminalIntent,
+    PostgresJobStore,
+)
 from keel_server.api.v1 import router
 from keel_server.auth import parse_api_keys
 
@@ -182,6 +188,36 @@ async def test_final_attempt_expiry_cancel_maps_to_conflict_without_mutation(
     assert response.status_code == 409
     assert response.json()["detail"] == "job is finalizing and cannot be cancelled"
     assert await store.get(row.id) == before
+
+
+async def test_failed_terminal_reservation_cancel_maps_to_conflict(
+    jobs_client: tuple[httpx.AsyncClient, str, PostgresJobStore],
+) -> None:
+    client, _, store = jobs_client
+    claimed_at = datetime.now(UTC)
+    job_id = await _seed(
+        store,
+        "cancel-failed-reservation",
+        now=claimed_at,
+        cancel_mode=CancelMode.cooperative,
+    )
+    lease = await store.claim(job_id, claimed_at, 60)
+    assert lease is not None
+    reserved = await store.reserve_terminal(
+        lease,
+        JobTerminalIntent.failed,
+        now=claimed_at,
+        error=JobError("permanent", "Permanent failure."),
+    )
+
+    response = await client.post(
+        f"/v1/jobs/{job_id}/cancel",
+        headers={"X-API-Key": "op"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "job is finalizing and cannot be cancelled"
+    assert await store.get(job_id) == reserved
 
 
 async def test_cooperative_queued_cancel_response_stays_queued_and_exposes_mode(
