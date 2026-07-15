@@ -83,6 +83,7 @@ from .models import (
     validate_knowledge_version_id,
     validate_scope_id,
 )
+from .search import KnowledgeSearcher
 from .store import InMemoryKnowledgeStore, KnowledgeStore, PostgresKnowledgeStore
 
 __all__ = [
@@ -134,6 +135,7 @@ __all__ = [
     "KnowledgeResourceKind",
     "KnowledgeSearchCommand",
     "KnowledgeSearchMode",
+    "KnowledgeSearcher",
     "KnowledgeSearchStatus",
     "KnowledgeSourceType",
     "KnowledgeStorageError",
