@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tracemalloc
 from collections.abc import Sequence
 
 import pytest
@@ -66,6 +67,34 @@ def test_normalize_document_text_requires_strict_positive_max_bytes(max_bytes: o
 
 def test_normalize_document_text_accepts_exact_multibyte_boundary() -> None:
     assert normalize_document_text("🙂", max_bytes=4) == "🙂"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("\ufeff\ufeffText", "Text"),
+        (" \ufeffText", "Text"),
+        ("\ufeff \ufeff \tText", "Text"),
+        ("\n \ufeff\t\ufeff  Text", "Text"),
+        (" \ufeff \ufeffText \ufeff interior", "Text \ufeff interior"),
+    ],
+)
+def test_normalize_document_text_is_a_chunkable_fixed_point(
+    raw: str,
+    expected: str,
+) -> None:
+    normalized = normalize_document_text(raw, max_bytes=1024)
+
+    assert normalized == expected
+    assert normalize_document_text(normalized, max_bytes=1024) == normalized
+    for source_type in KnowledgeSourceType:
+        chunks = chunk_document(
+            normalized,
+            source_type,
+            target_chars=8,
+            overlap_chars=2,
+        )
+        _assert_valid_chunks(normalized, chunks)
 
 
 @pytest.mark.parametrize(
@@ -184,6 +213,49 @@ def test_oversized_plain_unit_hard_splits_with_character_overlap() -> None:
     _assert_valid_chunks(content, chunks)
 
 
+def test_hard_split_merges_default_sized_internal_whitespace_candidates() -> None:
+    content = "A" + (" " * 4_000) + "B"
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.text,
+        target_chars=1_600,
+        overlap_chars=200,
+    )
+
+    assert len(chunks) == 2
+    assert all(chunk.text.strip() for chunk in chunks)
+    _assert_valid_chunks(content, chunks)
+
+
+@pytest.mark.parametrize("whitespace_length", [8_000, 32_000])
+def test_hard_split_covers_long_whitespace_runs_without_blank_chunks(
+    whitespace_length: int,
+) -> None:
+    content = "A" + (" " * whitespace_length) + "B"
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.text,
+        target_chars=1_600,
+        overlap_chars=200,
+    )
+
+    assert all(chunk.text.strip() for chunk in chunks)
+    _assert_valid_chunks(content, chunks)
+
+
+def test_hard_split_merges_leading_whitespace_candidates_into_first_text_span() -> None:
+    content = "Lead.\n\n" + (" " * 8_000) + "Tail."
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.text,
+        target_chars=1_600,
+        overlap_chars=200,
+    )
+
+    assert all(chunk.text.strip() for chunk in chunks)
+    _assert_valid_chunks(content, chunks)
+
+
 def test_plain_text_target_boundary_and_zero_overlap() -> None:
     boundary = chunk_document(
         "甲乙🙂丙",
@@ -247,6 +319,72 @@ def test_markdown_heading_inside_matching_fence_is_not_parsed() -> None:
 
     assert [chunk.heading_path for chunk in chunks] == [("Guide",)]
     assert chunks[0].text == content
+
+
+def test_tab_indented_closing_fence_does_not_close_early() -> None:
+    content = "# Guide\n\n```md\ninside\n\t```\n## Hidden\n```\n\n## Visible\n\nAfter."
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.markdown,
+        target_chars=100,
+        overlap_chars=10,
+    )
+
+    assert [chunk.heading_path for chunk in chunks] == [
+        ("Guide",),
+        ("Guide", "Visible"),
+    ]
+    _assert_valid_chunks(content, chunks)
+
+
+def test_tab_indented_opening_fence_is_not_a_delimiter() -> None:
+    content = "# Root\n\n\t```md\n## This is a heading\n\t```\n\n## Visible\n\nAfter."
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.markdown,
+        target_chars=100,
+        overlap_chars=10,
+    )
+
+    assert [chunk.heading_path for chunk in chunks] == [
+        ("Root",),
+        ("Root", "This is a heading"),
+        ("Root", "Visible"),
+    ]
+    _assert_valid_chunks(content, chunks)
+
+
+def test_tab_indented_atx_heading_is_not_a_delimiter() -> None:
+    content = "# Root\n\n\t## Not a heading\nText.\n\n## Visible\n\nAfter."
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.markdown,
+        target_chars=100,
+        overlap_chars=10,
+    )
+
+    assert [chunk.heading_path for chunk in chunks] == [
+        ("Root",),
+        ("Root", "Visible"),
+    ]
+    _assert_valid_chunks(content, chunks)
+
+
+@pytest.mark.parametrize("indent", ["", " ", "  ", "   "])
+def test_zero_to_three_space_fences_and_headings_are_delimiters(indent: str) -> None:
+    content = f"# Root\n\n{indent}```md\n## Hidden\n{indent}```\n\n{indent}## Visible\n\nAfter."
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.markdown,
+        target_chars=100,
+        overlap_chars=10,
+    )
+
+    assert [chunk.heading_path for chunk in chunks] == [
+        ("Root",),
+        ("Root", "Visible"),
+    ]
+    _assert_valid_chunks(content, chunks)
 
 
 def test_unclosed_or_mismatched_fence_consumes_the_remainder() -> None:
@@ -369,3 +507,24 @@ def test_chunking_is_deterministic_across_repeated_runs() -> None:
     )
 
     assert first == second
+
+
+def test_tiny_paragraph_stress_has_bounded_peak_memory() -> None:
+    paragraph_count = 349_526
+    content = ("x\n\n" * (paragraph_count - 1)) + "x"
+    assert len(content) == 1024 * 1024
+
+    tracemalloc.start()
+    try:
+        chunks = chunk_document(
+            content,
+            KnowledgeSourceType.text,
+            target_chars=1_600,
+            overlap_chars=200,
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 32 * 1024 * 1024
+    _assert_valid_chunks(content, chunks)

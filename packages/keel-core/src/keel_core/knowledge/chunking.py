@@ -7,7 +7,9 @@ other oversized unit.
 
 from __future__ import annotations
 
+import io
 import re
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 
 from .models import (
@@ -21,10 +23,10 @@ from .models import (
 
 _UTF8_BOM = "\ufeff"
 _FENCE_HARD_LIMIT_MULTIPLIER = 4
-_ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}(?P<marks>#{1,6})(?:[ \t]+(?P<title>.*)|[ \t]*)$")
+_ATX_HEADING_RE = re.compile(r"^ {0,3}(?P<marks>#{1,6})(?:[ \t]+(?P<title>.*)|[ \t]*)$")
 _CLOSING_HEADING_MARKS_RE = re.compile(r"(?:^|[ \t]+)#+[ \t]*$")
-_FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(?P<marker>`{3,}|~{3,}).*$")
-_FENCE_CLOSE_RE = re.compile(r"^[ \t]{0,3}(?P<marker>`+|~+)[ \t]*$")
+_FENCE_OPEN_RE = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,}).*$")
+_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(?P<marker>`+|~+)[ \t]*$")
 _LIST_ITEM_RE = re.compile(r"^[ \t]*(?:[-+*](?:[ \t]+|$)|\d{1,9}[.)](?:[ \t]+|$))")
 
 
@@ -59,6 +61,26 @@ class _ChunkSpan:
     heading_path: tuple[str, ...]
 
 
+class _LineCursor:
+    def __init__(self, lines: Iterator[_Line]) -> None:
+        self._lines = lines
+        self._next: _Line | None = None
+        self._finished = False
+
+    def peek(self) -> _Line | None:
+        if self._next is None and not self._finished:
+            try:
+                self._next = next(self._lines)
+            except StopIteration:
+                self._finished = True
+        return self._next
+
+    def pop(self) -> _Line | None:
+        line = self.peek()
+        self._next = None
+        return line
+
+
 def normalize_document_text(value: str, *, max_bytes: int) -> str:
     """Return canonical storage-safe document text within ``max_bytes``."""
 
@@ -70,9 +92,24 @@ def normalize_document_text(value: str, *, max_bytes: int) -> str:
     except UnicodeEncodeError as exc:
         raise _invalid_content() from exc
 
-    normalized = value.removeprefix(_UTF8_BOM).replace("\r\n", "\n").replace("\r", "\n")
-    lines = [line.rstrip(" \t") for line in normalized.split("\n")]
-    normalized = "\n".join(_collapse_blank_lines(lines)).strip()
+    normalized_line_endings = value.replace("\r\n", "\n").replace("\r", "\n")
+    output = io.StringIO()
+    pending_blank_lines = 0
+    has_content = False
+    for line in _line_texts(normalized_line_endings):
+        line = line.rstrip(" \t")
+        if line == "":
+            if has_content:
+                pending_blank_lines += 1
+            continue
+        if has_content:
+            retained_blank_lines = 2 if pending_blank_lines > 3 else pending_blank_lines
+            output.write("\n" * (retained_blank_lines + 1))
+        output.write(line)
+        pending_blank_lines = 0
+        has_content = True
+
+    normalized = _strip_document_boundaries(output.getvalue())
 
     if not normalized:
         raise KnowledgeValidationError(
@@ -106,18 +143,21 @@ def chunk_document(
     else:
         units = _markdown_units(safe_content)
 
-    spans = _pack_units(units, target=target, overlap=overlap)
-    return [
-        ChunkDraft(
-            ordinal=ordinal,
-            text=safe_content[span.start : span.end],
-            char_start=span.start,
-            char_end=span.end,
-            content_hash=content_sha256(safe_content[span.start : span.end]),
-            heading_path=span.heading_path,
+    drafts: list[ChunkDraft] = []
+    spans = _pack_units(units, content=safe_content, target=target, overlap=overlap)
+    for ordinal, span in enumerate(spans):
+        text = safe_content[span.start : span.end]
+        drafts.append(
+            ChunkDraft(
+                ordinal=ordinal,
+                text=text,
+                char_start=span.start,
+                char_end=span.end,
+                content_hash=content_sha256(text),
+                heading_path=span.heading_path,
+            )
         )
-        for ordinal, span in enumerate(spans)
-    ]
+    return drafts
 
 
 def _invalid_content() -> KnowledgeValidationError:
@@ -127,20 +167,22 @@ def _invalid_content() -> KnowledgeValidationError:
     )
 
 
-def _collapse_blank_lines(lines: list[str]) -> list[str]:
-    collapsed: list[str] = []
-    blank_count = 0
-    for line in lines:
-        if line == "":
-            blank_count += 1
-            continue
-        if blank_count:
-            collapsed.extend("" for _ in range(2 if blank_count > 3 else blank_count))
-            blank_count = 0
-        collapsed.append(line)
-    if blank_count:
-        collapsed.extend("" for _ in range(2 if blank_count > 3 else blank_count))
-    return collapsed
+def _line_texts(content: str) -> Iterator[str]:
+    start = 0
+    while True:
+        newline = content.find("\n", start)
+        if newline == -1:
+            yield content[start:]
+            return
+        yield content[start:newline]
+        start = newline + 1
+
+
+def _strip_document_boundaries(value: str) -> str:
+    start = 0
+    while start < len(value) and (value[start] == _UTF8_BOM or value[start].isspace()):
+        start += 1
+    return value[start:].rstrip()
 
 
 def _validate_chunk_settings(target_chars: object, overlap_chars: object) -> tuple[int, int]:
@@ -156,26 +198,31 @@ def _validate_chunk_settings(target_chars: object, overlap_chars: object) -> tup
 def _validate_normalized_content(content: object) -> str:
     if not isinstance(content, str) or "\x00" in content:
         raise _invalid_content()
-    try:
-        encoded = content.encode("utf-8")
-    except UnicodeEncodeError as exc:
-        raise _invalid_content() from exc
 
-    if normalize_document_text(content, max_bytes=max(1, len(encoded))) != content:
+    if normalize_document_text(content, max_bytes=max(1, len(content) * 4)) != content:
         raise _invalid_content()
     return content
 
 
-def _document_lines(content: str) -> list[_Line]:
-    parts = content.split("\n")
-    lines: list[_Line] = []
+def _document_lines(content: str) -> Iterator[_Line]:
     start = 0
-    for index, text in enumerate(parts):
-        content_end = start + len(text)
-        end = content_end + (1 if index < len(parts) - 1 else 0)
-        lines.append(_Line(start=start, content_end=content_end, end=end, text=text))
-        start = end
-    return lines
+    while True:
+        newline = content.find("\n", start)
+        if newline == -1:
+            yield _Line(
+                start=start,
+                content_end=len(content),
+                end=len(content),
+                text=content[start:],
+            )
+            return
+        yield _Line(
+            start=start,
+            content_end=newline,
+            end=newline + 1,
+            text=content[start:newline],
+        )
+        start = newline + 1
 
 
 def _is_blank(line: _Line) -> bool:
@@ -183,68 +230,67 @@ def _is_blank(line: _Line) -> bool:
 
 
 def _make_unit(
-    lines: list[_Line],
-    start_index: int,
-    block_end_index: int,
+    cursor: _LineCursor,
+    first_line: _Line,
+    last_line: _Line,
     heading_path: tuple[str, ...],
     section: int,
     *,
     is_fence: bool = False,
-) -> tuple[_Unit, int]:
-    next_index = block_end_index
-    while next_index < len(lines) and _is_blank(lines[next_index]):
-        next_index += 1
+) -> _Unit:
+    end = last_line.end
+    following = cursor.peek()
+    while following is not None and _is_blank(following):
+        cursor.pop()
+        end = following.end
+        following = cursor.peek()
 
-    last_index = next_index - 1 if next_index > block_end_index else block_end_index - 1
-    return (
-        _Unit(
-            start=lines[start_index].start,
-            body_end=lines[block_end_index - 1].content_end,
-            end=lines[last_index].end,
-            heading_path=heading_path,
-            section=section,
-            is_fence=is_fence,
-        ),
-        next_index,
+    return _Unit(
+        start=first_line.start,
+        body_end=last_line.content_end,
+        end=end,
+        heading_path=heading_path,
+        section=section,
+        is_fence=is_fence,
     )
 
 
-def _plain_text_units(content: str) -> list[_Unit]:
-    lines = _document_lines(content)
-    units: list[_Unit] = []
-    index = 0
-    while index < len(lines):
-        block_end = index + 1
-        while block_end < len(lines) and not _is_blank(lines[block_end]):
-            block_end += 1
-        unit, index = _make_unit(lines, index, block_end, (), 0)
-        units.append(unit)
-    return units
+def _plain_text_units(content: str) -> Iterator[_Unit]:
+    cursor = _LineCursor(_document_lines(content))
+    first_line = cursor.pop()
+    while first_line is not None:
+        last_line = first_line
+        following = cursor.peek()
+        while following is not None and not _is_blank(following):
+            cursor.pop()
+            last_line = following
+            following = cursor.peek()
+        yield _make_unit(cursor, first_line, last_line, (), 0)
+        first_line = cursor.pop()
 
 
-def _markdown_units(content: str) -> list[_Unit]:
-    lines = _document_lines(content)
-    units: list[_Unit] = []
+def _markdown_units(content: str) -> Iterator[_Unit]:
+    cursor = _LineCursor(_document_lines(content))
     heading_stack: list[tuple[int, str]] = []
     section = 0
-    index = 0
+    first_line = cursor.pop()
 
-    while index < len(lines):
-        opening_fence = _opening_fence(lines[index].text)
+    while first_line is not None:
+        opening_fence = _opening_fence(first_line.text)
         if opening_fence is not None:
-            block_end = _fence_end(lines, index, opening_fence)
-            unit, index = _make_unit(
-                lines,
-                index,
-                block_end,
+            last_line = _fence_end(cursor, first_line, opening_fence)
+            yield _make_unit(
+                cursor,
+                first_line,
+                last_line,
                 _heading_path(heading_stack),
                 section,
                 is_fence=True,
             )
-            units.append(unit)
+            first_line = cursor.pop()
             continue
 
-        heading = _atx_heading(lines[index].text)
+        heading = _atx_heading(first_line.text)
         if heading is not None:
             level, title = heading
             while heading_stack and heading_stack[-1][0] >= level:
@@ -252,46 +298,38 @@ def _markdown_units(content: str) -> list[_Unit]:
             if title:
                 heading_stack.append((level, title))
             section += 1
-            unit, index = _make_unit(
-                lines,
-                index,
-                index + 1,
+            yield _make_unit(
+                cursor,
+                first_line,
+                first_line,
                 _heading_path(heading_stack),
                 section,
             )
-            units.append(unit)
+            first_line = cursor.pop()
             continue
 
-        if _is_list_item(lines[index].text):
-            block_end = index + 1
-            while block_end < len(lines) and not _is_blank(lines[block_end]):
-                if (
-                    _opening_fence(lines[block_end].text) is not None
-                    or _atx_heading(lines[block_end].text) is not None
-                ):
-                    break
-                block_end += 1
-        else:
-            block_end = index + 1
-            while block_end < len(lines) and not _is_blank(lines[block_end]):
-                if (
-                    _opening_fence(lines[block_end].text) is not None
-                    or _atx_heading(lines[block_end].text) is not None
-                    or _is_list_item(lines[block_end].text)
-                ):
-                    break
-                block_end += 1
+        is_list_block = _is_list_item(first_line.text)
+        last_line = first_line
+        following = cursor.peek()
+        while following is not None and not _is_blank(following):
+            if (
+                _opening_fence(following.text) is not None
+                or _atx_heading(following.text) is not None
+                or (not is_list_block and _is_list_item(following.text))
+            ):
+                break
+            cursor.pop()
+            last_line = following
+            following = cursor.peek()
 
-        unit, index = _make_unit(
-            lines,
-            index,
-            block_end,
+        yield _make_unit(
+            cursor,
+            first_line,
+            last_line,
             _heading_path(heading_stack),
             section,
         )
-        units.append(unit)
-
-    return units
+        first_line = cursor.pop()
 
 
 def _heading_path(stack: list[tuple[int, str]]) -> tuple[str, ...]:
@@ -316,47 +354,59 @@ def _opening_fence(line: str) -> tuple[str, int] | None:
 
 
 def _fence_end(
-    lines: list[_Line],
-    start_index: int,
+    cursor: _LineCursor,
+    opening_line: _Line,
     opening_fence: tuple[str, int],
-) -> int:
+) -> _Line:
     marker_character, marker_length = opening_fence
-    index = start_index + 1
-    while index < len(lines):
-        match = _FENCE_CLOSE_RE.fullmatch(lines[index].text)
+    last_line = opening_line
+    line = cursor.pop()
+    while line is not None:
+        last_line = line
+        match = _FENCE_CLOSE_RE.fullmatch(line.text)
         if match is not None:
             marker = match.group("marker")
             if marker[0] == marker_character and len(marker) >= marker_length:
-                return index + 1
-        index += 1
-    return len(lines)
+                return line
+        line = cursor.pop()
+    return last_line
 
 
 def _is_list_item(line: str) -> bool:
     return _LIST_ITEM_RE.match(line) is not None
 
 
-def _pack_units(units: list[_Unit], *, target: int, overlap: int) -> list[_ChunkSpan]:
-    spans: list[_ChunkSpan] = []
+def _pack_units(
+    units: Iterable[_Unit],
+    *,
+    content: str,
+    target: int,
+    overlap: int,
+) -> Iterator[_ChunkSpan]:
     current: list[_Unit] = []
 
     for unit in units:
         if current and current[-1].section != unit.section:
-            spans.append(_span_for_units(current))
+            yield _span_for_units(current)
             current = []
 
         if _requires_hard_split(unit, target):
             if current:
-                spans.append(_span_for_units(current))
+                yield _span_for_units(current)
                 current = []
-            spans.extend(_hard_split(unit, target=target, overlap=overlap))
+            yield from _hard_split(
+                content,
+                unit,
+                target=target,
+                overlap=overlap,
+            )
             continue
 
         if unit.is_fence and unit.body_length > target:
             if current:
-                spans.append(_span_for_units(current))
+                yield _span_for_units(current)
                 current = []
-            spans.append(_span_for_units([unit]))
+            yield _span_for_units([unit])
             continue
 
         if not current:
@@ -367,12 +417,11 @@ def _pack_units(units: list[_Unit], *, target: int, overlap: int) -> list[_Chunk
             current.append(unit)
             continue
 
-        spans.append(_span_for_units(current))
+        yield _span_for_units(current)
         current = [*_overlap_units(current, unit, target=target, overlap=overlap), unit]
 
     if current:
-        spans.append(_span_for_units(current))
-    return spans
+        yield _span_for_units(current)
 
 
 def _requires_hard_split(unit: _Unit, target: int) -> bool:
@@ -409,24 +458,42 @@ def _overlap_units(
     return current[selected_start:]
 
 
-def _hard_split(unit: _Unit, *, target: int, overlap: int) -> list[_ChunkSpan]:
-    spans: list[_ChunkSpan] = []
+def _hard_split(
+    content: str,
+    unit: _Unit,
+    *,
+    target: int,
+    overlap: int,
+) -> Iterator[_ChunkSpan]:
     step = target - overlap
     start = unit.start
+    pending: _ChunkSpan | None = None
     while start < unit.body_end:
         body_end = min(start + target, unit.body_end)
         end = unit.end if body_end == unit.body_end else body_end
-        spans.append(
-            _ChunkSpan(
-                start=start,
+
+        if content[start:body_end].strip():
+            span_start = unit.start if pending is None else start
+            if pending is not None:
+                yield pending
+            pending = _ChunkSpan(
+                start=span_start,
                 end=end,
                 heading_path=unit.heading_path,
             )
-        )
+        elif pending is not None:
+            pending = _ChunkSpan(
+                start=pending.start,
+                end=max(pending.end, end),
+                heading_path=pending.heading_path,
+            )
+
         if body_end == unit.body_end:
             break
         start += step
-    return spans
+
+    if pending is not None:
+        yield pending
 
 
 __all__ = ["chunk_document", "normalize_document_text"]
