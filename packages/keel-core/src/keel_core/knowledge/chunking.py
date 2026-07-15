@@ -51,6 +51,10 @@ class _Unit:
     is_fence: bool = False
 
     @property
+    def body_length(self) -> int:
+        return self.body_end - self.start
+
+    @property
     def emitted_length(self) -> int:
         return self.end - self.start
 
@@ -412,7 +416,7 @@ def _pack_units(
             if current:
                 yield _span_for_units(current)
                 current = []
-            yield _span_for_units([unit])
+            yield _span_for_whole_fence(unit, target=target)
             continue
 
         if not current:
@@ -431,8 +435,9 @@ def _pack_units(
 
 
 def _requires_hard_split(unit: _Unit, target: int) -> bool:
-    hard_limit = target * _FENCE_HARD_LIMIT_MULTIPLIER if unit.is_fence else target
-    return unit.emitted_length > hard_limit
+    if unit.is_fence:
+        return unit.body_length > target * _FENCE_HARD_LIMIT_MULTIPLIER
+    return unit.emitted_length > target
 
 
 def _span_for_units(units: list[_Unit]) -> _ChunkSpan:
@@ -440,6 +445,14 @@ def _span_for_units(units: list[_Unit]) -> _ChunkSpan:
         start=units[0].start,
         end=units[-1].end,
         heading_path=units[0].heading_path,
+    )
+
+
+def _span_for_whole_fence(unit: _Unit, *, target: int) -> _ChunkSpan:
+    return _ChunkSpan(
+        start=unit.start,
+        end=min(unit.end, max(unit.body_end, unit.start + target)),
+        heading_path=unit.heading_path,
     )
 
 

@@ -560,6 +560,54 @@ def test_fenced_code_is_indivisible_until_four_target_hard_limit() -> None:
     assert [chunk.text for chunk in chunks] == [content]
 
 
+def test_fence_body_at_four_target_limit_stays_whole_before_tail() -> None:
+    target = 10
+    fence = "```\n" + ("x" * 32) + "\n```"
+    content = fence + "\nTail"
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.markdown,
+        target_chars=target,
+        overlap_chars=0,
+    )
+
+    assert len(fence) == 4 * target
+    assert [chunk.text for chunk in chunks] == [fence, "Tail"]
+    _assert_valid_chunks(content, chunks)
+
+
+def test_fence_body_one_over_four_target_limit_hard_splits() -> None:
+    target = 10
+    content = "```\n" + ("x" * 33) + "\n```"
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.markdown,
+        target_chars=target,
+        overlap_chars=0,
+    )
+
+    assert len(content) == 4 * target + 1
+    assert len(chunks) > 1
+    assert all(0 < len(chunk.text) <= target for chunk in chunks)
+    _assert_valid_chunks(content, chunks)
+
+
+def test_whole_fence_caps_owned_unicode_whitespace_separator() -> None:
+    target = 10
+    fence = "```\n" + ("x" * 12) + "\n```"
+    content = fence + "\n" + ("\u2003" * 100) + "\nTail"
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.markdown,
+        target_chars=target,
+        overlap_chars=0,
+    )
+
+    assert target < len(fence) < 4 * target
+    assert [chunk.text for chunk in chunks] == [fence, "Tail"]
+    _assert_valid_chunks(content, chunks)
+
+
 def test_fenced_code_above_hard_limit_uses_deterministic_hard_splits() -> None:
     content = "```\n" + "x" * 40 + "\n```"
     chunks = chunk_document(
