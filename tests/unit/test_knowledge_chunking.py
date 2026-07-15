@@ -18,21 +18,32 @@ def _assert_valid_chunks(content: str, chunks: Sequence[ChunkDraft]) -> None:
     assert chunks
     assert [chunk.ordinal for chunk in chunks] == list(range(len(chunks)))
 
+    covered = bytearray(len(content))
     covered_until = 0
     previous_start = -1
+    spans: set[tuple[int, int]] = set()
     for chunk in chunks:
         assert chunk.text
         assert chunk.text.strip()
+        assert 0 <= chunk.char_start < chunk.char_end <= len(content)
         assert chunk.text == content[chunk.char_start : chunk.char_end]
         assert chunk.content_hash == content_sha256(chunk.text)
         assert isinstance(chunk.heading_path, tuple)
-        assert chunk.char_start >= previous_start
-        assert chunk.char_start <= covered_until
+        assert chunk.char_start > previous_start
+        assert chunk.char_end > covered_until
+        span = (chunk.char_start, chunk.char_end)
+        assert span not in spans
+        spans.add(span)
+
+        if chunk.char_start > covered_until:
+            assert not content[covered_until : chunk.char_start].strip()
+        covered[chunk.char_start : chunk.char_end] = b"\x01" * (chunk.char_end - chunk.char_start)
         covered_until = max(covered_until, chunk.char_end)
         previous_start = chunk.char_start
 
-    assert chunks[0].char_start == 0
-    assert covered_until == len(content)
+    if covered_until < len(content):
+        assert not content[covered_until:].strip()
+    assert all(character.isspace() or covered[index] for index, character in enumerate(content))
 
 
 def test_normalize_document_text_applies_canonical_transformations() -> None:
@@ -213,46 +224,108 @@ def test_oversized_plain_unit_hard_splits_with_character_overlap() -> None:
     _assert_valid_chunks(content, chunks)
 
 
-def test_hard_split_merges_default_sized_internal_whitespace_candidates() -> None:
+def test_hard_split_skips_whitespace_only_candidate_windows() -> None:
     content = "A" + (" " * 4_000) + "B"
+    target = 1_600
     chunks = chunk_document(
         content,
         KnowledgeSourceType.text,
-        target_chars=1_600,
+        target_chars=target,
         overlap_chars=200,
     )
 
     assert len(chunks) == 2
-    assert all(chunk.text.strip() for chunk in chunks)
+    assert max(len(chunk.text) for chunk in chunks) <= target
+    assert chunks[0].text.startswith("A")
+    assert chunks[-1].text.endswith("B")
     _assert_valid_chunks(content, chunks)
 
 
-@pytest.mark.parametrize("whitespace_length", [8_000, 32_000])
-def test_hard_split_covers_long_whitespace_runs_without_blank_chunks(
-    whitespace_length: int,
-) -> None:
-    content = "A" + (" " * whitespace_length) + "B"
+def test_hard_split_skips_8000_space_gap_with_bounded_chunks() -> None:
+    content = "A" + (" " * 8_000) + "B"
+    target = 1_600
     chunks = chunk_document(
         content,
         KnowledgeSourceType.text,
-        target_chars=1_600,
+        target_chars=target,
         overlap_chars=200,
     )
 
-    assert all(chunk.text.strip() for chunk in chunks)
+    assert max(len(chunk.text) for chunk in chunks) <= target
+    assert chunks[0].char_start == 0
+    assert chunks[0].text.startswith("A")
+    assert chunks[-1].char_end == len(content)
+    assert chunks[-1].text.endswith("B")
     _assert_valid_chunks(content, chunks)
 
 
-def test_hard_split_merges_leading_whitespace_candidates_into_first_text_span() -> None:
+def test_hard_split_overlap_covers_every_non_whitespace_island() -> None:
+    content = "A" + ("\u2003" * 70) + "B" + ("\u2003" * 70) + "C"
+    target = 32
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.text,
+        target_chars=target,
+        overlap_chars=7,
+    )
+
+    assert max(len(chunk.text) for chunk in chunks) <= target
+    assert [chunk.text.strip() for chunk in chunks] == ["A", "B", "C"]
+    _assert_valid_chunks(content, chunks)
+
+
+def test_hard_split_skips_leading_whitespace_candidates_before_text() -> None:
     content = "Lead.\n\n" + (" " * 8_000) + "Tail."
+    target = 1_600
     chunks = chunk_document(
         content,
         KnowledgeSourceType.text,
-        target_chars=1_600,
+        target_chars=target,
         overlap_chars=200,
     )
 
-    assert all(chunk.text.strip() for chunk in chunks)
+    assert max(len(chunk.text) for chunk in chunks) <= target
+    assert [chunk.text.strip() for chunk in chunks] == ["Lead.", "Tail."]
+    _assert_valid_chunks(content, chunks)
+
+
+def test_hard_split_omits_trailing_separator_that_would_exceed_target() -> None:
+    content = "abcdefgh\n\nTail"
+    target = 4
+    chunks = chunk_document(
+        content,
+        KnowledgeSourceType.text,
+        target_chars=target,
+        overlap_chars=0,
+    )
+
+    assert [chunk.text for chunk in chunks] == ["abcd", "efgh", "Tail"]
+    assert max(len(chunk.text) for chunk in chunks) <= target
+    _assert_valid_chunks(content, chunks)
+
+
+def test_hard_split_near_mib_whitespace_gap_has_bounded_memory() -> None:
+    content = "A" + (" " * (1024 * 1024 - 2)) + "B"
+    target = 1_600
+
+    tracemalloc.start()
+    try:
+        chunks = chunk_document(
+            content,
+            KnowledgeSourceType.text,
+            target_chars=target,
+            overlap_chars=200,
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 32 * 1024 * 1024
+    assert max(len(chunk.text) for chunk in chunks) <= target
+    assert chunks[0].char_start == 0
+    assert chunks[0].text.startswith("A")
+    assert chunks[-1].char_end == len(content)
+    assert chunks[-1].text.endswith("B")
     _assert_valid_chunks(content, chunks)
 
 

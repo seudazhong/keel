@@ -597,6 +597,12 @@ def test_chunking_is_byte_stable() -> None:
     assert first == second
 ```
 
+The shared chunk invariant must keep ordinal/order/overlap/hash/exact-substring checks, assert every
+non-whitespace index is covered, and allow a gap only when `gap.strip()` is empty. Add regressions
+for `A + 8_000 spaces + B`, overlap-stepped non-whitespace islands, a trailing blank separator, and a
+near-1 MiB whitespace run with bounded peak memory. Assert no empty, whitespace-only, or duplicate
+chunks and `len(chunk.text) <= target_chars` for emitted hard splits.
+
 - [ ] **Step 2: Implement normalization**
 
 Normalize BOM/CRLF/trailing whitespace/blank-line runs/document ends, then enforce blank/NUL/surrogate/UTF-8 byte limits. Offsets always refer to the returned normalized string.
@@ -604,6 +610,14 @@ Normalize BOM/CRLF/trailing whitespace/blank-line runs/document ends, then enfor
 - [ ] **Step 3: Implement unit parsing and packing**
 
 Markdown recognizes ATX headings, fenced code, paragraphs, and list blocks. Plain text splits blank-line paragraphs. Packing keeps whole units when possible, overlaps complete trailing units, and hard-splits only an oversized single unit.
+
+Hard splitting emits unchanged contiguous substrings of normalized text with original offsets. Skip
+whitespace-only candidate windows instead of merging them: every non-whitespace character must be
+covered by at least one chunk, while uncovered gaps are permitted only when they contain Unicode
+whitespace. Every emitted hard-split span stays within `target_chars`; trailing separator whitespace
+may be omitted rather than exceeding that bound. The existing unsplit-fence exception remains
+limited to `4 * target_chars`. Chunk consumers, evals, and citations must not assume chunks form a
+contiguous full-text partition or reconstruct the document by concatenating them.
 
 - [ ] **Step 4: Run tests and quality gates**
 
@@ -982,6 +996,8 @@ Cases cover English paraphrase, Chinese lexical/semantic, heading citation, mult
 - [ ] **Step 2: Implement strict dataset models**
 
 Forbid unknown keys, pin version 1, and assert expected semantic locators by `content_sha256 + version + ordinal + offsets`, never generated UUIDs.
+Treat those offsets as exact chunk locators; hard-split chunks may leave only Unicode-whitespace gaps,
+so eval and citation assertions must not require contiguous full-document chunk coverage.
 
 - [ ] **Step 3: Implement runner and gates**
 

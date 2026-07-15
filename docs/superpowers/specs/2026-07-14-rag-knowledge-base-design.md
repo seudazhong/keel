@@ -456,7 +456,20 @@ Markdown chunker：
 - pack + overlap；
 - 超长段落 hard split。
 
-### 8.4 版本
+### 8.4 Hard-split coverage contract
+
+- 每个 emitted span 都是 normalized text 的 exact contiguous substring；content 不改写，
+  `char_start/char_end` 始终指向原 normalized text；
+- hard-split emitted span 长度不超过 `target_chars`；唯一例外仍是保持完整、且长度不超过
+  `4 * target_chars` 的 unsplit fenced code block；
+- whitespace-only candidate window 不生成 embedding chunk，也不与相邻 window 合并；
+- 每个 non-whitespace character 必须被至少一个 chunk 覆盖；任意未覆盖 gap 必须只包含
+  Unicode whitespace；
+- chunk 保持确定性顺序、允许 overlap、且永不为空或 whitespace-only，但不保证构成原文的
+  contiguous partition。Eval 与 citation 必须使用持久化的 exact text/hash/offsets，不能通过
+  拼接 chunks 重建原文，也不能假设 whitespace characters 全覆盖。
+
+### 8.5 版本
 
 ```text
 chunking_version = "keel-char-v1"
@@ -1178,6 +1191,9 @@ Case 类型：
 
 - repo JSONL source of truth；
 - deterministic normalized text、chunk ordinals、offsets、labels 与 ranking inputs；
+- hard-split chunks 的 text/offsets 是 exact locators，但 chunks 可在 Unicode
+  whitespace-only 区间留 gap；golden/citation assertions 不要求 contiguous full-text
+  coverage；
 - production UUID IDs 不作为 cassette/golden assertion；citation 断言使用
   `content_sha256 + version + ordinal + char_start/char_end`；
 - embedding cassette 复用现有 format；

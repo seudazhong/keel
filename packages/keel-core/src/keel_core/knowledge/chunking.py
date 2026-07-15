@@ -28,6 +28,7 @@ _CLOSING_HEADING_MARKS_RE = re.compile(r"(?:^|[ \t]+)#+[ \t]*$")
 _FENCE_OPEN_RE = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,}).*$")
 _FENCE_CLOSE_RE = re.compile(r"^ {0,3}(?P<marker>`+|~+)[ \t]*$")
 _LIST_ITEM_RE = re.compile(r"^[ \t]*(?:[-+*](?:[ \t]+|$)|\d{1,9}[.)](?:[ \t]+|$))")
+_NON_WHITESPACE_RE = re.compile(r"\S")
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,7 +132,12 @@ def chunk_document(
     target_chars: int,
     overlap_chars: int,
 ) -> list[ChunkDraft]:
-    """Split normalized text into deterministic offset-preserving chunks."""
+    """Split normalized text into deterministic offset-preserving chunks.
+
+    Hard splits emit unchanged substrings no longer than ``target_chars``.
+    They may omit Unicode-whitespace-only gaps, but every non-whitespace
+    character remains covered.
+    """
 
     target, overlap = _validate_chunk_settings(target_chars, overlap_chars)
     if not isinstance(source_type, KnowledgeSourceType):
@@ -467,33 +473,20 @@ def _hard_split(
 ) -> Iterator[_ChunkSpan]:
     step = target - overlap
     start = unit.start
-    pending: _ChunkSpan | None = None
     while start < unit.body_end:
         body_end = min(start + target, unit.body_end)
-        end = unit.end if body_end == unit.body_end else body_end
+        end = min(start + target, unit.end)
 
-        if content[start:body_end].strip():
-            span_start = unit.start if pending is None else start
-            if pending is not None:
-                yield pending
-            pending = _ChunkSpan(
-                start=span_start,
+        if _NON_WHITESPACE_RE.search(content, start, end) is not None:
+            yield _ChunkSpan(
+                start=start,
                 end=end,
                 heading_path=unit.heading_path,
-            )
-        elif pending is not None:
-            pending = _ChunkSpan(
-                start=pending.start,
-                end=max(pending.end, end),
-                heading_path=pending.heading_path,
             )
 
         if body_end == unit.body_end:
             break
         start += step
-
-    if pending is not None:
-        yield pending
 
 
 __all__ = ["chunk_document", "normalize_document_text"]
