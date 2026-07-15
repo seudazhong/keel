@@ -7,7 +7,7 @@ const groups = [
     items: [
       { icon: "💬", label: "Chat", to: "/chat" },
       { icon: "🗂️", label: "Sessions", to: "/sessions" },
-      { icon: "🧠", label: "Memory" },
+      { icon: "🧠", label: "Knowledge", to: "/knowledge" },
     ],
   },
   {

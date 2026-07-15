@@ -14,6 +14,7 @@ function shellAt(path: string) {
           { path: "chat", element: <div>chat</div> },
           { path: "sessions", element: <div>sessions</div> },
           { path: "connectors", element: <div>connectors</div> },
+          { path: "knowledge", element: <div>knowledge</div> },
           { path: "approvals", element: <ApprovalsPage /> },
         ],
       },
@@ -22,13 +23,14 @@ function shellAt(path: string) {
   );
 }
 
-test("the shell exposes real nav links (Chat, Sessions, Connectors, Schedules, Approvals, Observability)", () => {
+test("the shell exposes real navigation including Knowledge", () => {
   renderWithClient(<RouterProvider router={shellAt("/approvals")} />);
   const labels = screen.getAllByRole("link").map((l) => l.textContent ?? "");
   for (const name of [
     "Chat",
     "Sessions",
     "Connectors",
+    "Knowledge",
     "Schedules",
     "Approvals",
     "Observability",
@@ -37,8 +39,9 @@ test("the shell exposes real nav links (Chat, Sessions, Connectors, Schedules, A
   }
 });
 
-test("other nav items render as disabled placeholders", () => {
+test("unfinished nav items remain disabled while Knowledge is enabled", () => {
   renderWithClient(<RouterProvider router={shellAt("/approvals")} />);
   const disabled = Array.from(document.querySelectorAll("[aria-disabled='true']"));
-  expect(disabled.some((el) => el.textContent?.includes("Memory"))).toBe(true);
+  expect(disabled.some((el) => el.textContent?.includes("Agents"))).toBe(true);
+  expect(disabled.some((el) => el.textContent?.includes("Knowledge"))).toBe(false);
 });
