@@ -32,12 +32,16 @@ from keel_core.jobs import (
 )
 from keel_core.knowledge import (
     KnowledgeBaseCreate,
+    KnowledgeChunkReplacement,
+    KnowledgeChunkWrite,
     KnowledgeDocumentVersionCreate,
+    KnowledgeDocumentVersionRecord,
     KnowledgeJobHandlers,
     KnowledgeSourceType,
     KnowledgeStore,
     KnowledgeVersionStatus,
     PostgresKnowledgeStore,
+    content_sha256,
 )
 from keel_worker.jobs import JobDefinition, JobRegistry, dispatch_jobs, run_job
 from keel_worker.knowledge import knowledge_job_definitions, knowledge_job_registry
@@ -89,6 +93,44 @@ class _BlockingEmbedder(_Embedder):
         self.entered.set()
         await self.release.wait()
         return [[1.0, 0.0, 0.0] for _ in texts]
+
+
+class _ActivateAfterReadPostgresStore(PostgresKnowledgeStore):
+    def __init__(self, engine: AsyncEngine, scope_id: str) -> None:
+        super().__init__(engine, scope_id)
+        self._race_target: tuple[str, str, str] | None = None
+        self._reads_before_race = 0
+        self.read_status: KnowledgeVersionStatus | None = None
+        self.race_activated = False
+
+    def arm_activation_race(
+        self,
+        kb_id: str,
+        document_id: str,
+        version_id: str,
+        *,
+        reads_before_race: int = 0,
+    ) -> None:
+        self._race_target = (kb_id, document_id, version_id)
+        self._reads_before_race = reads_before_race
+
+    async def get_version(
+        self,
+        kb_id: str,
+        document_id: str,
+        document_version_id: str,
+    ) -> KnowledgeDocumentVersionRecord | None:
+        version = await super().get_version(kb_id, document_id, document_version_id)
+        target = (kb_id, document_id, document_version_id)
+        if self._race_target == target:
+            if self._reads_before_race > 0:
+                self._reads_before_race -= 1
+            else:
+                self._race_target = None
+                self.read_status = None if version is None else version.status
+                activation = await super().activate_version(kb_id, document_id, document_version_id)
+                self.race_activated = activation.activated
+        return version
 
 
 def _settings() -> Settings:
@@ -407,6 +449,130 @@ async def test_queued_retry_cancellation_runs_domain_cleanup(
     assert row is not None and row.status is JobStatus.cancelled
     assert version is not None and version.status is KnowledgeVersionStatus.cancelled
     assert await knowledge.list_version_chunks(kb_id, document_id, version_id) == []
+
+
+async def test_failed_hook_fences_postgres_activation_after_its_version_read(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = f"knowledge:terminal-race:{uuid.uuid4().hex}"
+    knowledge, kb_id, document_id, previous_version_id = await _knowledge_document(
+        migrated_db,
+        scope,
+        content="active",
+    )
+    await knowledge.mark_indexing(kb_id, document_id, previous_version_id, now=_NOW)
+    await knowledge.replace_version_chunks(
+        KnowledgeChunkReplacement(
+            kb_id=kb_id,
+            document_id=document_id,
+            document_version_id=previous_version_id,
+            chunks=(
+                KnowledgeChunkWrite(
+                    ordinal=0,
+                    text="active",
+                    char_start=0,
+                    char_end=len("active"),
+                    content_hash=content_sha256("active"),
+                    heading_path=(),
+                    metadata={},
+                    model="fake/embed",
+                    dim=3,
+                    embedding=(1.0, 0.0, 0.0),
+                ),
+            ),
+        ),
+        now=_NOW,
+    )
+    activated = await knowledge.activate_version(
+        kb_id,
+        document_id,
+        previous_version_id,
+        now=_NOW,
+    )
+    assert activated.activated
+    target = await knowledge.create_document_version(
+        KnowledgeDocumentVersionCreate(
+            kb_id=kb_id,
+            document_id=document_id,
+            title="Guide",
+            source_type=KnowledgeSourceType.text,
+            source_uri=None,
+            content="replacement",
+            mime_type="text/plain",
+            chunking_version="keel-char-v1",
+            target_chars=100,
+            overlap_chars=0,
+        ),
+        now=_NOW + timedelta(seconds=1),
+    )
+    raced_store = _ActivateAfterReadPostgresStore(migrated_db, scope)
+    jobs = PostgresJobStore(migrated_db, scope)
+    settings = _settings()
+    wrong_embedder = _Embedder()
+    wrong_embedder.model = "wrong/model"
+    registry = knowledge_job_registry(cast(KnowledgeStore, raced_store), wrong_embedder, settings)
+    definition = registry.get("knowledge.ingest")
+    assert definition is not None
+    job_id = await _enqueue_knowledge_job(
+        jobs,
+        definition,
+        {
+            "kb_id": kb_id,
+            "document_id": document_id,
+            "document_version_id": target.version.id,
+        },
+        key=f"terminal-race:{target.version.id}",
+    )
+    await knowledge.attach_version_job(kb_id, document_id, target.version.id, job_id)
+    await knowledge.mark_indexing(kb_id, document_id, target.version.id, now=_NOW)
+    await knowledge.replace_version_chunks(
+        KnowledgeChunkReplacement(
+            kb_id=kb_id,
+            document_id=document_id,
+            document_version_id=target.version.id,
+            chunks=(
+                KnowledgeChunkWrite(
+                    ordinal=0,
+                    text="replacement",
+                    char_start=0,
+                    char_end=len("replacement"),
+                    content_hash=content_sha256("replacement"),
+                    heading_path=(),
+                    metadata={},
+                    model="fake/embed",
+                    dim=3,
+                    embedding=(1.0, 0.0, 0.0),
+                ),
+            ),
+        ),
+        now=_NOW,
+    )
+    raced_store.arm_activation_race(
+        kb_id,
+        document_id,
+        target.version.id,
+        reads_before_race=1,
+    )
+    clock = _Clock()
+    ctx = _context(jobs, registry, clock, _noop_enqueue)
+
+    assert await run_job(ctx, scope, job_id) == JobStatus.failed.value
+
+    row = await jobs.get(job_id)
+    document = await knowledge.get_document(kb_id, document_id)
+    failed = await knowledge.get_version(kb_id, document_id, target.version.id)
+    restored = await knowledge.get_version(kb_id, document_id, previous_version_id)
+    assert raced_store.read_status is KnowledgeVersionStatus.indexing
+    assert raced_store.race_activated
+    assert row is not None and row.status is JobStatus.failed
+    assert row.terminal_intent is JobTerminalIntent.failed
+    assert failed is not None and failed.status is KnowledgeVersionStatus.failed
+    assert await knowledge.list_version_chunks(kb_id, document_id, target.version.id) == []
+    assert restored is not None and restored.status is KnowledgeVersionStatus.active
+    assert document is not None
+    assert document.status.value == "active"
+    assert document.active_version_id == previous_version_id
+    assert document.desired_version_id == previous_version_id
 
 
 async def test_failed_hook_crash_replays_same_terminal_intent(

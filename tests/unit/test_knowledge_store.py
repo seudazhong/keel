@@ -210,11 +210,19 @@ async def test_versions_are_monotonic_and_reuse_only_current_live_fingerprints()
         _version_command(base.id, "C", document_id=first.document.id),
         now=_NOW + timedelta(seconds=9),
     )
+    failed_job_id = "job_failed_version"
+    await store.attach_version_job(
+        base.id,
+        first.document.id,
+        failed.version.id,
+        failed_job_id,
+    )
     await store.mark_version_failed(
         KnowledgeVersionFailure(
             kb_id=base.id,
             document_id=first.document.id,
             document_version_id=failed.version.id,
+            ingest_job_id=failed_job_id,
             error_kind="embedding_unavailable",
             error_message="Embedding is unavailable.",
         ),
@@ -231,11 +239,19 @@ async def test_versions_are_monotonic_and_reuse_only_current_live_fingerprints()
         _version_command(base.id, "D", document_id=first.document.id),
         now=_NOW + timedelta(seconds=12),
     )
+    cancelled_job_id = "job_cancelled_version"
+    await store.attach_version_job(
+        base.id,
+        first.document.id,
+        cancelled.version.id,
+        cancelled_job_id,
+    )
     await store.mark_version_cancelled(
         KnowledgeVersionCancellation(
             kb_id=base.id,
             document_id=first.document.id,
             document_version_id=cancelled.version.id,
+            ingest_job_id=cancelled_job_id,
         ),
         now=_NOW + timedelta(seconds=13),
     )
@@ -370,6 +386,8 @@ async def test_failed_or_cancelled_update_preserves_old_active_version(terminal:
         update.version.id,
         now=_NOW + timedelta(seconds=2),
     )
+    job_id = f"job_{terminal}_update"
+    await store.attach_version_job(base.id, first.document.id, update.version.id, job_id)
 
     if terminal == "failed":
         version = await store.mark_version_failed(
@@ -377,6 +395,7 @@ async def test_failed_or_cancelled_update_preserves_old_active_version(terminal:
                 kb_id=base.id,
                 document_id=first.document.id,
                 document_version_id=update.version.id,
+                ingest_job_id=job_id,
                 error_kind="provider_failed",
                 error_message="Embedding failed.",
             ),
@@ -389,6 +408,7 @@ async def test_failed_or_cancelled_update_preserves_old_active_version(terminal:
                 kb_id=base.id,
                 document_id=first.document.id,
                 document_version_id=update.version.id,
+                ingest_job_id=job_id,
             ),
             now=_NOW + timedelta(seconds=3),
         )
@@ -400,16 +420,218 @@ async def test_failed_or_cancelled_update_preserves_old_active_version(terminal:
     assert document.active_version_id == first.version.id
 
 
+@pytest.mark.parametrize(
+    ("terminal", "expected_status"),
+    [
+        ("failed", KnowledgeVersionStatus.failed),
+        ("cancelled", KnowledgeVersionStatus.cancelled),
+    ],
+)
+async def test_terminal_fence_restores_immediate_previous_active_version(
+    terminal: str,
+    expected_status: KnowledgeVersionStatus,
+) -> None:
+    store = InMemoryKnowledgeStore("web:local")
+    base = await _base(store)
+    oldest = await store.create_document_version(_version_command(base.id, "A"), now=_NOW)
+    await _index_and_activate(store, base.id, oldest.document.id, oldest.version.id, now=_NOW)
+    previous = await store.create_document_version(
+        _version_command(base.id, "B", document_id=oldest.document.id),
+        now=_NOW,
+    )
+    await _index_and_activate(store, base.id, oldest.document.id, previous.version.id, now=_NOW)
+    target = await store.create_document_version(
+        _version_command(base.id, "C", document_id=oldest.document.id),
+        now=_NOW,
+    )
+    job_id = f"job_terminal_fence_{terminal}"
+    await store.attach_version_job(base.id, oldest.document.id, target.version.id, job_id)
+    await store.mark_indexing(base.id, oldest.document.id, target.version.id, now=_NOW)
+    await store.replace_version_chunks(
+        KnowledgeChunkReplacement(
+            kb_id=base.id,
+            document_id=oldest.document.id,
+            document_version_id=target.version.id,
+            chunks=(_chunk("C"),),
+        ),
+        now=_NOW,
+    )
+    activated = await store.activate_version(
+        base.id,
+        oldest.document.id,
+        target.version.id,
+        now=_NOW,
+    )
+    assert activated.activated
+
+    mismatched = await store.mark_version_failed(
+        KnowledgeVersionFailure(
+            kb_id=base.id,
+            document_id=oldest.document.id,
+            document_version_id=target.version.id,
+            ingest_job_id="job_different",
+            error_kind="stale_hook",
+            error_message="A stale hook must not change the active version.",
+        ),
+        now=_NOW + timedelta(seconds=1),
+    )
+    assert mismatched.status is KnowledgeVersionStatus.active
+    assert len(await store.list_version_chunks(base.id, oldest.document.id, target.version.id)) == 1
+
+    if terminal == "failed":
+        command = KnowledgeVersionFailure(
+            kb_id=base.id,
+            document_id=oldest.document.id,
+            document_version_id=target.version.id,
+            ingest_job_id=job_id,
+            error_kind="provider_failed",
+            error_message="Embedding failed.",
+        )
+        fenced = await store.mark_version_failed(
+            command,
+            now=_NOW + timedelta(seconds=2),
+        )
+        replayed = await store.mark_version_failed(
+            command,
+            now=_NOW + timedelta(seconds=3),
+        )
+    else:
+        cancellation = KnowledgeVersionCancellation(
+            kb_id=base.id,
+            document_id=oldest.document.id,
+            document_version_id=target.version.id,
+            ingest_job_id=job_id,
+        )
+        fenced = await store.mark_version_cancelled(
+            cancellation,
+            now=_NOW + timedelta(seconds=2),
+        )
+        replayed = await store.mark_version_cancelled(
+            cancellation,
+            now=_NOW + timedelta(seconds=3),
+        )
+
+    document = await store.get_document(base.id, oldest.document.id)
+    restored = await store.get_version(base.id, oldest.document.id, previous.version.id)
+    older = await store.get_version(base.id, oldest.document.id, oldest.version.id)
+    assert fenced.status is expected_status
+    assert replayed == fenced
+    assert await store.list_version_chunks(base.id, oldest.document.id, target.version.id) == []
+    assert document is not None
+    assert document.status is KnowledgeDocumentStatus.active
+    assert document.active_version_id == previous.version.id
+    assert document.desired_version_id == previous.version.id
+    assert document.last_error_kind is None
+    assert document.last_error_message is None
+    assert restored is not None and restored.status is KnowledgeVersionStatus.active
+    assert older is not None and older.status is KnowledgeVersionStatus.superseded
+
+    zombie = await store.activate_version(
+        base.id,
+        oldest.document.id,
+        target.version.id,
+        now=_NOW + timedelta(seconds=4),
+    )
+    assert not zombie.activated
+    assert zombie.version.status is expected_status
+
+
+async def test_terminal_fence_without_predecessor_clears_document_pointers() -> None:
+    store = InMemoryKnowledgeStore("web:local")
+    base = await _base(store)
+    target = await store.create_document_version(_version_command(base.id, "A"), now=_NOW)
+    job_id = "job_no_predecessor"
+    await store.attach_version_job(base.id, target.document.id, target.version.id, job_id)
+    await _index_and_activate(store, base.id, target.document.id, target.version.id, now=_NOW)
+
+    cancelled = await store.mark_version_cancelled(
+        KnowledgeVersionCancellation(
+            kb_id=base.id,
+            document_id=target.document.id,
+            document_version_id=target.version.id,
+            ingest_job_id=job_id,
+        ),
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    document = await store.get_document(base.id, target.document.id)
+    assert cancelled.status is KnowledgeVersionStatus.cancelled
+    assert await store.list_version_chunks(base.id, target.document.id, target.version.id) == []
+    assert document is not None
+    assert document.status is KnowledgeDocumentStatus.failed
+    assert document.active_version_id is None
+    assert document.desired_version_id is None
+    assert document.last_error_kind == "indexing_cancelled"
+    assert document.last_error_message == "Knowledge indexing was cancelled."
+
+
+async def test_terminal_fence_never_disturbs_a_newer_active_version() -> None:
+    store = InMemoryKnowledgeStore("web:local")
+    base = await _base(store)
+    first = await store.create_document_version(_version_command(base.id, "A"), now=_NOW)
+    await _index_and_activate(store, base.id, first.document.id, first.version.id, now=_NOW)
+    target = await store.create_document_version(
+        _version_command(base.id, "B", document_id=first.document.id),
+        now=_NOW + timedelta(seconds=1),
+    )
+    job_id = "job_superseded_target"
+    await store.attach_version_job(base.id, first.document.id, target.version.id, job_id)
+    await _index_and_activate(
+        store,
+        base.id,
+        first.document.id,
+        target.version.id,
+        now=_NOW + timedelta(seconds=2),
+    )
+    newer = await store.create_document_version(
+        _version_command(base.id, "C", document_id=first.document.id),
+        now=_NOW + timedelta(seconds=3),
+    )
+    await _index_and_activate(
+        store,
+        base.id,
+        first.document.id,
+        newer.version.id,
+        now=_NOW + timedelta(seconds=4),
+    )
+
+    fenced = await store.mark_version_failed(
+        KnowledgeVersionFailure(
+            kb_id=base.id,
+            document_id=first.document.id,
+            document_version_id=target.version.id,
+            ingest_job_id=job_id,
+            error_kind="late_failure",
+            error_message="The superseded ingest failed.",
+        ),
+        now=_NOW + timedelta(seconds=5),
+    )
+
+    document = await store.get_document(base.id, first.document.id)
+    current = await store.get_version(base.id, first.document.id, newer.version.id)
+    assert fenced.status is KnowledgeVersionStatus.failed
+    assert await store.list_version_chunks(base.id, first.document.id, target.version.id) == []
+    assert len(await store.list_version_chunks(base.id, first.document.id, newer.version.id)) == 1
+    assert document is not None
+    assert document.status is KnowledgeDocumentStatus.active
+    assert document.active_version_id == newer.version.id
+    assert document.desired_version_id == newer.version.id
+    assert current is not None and current.status is KnowledgeVersionStatus.active
+
+
 async def test_terminal_and_delete_transitions_never_downgrade_authoritative_state() -> None:
     store = InMemoryKnowledgeStore("web:local")
     base = await _base(store)
     created = await store.create_document_version(_version_command(base.id, "secret"), now=_NOW)
     await store.mark_indexing(base.id, created.document.id, created.version.id, now=_NOW)
+    job_id = "job_terminal_precedence"
+    await store.attach_version_job(base.id, created.document.id, created.version.id, job_id)
     failed = await store.mark_version_failed(
         KnowledgeVersionFailure(
             kb_id=base.id,
             document_id=created.document.id,
             document_version_id=created.version.id,
+            ingest_job_id=job_id,
             error_kind="failed",
             error_message="Indexing failed.",
         ),
@@ -420,6 +642,7 @@ async def test_terminal_and_delete_transitions_never_downgrade_authoritative_sta
             kb_id=base.id,
             document_id=created.document.id,
             document_version_id=created.version.id,
+            ingest_job_id=job_id,
         ),
         now=_NOW + timedelta(seconds=2),
     )
@@ -435,6 +658,7 @@ async def test_terminal_and_delete_transitions_never_downgrade_authoritative_sta
             kb_id=base.id,
             document_id=created.document.id,
             document_version_id=created.version.id,
+            ingest_job_id=job_id,
             error_kind="late_failure",
             error_message="Late failure.",
         ),
@@ -542,11 +766,19 @@ async def test_reindex_derives_format_from_active_version_after_failed_text_upda
     )
     assert text_update.version.version == 2
     assert text_update.document.source_type is KnowledgeSourceType.text
+    job_id = "job_source_type_update"
+    await store.attach_version_job(
+        base.id,
+        markdown.document.id,
+        text_update.version.id,
+        job_id,
+    )
     await store.mark_version_failed(
         KnowledgeVersionFailure(
             kb_id=base.id,
             document_id=markdown.document.id,
             document_version_id=text_update.version.id,
+            ingest_job_id=job_id,
             error_kind="embedding_unavailable",
             error_message="Embedding is unavailable.",
         ),
@@ -1118,11 +1350,14 @@ async def test_first_ingest_failure_is_safe_and_marks_document_failed() -> None:
     base = await _base(store)
     secret = "do-not-echo-this-content"
     created = await store.create_document_version(_version_command(base.id, secret), now=_NOW)
+    job_id = "job_first_ingest_failure"
+    await store.attach_version_job(base.id, created.document.id, created.version.id, job_id)
     await store.mark_version_failed(
         KnowledgeVersionFailure(
             kb_id=base.id,
             document_id=created.document.id,
             document_version_id=created.version.id,
+            ingest_job_id=job_id,
             error_kind="embedding_unavailable",
             error_message="Embedding is unavailable.",
         ),

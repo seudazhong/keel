@@ -419,6 +419,7 @@ class KnowledgeJobHandlers:
                     kb_id=payload.kb_id,
                     document_id=payload.document_id,
                     document_version_id=payload.document_version_id,
+                    ingest_job_id=row.id,
                 )
             )
         except KnowledgeStorageError:
@@ -453,6 +454,7 @@ class KnowledgeJobHandlers:
                     kb_id=payload.kb_id,
                     document_id=payload.document_id,
                     document_version_id=payload.document_version_id,
+                    ingest_job_id=row.id,
                     error_kind=error_kind,
                     error_message=error_message,
                 )

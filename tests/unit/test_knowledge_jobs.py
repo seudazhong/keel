@@ -26,14 +26,18 @@ from keel_core.knowledge import (
     InMemoryKnowledgeStore,
     KnowledgeBaseCreate,
     KnowledgeBaseStatus,
+    KnowledgeChunkReplacement,
+    KnowledgeChunkWrite,
     KnowledgeDeletePayload,
     KnowledgeDocumentTombstone,
     KnowledgeDocumentVersionCreate,
+    KnowledgeDocumentVersionRecord,
     KnowledgeIngestPayload,
     KnowledgeJobContext,
     KnowledgeJobHandlers,
     KnowledgeSourceType,
     KnowledgeVersionStatus,
+    content_sha256,
     new_knowledge_base_id,
     new_knowledge_document_id,
     new_knowledge_version_id,
@@ -77,6 +81,32 @@ class _Embedder:
         if self.response_override is not None:
             return self.response_override
         return [[float(index + 1), 0.0, 0.0] for index, _ in enumerate(batch)]
+
+
+class _ActivateAfterReadStore(InMemoryKnowledgeStore):
+    def __init__(self, scope_id: str) -> None:
+        super().__init__(scope_id)
+        self._race_target: tuple[str, str, str] | None = None
+        self.read_status: KnowledgeVersionStatus | None = None
+        self.race_activated = False
+
+    def arm_activation_race(self, kb_id: str, document_id: str, version_id: str) -> None:
+        self._race_target = (kb_id, document_id, version_id)
+
+    async def get_version(
+        self,
+        kb_id: str,
+        document_id: str,
+        document_version_id: str,
+    ) -> KnowledgeDocumentVersionRecord | None:
+        version = await super().get_version(kb_id, document_id, document_version_id)
+        target = (kb_id, document_id, document_version_id)
+        if self._race_target == target:
+            self._race_target = None
+            self.read_status = None if version is None else version.status
+            activation = await super().activate_version(kb_id, document_id, document_version_id)
+            self.race_activated = activation.activated
+        return version
 
 
 async def _document(
@@ -413,6 +443,79 @@ async def test_terminal_hooks_never_switch_a_reserved_intent() -> None:
     cancelled = await store.get_version(kb_id, document_id, version_id)
     assert cancelled is not None
     assert cancelled.status is KnowledgeVersionStatus.cancelled
+
+
+async def test_failed_hook_fences_activation_after_its_version_read() -> None:
+    store = _ActivateAfterReadStore("web:local")
+    kb_id, document_id, previous_version_id = await _document(store, content="active")
+    handlers = KnowledgeJobHandlers(store, _Embedder(), Settings())
+    await handlers.ingest(
+        _Context(job_id="job_previous"),
+        _payload(kb_id, document_id, previous_version_id),
+    )
+    target = await store.create_document_version(
+        KnowledgeDocumentVersionCreate(
+            kb_id=kb_id,
+            document_id=document_id,
+            title="Guide",
+            source_type=KnowledgeSourceType.text,
+            source_uri=None,
+            content="replacement",
+            mime_type="text/plain",
+            chunking_version="persisted-v1",
+            target_chars=100,
+            overlap_chars=0,
+        ),
+        now=_NOW,
+    )
+    job_id = "job_raced_terminal_fence"
+    await store.attach_version_job(kb_id, document_id, target.version.id, job_id)
+    await store.mark_indexing(kb_id, document_id, target.version.id)
+    await store.replace_version_chunks(
+        KnowledgeChunkReplacement(
+            kb_id=kb_id,
+            document_id=document_id,
+            document_version_id=target.version.id,
+            chunks=(
+                KnowledgeChunkWrite(
+                    ordinal=0,
+                    text="replacement",
+                    char_start=0,
+                    char_end=len("replacement"),
+                    content_hash=content_sha256("replacement"),
+                    heading_path=(),
+                    metadata={},
+                    model="fake/embed",
+                    dim=3,
+                    embedding=(1.0, 0.0, 0.0),
+                ),
+            ),
+        )
+    )
+    store.arm_activation_race(kb_id, document_id, target.version.id)
+
+    await handlers.ingest_failed(
+        _row(
+            job_id=job_id,
+            kind="knowledge.ingest",
+            payload=_payload(kb_id, document_id, target.version.id),
+            terminal_intent=JobTerminalIntent.failed,
+        ),
+        JobError("provider_failed", "Embedding failed."),
+    )
+
+    document = await store.get_document(kb_id, document_id)
+    failed = await store.get_version(kb_id, document_id, target.version.id)
+    restored = await store.get_version(kb_id, document_id, previous_version_id)
+    assert store.read_status is KnowledgeVersionStatus.indexing
+    assert store.race_activated
+    assert failed is not None and failed.status is KnowledgeVersionStatus.failed
+    assert await store.list_version_chunks(kb_id, document_id, target.version.id) == []
+    assert restored is not None and restored.status is KnowledgeVersionStatus.active
+    assert document is not None
+    assert document.status.value == "active"
+    assert document.active_version_id == previous_version_id
+    assert document.desired_version_id == previous_version_id
 
 
 async def test_cancel_hook_wins_before_zombie_chunk_write() -> None:
