@@ -204,7 +204,7 @@ def test_result_and_error_models_reject_empty_required_text() -> None:
 
 @pytest.mark.parametrize(
     ("attempt", "expected"),
-    [(1, 5), (2, 10), (3, 20), (7, 300)],
+    [(1, 5), (2, 10), (3, 20), (7, 300), (2_147_483_646, 300)],
 )
 def test_retry_delay_is_deterministic_and_capped(attempt: int, expected: int) -> None:
     assert retry_delay_seconds(attempt, 5, 300) == expected

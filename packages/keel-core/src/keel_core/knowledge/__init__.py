@@ -2,6 +2,14 @@
 
 from __future__ import annotations
 
+from .jobs import (
+    KNOWLEDGE_DELETE_KIND,
+    KNOWLEDGE_INGEST_KIND,
+    KnowledgeDeletePayload,
+    KnowledgeIngestPayload,
+    KnowledgeJobContext,
+    KnowledgeJobHandlers,
+)
 from .models import (
     DEFAULT_KNOWLEDGE_DOCUMENT_MAX_BYTES,
     ChunkDraft,
@@ -118,6 +126,7 @@ __all__ = [
     "KnowledgeDocumentVersionIdempotencyResult",
     "KnowledgeDocumentVersionRecord",
     "KnowledgeDocumentVersionResult",
+    "KnowledgeDeletePayload",
     "KnowledgeEmbeddingMismatch",
     "KnowledgeError",
     "KnowledgeErrorCode",
@@ -128,6 +137,9 @@ __all__ = [
     "KnowledgeIdempotencyId",
     "KnowledgeIdempotencyRecord",
     "KnowledgeIndexingResult",
+    "KnowledgeIngestPayload",
+    "KnowledgeJobContext",
+    "KnowledgeJobHandlers",
     "KnowledgeNotFound",
     "KnowledgeOperation",
     "KnowledgePublicCode",
@@ -141,6 +153,8 @@ __all__ = [
     "KnowledgeStorageError",
     "KnowledgeStore",
     "PostgresKnowledgeStore",
+    "KNOWLEDGE_DELETE_KIND",
+    "KNOWLEDGE_INGEST_KIND",
     "KnowledgeValidationError",
     "KnowledgeVersionCancellation",
     "KnowledgeVersionFailure",

@@ -1219,6 +1219,7 @@ class KnowledgeVersionFailure:
     kb_id: KnowledgeBaseId
     document_id: KnowledgeDocumentId
     document_version_id: KnowledgeVersionId
+    ingest_job_id: str
     error_kind: str
     error_message: str
 
@@ -1226,6 +1227,7 @@ class KnowledgeVersionFailure:
         validate_knowledge_base_id(self.kb_id)
         validate_knowledge_document_id(self.document_id)
         validate_knowledge_version_id(self.document_version_id)
+        _required_text(self.ingest_job_id, field="ingest_job_id")
         object.__setattr__(
             self,
             "error_kind",
@@ -1247,6 +1249,7 @@ class KnowledgeVersionCancellation:
     kb_id: KnowledgeBaseId
     document_id: KnowledgeDocumentId
     document_version_id: KnowledgeVersionId
+    ingest_job_id: str
     error_kind: str = "indexing_cancelled"
     error_message: str = "Knowledge indexing was cancelled."
 
@@ -1254,6 +1257,7 @@ class KnowledgeVersionCancellation:
         validate_knowledge_base_id(self.kb_id)
         validate_knowledge_document_id(self.document_id)
         validate_knowledge_version_id(self.document_version_id)
+        _required_text(self.ingest_job_id, field="ingest_job_id")
         object.__setattr__(
             self,
             "error_kind",

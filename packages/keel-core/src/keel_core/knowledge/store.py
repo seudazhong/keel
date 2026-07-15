@@ -1493,6 +1493,7 @@ class InMemoryKnowledgeStore:
         kb_id: str,
         document_id: str,
         document_version_id: str,
+        ingest_job_id: str,
         status: KnowledgeVersionStatus,
         error_kind: str,
         error_message: str,
@@ -1507,8 +1508,19 @@ class InMemoryKnowledgeStore:
         ):
             version, _, _ = self._purge_version_locked(version, timestamp)
             return _copy(version)
-        if version.status in _IMMUTABLE_TERMINAL_VERSION_STATUSES:
+        if version.ingest_job_id != ingest_job_id:
             return _copy(version)
+        if version.status in {
+            KnowledgeVersionStatus.failed,
+            KnowledgeVersionStatus.cancelled,
+            KnowledgeVersionStatus.deleted,
+            KnowledgeVersionStatus.purged,
+        }:
+            return _copy(version)
+        target_was_active = (
+            version.status is KnowledgeVersionStatus.active
+            and document.active_version_id == version.id
+        )
         self._delete_version_chunks_locked(version.id)
         version = replace(
             version,
@@ -1517,7 +1529,68 @@ class InMemoryKnowledgeStore:
             error_message=error_message,
         )
         self._versions[version.id] = version
-        if document.active_version_id is None and document.desired_version_id == version.id:
+        if target_was_active:
+            desired_was_target = document.desired_version_id == version.id
+            has_newer_desired = document.desired_version_id is not None and not desired_was_target
+            predecessors = [
+                candidate
+                for candidate in self._versions.values()
+                if candidate.kb_id == base.id
+                and candidate.document_id == document.id
+                and candidate.id != version.id
+                and candidate.status is KnowledgeVersionStatus.superseded
+                and candidate.activated_at is not None
+            ]
+            predecessor = max(
+                predecessors,
+                key=lambda candidate: (
+                    candidate.activated_at or candidate.created_at,
+                    candidate.version,
+                    candidate.id,
+                ),
+                default=None,
+            )
+            if predecessor is None:
+                if has_newer_desired:
+                    document = replace(
+                        document,
+                        status=KnowledgeDocumentStatus.pending,
+                        active_version_id=None,
+                        last_error_kind=None,
+                        last_error_message=None,
+                        updated_at=timestamp,
+                    )
+                else:
+                    document = replace(
+                        document,
+                        status=KnowledgeDocumentStatus.failed,
+                        active_version_id=None,
+                        desired_version_id=None,
+                        last_error_kind=error_kind,
+                        last_error_message=error_message,
+                        updated_at=timestamp,
+                    )
+            else:
+                predecessor = replace(
+                    predecessor,
+                    status=KnowledgeVersionStatus.active,
+                    error_kind=None,
+                    error_message=None,
+                )
+                self._versions[predecessor.id] = predecessor
+                document = replace(
+                    document,
+                    status=KnowledgeDocumentStatus.active,
+                    active_version_id=predecessor.id,
+                    desired_version_id=(
+                        predecessor.id if desired_was_target else document.desired_version_id
+                    ),
+                    last_error_kind=None,
+                    last_error_message=None,
+                    updated_at=timestamp,
+                )
+            self._documents[document.id] = document
+        elif document.active_version_id is None and document.desired_version_id == version.id:
             document = replace(
                 document,
                 status=KnowledgeDocumentStatus.failed,
@@ -1540,6 +1613,7 @@ class InMemoryKnowledgeStore:
                 kb_id=command.kb_id,
                 document_id=command.document_id,
                 document_version_id=command.document_version_id,
+                ingest_job_id=command.ingest_job_id,
                 status=KnowledgeVersionStatus.failed,
                 error_kind=command.error_kind,
                 error_message=command.error_message,
@@ -1558,6 +1632,7 @@ class InMemoryKnowledgeStore:
                 kb_id=command.kb_id,
                 document_id=command.document_id,
                 document_version_id=command.document_version_id,
+                ingest_job_id=command.ingest_job_id,
                 status=KnowledgeVersionStatus.cancelled,
                 error_kind=command.error_kind,
                 error_message=command.error_message,
@@ -3880,6 +3955,7 @@ class PostgresKnowledgeStore:
         kb_id: str,
         document_id: str,
         document_version_id: str,
+        ingest_job_id: str,
         status: KnowledgeVersionStatus,
         error_kind: str,
         error_message: str,
@@ -3905,8 +3981,19 @@ class PostgresKnowledgeStore:
         ):
             version, _, _ = await self._purge_version_tx(conn, version, timestamp)
             return version
-        if version.status in _IMMUTABLE_TERMINAL_VERSION_STATUSES:
+        if version.ingest_job_id != ingest_job_id:
             return version
+        if version.status in {
+            KnowledgeVersionStatus.failed,
+            KnowledgeVersionStatus.cancelled,
+            KnowledgeVersionStatus.deleted,
+            KnowledgeVersionStatus.purged,
+        }:
+            return version
+        target_was_active = (
+            version.status is KnowledgeVersionStatus.active
+            and document.active_version_id == version.id
+        )
         await self._delete_version_chunks_tx(conn, version)
         version_row = (
             (
@@ -3932,7 +4019,101 @@ class PostgresKnowledgeStore:
             .mappings()
             .one()
         )
-        if document.active_version_id is None and document.desired_version_id == version.id:
+        if target_was_active:
+            desired_was_target = document.desired_version_id == version.id
+            has_newer_desired = document.desired_version_id is not None and not desired_was_target
+            predecessor_row = (
+                (
+                    await conn.execute(
+                        text(
+                            f"SELECT {_PG_VERSION_COLUMNS} FROM kb_document_versions "
+                            "WHERE scope_id = :scope AND kb_id = :kb "
+                            "AND document_id = :document AND id <> :version "
+                            "AND status = 'superseded' AND activated_at IS NOT NULL "
+                            "ORDER BY activated_at DESC, version DESC, id DESC "
+                            "LIMIT 1 FOR UPDATE"
+                        ),
+                        {
+                            "scope": self._scope_id,
+                            "kb": base.id,
+                            "document": document.id,
+                            "version": version.id,
+                        },
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if predecessor_row is None:
+                if has_newer_desired:
+                    await conn.execute(
+                        text(
+                            "UPDATE kb_documents SET status = 'pending', "
+                            "active_version_id = NULL, last_error_kind = NULL, "
+                            "last_error_message = NULL, updated_at = :now "
+                            "WHERE scope_id = :scope AND kb_id = :kb AND id = :document"
+                        ),
+                        {
+                            "now": timestamp,
+                            "scope": self._scope_id,
+                            "kb": base.id,
+                            "document": document.id,
+                        },
+                    )
+                else:
+                    await conn.execute(
+                        text(
+                            "UPDATE kb_documents SET status = 'failed', "
+                            "active_version_id = NULL, desired_version_id = NULL, "
+                            "last_error_kind = :error_kind, "
+                            "last_error_message = :error_message, updated_at = :now "
+                            "WHERE scope_id = :scope AND kb_id = :kb AND id = :document"
+                        ),
+                        {
+                            "error_kind": error_kind,
+                            "error_message": error_message,
+                            "now": timestamp,
+                            "scope": self._scope_id,
+                            "kb": base.id,
+                            "document": document.id,
+                        },
+                    )
+            else:
+                predecessor = _pg_version_record(predecessor_row)
+                await conn.execute(
+                    text(
+                        "UPDATE kb_document_versions SET status = 'active', "
+                        "error_kind = NULL, error_message = NULL "
+                        "WHERE scope_id = :scope AND kb_id = :kb "
+                        "AND document_id = :document AND id = :version "
+                        "AND status = 'superseded'"
+                    ),
+                    {
+                        "scope": self._scope_id,
+                        "kb": base.id,
+                        "document": document.id,
+                        "version": predecessor.id,
+                    },
+                )
+                await conn.execute(
+                    text(
+                        "UPDATE kb_documents SET status = 'active', "
+                        "active_version_id = :version, "
+                        "desired_version_id = CASE WHEN desired_version_id = :target "
+                        "THEN :version ELSE desired_version_id END, "
+                        "last_error_kind = NULL, last_error_message = NULL, updated_at = :now "
+                        "WHERE scope_id = :scope AND kb_id = :kb AND id = :document"
+                    ),
+                    {
+                        "version": predecessor.id,
+                        "target": version.id,
+                        "now": timestamp,
+                        "scope": self._scope_id,
+                        "kb": base.id,
+                        "document": document.id,
+                    },
+                )
+        elif document.active_version_id is None and document.desired_version_id == version.id:
             await conn.execute(
                 text(
                     "UPDATE kb_documents SET status = 'failed', last_error_kind = :error_kind, "
@@ -3964,6 +4145,7 @@ class PostgresKnowledgeStore:
                 kb_id=command.kb_id,
                 document_id=command.document_id,
                 document_version_id=command.document_version_id,
+                ingest_job_id=command.ingest_job_id,
                 status=KnowledgeVersionStatus.failed,
                 error_kind=command.error_kind,
                 error_message=command.error_message,
@@ -3984,6 +4166,7 @@ class PostgresKnowledgeStore:
                 kb_id=command.kb_id,
                 document_id=command.document_id,
                 document_version_id=command.document_version_id,
+                ingest_job_id=command.ingest_job_id,
                 status=KnowledgeVersionStatus.cancelled,
                 error_kind=command.error_kind,
                 error_message=command.error_message,

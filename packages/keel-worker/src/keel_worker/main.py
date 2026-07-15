@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, cast
 
 from arq import cron
 from arq.connections import RedisSettings
@@ -46,17 +46,13 @@ from keel_core.memory import PostgresMemoryStore
 from keel_core.observability import configure_logging, configure_tracing
 from keel_core.state import PostgresEventStore
 from keel_scheduler.store import ScheduleRow, due_tick
-from keel_worker.jobs import JobRegistry, dispatch_jobs, run_job
+from keel_worker.jobs import dispatch_jobs, run_job
+from keel_worker.knowledge import knowledge_job_registry
 
 logger = logging.getLogger("keel.worker")
 
 # The autonomy slice operates on a single scope (matches the web server's default).
 _DURABLE_SCOPE = "web:local"
-
-
-def _empty_job_registry() -> JobRegistry:
-    # Intentionally empty until the RAG slice registers the first real kind.
-    return JobRegistry()
 
 
 async def _enqueue_arq(redis: Any, name: str, *args: object, **options: object) -> None:
@@ -246,6 +242,7 @@ async def startup(ctx: dict[str, Any]) -> None:
 
     from keel_core.approvals import PostgresApprovalStore
     from keel_core.embeddings import LiteLLMEmbedder
+    from keel_core.knowledge import KnowledgeStore, PostgresKnowledgeStore
     from keel_core.providers import LiteLLMGateway
     from keel_scheduler.store import PostgresClaimStore, PostgresScheduleStore
 
@@ -259,17 +256,28 @@ async def startup(ctx: dict[str, Any]) -> None:
         _DURABLE_SCOPE,
         limits=JobLimits.from_settings(settings),
     )
-    ctx["job_registry"] = _empty_job_registry()
     ctx["store"] = PostgresEventStore(engine, _DURABLE_SCOPE)
     ctx["approvals"] = PostgresApprovalStore(engine, _DURABLE_SCOPE)
     ctx["schedules"] = PostgresScheduleStore(engine, _DURABLE_SCOPE)
     ctx["claim"] = PostgresClaimStore(engine, _DURABLE_SCOPE)
     ctx["provider"] = LiteLLMGateway()
-    ctx["embedder"] = LiteLLMEmbedder(
+    embedder = LiteLLMEmbedder(
         settings.embedding_model,
         settings.embedding_dim,
         send_dimensions=settings.embedding_send_dimensions,
         timeout_seconds=settings.embedding_timeout_seconds,
+    )
+    knowledge = PostgresKnowledgeStore(
+        engine,
+        _DURABLE_SCOPE,
+        document_max_bytes=settings.knowledge_document_max_bytes,
+    )
+    ctx["embedder"] = embedder
+    ctx["knowledge"] = knowledge
+    ctx["job_registry"] = knowledge_job_registry(
+        cast(KnowledgeStore, knowledge),
+        embedder,
+        settings,
     )
 
     async def enqueue(name: str, *args: object, **options: object) -> None:

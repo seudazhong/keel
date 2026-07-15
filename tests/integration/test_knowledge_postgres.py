@@ -990,11 +990,19 @@ async def test_guarded_chunk_retry_stale_activation_and_active_preservation(
         third.version.id,
         now=_NOW + timedelta(seconds=7),
     )
+    failed_job_id = "job_failed_postgres_version"
+    await store.attach_version_job(
+        base.id,
+        first.document.id,
+        third.version.id,
+        failed_job_id,
+    )
     failed = await store.mark_version_failed(
         KnowledgeVersionFailure(
             kb_id=base.id,
             document_id=first.document.id,
             document_version_id=third.version.id,
+            ingest_job_id=failed_job_id,
             error_kind="embedding_unavailable",
             error_message="Embedding is unavailable.",
         ),
@@ -1006,6 +1014,7 @@ async def test_guarded_chunk_retry_stale_activation_and_active_preservation(
             kb_id=base.id,
             document_id=first.document.id,
             document_version_id=third.version.id,
+            ingest_job_id=failed_job_id,
         ),
         now=_NOW + timedelta(seconds=9),
     )
@@ -1025,11 +1034,19 @@ async def test_guarded_chunk_retry_stale_activation_and_active_preservation(
         cancelled.version.id,
         now=_NOW + timedelta(seconds=11),
     )
+    cancelled_job_id = "job_cancelled_postgres_version"
+    await store.attach_version_job(
+        base.id,
+        first.document.id,
+        cancelled.version.id,
+        cancelled_job_id,
+    )
     cancelled_version = await store.mark_version_cancelled(
         KnowledgeVersionCancellation(
             kb_id=base.id,
             document_id=first.document.id,
             document_version_id=cancelled.version.id,
+            ingest_job_id=cancelled_job_id,
         ),
         now=_NOW + timedelta(seconds=12),
     )
@@ -1068,6 +1085,311 @@ async def test_guarded_chunk_retry_stale_activation_and_active_preservation(
             ),
             now=_NOW + timedelta(seconds=15),
         )
+
+
+async def test_terminal_fence_restores_previous_active_and_is_idempotent(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "terminal-fence:restore")
+    base = await _base(store)
+    oldest = await store.create_document_version(_version(base.id, "A"), now=_NOW)
+    await _index_and_activate(
+        store,
+        base.id,
+        oldest.document.id,
+        oldest.version.id,
+        "A",
+        now=_NOW,
+    )
+    previous = await store.create_document_version(
+        _version(base.id, "B", document_id=oldest.document.id),
+        now=_NOW,
+    )
+    await _index_and_activate(
+        store,
+        base.id,
+        oldest.document.id,
+        previous.version.id,
+        "B",
+        now=_NOW,
+    )
+    target = await store.create_document_version(
+        _version(base.id, "C", document_id=oldest.document.id),
+        now=_NOW,
+    )
+    job_id = "job_postgres_terminal_fence"
+    await store.attach_version_job(base.id, oldest.document.id, target.version.id, job_id)
+    await store.mark_indexing(base.id, oldest.document.id, target.version.id, now=_NOW)
+    await store.replace_version_chunks(
+        KnowledgeChunkReplacement(
+            kb_id=base.id,
+            document_id=oldest.document.id,
+            document_version_id=target.version.id,
+            chunks=(_chunk("C"),),
+        ),
+        now=_NOW,
+    )
+    activated = await store.activate_version(
+        base.id,
+        oldest.document.id,
+        target.version.id,
+        now=_NOW,
+    )
+    assert activated.activated
+
+    mismatched = await store.mark_version_failed(
+        KnowledgeVersionFailure(
+            kb_id=base.id,
+            document_id=oldest.document.id,
+            document_version_id=target.version.id,
+            ingest_job_id="job_different",
+            error_kind="stale_hook",
+            error_message="A stale hook must not change the active version.",
+        ),
+        now=_NOW + timedelta(seconds=1),
+    )
+    assert mismatched.status is KnowledgeVersionStatus.active
+    assert len(await store.list_version_chunks(base.id, oldest.document.id, target.version.id)) == 1
+
+    command = KnowledgeVersionFailure(
+        kb_id=base.id,
+        document_id=oldest.document.id,
+        document_version_id=target.version.id,
+        ingest_job_id=job_id,
+        error_kind="provider_failed",
+        error_message="Embedding failed.",
+    )
+    fenced = await store.mark_version_failed(command, now=_NOW + timedelta(seconds=2))
+    replayed = await store.mark_version_failed(command, now=_NOW + timedelta(seconds=3))
+
+    document = await store.get_document(base.id, oldest.document.id)
+    restored = await store.get_version(base.id, oldest.document.id, previous.version.id)
+    older = await store.get_version(base.id, oldest.document.id, oldest.version.id)
+    assert fenced.status is KnowledgeVersionStatus.failed
+    assert replayed == fenced
+    assert await store.list_version_chunks(base.id, oldest.document.id, target.version.id) == []
+    assert document is not None
+    assert document.status is KnowledgeDocumentStatus.active
+    assert document.active_version_id == previous.version.id
+    assert document.desired_version_id == previous.version.id
+    assert document.last_error_kind is None
+    assert document.last_error_message is None
+    assert restored is not None and restored.status is KnowledgeVersionStatus.active
+    assert older is not None and older.status is KnowledgeVersionStatus.superseded
+
+    zombie = await store.activate_version(
+        base.id,
+        oldest.document.id,
+        target.version.id,
+        now=_NOW + timedelta(seconds=4),
+    )
+    assert not zombie.activated
+    assert zombie.version.status is KnowledgeVersionStatus.failed
+
+
+async def test_terminal_fence_without_predecessor_clears_postgres_document_pointers(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "terminal-fence:none")
+    base = await _base(store)
+    target = await store.create_document_version(_version(base.id, "A"), now=_NOW)
+    job_id = "job_postgres_no_predecessor"
+    await store.attach_version_job(base.id, target.document.id, target.version.id, job_id)
+    await _index_and_activate(
+        store,
+        base.id,
+        target.document.id,
+        target.version.id,
+        "A",
+        now=_NOW,
+    )
+
+    cancelled = await store.mark_version_cancelled(
+        KnowledgeVersionCancellation(
+            kb_id=base.id,
+            document_id=target.document.id,
+            document_version_id=target.version.id,
+            ingest_job_id=job_id,
+        ),
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    document = await store.get_document(base.id, target.document.id)
+    assert cancelled.status is KnowledgeVersionStatus.cancelled
+    assert await store.list_version_chunks(base.id, target.document.id, target.version.id) == []
+    assert document is not None
+    assert document.status is KnowledgeDocumentStatus.failed
+    assert document.active_version_id is None
+    assert document.desired_version_id is None
+    assert document.last_error_kind == "indexing_cancelled"
+    assert document.last_error_message == "Knowledge indexing was cancelled."
+
+
+async def test_terminal_fence_without_predecessor_preserves_newer_postgres_desired_version(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "terminal-fence:none-newer")
+    base = await _base(store)
+    target = await store.create_document_version(_version(base.id, "A"), now=_NOW)
+    job_id = "job_postgres_no_predecessor_newer_desired"
+    await store.attach_version_job(base.id, target.document.id, target.version.id, job_id)
+    await _index_and_activate(
+        store,
+        base.id,
+        target.document.id,
+        target.version.id,
+        "A",
+        now=_NOW,
+    )
+    newer = await store.create_document_version(
+        _version(base.id, "B", document_id=target.document.id),
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    failed = await store.mark_version_failed(
+        KnowledgeVersionFailure(
+            kb_id=base.id,
+            document_id=target.document.id,
+            document_version_id=target.version.id,
+            ingest_job_id=job_id,
+            error_kind="late_failure",
+            error_message="The active ingest failed after a newer request arrived.",
+        ),
+        now=_NOW + timedelta(seconds=2),
+    )
+
+    document = await store.get_document(base.id, target.document.id)
+    pending = await store.get_version(base.id, target.document.id, newer.version.id)
+    assert failed.status is KnowledgeVersionStatus.failed
+    assert document is not None
+    assert document.status is KnowledgeDocumentStatus.pending
+    assert document.active_version_id is None
+    assert document.desired_version_id == newer.version.id
+    assert document.last_error_kind is None
+    assert document.last_error_message is None
+    assert pending is not None and pending.status is KnowledgeVersionStatus.pending
+
+
+async def test_terminal_fence_restores_postgres_predecessor_and_preserves_newer_desired_version(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "terminal-fence:predecessor-newer")
+    base = await _base(store)
+    first = await store.create_document_version(_version(base.id, "A"), now=_NOW)
+    await _index_and_activate(
+        store,
+        base.id,
+        first.document.id,
+        first.version.id,
+        "A",
+        now=_NOW,
+    )
+    target = await store.create_document_version(
+        _version(base.id, "B", document_id=first.document.id),
+        now=_NOW + timedelta(seconds=1),
+    )
+    job_id = "job_postgres_predecessor_newer_desired"
+    await store.attach_version_job(base.id, first.document.id, target.version.id, job_id)
+    await _index_and_activate(
+        store,
+        base.id,
+        first.document.id,
+        target.version.id,
+        "B",
+        now=_NOW + timedelta(seconds=2),
+    )
+    newer = await store.create_document_version(
+        _version(base.id, "C", document_id=first.document.id),
+        now=_NOW + timedelta(seconds=3),
+    )
+
+    failed = await store.mark_version_failed(
+        KnowledgeVersionFailure(
+            kb_id=base.id,
+            document_id=first.document.id,
+            document_version_id=target.version.id,
+            ingest_job_id=job_id,
+            error_kind="late_failure",
+            error_message="The active ingest failed after a newer request arrived.",
+        ),
+        now=_NOW + timedelta(seconds=4),
+    )
+
+    document = await store.get_document(base.id, first.document.id)
+    restored = await store.get_version(base.id, first.document.id, first.version.id)
+    pending = await store.get_version(base.id, first.document.id, newer.version.id)
+    assert failed.status is KnowledgeVersionStatus.failed
+    assert document is not None
+    assert document.status is KnowledgeDocumentStatus.active
+    assert document.active_version_id == first.version.id
+    assert document.desired_version_id == newer.version.id
+    assert restored is not None and restored.status is KnowledgeVersionStatus.active
+    assert pending is not None and pending.status is KnowledgeVersionStatus.pending
+
+
+async def test_terminal_fence_does_not_disturb_newer_postgres_active_version(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "terminal-fence:newer")
+    base = await _base(store)
+    first = await store.create_document_version(_version(base.id, "A"), now=_NOW)
+    await _index_and_activate(
+        store,
+        base.id,
+        first.document.id,
+        first.version.id,
+        "A",
+        now=_NOW,
+    )
+    target = await store.create_document_version(
+        _version(base.id, "B", document_id=first.document.id),
+        now=_NOW + timedelta(seconds=1),
+    )
+    job_id = "job_postgres_superseded_target"
+    await store.attach_version_job(base.id, first.document.id, target.version.id, job_id)
+    await _index_and_activate(
+        store,
+        base.id,
+        first.document.id,
+        target.version.id,
+        "B",
+        now=_NOW + timedelta(seconds=2),
+    )
+    newer = await store.create_document_version(
+        _version(base.id, "C", document_id=first.document.id),
+        now=_NOW + timedelta(seconds=3),
+    )
+    await _index_and_activate(
+        store,
+        base.id,
+        first.document.id,
+        newer.version.id,
+        "C",
+        now=_NOW + timedelta(seconds=4),
+    )
+
+    fenced = await store.mark_version_failed(
+        KnowledgeVersionFailure(
+            kb_id=base.id,
+            document_id=first.document.id,
+            document_version_id=target.version.id,
+            ingest_job_id=job_id,
+            error_kind="late_failure",
+            error_message="The superseded ingest failed.",
+        ),
+        now=_NOW + timedelta(seconds=5),
+    )
+
+    document = await store.get_document(base.id, first.document.id)
+    current = await store.get_version(base.id, first.document.id, newer.version.id)
+    assert fenced.status is KnowledgeVersionStatus.failed
+    assert await store.list_version_chunks(base.id, first.document.id, target.version.id) == []
+    assert len(await store.list_version_chunks(base.id, first.document.id, newer.version.id)) == 1
+    assert document is not None
+    assert document.status is KnowledgeDocumentStatus.active
+    assert document.active_version_id == newer.version.id
+    assert document.desired_version_id == newer.version.id
+    assert current is not None and current.status is KnowledgeVersionStatus.active
 
 
 async def test_delete_hooks_purge_without_resurrection_and_purge_is_idempotent(

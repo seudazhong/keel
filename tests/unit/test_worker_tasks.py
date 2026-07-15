@@ -11,6 +11,9 @@ from arq.worker import Function
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.config import get_settings
 from keel_core.digest import digest_session_id
+from keel_core.embeddings import FakeEmbedder
+from keel_core.jobs import CancelMode
+from keel_core.knowledge import InMemoryKnowledgeStore
 from keel_core.protocols import ProviderChunk, ToolCall
 from keel_core.state import InMemoryEventStore
 from keel_core.testing import ScriptedProviderGateway
@@ -18,9 +21,9 @@ from keel_core.types import FinishReason, StopReason
 from keel_scheduler.atmostonce import InMemoryClaimStore
 from keel_scheduler.store import InMemoryScheduleStore, ScheduleRow
 from keel_worker.jobs import JobRegistry, dispatch_jobs, run_job
+from keel_worker.knowledge import knowledge_job_definitions, knowledge_job_registry
 from keel_worker.main import (
     WorkerSettings,
-    _empty_job_registry,
     _enqueue_arq,
     resume_run,
     run_agent,
@@ -203,10 +206,40 @@ def test_worker_registers_job_functions_and_dispatch_cron() -> None:
     assert dispatch_cron.second == {0, 30}
 
 
-def test_production_job_registry_is_empty() -> None:
-    registry = _empty_job_registry()
+def test_production_job_registry_contains_only_knowledge_kinds() -> None:
+    settings = get_settings()
+    store = InMemoryKnowledgeStore(
+        "web:local",
+        document_max_bytes=settings.knowledge_document_max_bytes,
+    )
+    embedder = FakeEmbedder(dim=settings.embedding_dim, model=settings.embedding_model)
+    registry = knowledge_job_registry(store, embedder, settings)
     assert isinstance(registry, JobRegistry)
-    assert registry.kinds() == ()
+    assert registry.kinds() == ("knowledge.delete", "knowledge.ingest")
+
+
+def test_knowledge_job_definitions_use_durable_cancellation_and_leases() -> None:
+    settings = get_settings()
+    definitions = knowledge_job_definitions(
+        InMemoryKnowledgeStore("web:local"),
+        FakeEmbedder(dim=settings.embedding_dim, model=settings.embedding_model),
+        settings,
+    )
+    by_kind = {definition.kind: definition for definition in definitions}
+
+    ingest = by_kind["knowledge.ingest"]
+    assert ingest.cancel_mode is CancelMode.cooperative
+    assert ingest.max_attempts == 3
+    assert ingest.lease_seconds == settings.job_lease_seconds
+    assert ingest.on_cancelled is not None
+    assert ingest.on_failed is not None
+
+    delete = by_kind["knowledge.delete"]
+    assert delete.cancel_mode is CancelMode.disabled
+    assert delete.max_attempts == 2_147_483_647
+    assert delete.lease_seconds == settings.job_lease_seconds
+    assert delete.on_cancelled is None
+    assert delete.on_failed is not None
 
 
 async def test_worker_enqueue_adapter_forwards_arq_options() -> None:
