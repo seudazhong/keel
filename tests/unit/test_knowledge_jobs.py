@@ -333,7 +333,17 @@ async def test_ingest_claim_storage_failure_is_retryable_without_mutation() -> N
     assert version.status is KnowledgeVersionStatus.pending
 
 
-async def test_ingest_rejects_invalid_vectors_with_bounded_retryable_error() -> None:
+@pytest.mark.parametrize(
+    "invalid_vector",
+    [
+        [float("nan"), 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [1e-50, -1e-50, 0.0],
+    ],
+)
+async def test_ingest_rejects_invalid_vectors_with_bounded_retryable_error(
+    invalid_vector: list[float],
+) -> None:
     store = InMemoryKnowledgeStore("web:local")
     kb_id, document_id, version_id = await _document(
         store,
@@ -341,7 +351,7 @@ async def test_ingest_rejects_invalid_vectors_with_bounded_retryable_error() -> 
         target_chars=100,
     )
     embedder = _Embedder()
-    embedder.response_override = [[float("nan"), 0.0, 0.0]]
+    embedder.response_override = [invalid_vector]
     handlers = KnowledgeJobHandlers(store, embedder, Settings())
 
     with pytest.raises(RetryableJobError) as caught:

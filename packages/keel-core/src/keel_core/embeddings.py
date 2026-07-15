@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+import struct
 from collections.abc import Iterable, Sequence
 from typing import Any, Protocol, runtime_checkable
 
@@ -25,6 +26,30 @@ class Embedder(Protocol):
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         """Return one embedding per input text."""
         ...
+
+
+def normalize_embedding_vector(value: object, *, dim: int) -> list[float] | None:
+    """Return the finite, non-zero float32 vector pgvector will receive."""
+    if not isinstance(value, Sequence) or isinstance(value, str | bytes) or len(value) != dim:
+        return None
+    vector: list[float] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int | float):
+            return None
+        try:
+            number = float(item)
+        except (OverflowError, TypeError, ValueError):
+            return None
+        if not math.isfinite(number):
+            return None
+        try:
+            float32 = struct.unpack("!f", struct.pack("!f", number))[0]
+        except (OverflowError, struct.error):
+            return None
+        if not math.isfinite(float32):
+            return None
+        vector.append(float32)
+    return vector if any(vector) else None
 
 
 class FakeEmbedder:

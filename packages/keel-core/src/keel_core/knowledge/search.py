@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-import struct
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -12,7 +10,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from keel_core.embeddings import Embedder, rrf_fuse
+from keel_core.embeddings import Embedder, normalize_embedding_vector, rrf_fuse
 
 from .models import (
     KnowledgeCitation,
@@ -270,28 +268,7 @@ def _vector_literal(vector: Sequence[float]) -> str:
 
 
 def _validated_vector(value: object, *, dim: int) -> list[float] | None:
-    if not isinstance(value, Sequence) or isinstance(value, str | bytes) or len(value) != dim:
-        return None
-    vector: list[float] = []
-    for item in value:
-        if isinstance(item, bool) or not isinstance(item, int | float):
-            return None
-        try:
-            number = float(item)
-        except (OverflowError, TypeError, ValueError):
-            return None
-        if not math.isfinite(number):
-            return None
-        try:
-            float32 = struct.unpack("!f", struct.pack("!f", number))[0]
-        except (OverflowError, struct.error):
-            return None
-        if not math.isfinite(float32):
-            return None
-        vector.append(float32)
-    if not any(vector):
-        return None
-    return vector
+    return normalize_embedding_vector(value, dim=dim)
 
 
 def _fuse_chunk_ids(ranked_lists: Sequence[Sequence[str]]) -> list[str]:

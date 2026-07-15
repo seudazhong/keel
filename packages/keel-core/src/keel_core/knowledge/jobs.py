@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import re
 from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
@@ -10,7 +9,7 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict, StrictStr, ValidationError, field_validator
 
 from keel_core.config import Settings
-from keel_core.embeddings import Embedder
+from keel_core.embeddings import Embedder, normalize_embedding_vector
 from keel_core.jobs import (
     CancelMode,
     JobCancellationRequested,
@@ -685,20 +684,12 @@ def _validated_vectors(
             raise RetryableJobError(_EMBEDDING_RESPONSE_CODE, _EMBEDDING_RESPONSE_MESSAGE)
         if len(vector) != expected_dim:
             raise RetryableJobError(_EMBEDDING_RESPONSE_CODE, _EMBEDDING_RESPONSE_MESSAGE)
-        normalized: list[float] = []
-        for value in vector:
-            if isinstance(value, bool) or not isinstance(value, int | float):
-                raise RetryableJobError(
-                    _EMBEDDING_RESPONSE_CODE,
-                    _EMBEDDING_RESPONSE_MESSAGE,
-                )
-            converted = float(value)
-            if not math.isfinite(converted):
-                raise RetryableJobError(
-                    _EMBEDDING_RESPONSE_CODE,
-                    _EMBEDDING_RESPONSE_MESSAGE,
-                )
-            normalized.append(converted)
+        normalized = normalize_embedding_vector(vector, dim=expected_dim)
+        if normalized is None:
+            raise RetryableJobError(
+                _EMBEDDING_RESPONSE_CODE,
+                _EMBEDDING_RESPONSE_MESSAGE,
+            )
         vectors.append(tuple(normalized))
     return vectors
 
