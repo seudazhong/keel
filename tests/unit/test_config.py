@@ -165,3 +165,60 @@ def test_job_dispatch_limit_rejects_values_outside_store_bounds() -> None:
         Settings(job_dispatch_limit=0)
     with pytest.raises(ValidationError):
         Settings(job_dispatch_limit=101)
+
+
+def test_knowledge_defaults() -> None:
+    from keel_core.config import Settings
+
+    settings = Settings()
+    assert settings.knowledge_document_max_bytes == 1_048_576
+    assert settings.knowledge_title_max_chars == 300
+    assert settings.knowledge_description_max_chars == 2_000
+    assert settings.knowledge_search_query_max_chars == 2_000
+    assert settings.knowledge_search_k_max == 10
+    assert settings.knowledge_chunk_target_chars == 1_600
+    assert settings.knowledge_chunk_overlap_chars == 200
+    assert settings.knowledge_embedding_batch_size == 32
+    assert settings.knowledge_tool_output_max_chars == 8_000
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "knowledge_document_max_bytes",
+        "knowledge_title_max_chars",
+        "knowledge_description_max_chars",
+        "knowledge_search_query_max_chars",
+        "knowledge_search_k_max",
+        "knowledge_chunk_target_chars",
+        "knowledge_chunk_overlap_chars",
+        "knowledge_embedding_batch_size",
+        "knowledge_tool_output_max_chars",
+    ],
+)
+def test_knowledge_settings_reject_non_positive_values(field: str) -> None:
+    from pydantic import ValidationError
+
+    from keel_core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(**{field: 0})
+
+
+def test_knowledge_settings_reject_k_above_public_maximum() -> None:
+    from pydantic import ValidationError
+
+    from keel_core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(knowledge_search_k_max=11)
+
+
+@pytest.mark.parametrize("overlap", [100, 101])
+def test_knowledge_settings_reject_overlap_at_or_above_target(overlap: int) -> None:
+    from pydantic import ValidationError
+
+    from keel_core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(knowledge_chunk_target_chars=100, knowledge_chunk_overlap_chars=overlap)
