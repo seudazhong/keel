@@ -236,6 +236,9 @@ CREATE TABLE kb_document_versions (
     index_fingerprint text NOT NULL,
     mime_type text NOT NULL,
     chunking_version text NOT NULL,
+    target_chars integer NOT NULL CHECK (target_chars > 0),
+    overlap_chars integer NOT NULL
+        CHECK (overlap_chars >= 0 AND overlap_chars < target_chars),
     ingest_job_id text,
     status text NOT NULL DEFAULT 'pending'
         CHECK (status IN (
@@ -271,6 +274,10 @@ REFERENCES kb_document_versions(scope_id, kb_id, document_id, id);
 ```
 
 `content` 在 pending/active/superseded/failed/cancelled 时保留；purge 后置 `NULL`。
+每个 version 持久化 `mime_type`、`chunking_version`、`target_chars` 与
+`overlap_chars`。ingest 重启后只需 payload 中的 KB/document/version IDs，即可从
+version 读取原文与完整 chunking 输入、从 `mime_type` 严格派生 `source_type`，并从
+KB 读取 pinned embedding model/dim；不依赖进程内 settings snapshot。
 
 ### 6.4 `kb_chunks`
 
@@ -521,6 +528,9 @@ version 时用 reindex 恢复失败/取消的较新 indexing attempt。
 `POST /.../{document_id}/reindex`
 
 - 从 active version 的原文创建新 version；
+- source format 只从 active version 的 `mime_type` 严格派生：
+  `text/plain -> text`、`text/markdown -> markdown`；其他 MIME 拒绝。不得使用可被
+  pending/failed update 改写的 document-level `source_type`；
 - 若没有 active version，返回 `409 no_active_version`；首次 ingest 失败后的恢复使用
   update 重新提交原文；
 - 使用当前 chunking settings 与 KB pinned model/dim；

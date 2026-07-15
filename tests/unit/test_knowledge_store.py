@@ -31,6 +31,7 @@ from keel_core.knowledge import (
     KnowledgeVersionFailure,
     KnowledgeVersionStatus,
     content_sha256,
+    index_fingerprint,
     new_knowledge_base_id,
     new_knowledge_document_id,
     new_knowledge_idempotency_id,
@@ -146,6 +147,12 @@ async def test_versions_are_monotonic_and_reuse_only_current_live_fingerprints()
     first = await store.create_document_version(_version_command(base.id, "A"), now=_NOW)
     assert first.version.version == 1
     assert not first.reused
+    assert first.version.target_chars == 1600
+    assert first.version.overlap_chars == 200
+    stored_first = await store.get_version(base.id, first.document.id, first.version.id)
+    assert stored_first is not None
+    assert stored_first.target_chars == 1600
+    assert stored_first.overlap_chars == 200
 
     pending_replay = await store.create_document_version(
         _version_command(base.id, "A", document_id=first.document.id),
@@ -264,6 +271,26 @@ async def test_source_type_change_with_identical_bytes_creates_new_version() -> 
     assert stored is not None
     assert stored.source_type is KnowledgeSourceType.text
     assert stored.desired_version_id == text.version.id
+
+    text_replay = await store.create_document_version(
+        _version_command(
+            base.id,
+            "same",
+            document_id=markdown.document.id,
+            source_type=KnowledgeSourceType.text,
+        ),
+        now=_NOW + timedelta(seconds=2),
+    )
+    assert text_replay.reused
+    assert text_replay.version.id == text.version.id
+
+    markdown_again = await store.create_document_version(
+        _version_command(base.id, "same", document_id=markdown.document.id),
+        now=_NOW + timedelta(seconds=3),
+    )
+    assert not markdown_again.reused
+    assert markdown_again.version.version == 3
+    assert markdown_again.version.id != markdown.version.id
 
 
 async def test_concurrent_version_allocation_is_monotonic() -> None:
@@ -485,6 +512,87 @@ async def test_reindex_uses_active_content_and_current_server_pin() -> None:
     assert not changed.reused
     assert changed.version.content == "A"
     assert changed.version.version == 2
+    assert changed.version.target_chars == 1600
+    assert changed.version.overlap_chars == 200
+
+
+async def test_reindex_derives_format_from_active_version_after_failed_text_update() -> None:
+    store = InMemoryKnowledgeStore("web:local")
+    base = await _base(store)
+    markdown = await store.create_document_version(
+        _version_command(base.id, "# Active Markdown"),
+        now=_NOW,
+    )
+    await _index_and_activate(
+        store,
+        base.id,
+        markdown.document.id,
+        markdown.version.id,
+        now=_NOW,
+    )
+
+    text_update = await store.create_document_version(
+        _version_command(
+            base.id,
+            "Pending text replacement",
+            document_id=markdown.document.id,
+            source_type=KnowledgeSourceType.text,
+        ),
+        now=_NOW + timedelta(seconds=1),
+    )
+    assert text_update.version.version == 2
+    assert text_update.document.source_type is KnowledgeSourceType.text
+    await store.mark_version_failed(
+        KnowledgeVersionFailure(
+            kb_id=base.id,
+            document_id=markdown.document.id,
+            document_version_id=text_update.version.id,
+            error_kind="embedding_unavailable",
+            error_message="Embedding is unavailable.",
+        ),
+        now=_NOW + timedelta(seconds=2),
+    )
+
+    before_reindex = await store.get_document(base.id, markdown.document.id)
+    assert before_reindex is not None
+    assert before_reindex.source_type is KnowledgeSourceType.text
+    assert before_reindex.active_version_id == markdown.version.id
+
+    reindexed = await store.reindex_document(
+        KnowledgeDocumentReindex(
+            kb_id=base.id,
+            document_id=markdown.document.id,
+            chunking_version="keel-char-v2",
+            target_chars=1200,
+            overlap_chars=120,
+        ),
+        now=_NOW + timedelta(seconds=3),
+    )
+
+    assert not reindexed.reused
+    assert reindexed.version.version == 3
+    assert reindexed.version.content == "# Active Markdown"
+    assert reindexed.version.mime_type == "text/markdown"
+    assert reindexed.version.chunking_version == "keel-char-v2"
+    assert reindexed.version.target_chars == 1200
+    assert reindexed.version.overlap_chars == 120
+    assert reindexed.version.index_fingerprint == index_fingerprint(
+        content_sha256("# Active Markdown"),
+        KnowledgeSourceType.markdown,
+        "keel-char-v2",
+        base.embedding_model,
+        base.embedding_dim,
+        1200,
+        120,
+    )
+    assert reindexed.document.source_type is KnowledgeSourceType.markdown
+    assert [
+        version.version for version in await store.list_versions(base.id, markdown.document.id)
+    ] == [
+        1,
+        2,
+        3,
+    ]
 
 
 async def test_reindex_requires_an_active_version() -> None:

@@ -104,6 +104,9 @@ def upgrade() -> None:
             index_fingerprint text NOT NULL,
             mime_type text NOT NULL,
             chunking_version text NOT NULL,
+            target_chars integer NOT NULL CHECK (target_chars > 0),
+            overlap_chars integer NOT NULL
+                CHECK (overlap_chars >= 0 AND overlap_chars < target_chars),
             ingest_job_id text,
             status text NOT NULL DEFAULT 'pending'
                 CHECK (status IN (

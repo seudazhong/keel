@@ -60,6 +60,8 @@ _EXPECTED_COLUMNS = {
         "index_fingerprint",
         "mime_type",
         "chunking_version",
+        "target_chars",
+        "overlap_chars",
         "ingest_job_id",
         "status",
         "error_kind",
@@ -209,9 +211,10 @@ async def _seed_graph(engine: AsyncEngine, *, scope: str, suffix: str) -> None:
             text(
                 "INSERT INTO kb_document_versions "
                 "(id, scope_id, kb_id, document_id, version, content, "
-                "content_sha256, index_fingerprint, mime_type, chunking_version) "
+                "content_sha256, index_fingerprint, mime_type, chunking_version, "
+                "target_chars, overlap_chars) "
                 "VALUES (:version_id, :scope, :kb, :doc, 1, 'content', "
-                ":content_hash, :fingerprint, 'text/plain', 'keel-char-v1')"
+                ":content_hash, :fingerprint, 'text/plain', 'keel-char-v1', 1600, 200)"
             ),
             {
                 "version_id": f"kbv_{suffix}",
@@ -289,6 +292,9 @@ async def test_knowledge_schema_has_exact_columns_checks_fks_and_indexes(
     assert chunk_columns["heading_path"]["column_default"] is not None
     assert chunk_columns["metadata"]["is_nullable"] == "NO"
     assert chunk_columns["metadata"]["column_default"] is not None
+    version_columns = await _columns(migrated_db, "kb_document_versions")
+    assert version_columns["target_chars"]["is_nullable"] == "NO"
+    assert version_columns["overlap_chars"]["is_nullable"] == "NO"
 
     definitions = {
         table: "\n".join((await _constraint_definitions(migrated_db, table)).values())
@@ -301,6 +307,9 @@ async def test_knowledge_schema_has_exact_columns_checks_fks_and_indexes(
         value in definitions["kb_documents"] for value in ("pending", "active", "failed", "deleted")
     )
     assert "version >= 1" in definitions["kb_document_versions"]
+    assert "target_chars > 0" in definitions["kb_document_versions"]
+    assert "overlap_chars >= 0" in definitions["kb_document_versions"]
+    assert "overlap_chars < target_chars" in definitions["kb_document_versions"]
     assert all(
         value in definitions["kb_document_versions"]
         for value in (
@@ -379,6 +388,31 @@ async def test_knowledge_schema_has_exact_columns_checks_fks_and_indexes(
     chunk_indexes = await _index_definitions(migrated_db, "kb_chunks")
     assert "USING gin (fts)" in chunk_indexes["ix_kb_chunks_fts"]
     assert "USING gin (text gin_trgm_ops)" in chunk_indexes["ix_kb_chunks_trgm"]
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    [
+        "target_chars = NULL",
+        "overlap_chars = NULL",
+        "target_chars = 0",
+        "overlap_chars = -1",
+        "overlap_chars = target_chars",
+    ],
+)
+async def test_document_version_chunk_settings_are_database_enforced(
+    migrated_db: AsyncEngine,
+    assignment: str,
+) -> None:
+    await _seed_graph(migrated_db, scope="schema:chunk-settings", suffix="chunk_settings")
+
+    with pytest.raises(IntegrityError):
+        async with migrated_db.begin() as conn:
+            await conn.execute(
+                text(
+                    f"UPDATE kb_document_versions SET {assignment} WHERE id = 'kbv_chunk_settings'"
+                )
+            )
 
 
 async def test_jobs_cancel_mode_migration_defaults_existing_behavior_and_checks_values(
@@ -462,9 +496,11 @@ async def test_composite_foreign_keys_reject_same_scope_cross_kb_and_cross_docum
             text(
                 "INSERT INTO kb_document_versions "
                 "(id, scope_id, kb_id, document_id, version, content, "
-                "content_sha256, index_fingerprint, mime_type, chunking_version) "
+                "content_sha256, index_fingerprint, mime_type, chunking_version, "
+                "target_chars, overlap_chars) "
                 "VALUES ('kbv_fk_a2', 'schema:fk', 'kb_fk_a', 'doc_fk_a2', 1, "
-                "'content', :content_hash, :fingerprint, 'text/markdown', 'keel-char-v1')"
+                "'content', :content_hash, :fingerprint, 'text/markdown', "
+                "'keel-char-v1', 1600, 200)"
             ),
             {"content_hash": "e" * 64, "fingerprint": "f" * 64},
         )
@@ -475,9 +511,11 @@ async def test_composite_foreign_keys_reject_same_scope_cross_kb_and_cross_docum
                 text(
                     "INSERT INTO kb_document_versions "
                     "(id, scope_id, kb_id, document_id, version, content, "
-                    "content_sha256, index_fingerprint, mime_type, chunking_version) "
+                    "content_sha256, index_fingerprint, mime_type, chunking_version, "
+                    "target_chars, overlap_chars) "
                     "VALUES ('kbv_wrong_kb', 'schema:fk', 'kb_fk_b', 'doc_fk_a', 2, "
-                    "'content', :content_hash, :fingerprint, 'text/plain', 'keel-char-v1')"
+                    "'content', :content_hash, :fingerprint, 'text/plain', "
+                    "'keel-char-v1', 1600, 200)"
                 ),
                 {"content_hash": "1" * 64, "fingerprint": "2" * 64},
             )

@@ -187,6 +187,33 @@ class KnowledgeVersionStatus(StrEnum):
     purged = "purged"
 
 
+def knowledge_source_type_from_mime_type(mime_type: object) -> KnowledgeSourceType: ...
+
+
+@dataclass(frozen=True)
+class KnowledgeDocumentVersionRecord:
+    id: str
+    scope_id: str
+    kb_id: str
+    document_id: str
+    version: int
+    content: str | None
+    content_sha256: str
+    index_fingerprint: str
+    mime_type: str
+    chunking_version: str
+    target_chars: int
+    overlap_chars: int
+    ingest_job_id: str | None
+    status: KnowledgeVersionStatus
+    error_kind: str | None
+    error_message: str | None
+    created_at: datetime
+    activated_at: datetime | None
+    deleted_at: datetime | None
+    purged_at: datetime | None
+
+
 class KnowledgeSearchMode(StrEnum):
     hybrid = "hybrid"
     lexical = "lexical"
@@ -457,7 +484,10 @@ git commit -m "feat(jobs): add knowledge lifecycle hooks" -m "Co-authored-by: Co
 - Test: `tests/unit/test_config.py`
 
 **Interfaces:**
-- Produces strict records/errors/commands, `KnowledgeStore`, `InMemoryKnowledgeStore`, ID/fingerprint helpers, and validated settings consumed by every later task.
+- Produces strict records/errors/commands, `KnowledgeStore`, `InMemoryKnowledgeStore`,
+  ID/fingerprint helpers, and validated settings consumed by every later task. Document versions
+  durably carry `mime_type`, `chunking_version`, `target_chars`, and `overlap_chars`; source type
+  is strictly recoverable from the version MIME type.
 
 - [ ] **Step 1: Write RED model/settings tests**
 
@@ -499,7 +529,12 @@ def test_knowledge_settings_reject_overlap_at_or_above_target() -> None:
 
 - [ ] **Step 2: Define strict domain models and errors**
 
-Use `StrEnum` and frozen dataclasses for persistence records; Pydantic `ConfigDict(extra="forbid")` for API/job commands. Implement storage-safe `kb_`, `doc_`, `kbv_`, `kbc_`, and `kbi_` IDs and bounded public errors such as `KnowledgeNotFound`, `KnowledgeConflict`, `KnowledgeValidationError`, and `KnowledgeEmbeddingMismatch`.
+Use `StrEnum` and frozen dataclasses for persistence records; Pydantic
+`ConfigDict(extra="forbid")` for API/job commands. `KnowledgeDocumentVersionRecord` persists every
+non-KB input to `index_fingerprint`, including strict positive `target_chars`, non-negative
+`overlap_chars`, and `overlap_chars < target_chars`. Implement storage-safe `kb_`, `doc_`, `kbv_`,
+`kbc_`, and `kbi_` IDs and bounded public errors such as `KnowledgeNotFound`,
+`KnowledgeConflict`, `KnowledgeValidationError`, and `KnowledgeEmbeddingMismatch`.
 
 - [ ] **Step 3: Add the settings from design §18**
 
@@ -607,7 +642,10 @@ async with self._engine.begin() as conn:
     await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
 ```
 
-Every `SELECT`, `UPDATE`, and `DELETE` includes `scope_id = :scope`; global-ID foreign-scope collisions return not found. Use transaction advisory locks for idempotency keys and `SELECT ... FOR UPDATE` for document version allocation/activation/chunk writes/purge.
+Every `SELECT`, `UPDATE`, and `DELETE` includes `scope_id = :scope`; global-ID foreign-scope
+collisions return not found. Version row serialization includes `target_chars` and
+`overlap_chars`. Use transaction advisory locks for idempotency keys and `SELECT ... FOR UPDATE`
+for document version allocation/activation/chunk writes/purge.
 
 - [ ] **Step 3: Implement request-ledger crash recovery**
 
@@ -764,7 +802,12 @@ Cover payload `extra="forbid"`, embedder pin mismatch, batch checkpoints, idempo
 
 - [ ] **Step 2: Implement ingest handler**
 
-Parse payload before side effects; load/lock lifecycle; normalize/chunk; verify embedder pin; embed batches of `knowledge_embedding_batch_size`; checkpoint after each batch; write only while version is indexing; activate atomically. Return bounded `JobResult` IDs/counts only.
+Parse the IDs-only payload before side effects; load version content, MIME type,
+`chunking_version`, `target_chars`, and `overlap_chars`, plus the KB pinned model/dim, from durable
+rows; strictly derive source type from the version MIME type. Then normalize/chunk, verify the
+embedder pin, embed batches of `knowledge_embedding_batch_size`, checkpoint after each batch,
+write only while the version is indexing, and activate atomically. Return bounded `JobResult`
+IDs/counts only.
 
 - [ ] **Step 3: Implement terminal hooks**
 

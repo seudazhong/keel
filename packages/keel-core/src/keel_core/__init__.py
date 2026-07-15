@@ -63,6 +63,7 @@ from .knowledge import (
     canonical_request_fingerprint,
     content_sha256,
     index_fingerprint,
+    knowledge_source_type_from_mime_type,
     request_fingerprint,
 )
 from .loop import RunBudget, RunResult, ToolRegistry, admit, run
@@ -182,6 +183,7 @@ __all__ = [
     "canonical_request_fingerprint",
     "content_sha256",
     "index_fingerprint",
+    "knowledge_source_type_from_mime_type",
     "request_fingerprint",
     # events
     "Event",

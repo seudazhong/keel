@@ -45,6 +45,7 @@ from .models import (
     KnowledgeVersionStatus,
     content_sha256,
     index_fingerprint,
+    knowledge_source_type_from_mime_type,
     new_knowledge_base_id,
     new_knowledge_chunk_id,
     new_knowledge_document_id,
@@ -772,6 +773,8 @@ class InMemoryKnowledgeStore:
             index_fingerprint=fingerprint,
             mime_type=command.mime_type,
             chunking_version=command.chunking_version,
+            target_chars=command.target_chars,
+            overlap_chars=command.overlap_chars,
             ingest_job_id=None,
             status=KnowledgeVersionStatus.pending,
             error_kind=None,
@@ -1043,12 +1046,13 @@ class InMemoryKnowledgeStore:
                 KnowledgePublicCode.no_active_version,
                 "Knowledge document has no active version to reindex.",
             )
+        source_type = knowledge_source_type_from_mime_type(active.mime_type)
         return self._create_document_version_locked(
             KnowledgeDocumentVersionCreate(
                 kb_id=base.id,
                 document_id=document.id,
                 title=document.title,
-                source_type=document.source_type,
+                source_type=source_type,
                 source_uri=document.source_uri,
                 content=active.content,
                 mime_type=active.mime_type,

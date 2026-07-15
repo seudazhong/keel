@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, asdict, replace
+from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
@@ -17,6 +18,7 @@ from keel_core.knowledge import (
     KnowledgeChunkWrite,
     KnowledgeCitation,
     KnowledgeDocumentVersionCreate,
+    KnowledgeDocumentVersionRecord,
     KnowledgeEmbeddingMismatch,
     KnowledgeHit,
     KnowledgeOperation,
@@ -25,9 +27,11 @@ from keel_core.knowledge import (
     KnowledgeSearchStatus,
     KnowledgeSourceType,
     KnowledgeValidationError,
+    KnowledgeVersionStatus,
     canonical_request_fingerprint,
     content_sha256,
     index_fingerprint,
+    knowledge_source_type_from_mime_type,
     new_knowledge_base_id,
     new_knowledge_chunk_id,
     new_knowledge_document_id,
@@ -225,6 +229,56 @@ def test_index_fingerprint_uses_unambiguous_canonical_json() -> None:
         200,
     )
     assert first != second
+
+
+def test_source_type_from_mime_type_is_strict_and_public() -> None:
+    assert knowledge_source_type_from_mime_type("text/plain") is KnowledgeSourceType.text
+    assert knowledge_source_type_from_mime_type("text/markdown") is KnowledgeSourceType.markdown
+
+    for invalid in ("text/html", "text/plain; charset=utf-8", " text/plain", ""):
+        with pytest.raises(KnowledgeValidationError, match="invalid_knowledge_input"):
+            knowledge_source_type_from_mime_type(invalid)
+
+
+def test_document_version_record_persists_strict_chunk_settings() -> None:
+    now = datetime(2026, 7, 15, 8, 0, tzinfo=UTC)
+    record = KnowledgeDocumentVersionRecord(
+        id=new_knowledge_version_id(),
+        scope_id="web:local",
+        kb_id=new_knowledge_base_id(),
+        document_id=new_knowledge_document_id(),
+        version=1,
+        content="# Guide",
+        content_sha256=content_sha256("# Guide"),
+        index_fingerprint="a" * 64,
+        mime_type="text/markdown",
+        chunking_version="keel-char-v1",
+        target_chars=1600,
+        overlap_chars=200,
+        ingest_job_id=None,
+        status=KnowledgeVersionStatus.pending,
+        error_kind=None,
+        error_message=None,
+        created_at=now,
+        activated_at=None,
+        deleted_at=None,
+        purged_at=None,
+    )
+
+    serialized = asdict(record)
+    assert serialized["target_chars"] == 1600
+    assert serialized["overlap_chars"] == 200
+
+    with pytest.raises(ValueError, match="target_chars"):
+        replace(record, target_chars=0)
+    with pytest.raises(ValueError, match="integer"):
+        replace(record, target_chars=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="overlap_chars"):
+        replace(record, overlap_chars=-1)
+    with pytest.raises(ValueError, match="integer"):
+        replace(record, overlap_chars=1.5)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="chunk overlap"):
+        replace(record, overlap_chars=1600)
 
 
 def test_request_fingerprint_is_canonical_and_path_bound() -> None:

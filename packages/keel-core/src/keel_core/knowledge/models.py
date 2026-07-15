@@ -69,6 +69,12 @@ class KnowledgeSourceType(StrEnum):
     markdown = "markdown"
 
 
+_MIME_SOURCE_TYPES = {
+    "text/plain": KnowledgeSourceType.text,
+    "text/markdown": KnowledgeSourceType.markdown,
+}
+
+
 class KnowledgeBaseStatus(StrEnum):
     active = "active"
     deleted = "deleted"
@@ -209,6 +215,14 @@ def _strict_int(value: object, *, field: str, minimum: int | None = None) -> int
             raise ValueError(f"{field} must be a positive integer")
         raise ValueError(f"{field} must be an integer greater than or equal to {minimum}")
     return value
+
+
+def _validate_chunk_settings(target_chars: object, overlap_chars: object) -> tuple[int, int]:
+    target = _strict_int(target_chars, field="target_chars", minimum=1)
+    overlap = _strict_int(overlap_chars, field="overlap_chars", minimum=0)
+    if overlap >= target:
+        raise ValueError("chunk overlap must be non-negative and less than target")
+    return target, overlap
 
 
 class KnowledgeError(KeelError):
@@ -372,6 +386,19 @@ def validate_document_max_bytes(value: object) -> int:
         ) from exc
 
 
+def knowledge_source_type_from_mime_type(mime_type: object) -> KnowledgeSourceType:
+    if not isinstance(mime_type, str):
+        source_type = None
+    else:
+        source_type = _MIME_SOURCE_TYPES.get(mime_type)
+    if source_type is None:
+        raise KnowledgeValidationError(
+            KnowledgePublicCode.invalid_input,
+            "Knowledge document MIME type is unsupported.",
+        )
+    return source_type
+
+
 def content_sha256(content: str) -> str:
     try:
         safe = _storage_safe_text(content, field="content", allow_empty=True)
@@ -398,18 +425,12 @@ def index_fingerprint(
         chunker = _required_text(chunking_version, field="chunking_version")
         model = _required_text(embedding_model, field="embedding_model")
         dim = _strict_int(embedding_dim, field="embedding_dim", minimum=1)
-        target = _strict_int(target_chars, field="target_chars", minimum=1)
-        overlap = _strict_int(overlap_chars, field="overlap_chars", minimum=0)
+        target, overlap = _validate_chunk_settings(target_chars, overlap_chars)
     except ValueError as exc:
         raise KnowledgeValidationError(
             KnowledgePublicCode.fingerprint_invalid,
             "Index fingerprint input is invalid.",
         ) from exc
-    if overlap >= target:
-        raise KnowledgeValidationError(
-            KnowledgePublicCode.fingerprint_invalid,
-            "Index fingerprint input is invalid.",
-        )
     serialized = json.dumps(
         {
             "chunking_version": chunker,
@@ -869,6 +890,8 @@ class KnowledgeDocumentVersionRecord:
     index_fingerprint: str
     mime_type: str
     chunking_version: str
+    target_chars: int
+    overlap_chars: int
     ingest_job_id: str | None
     status: KnowledgeVersionStatus
     error_kind: str | None
@@ -890,8 +913,9 @@ class KnowledgeDocumentVersionRecord:
         if self.content is not None and self.content_sha256 != content_sha256(self.content):
             raise ValueError("content_sha256 does not match content")
         _validate_hash(self.index_fingerprint, field="index_fingerprint")
-        _required_text(self.mime_type, field="mime_type")
+        knowledge_source_type_from_mime_type(self.mime_type)
         _required_text(self.chunking_version, field="chunking_version")
+        _validate_chunk_settings(self.target_chars, self.overlap_chars)
         _require_enum(self.status, KnowledgeVersionStatus, field="status")
         if self.ingest_job_id is not None:
             _required_text(self.ingest_job_id, field="ingest_job_id")
@@ -1071,21 +1095,15 @@ class KnowledgeDocumentVersionCreate:
                 "Document content must not be blank.",
             )
         object.__setattr__(self, "content", safe_content)
-        object.__setattr__(self, "mime_type", _required_text(self.mime_type, field="mime_type"))
-        expected_mime_type = (
-            "text/markdown" if self.source_type is KnowledgeSourceType.markdown else "text/plain"
-        )
-        if self.mime_type != expected_mime_type:
+        mime_source_type = knowledge_source_type_from_mime_type(self.mime_type)
+        if mime_source_type is not self.source_type:
             raise ValueError("mime_type does not match source_type")
         object.__setattr__(
             self,
             "chunking_version",
             _required_text(self.chunking_version, field="chunking_version"),
         )
-        _strict_int(self.target_chars, field="target_chars", minimum=1)
-        _strict_int(self.overlap_chars, field="overlap_chars", minimum=0)
-        if self.overlap_chars >= self.target_chars:
-            raise ValueError("chunk overlap must be non-negative and less than target")
+        _validate_chunk_settings(self.target_chars, self.overlap_chars)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1107,10 +1125,7 @@ class KnowledgeDocumentReindex:
             "chunking_version",
             _required_text(self.chunking_version, field="chunking_version"),
         )
-        _strict_int(self.target_chars, field="target_chars", minimum=1)
-        _strict_int(self.overlap_chars, field="overlap_chars", minimum=0)
-        if self.overlap_chars >= self.target_chars:
-            raise ValueError("chunk overlap must be non-negative and less than target")
+        _validate_chunk_settings(self.target_chars, self.overlap_chars)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1412,6 +1427,7 @@ __all__ = [
     "content_sha256",
     "canonical_request_fingerprint",
     "index_fingerprint",
+    "knowledge_source_type_from_mime_type",
     "new_knowledge_base_id",
     "new_knowledge_chunk_id",
     "new_knowledge_document_id",
