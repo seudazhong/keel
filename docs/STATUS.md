@@ -72,7 +72,7 @@ Keel 当前处于 **M3（Knowledge & quality）后段**：
 
 ## 3. 当前验证基线
 
-- Python test suite：**1034 passed / 1 skipped**（1035 collected）。
+- Python test suite：**1036 passed / 1 skipped**（1037 collected）。
 - React/Vitest：**49 passed**。
 - Ruff lint + format：通过。
 - mypy strict：通过。
