@@ -1205,12 +1205,7 @@ async def test_postgres_terminal_transition_injects_one_assistant_event(
             JobResult(data={}, message="duplicate"),
             terminal_at + timedelta(seconds=1),
         )
-    if terminal == "failed":
-        with pytest.raises(JobValidationError) as caught:
-            await store.request_cancel(job_id, terminal_at + timedelta(seconds=2))
-        assert caught.value.code == "job_finalizing"
-    else:
-        assert await store.request_cancel(job_id, terminal_at + timedelta(seconds=2)) == row
+    assert await store.request_cancel(job_id, terminal_at + timedelta(seconds=2)) == row
     assert len(await _job_events(migrated_db, scope, session_id, job_id)) == 1
 
 

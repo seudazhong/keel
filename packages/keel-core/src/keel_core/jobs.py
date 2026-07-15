@@ -52,6 +52,9 @@ class JobTerminalIntent(StrEnum):
     cancelled = "cancelled"
 
 
+_TERMINAL_STATUSES = frozenset({JobStatus.succeeded, JobStatus.failed, JobStatus.cancelled})
+
+
 class CancelMode(StrEnum):
     immediate = "immediate"
     cooperative = "cooperative"
@@ -1069,6 +1072,8 @@ class InMemoryJobStore:
             row = self._rows.get(safe_job_id)
             if row is None:
                 return None
+            if row.status in _TERMINAL_STATUSES:
+                return _copy_record(row)
             if row.cancel_mode is CancelMode.disabled:
                 raise JobValidationError(
                     "job_not_cancellable",
@@ -1924,6 +1929,8 @@ class PostgresJobStore:
             if locked is None:
                 return None
             record = _to_job_record(locked)
+            if record.status in _TERMINAL_STATUSES:
+                return record
             if record.cancel_mode is CancelMode.disabled:
                 raise JobValidationError(
                     "job_not_cancellable",

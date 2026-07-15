@@ -1058,12 +1058,7 @@ async def test_terminal_finalizers_inject_exactly_once_and_freeze_the_job(
             JobResult(data={}, message="again"),
             _NOW + timedelta(seconds=1),
         )
-    if terminal == "failed":
-        with pytest.raises(JobValidationError) as caught:
-            await store.request_cancel(job.id, _NOW + timedelta(seconds=2))
-        assert caught.value.code == "job_finalizing"
-    else:
-        assert await store.request_cancel(job.id, _NOW + timedelta(seconds=2)) == result
+    assert await store.request_cancel(job.id, _NOW + timedelta(seconds=2)) == result
     assert await store.get(job.id) == result
     injected = [
         event for event in events.snapshot("target") if event.payload.get("job_id") == job.id
@@ -1073,6 +1068,24 @@ async def test_terminal_finalizers_inject_exactly_once_and_freeze_the_job(
     assert injected[0].payload["text"] == expected_text
     assert injected[0].payload["partial"] is False
     assert injected[0].payload["job_status"] == terminal
+
+
+async def test_terminal_disabled_job_cancel_is_idempotent() -> None:
+    store = InMemoryJobStore("web:local")
+    job, _ = await store.enqueue_once(
+        kind="test.cleanup",
+        payload={},
+        target_session_id=None,
+        idempotency_key="terminal-disabled",
+        max_attempts=3,
+        cancel_mode=CancelMode.disabled,
+        now=_NOW,
+    )
+    lease = await store.claim(job.id, _NOW, 60)
+    assert lease is not None
+    terminal = await store.succeed(lease, JobResult(data={}, message="done"), _NOW)
+
+    assert await store.request_cancel(job.id, _NOW + timedelta(seconds=1)) == terminal
 
 
 async def test_terminal_finalizer_bounds_record_error_and_injected_messages() -> None:
