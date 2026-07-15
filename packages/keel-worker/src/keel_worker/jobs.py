@@ -14,6 +14,7 @@ from time import perf_counter
 from typing import Any, TypeVar, cast
 
 from keel_core.jobs import (
+    CancelMode,
     JobCancellationRequested,
     JobError,
     JobLease,
@@ -67,6 +68,7 @@ class JobDefinition:
     lease_seconds: int = 300
     on_cancelled: JobCancelledHook | None = None
     on_failed: JobFailedHook | None = None
+    cancel_mode: CancelMode = CancelMode.immediate
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", _normalized_kind(self.kind))
@@ -76,6 +78,8 @@ class JobDefinition:
             raise ValueError("on_cancelled must be callable")
         if self.on_failed is not None and not callable(self.on_failed):
             raise ValueError("on_failed must be callable")
+        if not isinstance(self.cancel_mode, CancelMode):
+            raise ValueError("cancel_mode must be a CancelMode")
         if (
             isinstance(self.max_attempts, bool)
             or not isinstance(self.max_attempts, int)

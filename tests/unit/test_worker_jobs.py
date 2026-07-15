@@ -134,6 +134,16 @@ def test_job_definition_rejects_non_callable_hooks(field: str) -> None:
         JobDefinition(kind="test.bad", handler=_handler, **{field: object()})  # type: ignore[arg-type]
 
 
+def test_job_definition_requires_cancel_mode_enum() -> None:
+    assert JobDefinition(kind="test.good", handler=_handler).cancel_mode is CancelMode.immediate
+    with pytest.raises(ValueError, match="cancel_mode"):
+        JobDefinition(
+            kind="test.bad",
+            handler=_handler,
+            cancel_mode="cooperative",  # type: ignore[arg-type]
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [

@@ -2211,4 +2211,7 @@ def retry_delay_seconds(attempt: int, base_seconds: int, max_seconds: int) -> in
     values = (attempt, base_seconds, max_seconds)
     if any(isinstance(value, bool) or not isinstance(value, int) or value < 1 for value in values):
         raise ValueError("attempt, base_seconds and max_seconds must be positive")
-    return min(base_seconds * int(2 ** (attempt - 1)), max_seconds)
+    exponent = attempt - 1
+    if exponent >= max_seconds.bit_length():
+        return max_seconds
+    return min(base_seconds * (1 << exponent), max_seconds)
