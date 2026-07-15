@@ -7,14 +7,23 @@ import copy
 import hashlib
 import json
 import logging
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
+from functools import wraps
 from typing import Any, NoReturn, Protocol, runtime_checkable
 
 from sqlalchemy import text
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import (
+    DBAPIError,
+    DisconnectionError,
+    IntegrityError,
+    InvalidRequestError,
+)
+from sqlalchemy.exc import (
+    TimeoutError as SQLAlchemyTimeoutError,
+)
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from .models import (
@@ -1993,19 +2002,64 @@ def _pg_idempotency_lock_id(
     return int.from_bytes(hashlib.sha256(encoded).digest()[:8], byteorder="big", signed=True)
 
 
-def _pg_raise_integrity_error(exc: IntegrityError) -> NoReturn:
+def _pg_integrity_error_code(exc: IntegrityError) -> KnowledgePublicCode:
     original = getattr(exc, "orig", None)
     diagnostic = getattr(original, "diag", None)
     constraint = getattr(diagnostic, "constraint_name", None)
     if constraint == "uq_kb_scope_active_name":
+        return KnowledgePublicCode.knowledge_base_name_conflict
+    return KnowledgePublicCode.knowledge_conflict
+
+
+def _pg_raise_integrity_error(code: KnowledgePublicCode) -> NoReturn:
+    if code is KnowledgePublicCode.knowledge_base_name_conflict:
         raise KnowledgeConflict(
-            KnowledgePublicCode.knowledge_base_name_conflict,
+            code,
             "An active Knowledge Base already uses this name.",
-        ) from None
+        )
     raise KnowledgeConflict(
-        KnowledgePublicCode.knowledge_conflict,
+        code,
         "Knowledge resource state conflicts with this operation.",
-    ) from None
+    )
+
+
+_PG_INFRASTRUCTURE_ERRORS = (
+    DBAPIError,
+    DisconnectionError,
+    SQLAlchemyTimeoutError,
+)
+
+
+def _pg_is_exhausted_disconnect(exc: InvalidRequestError) -> bool:
+    return type(exc) is InvalidRequestError and exc.args == ("This connection is closed",)
+
+
+def _pg_error_boundary[**P, R](
+    operation: Callable[P, Awaitable[R]],
+) -> Callable[P, Awaitable[R]]:
+    @wraps(operation)
+    async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        conflict_code: KnowledgePublicCode | None = None
+        storage_failure = False
+        try:
+            return await operation(*args, **kwargs)
+        except IntegrityError as exc:
+            conflict_code = _pg_integrity_error_code(exc)
+        except _PG_INFRASTRUCTURE_ERRORS:
+            storage_failure = True
+        except InvalidRequestError as exc:
+            if not _pg_is_exhausted_disconnect(exc):
+                raise
+            storage_failure = True
+
+        del args, kwargs
+        if conflict_code is not None:
+            _pg_raise_integrity_error(conflict_code)
+        if storage_failure:
+            raise KnowledgeStorageError()
+        raise AssertionError("unreachable Postgres error boundary state")
+
+    return wrapped
 
 
 def _pg_harden_engine_logging(engine: AsyncEngine) -> None:
@@ -2053,14 +2107,9 @@ class PostgresKnowledgeStore:
 
     @asynccontextmanager
     async def _transaction(self) -> AsyncIterator[AsyncConnection]:
-        try:
-            async with self._engine.begin() as conn:
-                await conn.execute(_PG_SET_SCOPE, {"scope": self._scope_id})
-                yield conn
-        except IntegrityError as exc:
-            _pg_raise_integrity_error(exc)
-        except DBAPIError:
-            raise KnowledgeStorageError() from None
+        async with self._engine.begin() as conn:
+            await conn.execute(_PG_SET_SCOPE, {"scope": self._scope_id})
+            yield conn
 
     async def _get_base_tx(
         self,
@@ -2873,6 +2922,7 @@ class PostgresKnowledgeStore:
             enforce_content_limit=False,
         )
 
+    @_pg_error_boundary
     async def create_base(
         self,
         command: KnowledgeBaseCreate,
@@ -2883,6 +2933,7 @@ class PostgresKnowledgeStore:
         async with self._transaction() as conn:
             return await self._create_base_tx(conn, command, timestamp)
 
+    @_pg_error_boundary
     async def create_base_idempotent(
         self,
         command: KnowledgeBaseCreate,
@@ -2924,6 +2975,7 @@ class PostgresKnowledgeStore:
                 replayed=False,
             )
 
+    @_pg_error_boundary
     async def list_bases(
         self,
         *,
@@ -2946,11 +2998,13 @@ class PostgresKnowledgeStore:
             )
         return [_pg_base_record(row) for row in rows]
 
+    @_pg_error_boundary
     async def get_base(self, kb_id: str) -> KnowledgeBaseRecord | None:
         validated = validate_knowledge_base_id(kb_id)
         async with self._transaction() as conn:
             return await self._get_base_tx(conn, validated)
 
+    @_pg_error_boundary
     async def create_document_version(
         self,
         command: KnowledgeDocumentVersionCreate,
@@ -2961,6 +3015,7 @@ class PostgresKnowledgeStore:
         async with self._transaction() as conn:
             return await self._create_document_version_tx(conn, command, timestamp)
 
+    @_pg_error_boundary
     async def create_document_version_idempotent(
         self,
         command: KnowledgeDocumentVersionCreate,
@@ -3009,6 +3064,7 @@ class PostgresKnowledgeStore:
                 replayed=False,
             )
 
+    @_pg_error_boundary
     async def update_document_version_idempotent(
         self,
         command: KnowledgeDocumentVersionCreate,
@@ -3057,6 +3113,7 @@ class PostgresKnowledgeStore:
                 replayed=False,
             )
 
+    @_pg_error_boundary
     async def reindex_document(
         self,
         command: KnowledgeDocumentReindex,
@@ -3067,6 +3124,7 @@ class PostgresKnowledgeStore:
         async with self._transaction() as conn:
             return await self._reindex_document_tx(conn, command, timestamp)
 
+    @_pg_error_boundary
     async def reindex_document_idempotent(
         self,
         command: KnowledgeDocumentReindex,
@@ -3110,6 +3168,7 @@ class PostgresKnowledgeStore:
                 replayed=False,
             )
 
+    @_pg_error_boundary
     async def get_document(
         self,
         kb_id: str,
@@ -3120,6 +3179,7 @@ class PostgresKnowledgeStore:
         async with self._transaction() as conn:
             return await self._get_document_tx(conn, base_id, doc_id)
 
+    @_pg_error_boundary
     async def list_documents(
         self,
         kb_id: str,
@@ -3146,6 +3206,7 @@ class PostgresKnowledgeStore:
             )
         return [_pg_document_record(row) for row in rows]
 
+    @_pg_error_boundary
     async def get_version(
         self,
         kb_id: str,
@@ -3158,6 +3219,7 @@ class PostgresKnowledgeStore:
         async with self._transaction() as conn:
             return await self._get_version_tx(conn, base_id, doc_id, version_id)
 
+    @_pg_error_boundary
     async def list_versions(
         self,
         kb_id: str,
@@ -3187,6 +3249,7 @@ class PostgresKnowledgeStore:
             )
         return [_pg_version_record(row) for row in rows]
 
+    @_pg_error_boundary
     async def list_version_chunks(
         self,
         kb_id: str,
@@ -3235,6 +3298,7 @@ class PostgresKnowledgeStore:
             ) from exc
         return job_id
 
+    @_pg_error_boundary
     async def attach_version_job(
         self,
         kb_id: str,
@@ -3352,6 +3416,7 @@ class PostgresKnowledgeStore:
         )
         return _pg_version_record(row), removed, True
 
+    @_pg_error_boundary
     async def mark_indexing(
         self,
         kb_id: str,
@@ -3481,6 +3546,7 @@ class PostgresKnowledgeStore:
                 )
             chunk_id = new_knowledge_chunk_id()
 
+    @_pg_error_boundary
     async def replace_version_chunks(
         self,
         command: KnowledgeChunkReplacement,
@@ -3651,6 +3717,7 @@ class PostgresKnowledgeStore:
                 chunk_count=len(prepared),
             )
 
+    @_pg_error_boundary
     async def activate_version(
         self,
         kb_id: str,
@@ -3881,6 +3948,7 @@ class PostgresKnowledgeStore:
             )
         return _pg_version_record(version_row)
 
+    @_pg_error_boundary
     async def mark_version_failed(
         self,
         command: KnowledgeVersionFailure,
@@ -3900,6 +3968,7 @@ class PostgresKnowledgeStore:
                 timestamp=timestamp,
             )
 
+    @_pg_error_boundary
     async def mark_version_cancelled(
         self,
         command: KnowledgeVersionCancellation,
@@ -3957,6 +4026,7 @@ class PostgresKnowledgeStore:
         )
         return _pg_document_record(row)
 
+    @_pg_error_boundary
     async def tombstone_document(
         self,
         kb_id: str,
@@ -3973,6 +4043,7 @@ class PostgresKnowledgeStore:
                 timestamp,
             )
 
+    @_pg_error_boundary
     async def tombstone_document_idempotent(
         self,
         command: KnowledgeDocumentTombstone,
@@ -4046,6 +4117,7 @@ class PostgresKnowledgeStore:
         )
         return _pg_base_record(row)
 
+    @_pg_error_boundary
     async def tombstone_base(
         self,
         kb_id: str,
@@ -4056,6 +4128,7 @@ class PostgresKnowledgeStore:
         async with self._transaction() as conn:
             return await self._tombstone_base_tx(conn, kb_id, timestamp)
 
+    @_pg_error_boundary
     async def tombstone_base_idempotent(
         self,
         command: KnowledgeBaseTombstone,
@@ -4159,6 +4232,7 @@ class PostgresKnowledgeStore:
             chunks_removed=chunks_removed,
         )
 
+    @_pg_error_boundary
     async def purge_document(
         self,
         kb_id: str,
@@ -4185,6 +4259,7 @@ class PostgresKnowledgeStore:
                 )
             return await self._purge_document_tx(conn, document, timestamp)
 
+    @_pg_error_boundary
     async def purge_base(
         self,
         kb_id: str,
@@ -4239,6 +4314,7 @@ class PostgresKnowledgeStore:
                 chunks_removed=chunks_removed,
             )
 
+    @_pg_error_boundary
     async def get_idempotent_request(
         self,
         operation: KnowledgeOperation,
@@ -4253,6 +4329,7 @@ class PostgresKnowledgeStore:
         async with self._transaction() as conn:
             return await self._get_idempotency_tx(conn, operation, validated_key)
 
+    @_pg_error_boundary
     async def attach_idempotent_job(
         self,
         command: KnowledgeIdempotencyAttach,

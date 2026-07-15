@@ -9,9 +9,9 @@ from datetime import UTC, datetime, timedelta
 
 import psycopg
 import pytest
-from sqlalchemy import event
-from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy import event, text
+from sqlalchemy.exc import DisconnectionError, InvalidRequestError, SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from keel_core.knowledge import (
     KnowledgeBaseCreate,
@@ -48,6 +48,56 @@ from keel_core.knowledge import (
 pytestmark = pytest.mark.integration
 
 _NOW = datetime(2026, 7, 15, 8, 0, tzinfo=UTC)
+
+
+def _assert_detached_public_exception(
+    error: BaseException,
+    *forbidden_text: str,
+) -> None:
+    assert error.__cause__ is None
+    assert error.__context__ is None
+
+    pending: list[object] = [error]
+    seen: set[int] = set()
+    while pending:
+        value = pending.pop()
+        identity = id(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+
+        if isinstance(value, str):
+            for forbidden in forbidden_text:
+                assert forbidden not in value
+        elif isinstance(value, BaseException):
+            assert not isinstance(value, SQLAlchemyError)
+            for forbidden in forbidden_text:
+                assert forbidden not in str(value)
+                assert forbidden not in repr(value)
+            pending.extend(value.args)
+            pending.extend(vars(value).values())
+            pending.extend(
+                linked for linked in (value.__cause__, value.__context__) if linked is not None
+            )
+        elif isinstance(value, dict):
+            pending.extend(value.keys())
+            pending.extend(value.values())
+        elif isinstance(value, list | tuple | set | frozenset):
+            pending.extend(value)
+
+    boundary_frame_found = False
+    traceback = error.__traceback__
+    while traceback is not None:
+        frame_locals = traceback.tb_frame.f_locals
+        if "storage_failure" in frame_locals and "conflict_code" in frame_locals:
+            boundary_frame_found = True
+            assert "args" not in frame_locals
+            assert "kwargs" not in frame_locals
+            assert not any(isinstance(value, SQLAlchemyError) for value in frame_locals.values())
+            for forbidden in forbidden_text:
+                assert forbidden not in repr(frame_locals)
+        traceback = traceback.tb_next
+    assert boundary_frame_found
 
 
 async def _base(
@@ -364,30 +414,171 @@ async def test_dbapi_failures_are_bounded_redacted_and_retryable(
     assert error.retryable is True
     assert secret not in str(error)
     assert secret not in repr(error)
-    assert error.__cause__ is None
-    assert error.__suppress_context__ is True
-    dbapi_error = error.__context__
-    assert isinstance(dbapi_error, SQLAlchemyOperationalError)
-    assert isinstance(dbapi_error.orig, psycopg.OperationalError)
-    assert secret in repr(dbapi_error.params)
-    assert dbapi_error.hide_parameters is True
-    assert "SQL parameters hidden due to hide_parameters=True" in str(dbapi_error)
-    assert secret not in str(dbapi_error)
-    assert secret not in repr(dbapi_error)
+    _assert_detached_public_exception(error, secret, "forced storage outage")
     assert secret not in caplog.text
+    assert "forced storage outage" not in caplog.text
 
 
 async def test_integrity_errors_keep_specific_conflict_mapping(
     migrated_db: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     store = PostgresKnowledgeStore(migrated_db, "integrity:scope")
-    await _base(store)
+    secret = "sentinel-integrity-secret"
+    await _base(store, name=secret)
 
+    async def force_unique_violation(
+        target_store: PostgresKnowledgeStore,
+        conn: AsyncConnection,
+        command: KnowledgeBaseCreate,
+        timestamp: datetime,
+    ) -> None:
+        await conn.execute(
+            text(
+                "INSERT INTO knowledge_bases "
+                "(id, scope_id, name, description, embedding_model, embedding_dim, "
+                "status, created_at, updated_at) "
+                "VALUES (:id, :scope, :name, :description, :model, :dim, "
+                "'active', :now, :now)"
+            ),
+            {
+                "id": new_knowledge_base_id(),
+                "scope": target_store.scope_id,
+                "name": command.name,
+                "description": command.description,
+                "model": command.embedding_model,
+                "dim": command.embedding_dim,
+                "now": timestamp,
+            },
+        )
+
+    monkeypatch.setattr(
+        PostgresKnowledgeStore,
+        "_create_base_tx",
+        force_unique_violation,
+    )
+    caplog.set_level(logging.DEBUG)
     with pytest.raises(KnowledgeConflict) as caught:
-        await _base(store, now=_NOW + timedelta(seconds=1))
+        await _base(store, name=secret, now=_NOW + timedelta(seconds=1))
 
-    assert type(caught.value) is KnowledgeConflict
-    assert caught.value.code == "knowledge_base_name_conflict"
+    error = caught.value
+    assert type(error) is KnowledgeConflict
+    assert error.code == "knowledge_base_name_conflict"
+    assert error.public_message == "An active Knowledge Base already uses this name."
+    _assert_detached_public_exception(error, secret)
+    assert secret not in caplog.text
+
+
+async def test_pool_exhaustion_is_bounded_without_sqlalchemy_timeout_context(
+    migrated_db: AsyncEngine,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    engine = create_async_engine(
+        migrated_db.url,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.05,
+    )
+    caplog.set_level(logging.DEBUG)
+    try:
+        store = PostgresKnowledgeStore(engine, "pool:scope")
+        async with engine.connect() as held_connection:
+            await held_connection.execute(text("SELECT 1"))
+            with pytest.raises(KnowledgeStorageError) as caught:
+                await store.list_bases()
+    finally:
+        await engine.dispose()
+
+    error = caught.value
+    assert error.code == "knowledge_storage_failure"
+    assert error.retryable is True
+    _assert_detached_public_exception(error, "QueuePool limit")
+    assert "QueuePool limit" not in caplog.text
+
+
+async def test_exhausted_pool_disconnect_is_bounded_without_secret_context(
+    migrated_db: AsyncEngine,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    engine = create_async_engine(migrated_db.url)
+    store = PostgresKnowledgeStore(engine, "disconnect:scope")
+    secret = "sentinel-pool-disconnect-secret"
+
+    def disconnect_on_checkout(
+        _dbapi_connection: object,
+        _connection_record: object,
+        _connection_proxy: object,
+    ) -> None:
+        raise DisconnectionError(secret)
+
+    event.listen(engine.sync_engine, "checkout", disconnect_on_checkout)
+    caplog.set_level(logging.DEBUG)
+    try:
+        with pytest.raises(KnowledgeStorageError) as caught:
+            await store.list_bases()
+    finally:
+        event.remove(engine.sync_engine, "checkout", disconnect_on_checkout)
+        await engine.dispose()
+
+    error = caught.value
+    assert error.code == "knowledge_storage_failure"
+    assert error.retryable is True
+    _assert_detached_public_exception(error, secret, "This connection is closed")
+    assert secret not in caplog.text
+
+
+async def test_domain_cancellation_and_programmer_errors_propagate(
+    migrated_db: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "propagation:scope")
+    base_id = new_knowledge_base_id()
+    caplog.set_level(logging.DEBUG)
+
+    domain_error = KnowledgeValidationError(
+        "domain_passthrough",
+        "Domain passthrough marker.",
+    )
+
+    async def raise_domain(*_args: object, **_kwargs: object) -> None:
+        raise domain_error
+
+    monkeypatch.setattr(PostgresKnowledgeStore, "_get_base_tx", raise_domain)
+    with pytest.raises(KnowledgeValidationError) as caught_domain:
+        await store.get_base(base_id)
+    assert caught_domain.value is domain_error
+
+    cancellation = asyncio.CancelledError("cancellation passthrough marker")
+
+    async def raise_cancellation(*_args: object, **_kwargs: object) -> None:
+        raise cancellation
+
+    monkeypatch.setattr(PostgresKnowledgeStore, "_get_base_tx", raise_cancellation)
+    with pytest.raises(asyncio.CancelledError) as caught_cancellation:
+        await store.get_base(base_id)
+    assert caught_cancellation.value is cancellation
+
+    programmer_error = InvalidRequestError("programmer passthrough marker")
+
+    async def raise_programmer_error(*_args: object, **_kwargs: object) -> None:
+        raise programmer_error
+
+    monkeypatch.setattr(
+        PostgresKnowledgeStore,
+        "_get_base_tx",
+        raise_programmer_error,
+    )
+    with pytest.raises(InvalidRequestError) as caught_programmer:
+        await store.get_base(base_id)
+    assert caught_programmer.value is programmer_error
+    for marker in (
+        "Domain passthrough marker.",
+        "cancellation passthrough marker",
+        "programmer passthrough marker",
+    ):
+        assert marker not in caplog.text
 
 
 async def test_all_idempotent_mutations_are_atomic_replayable_and_recover_jobs(
