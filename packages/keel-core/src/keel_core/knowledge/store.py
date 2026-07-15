@@ -6,6 +6,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
 from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import replace
@@ -2007,6 +2008,21 @@ def _pg_raise_integrity_error(exc: IntegrityError) -> NoReturn:
     ) from None
 
 
+def _pg_harden_engine_logging(engine: AsyncEngine) -> None:
+    sync_engine = engine.sync_engine
+    sync_engine.hide_parameters = True
+    engine.echo = False
+
+    # echo=False removes SQLAlchemy's echo adapter, but a DEBUG-configured
+    # sqlalchemy.engine logger can still expose result rows. Gate only this
+    # engine at WARNING without changing unrelated application or engine loggers.
+    instance_logger = logging.getLogger(
+        f"sqlalchemy.engine.Engine.keel_knowledge_{id(sync_engine):x}"
+    )
+    instance_logger.setLevel(logging.WARNING)
+    sync_engine.logger = instance_logger
+
+
 class PostgresKnowledgeStore:
     """Production scope-bound Knowledge lifecycle store over Postgres."""
 
@@ -2022,7 +2038,7 @@ class PostgresKnowledgeStore:
                 KnowledgePublicCode.invalid_input,
                 "Knowledge database engine is invalid.",
             )
-        engine.sync_engine.hide_parameters = True
+        _pg_harden_engine_logging(engine)
         self._engine = engine
         self._scope_id = validate_scope_id(scope_id)
         self._document_max_bytes = validate_document_max_bytes(document_max_bytes)

@@ -11,7 +11,7 @@ import psycopg
 import pytest
 from sqlalchemy import event
 from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from keel_core.knowledge import (
     KnowledgeBaseCreate,
@@ -208,6 +208,122 @@ async def test_constructor_scope_guards_cross_kb_non_disclosure_and_byte_limit(
     )
     with pytest.raises(KnowledgeNotFound, match="knowledge_document_not_found"):
         await first_scope.list_versions(second_base.id, accepted.document.id)
+
+
+async def test_debug_echo_cannot_log_successful_knowledge_rows(
+    migrated_db: AsyncEngine,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    caplog.set_level(logging.DEBUG, logger="sqlalchemy.engine")
+    logger = logging.getLogger("sqlalchemy.engine.Engine")
+    original_handlers = tuple(logger.handlers)
+    original_level = logger.level
+    engine = create_async_engine(
+        migrated_db.url,
+        echo="debug",
+        hide_parameters=False,
+    )
+    description = "sentinel-knowledge-description"
+    source_uri = "https://sentinel-source-uri.example.test/private"
+    raw_content = "sentinel-knowledge-raw-content"
+    chunk_text = "sentinel-knowledge-chunk-text"
+    try:
+        store = PostgresKnowledgeStore(engine, "logging:scope")
+        assert engine.echo is False
+        assert engine.sync_engine.echo is False
+        assert engine.sync_engine.hide_parameters is True
+        assert not engine.sync_engine.logger.isEnabledFor(logging.DEBUG)
+        assert not engine.sync_engine.logger.isEnabledFor(logging.INFO)
+
+        base = await store.create_base(
+            KnowledgeBaseCreate(
+                name="Logging secrecy",
+                description=description,
+                embedding_model="fake/embed",
+                embedding_dim=3,
+            ),
+            now=_NOW,
+        )
+        created = await store.create_document_version(
+            replace(
+                _version(base.id, raw_content),
+                source_uri=source_uri,
+            ),
+            now=_NOW,
+        )
+        updated_content = f"{chunk_text}\n{raw_content}"
+        updated = await store.create_document_version(
+            replace(
+                _version(
+                    base.id,
+                    updated_content,
+                    document_id=created.document.id,
+                    title="Updated guide",
+                ),
+                source_uri=f"{source_uri}/updated",
+            ),
+            now=_NOW + timedelta(seconds=1),
+        )
+        await store.mark_indexing(
+            base.id,
+            updated.document.id,
+            updated.version.id,
+            now=_NOW + timedelta(seconds=2),
+        )
+        await store.replace_version_chunks(
+            KnowledgeChunkReplacement(
+                kb_id=base.id,
+                document_id=updated.document.id,
+                document_version_id=updated.version.id,
+                chunks=(_chunk(chunk_text),),
+            ),
+            now=_NOW + timedelta(seconds=3),
+        )
+
+        loaded_base = await store.get_base(base.id)
+        assert loaded_base is not None
+        assert loaded_base.description == description
+        assert [item.id for item in await store.list_bases()] == [base.id]
+        loaded_document = await store.get_document(base.id, updated.document.id)
+        assert loaded_document is not None
+        assert loaded_document.source_uri == f"{source_uri}/updated"
+        assert [item.id for item in await store.list_documents(base.id)] == [updated.document.id]
+        loaded_version = await store.get_version(
+            base.id,
+            updated.document.id,
+            updated.version.id,
+        )
+        assert loaded_version is not None
+        assert loaded_version.content == updated_content
+        assert [item.id for item in await store.list_versions(base.id, updated.document.id)] == [
+            created.version.id,
+            updated.version.id,
+        ]
+        assert [
+            item.text
+            for item in await store.list_version_chunks(
+                base.id,
+                updated.document.id,
+                updated.version.id,
+            )
+        ] == [chunk_text]
+    finally:
+        await engine.dispose()
+        logger.setLevel(original_level)
+        for handler in tuple(logger.handlers):
+            if handler not in original_handlers:
+                logger.removeHandler(handler)
+                handler.close()
+
+    logging.getLogger(__name__).debug("unrelated application debug remains enabled")
+    captured = capsys.readouterr()
+    assert "unrelated application debug remains enabled" in caplog.text
+    for sentinel in (description, source_uri, raw_content, chunk_text):
+        assert sentinel not in caplog.text
+        assert sentinel not in captured.out
+        assert sentinel not in captured.err
 
 
 async def test_dbapi_failures_are_bounded_redacted_and_retryable(
