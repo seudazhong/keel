@@ -55,6 +55,7 @@ from .knowledge import (
     KnowledgeSearcher,
     KnowledgeSearchMode,
     KnowledgeSearchStatus,
+    KnowledgeSearchTool,
     KnowledgeSourceType,
     KnowledgeStorageError,
     KnowledgeStore,
@@ -80,6 +81,7 @@ from .memory import (
 from .permissions import Rule, RuleBasedPermissionEngine
 from .projections import project_messages
 from .protocols import (
+    Citation,
     EventStore,
     PermissionEngine,
     PromptAssembler,
@@ -137,6 +139,7 @@ __all__ = [
     # types
     "AgentId",
     "ContentTaint",
+    "Citation",
     "FinishReason",
     "PermissionDecision",
     "Role",
@@ -178,6 +181,7 @@ __all__ = [
     "KnowledgeSearchMode",
     "KnowledgeSearcher",
     "KnowledgeSearchStatus",
+    "KnowledgeSearchTool",
     "KnowledgeSourceType",
     "KnowledgeStorageError",
     "KnowledgeStore",

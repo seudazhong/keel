@@ -16,7 +16,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from .types import RunId, ScopeId, SessionId, StopReason
+from .citations import Citation
+from .types import ContentTaint, RunId, ScopeId, SessionId, StopReason
 
 
 class EventType(StrEnum):
@@ -77,4 +78,7 @@ class ToolResultPayload(BaseModel):
 
     call_id: str
     ok: bool
+    output: str = ""
     spill_path: str | None = None
+    taint: ContentTaint = ContentTaint.clean
+    citations: list[Citation] = Field(default_factory=list)

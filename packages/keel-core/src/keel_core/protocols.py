@@ -19,6 +19,7 @@ from typing import Any, Protocol, runtime_checkable
 from pydantic import BaseModel, Field
 
 from .agents import AgentSpec
+from .citations import Citation as Citation
 from .events import Event
 from .types import (
     ContentTaint,
@@ -55,6 +56,7 @@ class ToolResult(BaseModel):
     display: str | None = None
     spill_path: str | None = None
     taint: ContentTaint = ContentTaint.clean
+    citations: list[Citation] = Field(default_factory=list)
 
 
 class ProviderRequest(BaseModel):

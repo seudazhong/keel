@@ -93,6 +93,7 @@ from .models import (
 )
 from .search import KnowledgeSearcher
 from .store import InMemoryKnowledgeStore, KnowledgeStore, PostgresKnowledgeStore
+from .tools import KnowledgeSearchTool
 
 __all__ = [
     "ChunkDraft",
@@ -149,6 +150,7 @@ __all__ = [
     "KnowledgeSearchMode",
     "KnowledgeSearcher",
     "KnowledgeSearchStatus",
+    "KnowledgeSearchTool",
     "KnowledgeSourceType",
     "KnowledgeStorageError",
     "KnowledgeStore",

@@ -84,6 +84,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         memory_block_max_chars=settings.memory_block_max_chars,
         session_embedding_batch_size=settings.session_embedding_batch_size,
         session_embedding_catchup_limit=settings.session_embedding_catchup_limit,
+        knowledge_search_query_max_chars=settings.knowledge_search_query_max_chars,
+        knowledge_search_k_max=settings.knowledge_search_k_max,
+        knowledge_tool_output_max_chars=settings.knowledge_tool_output_max_chars,
     )
     # Durable approvals raised by unattended (scheduled) runs — the Approvals page +
     # API read this; approving enqueues a resume_run onto the worker's arq queue (G5).
