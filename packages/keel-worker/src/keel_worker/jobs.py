@@ -227,16 +227,16 @@ async def _finish_cancelled(
     store: JobStore,
     definition: JobDefinition,
     lease: JobLease,
-    now: datetime,
+    clock: JobClock,
 ) -> tuple[str, JobStatus | None]:
     if definition.on_cancelled is not None:
-        row = await _lease_hook_record(store, lease, now)
+        row = await _lease_hook_record(store, lease, clock())
         if row is not None:
             await _call_cancelled_hook(definition, row)
     return await _transition_or_current(
         store,
         lease.job_id,
-        store.finish_cancelled(lease, now),
+        store.finish_cancelled(lease, clock()),
     )
 
 
@@ -245,16 +245,16 @@ async def _fail_terminal(
     definition: JobDefinition,
     lease: JobLease,
     error: JobError,
-    now: datetime,
+    clock: JobClock,
 ) -> tuple[str, JobStatus | None]:
     if definition.on_failed is not None:
-        row = await _lease_hook_record(store, lease, now)
+        row = await _lease_hook_record(store, lease, clock())
         if row is not None:
             await _call_failed_hook(definition, row, error)
     return await _transition_or_current(
         store,
         lease.job_id,
-        store.fail_terminal(lease, error, now),
+        store.fail_terminal(lease, error, clock()),
     )
 
 
@@ -285,7 +285,7 @@ async def _retry_or_fail(
     definition: JobDefinition,
     lease: JobLease,
     error: JobError,
-    now: datetime,
+    clock: JobClock,
     on_status: JobStatusSink,
 ) -> tuple[str, JobStatus | None]:
     if lease.attempt >= lease.max_attempts:
@@ -294,11 +294,12 @@ async def _retry_or_fail(
             definition,
             lease,
             error,
-            now,
+            clock,
         )
         if result[1] is not None:
             on_status(result[1])
         return result
+    now = clock()
     settings = ctx["job_settings"]
     retry_at = now + timedelta(
         seconds=retry_delay_seconds(
@@ -447,13 +448,12 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
         except asyncio.CancelledError:
             raise asyncio.CancelledError from None
         except JobCancellationRequested:
-            terminal_at = clock()
             status_value, status = await _without_exception_context(
                 lambda: _finish_cancelled(
                     store,
                     definition,
                     lease,
-                    terminal_at,
+                    clock,
                 )
             )
             if status is not None:
@@ -461,14 +461,13 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
             return status_value
         except PermanentJobError as exc:
             job_error = JobError(exc.code, exc.public_message)
-            terminal_at = clock()
             status_value, status = await _without_exception_context(
                 lambda: _fail_terminal(
                     store,
                     definition,
                     lease,
                     job_error,
-                    terminal_at,
+                    clock,
                 )
             )
             if status is not None:
@@ -476,14 +475,13 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
             return status_value
         except JobValidationError as exc:
             job_error = JobError(exc.code, exc.public_message)
-            terminal_at = clock()
             status_value, status = await _without_exception_context(
                 lambda: _fail_terminal(
                     store,
                     definition,
                     lease,
                     job_error,
-                    terminal_at,
+                    clock,
                 )
             )
             if status is not None:
@@ -498,7 +496,7 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                     definition=definition,
                     lease=lease,
                     error=job_error,
-                    now=clock(),
+                    clock=clock,
                     on_status=set_final_status,
                 )
             )
@@ -532,7 +530,7 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                         "internal_error",
                         "job failed with a temporary internal error",
                     ),
-                    now=clock(),
+                    clock=clock,
                     on_status=set_final_status,
                 )
             )

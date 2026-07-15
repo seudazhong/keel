@@ -157,6 +157,33 @@ async def test_running_cancel_response_exposes_request_flag(
     assert response.json()["cancel_requested"] is True
 
 
+async def test_final_attempt_expiry_cancel_maps_to_conflict_without_mutation(
+    jobs_client: tuple[httpx.AsyncClient, str, PostgresJobStore],
+) -> None:
+    client, _, store = jobs_client
+    claimed_at = datetime.now(UTC) - timedelta(seconds=2)
+    row, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id=None,
+        idempotency_key="cancel-finalizing",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+        now=claimed_at,
+    )
+    assert await store.claim(row.id, claimed_at, 1) is not None
+    before = await store.get(row.id)
+
+    response = await client.post(
+        f"/v1/jobs/{row.id}/cancel",
+        headers={"X-API-Key": "op"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "job is finalizing and cannot be cancelled"
+    assert await store.get(row.id) == before
+
+
 async def test_cooperative_queued_cancel_response_stays_queued_and_exposes_mode(
     jobs_client: tuple[httpx.AsyncClient, str, PostgresJobStore],
 ) -> None:

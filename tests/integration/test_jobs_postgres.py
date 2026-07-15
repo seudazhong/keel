@@ -967,6 +967,39 @@ async def test_postgres_running_cancel_is_persisted_and_success_can_win(
     assert await store.request_cancel(job_id, _NOW + timedelta(seconds=5)) == result
 
 
+async def test_postgres_running_cancel_freezes_at_final_attempt_lease_expiry(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:cancel:finalizing")
+    finalizing_id = await _pg_job(
+        store,
+        "cancel-finalizing",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+    assert await store.claim(finalizing_id, _NOW, 10) is not None
+    before = await store.get(finalizing_id)
+
+    with pytest.raises(JobValidationError) as caught:
+        await store.request_cancel(finalizing_id, _NOW + timedelta(seconds=10))
+
+    assert caught.value.code == "job_finalizing"
+    assert await store.get(finalizing_id) == before
+
+    cancelled_id = await _pg_job(
+        store,
+        "cancel-before-finalizing",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+    assert await store.claim(cancelled_id, _NOW, 10) is not None
+    requested = await store.request_cancel(cancelled_id, _NOW + timedelta(seconds=9))
+
+    assert requested is not None
+    assert await store.request_cancel(cancelled_id, _NOW + timedelta(seconds=10)) == requested
+    assert await store.get(cancelled_id) == requested
+
+
 async def test_postgres_reclaimed_stale_lease_cannot_complete(
     migrated_db: AsyncEngine,
 ) -> None:

@@ -396,6 +396,15 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+def _final_attempt_lease_expired(row: JobRecord, now: datetime) -> bool:
+    return (
+        row.status is JobStatus.running
+        and row.attempt >= row.max_attempts
+        and row.lease_expires_at is not None
+        and row.lease_expires_at <= now
+    )
+
+
 def _validated_identity(value: str, *, field: str, code: str) -> str:
     if not isinstance(value, str):
         raise JobValidationError(code, f"{field} must be storage-safe text")
@@ -897,6 +906,13 @@ class InMemoryJobStore:
             row = self._rows.get(safe_job_id)
             if row is None:
                 return None
+            if _final_attempt_lease_expired(row, now):
+                if row.cancel_requested_at is not None:
+                    return _copy_record(row)
+                raise JobValidationError(
+                    "job_finalizing",
+                    "job is finalizing and cannot be cancelled",
+                )
             if row.cancel_mode is CancelMode.disabled:
                 raise JobValidationError(
                     "job_not_cancellable",
@@ -1555,6 +1571,13 @@ class PostgresJobStore:
             if locked is None:
                 return None
             record = _to_job_record(locked)
+            if _final_attempt_lease_expired(record, now):
+                if record.cancel_requested_at is not None:
+                    return record
+                raise JobValidationError(
+                    "job_finalizing",
+                    "job is finalizing and cannot be cancelled",
+                )
             if record.cancel_mode is CancelMode.disabled:
                 raise JobValidationError(
                     "job_not_cancellable",

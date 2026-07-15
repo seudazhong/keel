@@ -135,7 +135,7 @@ async def cancel_job(job_id: str, request: Request) -> JobResponse:
     try:
         row = await _jobs(request).request_cancel(job_id, datetime.now(UTC))
     except JobValidationError as exc:
-        if exc.code == "job_not_cancellable":
+        if exc.code in {"job_finalizing", "job_not_cancellable"}:
             raise HTTPException(status.HTTP_409_CONFLICT, exc.public_message) from None
         raise
     if row is None:
