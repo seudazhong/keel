@@ -4,7 +4,7 @@
 - **Date:** 2026-07-07
 - **Related:** `docs/IMPLEMENTATION-PLAN.md` (M2), `docs/adr/0006-scheduler-and-queue.md`,
   `docs/adr/0009-product-form-and-primary-use-cases.md`, `docs/INVARIANTS.md` (I7/I9),
-  `docs/superpowers/specs/2026-07-07-keel-ux-design.md`
+  `docs/designs/2026-07-07-keel-ux-design.md`
 - **Visual companion (rationale + effect):** `docs/mockups/slice-decisions.html`,
   `slice-preview.html`, `slice-chat.html`
 

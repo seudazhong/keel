@@ -1,6 +1,6 @@
 # Web Chat Page Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:executing-plans. Steps use checkbox (`- [ ]`) syntax.
+> **Execution:** Work through the checklist task-by-task and run the narrowest applicable validation before advancing.
 
 **Goal:** A streaming Chat page in the React app (`web/`) — the primary product surface (M1.7) — with live token streaming, a tool/step timeline, and inline interactive approvals for mutating tools.
 

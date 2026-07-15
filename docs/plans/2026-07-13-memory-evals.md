@@ -1,6 +1,6 @@
 # Memory Evals Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Execution:** Work through the checklist task-by-task and run the narrowest applicable validation before advancing.
 
 **Goal:** Build a repo-owned, offline-replayable, live-runnable quality-eval harness for Keel memory (Consolidation / Recall / Safety) that gives a deterministic CI gate, comparable experiment reports, and optional Langfuse/judge, driving the real production consolidation and search code.
 
@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-Copied verbatim from the spec (`docs/superpowers/specs/2026-07-12-memory-evals-design.md`). **Every task implicitly includes this section.**
+Copied verbatim from the design (`docs/designs/2026-07-12-memory-evals-design.md`). **Every task implicitly includes this section.**
 
 - **Repo is source of truth.** Dataset, gold expectations, cassettes and gate thresholds are all code-reviewable and version-controlled. Runtime artifacts write to `.keel/evals/<run-id>/` and are **not** committed.
 - **Deterministic gate, live quality.** CI uses replay + deterministic scorers; a non-deterministic judge is **never** a merge gate.
@@ -69,7 +69,7 @@ Tests: `tests/unit/test_eval_*.py` (no services) and `tests/integration/test_mem
 
 ## Dataset field-name reconciliation (plan ↔ spec)
 
-The spec (`docs/superpowers/specs/2026-07-12-memory-evals-design.md` §4/§8/§10/§16) and this
+The design (`docs/designs/2026-07-12-memory-evals-design.md` §4/§8/§10/§16) and this
 plan use **different field names and shapes** for the dataset contract. This is a deliberate,
 scorer-aligned choice — the plan flattens the spec's nested expectation objects into the
 claim-list / count form the scorers actually consume, and keeps dataset-authoring keys that
@@ -223,7 +223,7 @@ def test_id_pattern_enforced() -> None:
 
 Placed under ``keel_worker`` so the consolidation executor can import the real
 production chain (``keel_worker.main.consolidate_memory``) without inverting the
-``keel-core`` dependency. See docs/superpowers/specs/2026-07-12-memory-evals-design.md.
+``keel-core`` dependency. See docs/designs/2026-07-12-memory-evals-design.md.
 """
 
 from __future__ import annotations
@@ -4626,7 +4626,7 @@ async def test_gate_failure_exits_1_with_junit_failure(tmp_path: Path) -> None:
 
 ## Appendix A — Spec Coverage Matrix
 
-Every spec section (`docs/superpowers/specs/2026-07-12-memory-evals-design.md`) maps to at least one task. Verified during Self-Review.
+Every design section (`docs/designs/2026-07-12-memory-evals-design.md`) maps to at least one task. Verified during Self-Review.
 
 | Spec § | Topic | Implementing task(s) |
 |--------|-------|----------------------|
@@ -4675,9 +4675,8 @@ Run against the spec with fresh eyes (per the `writing-plans` Self-Review checkl
 
 ## Appendix C — Execution Handoff
 
-Plan complete and saved to `docs/superpowers/plans/2026-07-13-memory-evals.md`. Two execution options:
-
-1. **Subagent-Driven (recommended)** — dispatch a fresh subagent per task with two-stage review between tasks (**REQUIRED SUB-SKILL:** `superpowers:subagent-driven-development`). Fast iteration; each task's RED/GREEN gate is checked before the next starts.
-2. **Inline Execution** — execute tasks in-session with checkpoints (**REQUIRED SUB-SKILL:** `superpowers:executing-plans`). Batch execution, review at checkpoints.
+Plan complete and saved to `docs/plans/2026-07-13-memory-evals.md`. Execute tasks in
+dependency order, using isolated worktrees for independent batches and checking each
+task's RED/GREEN gate before advancing.
 
 Tasks 1–13 are pure/unit-testable with no services. Tasks 3, 8–10, 14, 17 add integration tests that need a migrated `keel_test`/`keel_eval` Postgres. Task 17's live `--record` step is operator-run (real LiteLLM + embeddings) and is the only step that regenerates the committed cassettes.

@@ -4,7 +4,7 @@
 - **Date:** 2026-07-08
 - **Related:** `docs/adr/0004-frontend.md`, `docs/mockups/slice-preview.html`,
   `docs/mockups/approvals.html`, `docs/mockups/assets/app.css`, `docs/PRD.md` (FR-X2/N4),
-  `docs/superpowers/specs/2026-07-07-keel-ux-design.md`
+  `docs/designs/2026-07-07-keel-ux-design.md`
 
 ## 1. Purpose
 

@@ -1,6 +1,6 @@
 # RAG / Knowledge Base Vertical Slice Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Execution:** Work through the checklist task-by-task and run the narrowest applicable validation before advancing.
 
 **Goal:** Deliver a scope-bound text/Markdown Knowledge Base with durable ingest/delete jobs, deterministic chunking, hybrid retrieval, stable citations, always-tainted `kb_search`, REST/UI management, and replayable quality evals.
 
@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- The approved contract is `docs/superpowers/specs/2026-07-14-rag-knowledge-base-design.md`; implementation must not weaken its lifecycle, deletion, scope, taint, citation, or idempotency guarantees.
+- The approved contract is `docs/designs/2026-07-14-rag-knowledge-base-design.md`; implementation must not weaken its lifecycle, deletion, scope, taint, citation, or idempotency guarantees.
 - Current visibility is exactly one explicit agent scope (`web:local` in production wiring); every Postgres transaction sets `app.scope_id` and every query also filters `scope_id`.
 - Composite foreign keys must reject both cross-scope and same-scope cross-KB document/version/chunk references.
 - Text/Markdown only; normalized UTF-8 raw content is stored in Postgres and is limited to 1,048,576 bytes. Reject NUL, unpaired surrogates, blank normalized content, and unsafe error echoing.

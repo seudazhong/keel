@@ -1,6 +1,6 @@
 # Autonomy Slice v1 Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Execution:** Work through the checklist task-by-task and run the narrowest applicable validation before advancing.
 
 **Goal:** A scheduled, unattended agent run triages a fake inbox, summarizes it, and gates its outbound email behind a **durable cross-surface approval** (suspend the run to the event log; resume and send exactly once on approval).
 

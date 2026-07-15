@@ -1,6 +1,6 @@
 # Product Shell v1 — Approvals Queue Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax.
+> **Execution:** Work through the checklist task-by-task and run the narrowest applicable validation before advancing.
 
 **Goal:** A real React Approvals-queue page (from `slice-preview.html`) that stands up the ADR-0004 toolchain, the ported light design system, and a reusable app shell.
 

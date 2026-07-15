@@ -1,6 +1,6 @@
 # Web Sessions Page Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:executing-plans. Steps use checkbox (`- [ ]`) syntax.
+> **Execution:** Work through the checklist task-by-task and run the narrowest applicable validation before advancing.
 
 **Goal:** A Sessions list + detail (M1.7 slice 3): browse past sessions (Web/IM) with a client-side filter, and open a read-only replay of a session's event/message history.
 

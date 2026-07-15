@@ -1,6 +1,6 @@
 # Memory + Semantic-Retrieval Foundation — Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Execution:** Work through the checklist task-by-task and run the narrowest applicable validation before advancing.
 
 **Goal:** Give the web assistant a working memory triad — self-edited in-context **core memory**, semantic **archival memory**, and lexical **session recall** — by wiring the (mostly-built) storage layer into the loop and runtime with a real Ollama `bge-m3` embedder.
 
@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python (keel-core / keel-server), Postgres + pgvector, LiteLLM, Ollama (`bge-m3`), Docker Compose, pytest.
 
-**Spec:** `docs/superpowers/specs/2026-07-09-memory-retrieval-foundation-design.md` (+ Chinese deep-dive `2026-07-09-core-memory-notes-zh.md`).
+**Design:** `docs/designs/2026-07-09-memory-retrieval-foundation-design.md` (+ Chinese deep-dive `docs/designs/2026-07-09-core-memory-notes-zh.md`).
 
 ## Global Constraints
 

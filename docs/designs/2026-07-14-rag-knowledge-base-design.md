@@ -5,12 +5,12 @@
 > **Milestone：** M3 Knowledge & Quality
 > **依赖：** Durable Background Jobs (`main@9c4d09f+`)
 > **相关文档：**
-> [`STATUS.md`](../../STATUS.md)、
-> [`PRD.md`](../../PRD.md) FR-D5、
-> [`ARCHITECTURE.md`](../../ARCHITECTURE.md) §8、
-> [`ADR-0007`](../../adr/0007-embeddings-and-rerank.md)、
-> [`ADR-0009`](../../adr/0009-product-form-and-primary-use-cases.md)、
-> [`ADR-0010`](../../adr/0010-durable-background-jobs.md)
+> [`STATUS.md`](../STATUS.md)、
+> [`PRD.md`](../PRD.md) FR-D5、
+> [`ARCHITECTURE.md`](../ARCHITECTURE.md) §8、
+> [`ADR-0007`](../adr/0007-embeddings-and-rerank.md)、
+> [`ADR-0009`](../adr/0009-product-form-and-primary-use-cases.md)、
+> [`ADR-0010`](../adr/0010-durable-background-jobs.md)
 
 ## 1. 目标
 

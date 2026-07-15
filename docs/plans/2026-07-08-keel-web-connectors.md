@@ -1,6 +1,6 @@
 # Web Connectors Page Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: superpowers:executing-plans. Steps use checkbox (`- [ ]`) syntax.
+> **Execution:** Work through the checklist task-by-task and run the narrowest applicable validation before advancing.
 
 **Goal:** A Connectors page (M1.7 slice 2) giving read-only visibility into the scope's OAuth connectors — connection status, granted scopes, last activity — plus the confused-deputy taint rule and a catalog of addable integrations. Surfaces the real Gmail connector built earlier.
 

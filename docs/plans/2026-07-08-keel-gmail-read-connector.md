@@ -1,6 +1,6 @@
 # Gmail Read Connector Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Execution:** Work through the checklist task-by-task and run the narrowest applicable validation before advancing.
 
 **Goal:** Replace the digest agent's fake `inbox_list` with a real read-only Gmail fetch behind the existing `ConnectorTool`/`ActionFn` seam, gated by a feature flag so the fake stays the default/test path.
 
