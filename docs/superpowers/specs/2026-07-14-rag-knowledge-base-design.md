@@ -1,9 +1,9 @@
 # RAG / Knowledge Base Vertical Slice 设计文档
 
-> **状态：** Reviewed / implementation-ready  
-> **日期：** 2026-07-14  
-> **Milestone：** M3 Knowledge & Quality  
-> **依赖：** Durable Background Jobs (`main@9c4d09f+`)  
+> **状态：** Reviewed / implementation-ready
+> **日期：** 2026-07-14
+> **Milestone：** M3 Knowledge & Quality
+> **依赖：** Durable Background Jobs (`main@9c4d09f+`)
 > **相关文档：**
 > [`STATUS.md`](../../STATUS.md)、
 > [`PRD.md`](../../PRD.md) FR-D5、
@@ -131,12 +131,13 @@ packages/keel-core/src/keel_core/
     store.py        # metadata/version/chunk lifecycle
     search.py       # hybrid retrieval + degraded mode
     tools.py        # kb_search
-    jobs.py         # strict job payloads + handler factory
+    jobs.py         # strict job payloads + core handlers/hooks
 
 packages/keel-server/src/keel_server/
   api/knowledge.py  # scoped REST API
 
 packages/keel-worker/src/keel_worker/
+  knowledge.py      # wrap core handlers/hooks as JobDefinition entries
   jobs.py           # terminal lifecycle hooks for domain cleanup
   main.py           # register production knowledge job definitions
 
