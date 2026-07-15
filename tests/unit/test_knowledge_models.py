@@ -26,6 +26,7 @@ from keel_core.knowledge import (
     KnowledgeSearchMode,
     KnowledgeSearchStatus,
     KnowledgeSourceType,
+    KnowledgeStorageError,
     KnowledgeValidationError,
     KnowledgeVersionStatus,
     canonical_request_fingerprint,
@@ -459,6 +460,13 @@ def test_public_knowledge_errors_are_bounded_and_stable() -> None:
     assert len(mismatch.code) <= 128
     assert len(mismatch.public_message) <= 512
 
+    storage = KnowledgeStorageError()
+    assert storage.code == "knowledge_storage_failure"
+    assert storage.public_message == "Knowledge storage is temporarily unavailable."
+    assert storage.retryable is True
+    assert len(storage.code) <= 128
+    assert len(storage.public_message) <= 512
+
     with pytest.raises(ValueError, match="code"):
         KnowledgeValidationError("x" * 129, "safe")
     with pytest.raises(ValueError, match="public_message"):
@@ -470,5 +478,6 @@ def test_root_package_exports_key_knowledge_contracts() -> None:
 
     assert keel_core.KnowledgeStore.__name__ == "KnowledgeStore"
     assert keel_core.InMemoryKnowledgeStore.__name__ == "InMemoryKnowledgeStore"
+    assert keel_core.KnowledgeStorageError is KnowledgeStorageError
     assert keel_core.canonical_request_fingerprint is canonical_request_fingerprint
     assert keel_core.index_fingerprint is index_fingerprint
