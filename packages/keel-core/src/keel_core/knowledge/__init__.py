@@ -82,7 +82,7 @@ from .models import (
     validate_knowledge_version_id,
     validate_scope_id,
 )
-from .store import InMemoryKnowledgeStore, KnowledgeStore
+from .store import InMemoryKnowledgeStore, KnowledgeStore, PostgresKnowledgeStore
 
 __all__ = [
     "ChunkDraft",
@@ -136,6 +136,7 @@ __all__ = [
     "KnowledgeSearchStatus",
     "KnowledgeSourceType",
     "KnowledgeStore",
+    "PostgresKnowledgeStore",
     "KnowledgeValidationError",
     "KnowledgeVersionCancellation",
     "KnowledgeVersionFailure",
