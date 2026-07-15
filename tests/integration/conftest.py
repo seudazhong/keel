@@ -104,8 +104,9 @@ async def migrated_db(pg_engine: AsyncEngine) -> AsyncIterator[AsyncEngine]:
         _assert_test_database_name(str(database) if database is not None else None)
         await conn.execute(
             text(
-                "TRUNCATE jobs, consolidation_cursors, memory_proposals, "
-                "message_embeddings, events, sessions, memory_blocks, "
+                "TRUNCATE kb_chunks, knowledge_idempotency, kb_document_versions, "
+                "kb_documents, knowledge_bases, jobs, consolidation_cursors, "
+                "memory_proposals, message_embeddings, events, sessions, memory_blocks, "
                 "memory_block_versions, connector_tokens, archival, schedules, approvals"
             )
         )

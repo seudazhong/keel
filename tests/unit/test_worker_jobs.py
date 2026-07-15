@@ -12,11 +12,15 @@ import pytest
 
 from keel_core.config import Settings
 from keel_core.jobs import (
+    CancelMode,
     InMemoryJobStore,
     JobCancellationRequested,
+    JobError,
     JobLeaseLostError,
+    JobRecord,
     JobResult,
     JobStatus,
+    JobTerminalIntent,
     JobValidationError,
     PermanentJobError,
     RetryableJobError,
@@ -64,6 +68,7 @@ async def _enqueued_job(
     kind: str = "test.echo",
     payload: dict[str, Any] | None = None,
     max_attempts: int = 3,
+    cancel_mode: CancelMode = CancelMode.immediate,
 ) -> str:
     job, _ = await store.enqueue_once(
         kind=kind,
@@ -71,6 +76,7 @@ async def _enqueued_job(
         target_session_id=None,
         idempotency_key=key,
         max_attempts=max_attempts,
+        cancel_mode=cancel_mode,
         now=_NOW,
     )
     return job.id
@@ -122,6 +128,22 @@ def test_job_definition_rejects_non_callable_handlers(handler: object) -> None:
         JobDefinition(kind="test.bad", handler=handler)  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("field", ["on_cancelled", "on_failed"])
+def test_job_definition_rejects_non_callable_hooks(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        JobDefinition(kind="test.bad", handler=_handler, **{field: object()})  # type: ignore[arg-type]
+
+
+def test_job_definition_requires_cancel_mode_enum() -> None:
+    assert JobDefinition(kind="test.good", handler=_handler).cancel_mode is CancelMode.immediate
+    with pytest.raises(ValueError, match="cancel_mode"):
+        JobDefinition(
+            kind="test.bad",
+            handler=_handler,
+            cancel_mode="cooperative",  # type: ignore[arg-type]
+        )
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -151,7 +173,7 @@ async def test_job_context_progress_updates_record_and_exposes_identity() -> Non
 
     record = await store.get(context.job_id)
     assert record is not None
-    assert (context.scope_id, context.attempt) == ("web:local", 1)
+    assert (context.scope_id, context.attempt, context.max_attempts) == ("web:local", 1, 3)
     assert (record.progress_current, record.progress_total, record.progress_message) == (
         2,
         10,
@@ -354,6 +376,82 @@ async def test_run_job_permanent_error_executes_once() -> None:
     assert (await store.get(job_id)).error_kind == "invalid_document"  # type: ignore[union-attr]
 
 
+async def test_failed_hook_runs_before_permanent_terminal_transition() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    observed: list[tuple[JobStatus, str]] = []
+    clock = _Clock(_NOW)
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise PermanentJobError("permanent", "Permanent failure.")
+
+    async def on_failed(row: JobRecord, error: JobError) -> None:
+        observed.append((row.status, error.kind))
+        clock.value = _NOW + timedelta(seconds=1)
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            lease_seconds=60,
+            on_failed=on_failed,
+        )
+    )
+    job_id = await _enqueued_job(store, key="permanent-hook")
+
+    assert (
+        await run_job(
+            _ctx(store, registry, clock, []),
+            "web:local",
+            job_id,
+        )
+        == JobStatus.failed.value
+    )
+    assert observed == [(JobStatus.running, "permanent")]
+    assert (await store.get(job_id)).finished_at == _NOW + timedelta(seconds=1)  # type: ignore[union-attr]
+
+
+async def test_failed_hook_failure_leaves_job_nonterminal_and_is_retried() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    hook_calls = 0
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise PermanentJobError("permanent", "Permanent failure.")
+
+    async def on_failed(row: JobRecord, error: JobError) -> None:
+        nonlocal hook_calls
+        hook_calls += 1
+        assert row.status is JobStatus.running
+        if hook_calls == 1:
+            raise RuntimeError("cleanup unavailable")
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            max_attempts=2,
+            lease_seconds=10,
+            on_failed=on_failed,
+        )
+    )
+    job_id = await _enqueued_job(store, key="failed-hook-retry", max_attempts=2)
+    clock = _Clock(_NOW)
+    ctx = _ctx(store, registry, clock, [])
+
+    with pytest.raises(RuntimeError, match="cleanup unavailable"):
+        await run_job(ctx, "web:local", job_id)
+    first = await store.get(job_id)
+    assert first is not None
+    assert first.status is JobStatus.running
+    assert first.terminal_intent is JobTerminalIntent.failed
+    assert first.error_kind == "permanent"
+
+    clock.value = _NOW + timedelta(seconds=11)
+    assert await dispatch_jobs(ctx) == 1
+    assert hook_calls == 2
+
+
 async def test_run_job_validation_error_is_terminal() -> None:
     store = InMemoryJobStore("web:local")
     registry = JobRegistry()
@@ -446,6 +544,39 @@ async def test_run_job_retryable_error_fails_terminal_on_last_attempt() -> None:
     assert enqueued == []
 
 
+async def test_failed_hook_runs_for_retry_exhaustion_before_terminal_transition() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    observed: list[tuple[JobStatus, str]] = []
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise RetryableJobError("provider_timeout", "Provider timed out.")
+
+    async def on_failed(row: JobRecord, error: JobError) -> None:
+        observed.append((row.status, error.kind))
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            max_attempts=1,
+            lease_seconds=60,
+            on_failed=on_failed,
+        )
+    )
+    job_id = await _enqueued_job(store, key="retry-hook", max_attempts=1)
+
+    assert (
+        await run_job(
+            _ctx(store, registry, _Clock(_NOW), []),
+            "web:local",
+            job_id,
+        )
+        == JobStatus.failed.value
+    )
+    assert observed == [(JobStatus.running, "provider_timeout")]
+
+
 async def test_run_job_retry_enqueue_is_best_effort(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -522,7 +653,7 @@ async def test_finalization_error_suppresses_original_handler_secret(
         max_attempts=1,
         payload={"secret": "DO-NOT-LEAK"},
     )
-    monkeypatch.setattr(store, "fail_terminal", broken_finalizer)
+    monkeypatch.setattr(store, "finalize_terminal", broken_finalizer)
 
     with pytest.raises(RuntimeError) as caught:
         await run_job(
@@ -607,6 +738,221 @@ async def test_run_job_returns_authoritative_status_when_lease_expires_during_er
         )
         == JobStatus.running.value
     )
+
+
+@pytest.mark.parametrize("outcome", ["cancelled", "permanent", "retryable", "generic"])
+async def test_terminal_hook_cannot_finalize_after_lease_expires(outcome: str) -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    clock = _Clock(_NOW)
+    hook_calls: list[str] = []
+    job_id = await _enqueued_job(
+        store,
+        key=f"hook-expiry-{outcome}",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        if outcome == "cancelled":
+            await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+            raise JobCancellationRequested
+        if outcome == "permanent":
+            raise PermanentJobError("permanent", "Permanent failure.")
+        if outcome == "retryable":
+            raise RetryableJobError("retryable", "Retryable failure.")
+        raise RuntimeError("generic failure")
+
+    async def on_cancelled(row: JobRecord) -> None:
+        hook_calls.append("cancelled")
+        clock.value = _NOW + timedelta(seconds=11)
+
+    async def on_failed(row: JobRecord, error: JobError) -> None:
+        hook_calls.append(error.kind)
+        clock.value = _NOW + timedelta(seconds=11)
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            max_attempts=1,
+            lease_seconds=10,
+            on_cancelled=on_cancelled,
+            on_failed=on_failed,
+        )
+    )
+
+    assert (
+        await run_job(
+            _ctx(store, registry, clock, []),
+            "web:local",
+            job_id,
+        )
+        == JobStatus.running.value
+    )
+    row = await store.get(job_id)
+    assert row is not None
+    assert row.status is JobStatus.running
+    assert row.finished_at is None
+    assert hook_calls == [
+        {
+            "cancelled": "cancelled",
+            "permanent": "permanent",
+            "retryable": "retryable",
+            "generic": "internal_error",
+        }[outcome]
+    ]
+
+
+async def test_failed_intent_beats_preexpiry_cancel_when_hook_crosses_expiry() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    clock = _Clock(_NOW)
+    hooks: list[str] = []
+    job_id = await _enqueued_job(
+        store,
+        key="failed-intent-beats-cancel",
+        max_attempts=2,
+        cancel_mode=CancelMode.cooperative,
+    )
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+        raise PermanentJobError("permanent", "Permanent failure.")
+
+    async def on_failed(row: JobRecord, error: JobError) -> None:
+        hooks.append(f"failed:{error.kind}")
+        if len(hooks) == 1:
+            clock.value = _NOW + timedelta(seconds=11)
+
+    async def on_cancelled(row: JobRecord) -> None:
+        hooks.append("cancelled")
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            max_attempts=2,
+            lease_seconds=10,
+            on_failed=on_failed,
+            on_cancelled=on_cancelled,
+        )
+    )
+    ctx = _ctx(store, registry, clock, [])
+
+    assert await run_job(ctx, "web:local", job_id) == JobStatus.running.value
+    reserved = await store.get(job_id)
+    assert reserved is not None
+    assert reserved.terminal_intent is JobTerminalIntent.failed
+    assert reserved.error_kind == "permanent"
+    assert hooks == ["failed:permanent"]
+
+    assert await dispatch_jobs(ctx) == 1
+    final = await store.get(job_id)
+    assert final is not None
+    assert final.status is JobStatus.failed
+    assert final.terminal_intent is JobTerminalIntent.failed
+    assert hooks == ["failed:permanent", "failed:permanent"]
+
+
+async def test_cancelled_intent_crossing_expiry_never_runs_failed_hook() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    clock = _Clock(_NOW)
+    hooks: list[str] = []
+    job_id = await _enqueued_job(
+        store,
+        key="cancelled-intent-crosses-expiry",
+        max_attempts=2,
+        cancel_mode=CancelMode.cooperative,
+    )
+    await store.request_cancel(job_id, _NOW)
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise AssertionError("cancelled job handler must not run")
+
+    async def on_cancelled(row: JobRecord) -> None:
+        hooks.append("cancelled")
+        if len(hooks) == 1:
+            clock.value = _NOW + timedelta(seconds=11)
+
+    async def on_failed(row: JobRecord, error: JobError) -> None:
+        hooks.append(f"failed:{error.kind}")
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            max_attempts=2,
+            lease_seconds=10,
+            on_failed=on_failed,
+            on_cancelled=on_cancelled,
+        )
+    )
+    ctx = _ctx(store, registry, clock, [])
+
+    assert await run_job(ctx, "web:local", job_id) == JobStatus.running.value
+    reserved = await store.get(job_id)
+    assert reserved is not None
+    assert reserved.terminal_intent is JobTerminalIntent.cancelled
+    assert hooks == ["cancelled"]
+
+    assert await dispatch_jobs(ctx) == 1
+    final = await store.get(job_id)
+    assert final is not None
+    assert final.status is JobStatus.cancelled
+    assert final.terminal_intent is JobTerminalIntent.cancelled
+    assert hooks == ["cancelled", "cancelled"]
+
+
+async def test_hook_crash_after_reservation_is_recovered_by_dispatcher_with_same_intent() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    clock = _Clock(_NOW)
+    failed_calls = 0
+    cancelled_calls = 0
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise PermanentJobError("permanent", "Permanent failure.")
+
+    async def on_failed(row: JobRecord, error: JobError) -> None:
+        nonlocal failed_calls
+        failed_calls += 1
+        if failed_calls == 1:
+            raise RuntimeError("worker crashed in hook")
+
+    async def on_cancelled(row: JobRecord) -> None:
+        nonlocal cancelled_calls
+        cancelled_calls += 1
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            max_attempts=3,
+            lease_seconds=10,
+            on_failed=on_failed,
+            on_cancelled=on_cancelled,
+        )
+    )
+    job_id = await _enqueued_job(store, key="hook-crash-reserved", max_attempts=3)
+    ctx = _ctx(store, registry, clock, [])
+
+    with pytest.raises(RuntimeError, match="worker crashed in hook"):
+        await run_job(ctx, "web:local", job_id)
+    reserved = await store.get(job_id)
+    assert reserved is not None
+    assert reserved.status is JobStatus.running
+    assert reserved.terminal_intent is JobTerminalIntent.failed
+    assert reserved.error_kind == "permanent"
+
+    clock.value = _NOW + timedelta(seconds=11)
+    assert await dispatch_jobs(ctx) == 1
+    final = await store.get(job_id)
+    assert final is not None
+    assert final.status is JobStatus.failed
+    assert failed_calls == 2
+    assert cancelled_calls == 0
 
 
 async def test_run_job_unknown_exception_retries_then_fails_terminal() -> None:
@@ -717,6 +1063,139 @@ async def test_run_job_observes_persisted_cancel_before_reclaimed_handler() -> N
 
     assert result == JobStatus.cancelled.value
     assert called is False
+
+
+async def test_cooperative_queued_cancel_runs_hook_before_terminal_transition() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    handler_called = False
+    observed: list[tuple[JobStatus, datetime | None]] = []
+    clock = _Clock(_NOW)
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        nonlocal handler_called
+        handler_called = True
+        return JobResult(data={}, message="should not run")
+
+    async def on_cancelled(row: JobRecord) -> None:
+        observed.append((row.status, row.cancel_requested_at))
+        clock.value = _NOW + timedelta(seconds=1)
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            lease_seconds=10,
+            on_cancelled=on_cancelled,
+        )
+    )
+    job_id = await _enqueued_job(
+        store,
+        key="cooperative-cancel-hook",
+        cancel_mode=CancelMode.cooperative,
+    )
+    await store.request_cancel(job_id, _NOW)
+
+    assert (
+        await run_job(
+            _ctx(store, registry, clock, []),
+            "web:local",
+            job_id,
+        )
+        == JobStatus.cancelled.value
+    )
+    assert handler_called is False
+    assert observed == [(JobStatus.running, _NOW)]
+    assert (await store.get(job_id)).finished_at == _NOW + timedelta(seconds=1)  # type: ignore[union-attr]
+
+
+async def test_cancelled_hook_failure_leaves_job_nonterminal_and_retries() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    hook_calls = 0
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise AssertionError("cancelled job handler must not run")
+
+    async def on_cancelled(row: JobRecord) -> None:
+        nonlocal hook_calls
+        hook_calls += 1
+        assert row.status is JobStatus.running
+        if hook_calls == 1:
+            raise RuntimeError("cancel cleanup unavailable")
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            max_attempts=2,
+            lease_seconds=10,
+            on_cancelled=on_cancelled,
+        )
+    )
+    job_id = await _enqueued_job(
+        store,
+        key="cancel-hook-retry",
+        max_attempts=2,
+        cancel_mode=CancelMode.cooperative,
+    )
+    await store.request_cancel(job_id, _NOW)
+    clock = _Clock(_NOW)
+    ctx = _ctx(store, registry, clock, [])
+
+    with pytest.raises(RuntimeError, match="cancel cleanup unavailable"):
+        await run_job(ctx, "web:local", job_id)
+    first = await store.get(job_id)
+    assert first is not None
+    assert first.status is JobStatus.running
+    assert first.cancel_requested_at == _NOW
+    assert first.terminal_intent is JobTerminalIntent.cancelled
+
+    clock.value = _NOW + timedelta(seconds=11)
+    assert await dispatch_jobs(ctx) == 1
+    assert hook_calls == 2
+
+
+async def test_cancel_after_retry_becomes_due_and_runs_cleanup_without_handler_retry() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    handler_calls = 0
+    hook_calls = 0
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        nonlocal handler_calls
+        handler_calls += 1
+        raise RetryableJobError("temporary", "Temporary failure.")
+
+    async def on_cancelled(row: JobRecord) -> None:
+        nonlocal hook_calls
+        hook_calls += 1
+        assert row.status is JobStatus.running
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            max_attempts=3,
+            lease_seconds=10,
+            on_cancelled=on_cancelled,
+        )
+    )
+    job_id = await _enqueued_job(
+        store,
+        key="cancel-after-retry",
+        cancel_mode=CancelMode.cooperative,
+    )
+    clock = _Clock(_NOW)
+    ctx = _ctx(store, registry, clock, [])
+
+    assert await run_job(ctx, "web:local", job_id) == JobStatus.queued.value
+    await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+    clock.value = _NOW + timedelta(seconds=1)
+
+    assert await run_job(ctx, "web:local", job_id) == JobStatus.cancelled.value
+    assert handler_calls == 1
+    assert hook_calls == 1
 
 
 async def test_run_job_returns_current_status_when_lease_is_lost() -> None:
@@ -1000,6 +1479,161 @@ async def test_dispatcher_finalizes_crash_at_attempt_ceiling() -> None:
     assert exhausted.error_kind == "attempts_exhausted"
 
 
+async def test_dispatcher_runs_failed_hook_before_lease_exhaustion_terminal_transition() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    observed: list[tuple[JobStatus, str]] = []
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise asyncio.CancelledError
+
+    async def on_failed(row: JobRecord, error: JobError) -> None:
+        observed.append((row.status, error.kind))
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            max_attempts=1,
+            lease_seconds=10,
+            on_failed=on_failed,
+        )
+    )
+    job_id = await _enqueued_job(store, key="lease-failed-hook", max_attempts=1)
+    ctx = _ctx(store, registry, _Clock(_NOW), [])
+    with pytest.raises(asyncio.CancelledError):
+        await run_job(ctx, "web:local", job_id)
+
+    ctx["job_clock"] = _Clock(_NOW + timedelta(seconds=11))
+    assert await dispatch_jobs(ctx) == 1
+    assert observed == [(JobStatus.running, "attempts_exhausted")]
+    assert (await store.get(job_id)).status is JobStatus.failed  # type: ignore[union-attr]
+
+
+async def test_dispatcher_rejects_cancel_during_failed_exhaustion_hook() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    observed: list[str] = []
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise asyncio.CancelledError
+
+    async def on_failed(row: JobRecord, error: JobError) -> None:
+        observed.append("failed")
+        assert row.lease_expires_at is not None
+        with pytest.raises(JobValidationError) as caught:
+            await store.request_cancel(row.id, row.lease_expires_at)
+        assert caught.value.code == "job_finalizing"
+
+    async def on_cancelled(row: JobRecord) -> None:
+        observed.append("cancelled")
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            max_attempts=1,
+            lease_seconds=10,
+            on_cancelled=on_cancelled,
+            on_failed=on_failed,
+        )
+    )
+    job_id = await _enqueued_job(
+        store,
+        key="lease-failed-cancel-race",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+    ctx = _ctx(store, registry, _Clock(_NOW), [])
+    with pytest.raises(asyncio.CancelledError):
+        await run_job(ctx, "web:local", job_id)
+
+    ctx["job_clock"] = _Clock(_NOW + timedelta(seconds=10))
+    assert await dispatch_jobs(ctx) == 1
+    assert await dispatch_jobs(ctx) == 0
+    row = await store.get(job_id)
+    assert row is not None
+    assert row.status is JobStatus.failed
+    assert row.cancel_requested_at is None
+    assert observed == ["failed"]
+
+
+async def test_dispatcher_cancelled_lease_exhaustion_runs_hook_and_cancels() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    observed: list[JobStatus] = []
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        await store.request_cancel(context.job_id, _NOW + timedelta(seconds=1))
+        raise asyncio.CancelledError
+
+    async def on_cancelled(row: JobRecord) -> None:
+        observed.append(row.status)
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            max_attempts=1,
+            lease_seconds=10,
+            on_cancelled=on_cancelled,
+        )
+    )
+    job_id = await _enqueued_job(
+        store,
+        key="lease-cancel-hook",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+    ctx = _ctx(store, registry, _Clock(_NOW), [])
+    with pytest.raises(asyncio.CancelledError):
+        await run_job(ctx, "web:local", job_id)
+
+    ctx["job_clock"] = _Clock(_NOW + timedelta(seconds=11))
+    assert await dispatch_jobs(ctx) == 1
+    row = await store.get(job_id)
+    assert row is not None
+    assert row.status is JobStatus.cancelled
+    assert row.error_kind is None
+    assert observed == [JobStatus.running]
+
+
+async def test_dispatcher_hook_failure_leaves_expired_job_nonterminal_for_retry() -> None:
+    store = InMemoryJobStore("web:local")
+    registry = JobRegistry()
+    hook_calls = 0
+
+    async def handler(context: JobContext, payload: dict[str, Any]) -> JobResult:
+        raise asyncio.CancelledError
+
+    async def on_failed(row: JobRecord, error: JobError) -> None:
+        nonlocal hook_calls
+        hook_calls += 1
+        if hook_calls == 1:
+            raise RuntimeError("cleanup unavailable")
+
+    registry.register(
+        JobDefinition(
+            "test.echo",
+            handler,
+            max_attempts=1,
+            lease_seconds=10,
+            on_failed=on_failed,
+        )
+    )
+    job_id = await _enqueued_job(store, key="lease-hook-retry", max_attempts=1)
+    ctx = _ctx(store, registry, _Clock(_NOW), [])
+    with pytest.raises(asyncio.CancelledError):
+        await run_job(ctx, "web:local", job_id)
+
+    ctx["job_clock"] = _Clock(_NOW + timedelta(seconds=11))
+    assert await dispatch_jobs(ctx) == 0
+    assert (await store.get(job_id)).status is JobStatus.running  # type: ignore[union-attr]
+    assert await dispatch_jobs(ctx) == 1
+    assert (await store.get(job_id)).status is JobStatus.failed  # type: ignore[union-attr]
+    assert hook_calls == 2
+
+
 async def test_dispatcher_recovers_lost_immediate_enqueue_and_tolerates_duplicates() -> None:
     store = InMemoryJobStore("web:local")
     registry = JobRegistry()
@@ -1067,15 +1701,15 @@ async def test_dispatcher_continues_after_exhaustion_failure_without_logging_sec
     assert await store.claim(first, _NOW, 10) is not None
     assert await store.claim(second, _NOW, 10) is not None
     attempted: list[str] = []
-    real_fail_exhausted = store.fail_exhausted
+    real_reserve_exhausted = store.reserve_exhausted
 
     async def flaky(job_id: str, now: datetime) -> object:
         attempted.append(job_id)
         if job_id == first:
             raise RuntimeError("database-token=DO-NOT-LOG")
-        return await real_fail_exhausted(job_id, now)
+        return await real_reserve_exhausted(job_id, now)
 
-    monkeypatch.setattr(store, "fail_exhausted", flaky)
+    monkeypatch.setattr(store, "reserve_exhausted", flaky)
     caplog.set_level(logging.ERROR, logger="keel.worker.jobs")
 
     assert (
@@ -1172,7 +1806,7 @@ async def test_dispatcher_redacts_cancelled_finalizer_message(
     async def cancelled_finalizer(value: str, now: datetime) -> None:
         raise asyncio.CancelledError("FINALIZER-SECRET")
 
-    monkeypatch.setattr(store, "fail_exhausted", cancelled_finalizer)
+    monkeypatch.setattr(store, "finalize_exhausted", cancelled_finalizer)
     with pytest.raises(asyncio.CancelledError) as caught:
         await dispatch_jobs(
             _ctx(

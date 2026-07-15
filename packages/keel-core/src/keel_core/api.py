@@ -12,7 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .jobs import JobRecord, JobStatus
+from .jobs import CancelMode, JobRecord, JobStatus
 from .types import PermissionDecision, RunId, SessionId
 
 
@@ -62,6 +62,7 @@ class JobResponse(BaseModel):
     id: str
     kind: str
     status: JobStatus
+    cancel_mode: CancelMode
     target_session_id: str | None
     attempt: int
     max_attempts: int
@@ -88,6 +89,7 @@ class JobResponse(BaseModel):
             id=record.id,
             kind=record.kind,
             status=record.status,
+            cancel_mode=record.cancel_mode,
             target_session_id=record.target_session_id,
             attempt=record.attempt,
             max_attempts=record.max_attempts,

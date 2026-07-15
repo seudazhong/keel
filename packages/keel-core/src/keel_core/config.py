@@ -9,8 +9,9 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -43,6 +44,17 @@ class Settings(BaseSettings):
     memory_block_max_chars: int = 2000
     session_embedding_batch_size: int = 64
     session_embedding_catchup_limit: int = 500
+
+    # Scope-bound Knowledge Base ingestion and retrieval limits.
+    knowledge_document_max_bytes: int = Field(default=1_048_576, gt=0)
+    knowledge_title_max_chars: int = Field(default=300, gt=0)
+    knowledge_description_max_chars: int = Field(default=2_000, gt=0)
+    knowledge_search_query_max_chars: int = Field(default=2_000, gt=0)
+    knowledge_search_k_max: int = Field(default=10, gt=0, le=10)
+    knowledge_chunk_target_chars: int = Field(default=1_600, gt=0)
+    knowledge_chunk_overlap_chars: int = Field(default=200, gt=0)
+    knowledge_embedding_batch_size: int = Field(default=32, gt=0)
+    knowledge_tool_output_max_chars: int = Field(default=8_000, gt=0)
 
     # Consolidation settings (memory compression & archival).
     consolidation_min_messages: int = 10
@@ -122,6 +134,12 @@ class Settings(BaseSettings):
     # the safe posture is "read real mail, send is mocked + approval-gated". Turning
     # this on requires re-authorizing (the send scope) via scripts/gmail_authorize.py.
     gmail_send_enabled: bool = False
+
+    @model_validator(mode="after")
+    def _validate_knowledge_chunk_settings(self) -> Self:
+        if self.knowledge_chunk_overlap_chars >= self.knowledge_chunk_target_chars:
+            raise ValueError("knowledge_chunk_overlap_chars must be less than target")
+        return self
 
     @property
     def sync_database_url(self) -> str:

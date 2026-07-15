@@ -92,8 +92,8 @@
 
 | File | Change |
 |---|---|
-| `packages/keel-core/src/keel_core/jobs.py` | `CancelMode`, `JobRecord.cancel_mode`, cooperative/disabled cancel behavior, exhaustion cancellation finalizer. |
-| `packages/keel-worker/src/keel_worker/jobs.py` | `JobContext.max_attempts`, `JobDefinition` terminal hooks, hook-before-terminal orchestration. |
+| `packages/keel-core/src/keel_core/jobs.py` | `CancelMode`, immutable `JobTerminalIntent`, cooperative/disabled cancel behavior, reserve/finalize protocol, exhaustion recovery. |
+| `packages/keel-worker/src/keel_worker/jobs.py` | `JobContext.max_attempts`, `JobDefinition` hooks, intent-before-hook and fresh-clock finalization orchestration. |
 | `packages/keel-core/src/keel_core/protocols.py` | Add generic `Citation` and `ToolResult.citations`. |
 | `packages/keel-core/src/keel_core/events.py` | Add citations to strict `ToolResultPayload`. |
 | `packages/keel-core/src/keel_core/loop.py` | Persist citations in normal and resumed `tool.result` events. |
@@ -121,6 +121,11 @@ class CancelMode(StrEnum):
     disabled = "disabled"
 
 
+class JobTerminalIntent(StrEnum):
+    failed = "failed"
+    cancelled = "cancelled"
+
+
 class JobStore(Protocol):
     async def enqueue_once(
         self,
@@ -134,9 +139,18 @@ class JobStore(Protocol):
         now: datetime | None = None,
     ) -> tuple[JobRecord, bool]: ...
 
-    async def finish_cancelled_exhausted(
-        self, job_id: str, now: datetime
-    ) -> JobRecord | None: ...
+    async def reserve_terminal(
+        self,
+        lease: JobLease,
+        intent: JobTerminalIntent,
+        *,
+        now: datetime,
+        error: JobError | None = None,
+    ) -> JobRecord: ...
+
+    async def finalize_terminal(self, lease: JobLease, now: datetime) -> JobRecord: ...
+    async def reserve_exhausted(self, job_id: str, now: datetime) -> JobRecord | None: ...
+    async def finalize_exhausted(self, job_id: str, now: datetime) -> JobRecord | None: ...
 ```
 
 ```python
@@ -171,6 +185,33 @@ class KnowledgeVersionStatus(StrEnum):
     cancelled = "cancelled"
     deleted = "deleted"
     purged = "purged"
+
+
+def knowledge_source_type_from_mime_type(mime_type: object) -> KnowledgeSourceType: ...
+
+
+@dataclass(frozen=True)
+class KnowledgeDocumentVersionRecord:
+    id: str
+    scope_id: str
+    kb_id: str
+    document_id: str
+    version: int
+    content: str | None
+    content_sha256: str
+    index_fingerprint: str
+    mime_type: str
+    chunking_version: str
+    target_chars: int
+    overlap_chars: int
+    ingest_job_id: str | None
+    status: KnowledgeVersionStatus
+    error_kind: str | None
+    error_message: str | None
+    created_at: datetime
+    activated_at: datetime | None
+    deleted_at: datetime | None
+    purged_at: datetime | None
 
 
 class KnowledgeSearchMode(StrEnum):
@@ -316,7 +357,9 @@ def knowledge_job_definitions(
 - Test: `tests/integration/test_knowledge_schema.py`
 
 **Interfaces:**
-- Produces `CancelMode`, `JobRecord.cancel_mode`, `enqueue_once(..., cancel_mode=...)`, `finish_cancelled_exhausted()`, `JobDefinition.on_cancelled/on_failed`, and all SQL tables required by later tasks.
+- Produces `CancelMode`, `JobTerminalIntent`, `JobRecord.cancel_mode/terminal_intent`,
+  `enqueue_once(..., cancel_mode=...)`, reserve/finalize methods,
+  `JobDefinition.on_cancelled/on_failed`, and all SQL tables required by later tasks.
 
 - [ ] **Step 1: Write failing unit tests for cancel modes and terminal hooks**
 
@@ -378,7 +421,13 @@ class CancelMode(StrEnum):
     disabled = "disabled"
 ```
 
-Queued cooperative cancellation sets `cancel_requested_at` and makes `next_attempt_at <= now`; disabled cancellation raises `JobValidationError("job_not_cancellable", ...)`. Before every defined-kind cancelled/failed terminal transition, load the authoritative `JobRecord`, await the hook, and only then call the store finalizer. Hook failure must leave the job non-terminal. Exhausted jobs with `cancel_requested_at` use `finish_cancelled_exhausted`; other exhausted jobs use `on_failed` then `fail_exhausted`.
+Queued cooperative cancellation sets `cancel_requested_at` and makes `next_attempt_at <= now`;
+disabled cancellation raises `JobValidationError("job_not_cancellable", ...)`. Before every
+hook-bearing cancelled/failed transition, atomically reserve immutable terminal intent, call only
+that intent's hook, obtain a fresh clock value, and finalize only while the lease remains valid.
+Hook failure leaves the job running with intent. Expired intent rows are not reclaimed; dispatcher
+replays the same hook and finalizes exactly once. Exhaustion reserves failed/cancelled under row
+lock based on whether cancellation was persisted before exact expiry.
 
 - [ ] **Step 4: Write the complete 0010 migration**
 
@@ -388,6 +437,11 @@ Create every table/check/index/FK/RLS policy from design §§6 and 10.0, includi
 ALTER TABLE jobs
 ADD COLUMN cancel_mode text NOT NULL DEFAULT 'immediate'
 CHECK (cancel_mode IN ('immediate', 'cooperative', 'disabled'));
+
+ALTER TABLE jobs
+ADD COLUMN terminal_intent text
+    CHECK (terminal_intent IN ('failed', 'cancelled')),
+ADD COLUMN terminal_intent_at timestamptz;
 ```
 
 The downgrade drops Knowledge tables in FK order, then drops `jobs.cancel_mode`.
@@ -430,15 +484,42 @@ git commit -m "feat(jobs): add knowledge lifecycle hooks" -m "Co-authored-by: Co
 - Test: `tests/unit/test_config.py`
 
 **Interfaces:**
-- Produces strict records/errors/commands, `KnowledgeStore`, `InMemoryKnowledgeStore`, ID/fingerprint helpers, and validated settings consumed by every later task.
+- Produces strict records/errors/commands, `KnowledgeStore`, `InMemoryKnowledgeStore`,
+  ID/fingerprint helpers, and validated settings consumed by every later task. Document versions
+  durably carry `mime_type`, `chunking_version`, `target_chars`, and `overlap_chars`; source type
+  is strictly recoverable from the version MIME type.
 
 - [ ] **Step 1: Write RED model/settings tests**
 
 ```python
 def test_index_fingerprint_changes_with_every_index_input() -> None:
-    base = index_fingerprint("a" * 64, "keel-char-v1", "fake/embed", 16, 1600, 200)
-    assert base != index_fingerprint("b" * 64, "keel-char-v1", "fake/embed", 16, 1600, 200)
-    assert base != index_fingerprint("a" * 64, "keel-char-v2", "fake/embed", 16, 1600, 200)
+    base = index_fingerprint(
+        "a" * 64,
+        KnowledgeSourceType.markdown,
+        "keel-char-v1",
+        "fake/embed",
+        16,
+        1600,
+        200,
+    )
+    assert base != index_fingerprint(
+        "b" * 64,
+        KnowledgeSourceType.markdown,
+        "keel-char-v1",
+        "fake/embed",
+        16,
+        1600,
+        200,
+    )
+    assert base != index_fingerprint(
+        "a" * 64,
+        KnowledgeSourceType.text,
+        "keel-char-v1",
+        "fake/embed",
+        16,
+        1600,
+        200,
+    )
 
 
 def test_knowledge_settings_reject_overlap_at_or_above_target() -> None:
@@ -448,7 +529,12 @@ def test_knowledge_settings_reject_overlap_at_or_above_target() -> None:
 
 - [ ] **Step 2: Define strict domain models and errors**
 
-Use `StrEnum` and frozen dataclasses for persistence records; Pydantic `ConfigDict(extra="forbid")` for API/job commands. Implement storage-safe `kb_`, `doc_`, `kbv_`, `kbc_`, and `kbi_` IDs and bounded public errors such as `KnowledgeNotFound`, `KnowledgeConflict`, `KnowledgeValidationError`, and `KnowledgeEmbeddingMismatch`.
+Use `StrEnum` and frozen dataclasses for persistence records; Pydantic
+`ConfigDict(extra="forbid")` for API/job commands. `KnowledgeDocumentVersionRecord` persists every
+non-KB input to `index_fingerprint`, including strict positive `target_chars`, non-negative
+`overlap_chars`, and `overlap_chars < target_chars`. Implement storage-safe `kb_`, `doc_`, `kbv_`,
+`kbc_`, and `kbi_` IDs and bounded public errors such as `KnowledgeNotFound`,
+`KnowledgeConflict`, `KnowledgeValidationError`, and `KnowledgeEmbeddingMismatch`.
 
 - [ ] **Step 3: Add the settings from design §18**
 
@@ -511,6 +597,12 @@ def test_chunking_is_byte_stable() -> None:
     assert first == second
 ```
 
+The shared chunk invariant must keep ordinal/order/overlap/hash/exact-substring checks, assert every
+non-whitespace index is covered, and allow a gap only when `gap.strip()` is empty. Add regressions
+for `A + 8_000 spaces + B`, overlap-stepped non-whitespace islands, a trailing blank separator, and a
+near-1 MiB whitespace run with bounded peak memory. Assert no empty, whitespace-only, or duplicate
+chunks and `len(chunk.text) <= target_chars` for emitted hard splits.
+
 - [ ] **Step 2: Implement normalization**
 
 Normalize BOM/CRLF/trailing whitespace/blank-line runs/document ends, then enforce blank/NUL/surrogate/UTF-8 byte limits. Offsets always refer to the returned normalized string.
@@ -518,6 +610,14 @@ Normalize BOM/CRLF/trailing whitespace/blank-line runs/document ends, then enfor
 - [ ] **Step 3: Implement unit parsing and packing**
 
 Markdown recognizes ATX headings, fenced code, paragraphs, and list blocks. Plain text splits blank-line paragraphs. Packing keeps whole units when possible, overlaps complete trailing units, and hard-splits only an oversized single unit.
+
+Hard splitting emits unchanged contiguous substrings of normalized text with original offsets. Skip
+whitespace-only candidate windows instead of merging them: every non-whitespace character must be
+covered by at least one chunk, while uncovered gaps are permitted only when they contain Unicode
+whitespace. Every emitted hard-split span stays within `target_chars`; trailing separator whitespace
+may be omitted rather than exceeding that bound. The existing unsplit-fence exception remains
+limited to `4 * target_chars`. Chunk consumers, evals, and citations must not assume chunks form a
+contiguous full-text partition or reconstruct the document by concatenating them.
 
 - [ ] **Step 4: Run tests and quality gates**
 
@@ -556,7 +656,10 @@ async with self._engine.begin() as conn:
     await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
 ```
 
-Every `SELECT`, `UPDATE`, and `DELETE` includes `scope_id = :scope`; global-ID foreign-scope collisions return not found. Use transaction advisory locks for idempotency keys and `SELECT ... FOR UPDATE` for document version allocation/activation/chunk writes/purge.
+Every `SELECT`, `UPDATE`, and `DELETE` includes `scope_id = :scope`; global-ID foreign-scope
+collisions return not found. Version row serialization includes `target_chars` and
+`overlap_chars`. Use transaction advisory locks for idempotency keys and `SELECT ... FOR UPDATE`
+for document version allocation/activation/chunk writes/purge.
 
 - [ ] **Step 3: Implement request-ledger crash recovery**
 
@@ -713,7 +816,12 @@ Cover payload `extra="forbid"`, embedder pin mismatch, batch checkpoints, idempo
 
 - [ ] **Step 2: Implement ingest handler**
 
-Parse payload before side effects; load/lock lifecycle; normalize/chunk; verify embedder pin; embed batches of `knowledge_embedding_batch_size`; checkpoint after each batch; write only while version is indexing; activate atomically. Return bounded `JobResult` IDs/counts only.
+Parse the IDs-only payload before side effects; load version content, MIME type,
+`chunking_version`, `target_chars`, and `overlap_chars`, plus the KB pinned model/dim, from durable
+rows; strictly derive source type from the version MIME type. Then normalize/chunk, verify the
+embedder pin, embed batches of `knowledge_embedding_batch_size`, checkpoint after each batch,
+write only while the version is indexing, and activate atomically. Return bounded `JobResult`
+IDs/counts only.
 
 - [ ] **Step 3: Implement terminal hooks**
 
@@ -760,7 +868,11 @@ git commit -m "feat(knowledge): add durable ingest jobs" -m "Co-authored-by: Cop
 
 - [ ] **Step 1: Write RED API tests**
 
-Test viewer reads/search, viewer mutation denial, operator CRUD, missing/unsafe/oversized `Idempotency-Key`, same-key replay, different-body 409, model snapshot, first-failure update recovery, no-active reindex 409, immediate delete hide, cross-scope 404, disabled delete-job cancel 409, and crash-after-resource-commit retry attaching the same job.
+Test viewer reads/search, viewer mutation denial, operator CRUD, missing/unsafe/oversized
+`Idempotency-Key`, same-key replay, different-body 409, model snapshot, first-failure update
+recovery, no-active reindex 409, immediate delete hide, cross-scope 404, disabled delete-job
+cancel 409, crash-after-resource-commit retry attaching the same job, and malformed document
+content whose raw input must not appear in the 422 body.
 
 - [ ] **Step 2: Implement `KnowledgeService`**
 
@@ -768,7 +880,11 @@ For each mutation: validate canonical request, acquire ledger entry, create/upda
 
 - [ ] **Step 3: Implement router DTOs and error mapping**
 
-Use `Header(alias="Idempotency-Key")`, viewer router default, operator dependencies on mutations, 404 for malformed/foreign IDs, 409 for conflicts/no-active/not-cancellable, 413 for document bytes, and 503 when create-KB has no configured embedder.
+Use `Header(alias="Idempotency-Key")`, viewer router default, operator dependencies on mutations,
+404 for malformed/foreign IDs, 409 for conflicts/no-active/not-cancellable, 413 for document
+bytes, and 503 when create-KB has no configured embedder. Register a
+`RequestValidationError` sanitizer that returns only bounded `loc/type/msg` fields and strips
+Pydantic's raw `input`/unsafe context before serializing any 422 response.
 
 - [ ] **Step 4: Wire app state**
 
@@ -880,6 +996,8 @@ Cases cover English paraphrase, Chinese lexical/semantic, heading citation, mult
 - [ ] **Step 2: Implement strict dataset models**
 
 Forbid unknown keys, pin version 1, and assert expected semantic locators by `content_sha256 + version + ordinal + offsets`, never generated UUIDs.
+Treat those offsets as exact chunk locators; hard-split chunks may leave only Unicode-whitespace gaps,
+so eval and citation assertions must not require contiguous full-document chunk coverage.
 
 - [ ] **Step 3: Implement runner and gates**
 

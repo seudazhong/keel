@@ -236,6 +236,9 @@ CREATE TABLE kb_document_versions (
     index_fingerprint text NOT NULL,
     mime_type text NOT NULL,
     chunking_version text NOT NULL,
+    target_chars integer NOT NULL CHECK (target_chars > 0),
+    overlap_chars integer NOT NULL
+        CHECK (overlap_chars >= 0 AND overlap_chars < target_chars),
     ingest_job_id text,
     status text NOT NULL DEFAULT 'pending'
         CHECK (status IN (
@@ -271,6 +274,10 @@ REFERENCES kb_document_versions(scope_id, kb_id, document_id, id);
 ```
 
 `content` 在 pending/active/superseded/failed/cancelled 时保留；purge 后置 `NULL`。
+每个 version 持久化 `mime_type`、`chunking_version`、`target_chars` 与
+`overlap_chars`。ingest 重启后只需 payload 中的 KB/document/version IDs，即可从
+version 读取原文与完整 chunking 输入、从 `mime_type` 严格派生 `source_type`，并从
+KB 读取 pinned embedding model/dim；不依赖进程内 settings snapshot。
 
 ### 6.4 `kb_chunks`
 
@@ -449,7 +456,20 @@ Markdown chunker：
 - pack + overlap；
 - 超长段落 hard split。
 
-### 8.4 版本
+### 8.4 Hard-split coverage contract
+
+- 每个 emitted span 都是 normalized text 的 exact contiguous substring；content 不改写，
+  `char_start/char_end` 始终指向原 normalized text；
+- hard-split emitted span 长度不超过 `target_chars`；唯一例外仍是保持完整、且长度不超过
+  `4 * target_chars` 的 unsplit fenced code block；
+- whitespace-only candidate window 不生成 embedding chunk，也不与相邻 window 合并；
+- 每个 non-whitespace character 必须被至少一个 chunk 覆盖；任意未覆盖 gap 必须只包含
+  Unicode whitespace；
+- chunk 保持确定性顺序、允许 overlap、且永不为空或 whitespace-only，但不保证构成原文的
+  contiguous partition。Eval 与 citation 必须使用持久化的 exact text/hash/offsets，不能通过
+  拼接 chunks 重建原文，也不能假设 whitespace characters 全覆盖。
+
+### 8.5 版本
 
 ```text
 chunking_version = "keel-char-v1"
@@ -458,14 +478,15 @@ chunking_version = "keel-char-v1"
 `index_fingerprint`：
 
 ```text
-SHA-256(
-  content_sha256 |
-  chunking_version |
-  embedding_model |
-  embedding_dim |
-  target_chars |
-  overlap_chars
-)
+SHA-256(canonical compact sorted JSON {
+  "content_sha256": content_sha256,
+  "source_type": source_type,
+  "chunking_version": chunking_version,
+  "embedding_model": embedding_model,
+  "embedding_dim": embedding_dim,
+  "target_chars": target_chars,
+  "overlap_chars": overlap_chars
+})
 ```
 
 `index_fingerprint` 不是永久唯一键。只有当 fingerprint 等于当前
@@ -520,6 +541,9 @@ version 时用 reindex 恢复失败/取消的较新 indexing attempt。
 `POST /.../{document_id}/reindex`
 
 - 从 active version 的原文创建新 version；
+- source format 只从 active version 的 `mime_type` 严格派生：
+  `text/plain -> text`、`text/markdown -> markdown`；其他 MIME 拒绝。不得使用可被
+  pending/failed update 改写的 document-level `source_type`；
 - 若没有 active version，返回 `409 no_active_version`；首次 ingest 失败后的恢复使用
   update 重新提交原文；
 - 使用当前 chunking settings 与 KB pinned model/dim；
@@ -543,6 +567,16 @@ Knowledge ingest 的 partial chunks/domain status 不能被通用 job terminal t
 ALTER TABLE jobs
 ADD COLUMN cancel_mode text NOT NULL DEFAULT 'immediate'
 CHECK (cancel_mode IN ('immediate', 'cooperative', 'disabled'));
+
+ALTER TABLE jobs
+ADD COLUMN terminal_intent text
+    CHECK (terminal_intent IN ('failed', 'cancelled')),
+ADD COLUMN terminal_intent_at timestamptz,
+ADD CONSTRAINT ck_jobs_terminal_intent_timestamp
+    CHECK (
+        (terminal_intent IS NULL AND terminal_intent_at IS NULL)
+        OR (terminal_intent IS NOT NULL AND terminal_intent_at IS NOT NULL)
+    );
 ```
 
 语义：
@@ -554,6 +588,21 @@ CHECK (cancel_mode IN ('immediate', 'cooperative', 'disabled'));
 
 `JobRecord`、`enqueue_once()` 与 Jobs API additive 暴露 `cancel_mode`；现有调用默认
 `immediate`，行为不变。
+
+`terminal_intent` 是 hook 与 job terminal transition 之间的持久化协议：
+
+- worker 持有有效 lease 时先原子 reserve `failed` 或 `cancelled` intent，再执行
+  对应 hook；
+- failure intent 同时写入 bounded `error_kind/error_message`；
+- intent 一旦写入不可切换；running failed-intent job 的后续 cancel 返回
+  `409 job_finalizing`，已 terminal job 仍幂等返回当前 record；
+- claim/normal dispatch 不得 reclaim intent row；
+- lease 在 hook 中过期时，原 worker 用 fresh clock finalization 失去 lease；dispatcher
+  之后只重放同一种 hook 并完成同一 intent；
+- max-attempt lease expiry 通过 row lock 原子 reserve exhaustion intent：只有
+  expiry 前已持久化的 cancel request 才选择 cancelled，否则选择 failed；
+- hook/domain commit 后、job terminal commit 前 crash 只会重复同一种幂等 hook，
+  terminal event injection 仍由原有 transaction exactly once 完成。
 
 `JobDefinition` 增加可选 hooks：
 
@@ -569,14 +618,13 @@ class JobDefinition:
     on_failed: JobFailedHook | None = None
 ```
 
-- worker 在 `finish_cancelled` / `fail_terminal` **之前**调用对应 hook；
-- lease-expiry attempt exhaustion 若已有 `cancel_requested_at`，先调用
-  `on_cancelled`，再用 additive `finish_cancelled_exhausted(job_id, now)` 原子写
-  cancelled；否则先调用 `on_failed`，再 `fail_exhausted`；
+- worker reserve terminal intent 后、`finalize_terminal` **之前**调用对应 hook；
+- lease-expiry recovery 先读取/原子 reserve immutable intent，再调用唯一对应 hook，
+  最后 `finalize_exhausted`；
 - hooks 必须 idempotent、scope-bound、不得记录 payload/raw content；
 - hook 成功后 worker crash：下一次重复 hook，再做 terminal transition；
-- hook 失败：job 保持 non-terminal，保留 cancel request 或 expired lease，后续
-  dispatcher 重试；不得先 terminal 再 best-effort cleanup；
+- hook 失败：job 保持 running + reserved intent，后续 dispatcher 重试；不得先
+  terminal 再 best-effort cleanup；
 - `JobContext` additive 暴露 `max_attempts`，便于 handler/error tests，但 Knowledge
   correctness 依赖 terminal hooks，而不是仅依赖 handler catch。
 
@@ -728,9 +776,14 @@ cleanup 不被 job terminal transition 绕过。
 ```python
 class KnowledgeStore:
     async def create_base(...)
+    async def create_base_idempotent(command, idempotency, ...)
     async def list_bases(...)
     async def get_base(...)
     async def create_document_version(...)
+    async def create_document_version_idempotent(command, idempotency, ...)
+    async def update_document_version_idempotent(command, idempotency, ...)
+    async def reindex_document(...)
+    async def reindex_document_idempotent(command, idempotency, ...)
     async def get_document(...)
     async def list_documents(...)
     async def mark_indexing(...)
@@ -739,10 +792,12 @@ class KnowledgeStore:
     async def mark_version_failed(...)
     async def mark_version_cancelled(...)
     async def tombstone_document(...)
+    async def tombstone_document_idempotent(command, idempotency, ...)
     async def tombstone_base(...)
+    async def tombstone_base_idempotent(command, idempotency, ...)
     async def purge_document(...)
     async def purge_base(...)
-    async def begin_idempotent_request(...)
+    async def get_idempotent_request(...)
     async def attach_idempotent_job(...)
 ```
 
@@ -1136,6 +1191,9 @@ Case 类型：
 
 - repo JSONL source of truth；
 - deterministic normalized text、chunk ordinals、offsets、labels 与 ranking inputs；
+- hard-split chunks 的 text/offsets 是 exact locators，但 chunks 可在 Unicode
+  whitespace-only 区间留 gap；golden/citation assertions 不要求 contiguous full-text
+  coverage；
 - production UUID IDs 不作为 cassette/golden assertion；citation 断言使用
   `content_sha256 + version + ordinal + char_start/char_end`；
 - embedding cassette 复用现有 format；

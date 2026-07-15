@@ -26,6 +26,8 @@ from keel_core import (
     ArchivalInsertTool,
     EventStore,
     InMemoryEventStore,
+    KnowledgeSearcher,
+    KnowledgeSearchTool,
     LiteLLMGateway,
     MemoryAppendTool,
     MemoryReplaceTool,
@@ -111,10 +113,10 @@ def _build_memory_tools(
     return tools
 
 
-def _web_permissions(memory_allow: tuple[str, ...] = ()) -> RuleBasedPermissionEngine:
+def _web_permissions(read_only_allow: tuple[str, ...] = ()) -> RuleBasedPermissionEngine:
     """Read-only + own-scope memory tools allowed; mutating tools require an approval."""
     rules = [Rule(name, PermissionDecision.allow) for name in _READ_ONLY]
-    rules += [Rule(name, PermissionDecision.allow) for name in memory_allow]
+    rules += [Rule(name, PermissionDecision.allow) for name in read_only_allow]
     rules += [Rule(name, PermissionDecision.ask) for name in _MUTATING]
     return RuleBasedPermissionEngine(rules, default=PermissionDecision.ask)
 
@@ -316,6 +318,9 @@ class AgentRuntime:
         session_embedding_batch_size: int = 64,
         session_embedding_catchup_limit: int = 500,
         session_indexer: MessageEmbeddingIndexer | None = None,
+        knowledge_search_query_max_chars: int = 2_000,
+        knowledge_search_k_max: int = 10,
+        knowledge_tool_output_max_chars: int = 8_000,
     ) -> None:
         self._engine = engine
         self._fanout = RedisEventStore(redis_client)
@@ -351,16 +356,33 @@ class AgentRuntime:
             else []
         )
         memory_names = tuple(tool.name for tool in memory_tools)
+        knowledge_tools: list[ToolProto] = (
+            [
+                KnowledgeSearchTool(
+                    KnowledgeSearcher(
+                        engine,
+                        self._scope.id,
+                        embedder,
+                        query_max_chars=knowledge_search_query_max_chars,
+                        k_max=knowledge_search_k_max,
+                    ),
+                    output_max_chars=knowledge_tool_output_max_chars,
+                )
+            ]
+            if engine is not None and embedder is not None
+            else []
+        )
+        knowledge_names = tuple(tool.name for tool in knowledge_tools)
         self._agent = AgentSpec(
             id="web",
             name="Keel Web",
             model=model,
             scope=self._scope,
-            toolset=list(_READ_ONLY + _MUTATING) + list(memory_names),
+            toolset=list(_READ_ONLY + _MUTATING) + list(memory_names + knowledge_names),
         )
         self._provider = provider or LiteLLMGateway()
-        self._registry = ToolRegistry(_build_tools(workspace) + memory_tools)
-        self._permissions = _web_permissions(memory_names)
+        self._registry = ToolRegistry(_build_tools(workspace) + memory_tools + knowledge_tools)
+        self._permissions = _web_permissions(memory_names + knowledge_names)
         self._approvals = ApprovalRegistry()
         self._tracer = make_tracer()  # Langfuse if configured, else no-op
         self._runs: dict[RunId, asyncio.Task[None]] = {}

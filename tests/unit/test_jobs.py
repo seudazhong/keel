@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import FrozenInstanceError, replace
 from datetime import UTC, datetime, timedelta, timezone
 
@@ -10,6 +11,7 @@ import pytest
 from keel_core.config import Settings
 from keel_core.events import Event, EventType
 from keel_core.jobs import (
+    CancelMode,
     InMemoryJobStore,
     JobError,
     JobLease,
@@ -17,6 +19,7 @@ from keel_core.jobs import (
     JobLimits,
     JobResult,
     JobStatus,
+    JobTerminalIntent,
     JobValidationError,
     PermanentJobError,
     RetryableJobError,
@@ -58,6 +61,13 @@ def test_job_contracts_are_frozen_and_typed() -> None:
     assert JobStatus("succeeded") is JobStatus.succeeded
     with pytest.raises(ValueError):
         JobStatus("done")
+    assert CancelMode("immediate") is CancelMode.immediate
+    assert {mode.value for mode in CancelMode} == {
+        "immediate",
+        "cooperative",
+        "disabled",
+    }
+    assert {intent.value for intent in JobTerminalIntent} == {"failed", "cancelled"}
 
 
 def test_public_handler_errors_keep_code_and_safe_message() -> None:
@@ -194,7 +204,7 @@ def test_result_and_error_models_reject_empty_required_text() -> None:
 
 @pytest.mark.parametrize(
     ("attempt", "expected"),
-    [(1, 5), (2, 10), (3, 20), (7, 300)],
+    [(1, 5), (2, 10), (3, 20), (7, 300), (2_147_483_646, 300)],
 )
 def test_retry_delay_is_deterministic_and_capped(attempt: int, expected: int) -> None:
     assert retry_delay_seconds(attempt, 5, 300) == expected
@@ -232,6 +242,7 @@ async def test_in_memory_enqueue_once_dedupes_and_first_request_wins() -> None:
         target_session_id="missing-on-retry",
         idempotency_key="request-1",
         max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
         now=_NOW + timedelta(seconds=1),
     )
 
@@ -240,7 +251,9 @@ async def test_in_memory_enqueue_once_dedupes_and_first_request_wins() -> None:
     assert duplicate.id == first.id
     assert duplicate.payload == {"value": 1}
     assert duplicate.max_attempts == 3
+    assert duplicate.cancel_mode is CancelMode.immediate
     assert first.status is JobStatus.queued
+    assert first.cancel_mode is CancelMode.immediate
     assert first.attempt == 0
     assert first.next_attempt_at == _NOW
 
@@ -445,6 +458,7 @@ async def _queued(
     key: str,
     *,
     max_attempts: int = 3,
+    cancel_mode: CancelMode = CancelMode.immediate,
 ) -> str:
     row, _ = await store.enqueue_once(
         kind="test.echo",
@@ -452,6 +466,7 @@ async def _queued(
         target_session_id=None,
         idempotency_key=key,
         max_attempts=max_attempts,
+        cancel_mode=cancel_mode,
         now=_NOW,
     )
     return row.id
@@ -705,6 +720,49 @@ async def test_queued_cancel_is_terminal_idempotent_and_injects_once() -> None:
     }
 
 
+async def test_cooperative_queued_cancel_waits_for_worker_cleanup_and_becomes_due() -> None:
+    store = InMemoryJobStore("web:local")
+    row, _ = await store.enqueue_once(
+        kind="test.cleanup",
+        payload={},
+        target_session_id=None,
+        idempotency_key="cooperative-queued",
+        max_attempts=3,
+        cancel_mode=CancelMode.cooperative,
+        now=_NOW + timedelta(minutes=5),
+    )
+
+    cancelled = await store.request_cancel(row.id, _NOW)
+    again = await store.request_cancel(row.id, _NOW + timedelta(seconds=1))
+
+    assert cancelled is not None
+    assert cancelled.status is JobStatus.queued
+    assert cancelled.cancel_mode is CancelMode.cooperative
+    assert cancelled.cancel_requested_at == _NOW
+    assert cancelled.next_attempt_at == _NOW
+    assert cancelled.finished_at is None
+    assert again is not None
+    assert again.cancel_requested_at == _NOW
+    assert again.next_attempt_at == _NOW
+    assert await store.dispatchable(_NOW, 100) == [row.id]
+
+
+async def test_disabled_cancel_rejects_without_mutating_job() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _queued(
+        store,
+        "disabled-cancel",
+        cancel_mode=CancelMode.disabled,
+    )
+    before = await store.get(job_id)
+
+    with pytest.raises(JobValidationError) as caught:
+        await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+
+    assert caught.value.code == "job_not_cancellable"
+    assert await store.get(job_id) == before
+
+
 async def test_running_cancel_request_does_not_beat_a_handler_that_already_completed() -> None:
     store = InMemoryJobStore("web:local")
     job_id = await _queued(store, "cancel-running")
@@ -729,6 +787,123 @@ async def test_running_cancel_request_does_not_beat_a_handler_that_already_compl
     assert succeeded.cancel_requested_at == requested.cancel_requested_at
     assert succeeded.result == {"count": 1}
     assert await store.request_cancel(job_id, _NOW + timedelta(seconds=4)) == succeeded
+
+
+async def test_running_cancel_freezes_at_final_attempt_lease_expiry() -> None:
+    store = InMemoryJobStore("web:local")
+    finalizing_id = await _queued(
+        store,
+        "cancel-finalizing",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+    assert await store.claim(finalizing_id, _NOW, 10) is not None
+    before = await store.get(finalizing_id)
+
+    with pytest.raises(JobValidationError) as caught:
+        await store.request_cancel(finalizing_id, _NOW + timedelta(seconds=10))
+
+    assert caught.value.code == "job_finalizing"
+    assert await store.get(finalizing_id) == before
+
+    cancelled_id = await _queued(
+        store,
+        "cancel-before-finalizing",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+    assert await store.claim(cancelled_id, _NOW, 10) is not None
+    requested = await store.request_cancel(cancelled_id, _NOW + timedelta(seconds=9))
+
+    assert requested is not None
+    assert await store.request_cancel(cancelled_id, _NOW + timedelta(seconds=10)) == requested
+    assert await store.get(cancelled_id) == requested
+
+
+async def test_failed_terminal_intent_is_bounded_immutable_and_not_reclaimable() -> None:
+    store = InMemoryJobStore(
+        "web:local",
+        limits=JobLimits(error_message_max_chars=4),
+    )
+    job_id = await _queued(
+        store,
+        "failed-intent",
+        max_attempts=2,
+        cancel_mode=CancelMode.cooperative,
+    )
+    lease = await store.claim(job_id, _NOW, 10)
+    assert lease is not None
+    requested = await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+    assert requested is not None
+
+    reserved = await store.reserve_terminal(
+        lease,
+        JobTerminalIntent.failed,
+        now=_NOW + timedelta(seconds=2),
+        error=JobError("provider_timeout", "safe public message"),
+    )
+
+    assert reserved.status is JobStatus.running
+    assert reserved.terminal_intent is JobTerminalIntent.failed
+    assert reserved.terminal_intent_at == _NOW + timedelta(seconds=2)
+    assert reserved.error_kind == "provider_timeout"
+    assert reserved.error_message == "safe"
+    with pytest.raises(JobValidationError) as caught:
+        await store.request_cancel(job_id, _NOW + timedelta(seconds=3))
+    assert caught.value.code == "job_finalizing"
+    assert await store.get(job_id) == reserved
+    assert await store.dispatchable(_NOW + timedelta(seconds=10), 100) == []
+    assert await store.claim(job_id, _NOW + timedelta(seconds=10), 10) is None
+    assert await store.exhausted(_NOW + timedelta(seconds=10), 100) == [job_id]
+
+
+async def test_reserve_exhausted_atomically_freezes_the_exact_expiry_outcome() -> None:
+    store = InMemoryJobStore("web:local")
+    cancelled_id = await _queued(
+        store,
+        "reserve-cancelled-exhausted",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+    assert await store.claim(cancelled_id, _NOW, 10) is not None
+    await store.request_cancel(cancelled_id, _NOW + timedelta(seconds=9))
+
+    cancelled = await asyncio.gather(
+        store.reserve_exhausted(cancelled_id, _NOW + timedelta(seconds=10)),
+        store.reserve_exhausted(cancelled_id, _NOW + timedelta(seconds=10)),
+    )
+
+    assert all(row is not None for row in cancelled)
+    assert {row.terminal_intent for row in cancelled if row is not None} == {
+        JobTerminalIntent.cancelled
+    }
+    assert {row.terminal_intent_at for row in cancelled if row is not None} == {
+        _NOW + timedelta(seconds=10)
+    }
+    assert await store.request_cancel(cancelled_id, _NOW + timedelta(seconds=11)) == cancelled[0]
+
+    failed_id = await _queued(
+        store,
+        "reserve-failed-exhausted",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+    assert await store.claim(failed_id, _NOW, 10) is not None
+    with pytest.raises(JobValidationError) as caught:
+        await store.request_cancel(failed_id, _NOW + timedelta(seconds=10))
+    assert caught.value.code == "job_finalizing"
+
+    failed = await asyncio.gather(
+        store.reserve_exhausted(failed_id, _NOW + timedelta(seconds=10)),
+        store.reserve_exhausted(failed_id, _NOW + timedelta(seconds=11)),
+    )
+
+    assert all(row is not None for row in failed)
+    assert {row.terminal_intent for row in failed if row is not None} == {JobTerminalIntent.failed}
+    assert {row.terminal_intent_at for row in failed if row is not None} == {
+        _NOW + timedelta(seconds=10)
+    }
+    assert {row.error_kind for row in failed if row is not None} == {"attempts_exhausted"}
 
 
 async def test_observed_running_cancel_finishes_cancelled() -> None:
@@ -793,6 +968,30 @@ async def test_requeue_is_non_terminal_bounded_utc_and_does_not_inject() -> None
     assert queued.finished_at is None
     assert queued.injected_event_seq is None
     assert not any(e.payload.get("job_id") == job.id for e in events.snapshot("target"))
+
+
+async def test_requeue_with_pending_cancel_becomes_immediately_due() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _queued(
+        store,
+        "cancelled-retry",
+        cancel_mode=CancelMode.cooperative,
+    )
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+    await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+
+    queued = await store.requeue(
+        lease,
+        JobError("provider_timeout", "safe"),
+        _NOW + timedelta(minutes=5),
+        _NOW + timedelta(seconds=2),
+    )
+
+    assert queued.status is JobStatus.queued
+    assert queued.cancel_requested_at == _NOW + timedelta(seconds=1)
+    assert queued.next_attempt_at == _NOW + timedelta(seconds=2)
+    assert await store.dispatchable(_NOW + timedelta(seconds=2), 100) == [job_id]
 
 
 async def test_requeue_rejects_an_exhausted_attempt_without_mutating_the_job() -> None:
@@ -869,6 +1068,24 @@ async def test_terminal_finalizers_inject_exactly_once_and_freeze_the_job(
     assert injected[0].payload["text"] == expected_text
     assert injected[0].payload["partial"] is False
     assert injected[0].payload["job_status"] == terminal
+
+
+async def test_terminal_disabled_job_cancel_is_idempotent() -> None:
+    store = InMemoryJobStore("web:local")
+    job, _ = await store.enqueue_once(
+        kind="test.cleanup",
+        payload={},
+        target_session_id=None,
+        idempotency_key="terminal-disabled",
+        max_attempts=3,
+        cancel_mode=CancelMode.disabled,
+        now=_NOW,
+    )
+    lease = await store.claim(job.id, _NOW, 60)
+    assert lease is not None
+    terminal = await store.succeed(lease, JobResult(data={}, message="done"), _NOW)
+
+    assert await store.request_cancel(job.id, _NOW + timedelta(seconds=1)) == terminal
 
 
 async def test_terminal_finalizer_bounds_record_error_and_injected_messages() -> None:
@@ -990,6 +1207,30 @@ async def test_fail_exhausted_uses_terminal_finalizer_once() -> None:
     assert await store.fail_exhausted(retryable_id, _NOW + timedelta(seconds=10)) is None
 
 
+async def test_finish_cancelled_exhausted_requires_expired_cancelled_attempt() -> None:
+    store = InMemoryJobStore("web:local")
+    job_id = await _queued(
+        store,
+        "cancelled-exhausted",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+    )
+    assert await store.claim(job_id, _NOW, 10) is not None
+    await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+
+    assert await store.finish_cancelled_exhausted(job_id, _NOW + timedelta(seconds=9)) is None
+    assert await store.fail_exhausted(job_id, _NOW + timedelta(seconds=10)) is None
+    cancelled = await store.finish_cancelled_exhausted(
+        job_id,
+        _NOW + timedelta(seconds=10),
+    )
+
+    assert cancelled is not None
+    assert cancelled.status is JobStatus.cancelled
+    assert cancelled.finished_at == _NOW + timedelta(seconds=10)
+    assert await store.finish_cancelled_exhausted(job_id, _NOW + timedelta(seconds=11)) is None
+
+
 async def test_failed_rerun_requires_a_new_enqueue_request_key() -> None:
     store = InMemoryJobStore("web:local")
     first, _ = await store.enqueue_once(
@@ -1097,6 +1338,8 @@ async def test_new_lifecycle_methods_reject_naive_timestamps() -> None:
         await store.finish_cancelled(lease, naive)
     with pytest.raises(JobValidationError, match="timezone_required"):
         await store.fail_exhausted("missing", naive)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.finish_cancelled_exhausted("missing", naive)
 
     record = await store.get(running_id)
     assert record is not None

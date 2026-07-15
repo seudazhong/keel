@@ -16,14 +16,43 @@ import pytest
 import redis.asyncio as aioredis
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from keel_core.embeddings import FakeEmbedder
 from keel_core.events import Event, EventType
 from keel_core.jobs import JobResult, PostgresJobStore
-from keel_core.protocols import ProviderChunk, ToolCall
+from keel_core.protocols import ProviderChunk, ToolCall, ToolContext
 from keel_core.testing import ScriptedProviderGateway
-from keel_core.types import FinishReason
+from keel_core.types import FinishReason, PermissionDecision
 from keel_server.runtime import AgentRuntime
 
 pytestmark = pytest.mark.integration
+
+
+async def test_web_runtime_registers_kb_search_only_with_postgres_search_dependencies(
+    migrated_db: AsyncEngine, redis_client: aioredis.Redis, tmp_path: Path
+) -> None:
+    runtime = AgentRuntime(
+        redis_client=redis_client,
+        engine=migrated_db,
+        embedder=FakeEmbedder(),
+        model="test/model",
+        workspace=tmp_path,
+    )
+    ctx = ToolContext(scope_id=runtime.scope_id, session_id="s1")
+
+    assert runtime._registry.get("kb_search") is not None
+    assert "kb_search" in runtime._agent.toolset
+    assert runtime._permissions.evaluate("kb_search", {}, ctx) is PermissionDecision.allow
+    assert runtime._agent.connectors == []
+
+    lite_runtime = AgentRuntime(
+        redis_client=redis_client,
+        engine=None,
+        embedder=FakeEmbedder(),
+        model="test/model",
+        workspace=tmp_path,
+    )
+    assert lite_runtime._registry.get("kb_search") is None
+    assert "kb_search" not in lite_runtime._agent.toolset
 
 
 async def test_web_run_streams_over_redis(

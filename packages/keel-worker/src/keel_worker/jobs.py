@@ -14,6 +14,7 @@ from time import perf_counter
 from typing import Any, TypeVar, cast
 
 from keel_core.jobs import (
+    CancelMode,
     JobCancellationRequested,
     JobError,
     JobLease,
@@ -22,6 +23,7 @@ from keel_core.jobs import (
     JobResult,
     JobStatus,
     JobStore,
+    JobTerminalIntent,
     JobValidationError,
     PermanentJobError,
     RetryableJobError,
@@ -33,6 +35,8 @@ logger = logging.getLogger("keel.worker.jobs")
 _PG_INTEGER_MAX = 2**31 - 1
 
 JobHandler = Callable[["JobContext", dict[str, Any]], Awaitable[JobResult]]
+JobCancelledHook = Callable[[JobRecord], Awaitable[None]]
+JobFailedHook = Callable[[JobRecord, JobError], Awaitable[None]]
 JobClock = Callable[[], datetime]
 EnqueueJob = Callable[..., Awaitable[None]]
 JobStatusSink = Callable[[JobStatus], None]
@@ -62,11 +66,20 @@ class JobDefinition:
     handler: JobHandler
     max_attempts: int = 3
     lease_seconds: int = 300
+    on_cancelled: JobCancelledHook | None = None
+    on_failed: JobFailedHook | None = None
+    cancel_mode: CancelMode = CancelMode.immediate
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", _normalized_kind(self.kind))
         if not callable(self.handler):
             raise ValueError("handler must be callable")
+        if self.on_cancelled is not None and not callable(self.on_cancelled):
+            raise ValueError("on_cancelled must be callable")
+        if self.on_failed is not None and not callable(self.on_failed):
+            raise ValueError("on_failed must be callable")
+        if not isinstance(self.cancel_mode, CancelMode):
+            raise ValueError("cancel_mode must be a CancelMode")
         if (
             isinstance(self.max_attempts, bool)
             or not isinstance(self.max_attempts, int)
@@ -111,6 +124,7 @@ class JobContext:
         self.job_id = lease.job_id
         self.scope_id = lease.scope_id
         self.attempt = lease.attempt
+        self.max_attempts = lease.max_attempts
 
     async def progress(
         self,
@@ -180,6 +194,93 @@ async def _transition_or_current(
         return await _authoritative_status(store, job_id)
 
 
+async def _call_cancelled_hook(
+    definition: JobDefinition | None,
+    row: JobRecord,
+) -> None:
+    if definition is not None and definition.on_cancelled is not None:
+        await definition.on_cancelled(row)
+
+
+async def _call_failed_hook(
+    definition: JobDefinition | None,
+    row: JobRecord,
+    error: JobError,
+) -> None:
+    if definition is not None and definition.on_failed is not None:
+        await definition.on_failed(row, error)
+
+
+async def _call_reserved_hook(
+    definition: JobDefinition | None,
+    row: JobRecord,
+) -> None:
+    if row.terminal_intent is JobTerminalIntent.cancelled:
+        await _call_cancelled_hook(definition, row)
+        return
+    if (
+        row.terminal_intent is JobTerminalIntent.failed
+        and row.error_kind is not None
+        and row.error_message is not None
+    ):
+        await _call_failed_hook(
+            definition,
+            row,
+            JobError(row.error_kind, row.error_message),
+        )
+        return
+    raise JobValidationError(
+        "terminal_intent_invalid",
+        "reserved job terminal intent is incomplete",
+    )
+
+
+async def _finish_cancelled(
+    store: JobStore,
+    definition: JobDefinition,
+    lease: JobLease,
+    clock: JobClock,
+) -> tuple[str, JobStatus | None]:
+    try:
+        reserved = await store.reserve_terminal(
+            lease,
+            JobTerminalIntent.cancelled,
+            now=clock(),
+        )
+    except JobLeaseLostError:
+        return await _authoritative_status(store, lease.job_id)
+    await _call_reserved_hook(definition, reserved)
+    return await _transition_or_current(
+        store,
+        lease.job_id,
+        store.finalize_terminal(lease, clock()),
+    )
+
+
+async def _fail_terminal(
+    store: JobStore,
+    definition: JobDefinition,
+    lease: JobLease,
+    error: JobError,
+    clock: JobClock,
+) -> tuple[str, JobStatus | None]:
+    try:
+        reserved = await store.reserve_terminal(
+            lease,
+            JobTerminalIntent.failed,
+            now=clock(),
+            error=error,
+        )
+    except JobLeaseLostError:
+        return await _authoritative_status(store, lease.job_id)
+    await _call_reserved_hook(definition, reserved)
+    return await _transition_or_current(
+        store,
+        lease.job_id,
+        store.finalize_terminal(lease, clock()),
+    )
+
+
 async def _without_exception_context(  # noqa: UP047 - supports declared mypy>=1.11
     operation: AsyncOperation[T],
 ) -> T:
@@ -204,20 +305,24 @@ async def _retry_or_fail(
     *,
     ctx: dict[str, Any],
     store: JobStore,
+    definition: JobDefinition,
     lease: JobLease,
     error: JobError,
-    now: datetime,
+    clock: JobClock,
     on_status: JobStatusSink,
 ) -> tuple[str, JobStatus | None]:
     if lease.attempt >= lease.max_attempts:
-        result = await _transition_or_current(
+        result = await _fail_terminal(
             store,
-            lease.job_id,
-            store.fail_terminal(lease, error, now),
+            definition,
+            lease,
+            error,
+            clock,
         )
         if result[1] is not None:
             on_status(result[1])
         return result
+    now = clock()
     settings = ctx["job_settings"]
     retry_at = now + timedelta(
         seconds=retry_delay_seconds(
@@ -313,8 +418,21 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
         span.set_attribute("job.kind", lease.kind)
         span.set_attribute("job.scope_id", lease.scope_id)
         span.set_attribute("job.attempt", lease.attempt)
-        try:
-            if definition is None:
+
+        def finish_observability() -> None:
+            span.set_attribute("job.status", final_status.value)
+            logger.info(
+                "job transition scope=%s job=%s kind=%s attempt=%d status=%s duration_ms=%d",
+                lease.scope_id,
+                lease.job_id,
+                lease.kind,
+                lease.attempt,
+                final_status.value,
+                int((perf_counter() - started) * 1000),
+            )
+
+        if definition is None:
+            try:
                 status_value, status = await _transition_or_current(
                     store,
                     job_id,
@@ -330,6 +448,10 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                 if status is not None:
                     final_status = status
                 return status_value
+            finally:
+                finish_observability()
+
+        try:
             context = JobContext(store, lease, clock=clock)
             await context.checkpoint()
             result = await definition.handler(context, lease.payload)
@@ -350,10 +472,11 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
             raise asyncio.CancelledError from None
         except JobCancellationRequested:
             status_value, status = await _without_exception_context(
-                lambda: _transition_or_current(
+                lambda: _finish_cancelled(
                     store,
-                    job_id,
-                    store.finish_cancelled(lease, clock()),
+                    definition,
+                    lease,
+                    clock,
                 )
             )
             if status is not None:
@@ -362,10 +485,12 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
         except PermanentJobError as exc:
             job_error = JobError(exc.code, exc.public_message)
             status_value, status = await _without_exception_context(
-                lambda: _transition_or_current(
+                lambda: _fail_terminal(
                     store,
-                    job_id,
-                    store.fail_terminal(lease, job_error, clock()),
+                    definition,
+                    lease,
+                    job_error,
+                    clock,
                 )
             )
             if status is not None:
@@ -374,10 +499,12 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
         except JobValidationError as exc:
             job_error = JobError(exc.code, exc.public_message)
             status_value, status = await _without_exception_context(
-                lambda: _transition_or_current(
+                lambda: _fail_terminal(
                     store,
-                    job_id,
-                    store.fail_terminal(lease, job_error, clock()),
+                    definition,
+                    lease,
+                    job_error,
+                    clock,
                 )
             )
             if status is not None:
@@ -389,9 +516,10 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                 lambda: _retry_or_fail(
                     ctx=ctx,
                     store=store,
+                    definition=definition,
                     lease=lease,
                     error=job_error,
-                    now=clock(),
+                    clock=clock,
                     on_status=set_final_status,
                 )
             )
@@ -419,12 +547,13 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                 lambda: _retry_or_fail(
                     ctx=ctx,
                     store=store,
+                    definition=definition,
                     lease=lease,
                     error=JobError(
                         "internal_error",
                         "job failed with a temporary internal error",
                     ),
-                    now=clock(),
+                    clock=clock,
                     on_status=set_final_status,
                 )
             )
@@ -432,16 +561,7 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
                 final_status = status
             return status_value
         finally:
-            span.set_attribute("job.status", final_status.value)
-            logger.info(
-                "job transition scope=%s job=%s kind=%s attempt=%d status=%s duration_ms=%d",
-                lease.scope_id,
-                lease.job_id,
-                lease.kind,
-                lease.attempt,
-                final_status.value,
-                int((perf_counter() - started) * 1000),
-            )
+            finish_observability()
 
 
 async def dispatch_jobs(ctx: dict[str, Any]) -> int:
@@ -456,7 +576,9 @@ async def dispatch_jobs(ctx: dict[str, Any]) -> int:
         return 0
 
     settings = ctx["job_settings"]
-    now = _clock(ctx)()
+    registry: JobRegistry = ctx["job_registry"]
+    clock = _clock(ctx)
+    now = clock()
     limit = settings.job_dispatch_limit
     enqueue: EnqueueJob = ctx["enqueue"]
     processed = 0
@@ -478,8 +600,17 @@ async def dispatch_jobs(ctx: dict[str, Any]) -> int:
     exhausted_ids = await _without_exception_context(lambda: store.exhausted(now, limit))
     for job_id in exhausted_ids:
         try:
-            row = await _without_exception_context(partial(store.fail_exhausted, job_id, now))
-            if row is not None:
+            reserved = await _without_exception_context(
+                partial(store.reserve_exhausted, job_id, clock())
+            )
+            if reserved is None:
+                continue
+            definition = registry.get(reserved.kind)
+            await _without_exception_context(partial(_call_reserved_hook, definition, reserved))
+            finalized = await _without_exception_context(
+                partial(store.finalize_exhausted, job_id, clock())
+            )
+            if finalized is not None:
                 processed += 1
         except Exception as exc:
             logger.error(

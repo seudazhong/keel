@@ -12,7 +12,13 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from keel_core.jobs import PostgresJobStore
+from keel_core.jobs import (
+    CancelMode,
+    JobError,
+    JobStatus,
+    JobTerminalIntent,
+    PostgresJobStore,
+)
 from keel_server.api.v1 import router
 from keel_server.auth import parse_api_keys
 
@@ -44,6 +50,7 @@ async def _seed(
     *,
     kind: str = "test.echo",
     now: datetime = _NOW,
+    cancel_mode: CancelMode = CancelMode.immediate,
 ) -> str:
     row, _ = await store.enqueue_once(
         kind=kind,
@@ -51,6 +58,7 @@ async def _seed(
         target_session_id=None,
         idempotency_key=key,
         max_attempts=3,
+        cancel_mode=cancel_mode,
         now=now,
     )
     return row.id
@@ -86,6 +94,7 @@ async def test_viewer_lists_filters_and_reads_detail(
     detail = await client.get(f"/v1/jobs/{older}", headers=headers)
     assert detail.status_code == 200
     assert detail.json()["status"] == "queued"
+    assert detail.json()["cancel_mode"] == "immediate"
     assert detail.json()["cancel_requested"] is False
 
 
@@ -152,6 +161,111 @@ async def test_running_cancel_response_exposes_request_flag(
     assert response.status_code == 200
     assert response.json()["status"] == "running"
     assert response.json()["cancel_requested"] is True
+
+
+async def test_final_attempt_expiry_cancel_maps_to_conflict_without_mutation(
+    jobs_client: tuple[httpx.AsyncClient, str, PostgresJobStore],
+) -> None:
+    client, _, store = jobs_client
+    claimed_at = datetime.now(UTC) - timedelta(seconds=2)
+    row, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id=None,
+        idempotency_key="cancel-finalizing",
+        max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
+        now=claimed_at,
+    )
+    assert await store.claim(row.id, claimed_at, 1) is not None
+    before = await store.get(row.id)
+
+    response = await client.post(
+        f"/v1/jobs/{row.id}/cancel",
+        headers={"X-API-Key": "op"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "job is finalizing and cannot be cancelled"
+    assert await store.get(row.id) == before
+
+
+async def test_failed_terminal_reservation_cancel_maps_to_conflict(
+    jobs_client: tuple[httpx.AsyncClient, str, PostgresJobStore],
+) -> None:
+    client, _, store = jobs_client
+    claimed_at = datetime.now(UTC)
+    job_id = await _seed(
+        store,
+        "cancel-failed-reservation",
+        now=claimed_at,
+        cancel_mode=CancelMode.cooperative,
+    )
+    lease = await store.claim(job_id, claimed_at, 60)
+    assert lease is not None
+    reserved = await store.reserve_terminal(
+        lease,
+        JobTerminalIntent.failed,
+        now=claimed_at,
+        error=JobError("permanent", "Permanent failure."),
+    )
+
+    response = await client.post(
+        f"/v1/jobs/{job_id}/cancel",
+        headers={"X-API-Key": "op"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "job is finalizing and cannot be cancelled"
+    assert await store.get(job_id) == reserved
+
+
+async def test_cooperative_queued_cancel_response_stays_queued_and_exposes_mode(
+    jobs_client: tuple[httpx.AsyncClient, str, PostgresJobStore],
+) -> None:
+    client, _, store = jobs_client
+    job_id = await _seed(
+        store,
+        "cooperative-cancel",
+        now=_NOW + timedelta(minutes=5),
+        cancel_mode=CancelMode.cooperative,
+    )
+
+    response = await client.post(
+        f"/v1/jobs/{job_id}/cancel",
+        headers={"X-API-Key": "op"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "queued"
+    assert response.json()["cancel_mode"] == "cooperative"
+    assert response.json()["cancel_requested"] is True
+    row = await store.get(job_id)
+    assert row is not None
+    assert row.next_attempt_at <= row.cancel_requested_at  # type: ignore[operator]
+
+
+async def test_disabled_cancel_maps_to_conflict_and_leaves_job_queued(
+    jobs_client: tuple[httpx.AsyncClient, str, PostgresJobStore],
+) -> None:
+    client, _, store = jobs_client
+    job_id = await _seed(
+        store,
+        "disabled-cancel",
+        cancel_mode=CancelMode.disabled,
+    )
+
+    response = await client.post(
+        f"/v1/jobs/{job_id}/cancel",
+        headers={"X-API-Key": "op"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "job does not allow cancellation"
+    row = await store.get(job_id)
+    assert row is not None
+    assert row.status is JobStatus.queued
+    assert row.cancel_requested_at is None
 
 
 async def test_no_generic_create_retry_or_inject_routes(

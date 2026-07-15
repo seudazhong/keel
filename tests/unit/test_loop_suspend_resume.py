@@ -10,10 +10,18 @@ from keel_core.connectors import ConfusedDeputyEngine, ConnectorTool
 from keel_core.events import EventType
 from keel_core.loop import ToolRegistry, admit_system, run
 from keel_core.permissions import Rule, RuleBasedPermissionEngine
-from keel_core.protocols import ProviderChunk, ToolCall, ToolContext
+from keel_core.projections import project_messages
+from keel_core.protocols import Citation, ProviderChunk, ToolCall, ToolContext, ToolResult
 from keel_core.state import InMemoryEventStore
 from keel_core.testing import ScriptedProviderGateway
-from keel_core.types import FinishReason, PermissionDecision, ScopeKind, StopReason, TrustLevel
+from keel_core.types import (
+    ContentTaint,
+    FinishReason,
+    PermissionDecision,
+    ScopeKind,
+    StopReason,
+    TrustLevel,
+)
 
 _EXPIRES = datetime(2026, 7, 7, 9, 0, tzinfo=UTC) + timedelta(hours=24)
 
@@ -177,6 +185,81 @@ async def test_resume_after_reject_does_not_send() -> None:
         if e.type is EventType.tool_result and e.payload.get("call_id") == "c2"
     ]
     assert denied and denied[0].payload["ok"] is False
+
+
+async def test_resume_persists_tool_citations_without_changing_provider_projection() -> None:
+    from keel_core.loop import resume
+
+    class CitedTool:
+        name = "cited"
+        description = "Return cited content."
+        writes = False
+
+        def input_schema(self) -> dict[str, object]:
+            return {"type": "object", "additionalProperties": False}
+
+        async def run(self, args: dict[str, object], ctx: ToolContext) -> ToolResult:
+            return ToolResult(
+                ok=True,
+                output="[1] Guide.md#chunk-1\nInstall Keel.",
+                citations=[
+                    Citation(
+                        id="cite_1",
+                        label="Guide.md#chunk-1",
+                        source="knowledge",
+                        metadata={"chunk_id": "kbc_1"},
+                    )
+                ],
+                taint=ContentTaint.tainted,
+            )
+
+    store, approvals = InMemoryEventStore(), InMemoryApprovalStore()
+    await admit_system(store, "s1", "u:1", "search")
+    suspended = await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=ScriptedProviderGateway(
+            [
+                [
+                    ProviderChunk(
+                        tool_call=ToolCall(id="c1", name="cited", arguments={}),
+                        finish_reason=FinishReason.tool_use,
+                    )
+                ]
+            ]
+        ),
+        registry=ToolRegistry([CitedTool()]),
+        permissions=RuleBasedPermissionEngine([Rule("cited", PermissionDecision.ask)]),
+        approvals=approvals,
+        expires_at=_EXPIRES,
+    )
+    approval_id = (await approvals.list_pending("u:1"))[0].id
+    await approvals.resolve(approval_id, "granted", "reviewer")
+
+    await resume(
+        agent=_agent(),
+        session_id="s1",
+        run_id=suspended.run_id,
+        store=store,
+        provider=_done(),
+        registry=ToolRegistry([CitedTool()]),
+        permissions=RuleBasedPermissionEngine([Rule("cited", PermissionDecision.ask)]),
+        approvals=approvals,
+    )
+
+    events = store.snapshot("s1")
+    tool_result = next(
+        event
+        for event in events
+        if event.type is EventType.tool_result and event.payload.get("call_id") == "c1"
+    )
+    assert tool_result.payload["citations"][0]["id"] == "cite_1"
+    tool_message = next(
+        message for message in project_messages(events) if message["role"] == "tool"
+    )
+    assert tool_message["content"] == "[1] Guide.md#chunk-1\nInstall Keel."
+    assert set(tool_message) == {"role", "tool_call_id", "content"}
 
 
 async def test_double_resume_sends_once() -> None:

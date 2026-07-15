@@ -8,10 +8,25 @@ from keel_core.agents import AgentSpec, Scope
 from keel_core.events import EventType
 from keel_core.loop import RunBudget, ToolRegistry, admit, run
 from keel_core.permissions import Rule, RuleBasedPermissionEngine
-from keel_core.protocols import ProviderChunk, ProviderRequest, ToolCall, ToolContext, ToolResult
+from keel_core.projections import project_messages
+from keel_core.protocols import (
+    Citation,
+    ProviderChunk,
+    ProviderRequest,
+    ToolCall,
+    ToolContext,
+    ToolResult,
+)
 from keel_core.state import InMemoryEventStore
 from keel_core.testing import ScriptedProviderGateway
-from keel_core.types import FinishReason, PermissionDecision, ScopeKind, StopReason, TrustLevel
+from keel_core.types import (
+    ContentTaint,
+    FinishReason,
+    PermissionDecision,
+    ScopeKind,
+    StopReason,
+    TrustLevel,
+)
 
 
 def _agent() -> AgentSpec:
@@ -89,6 +104,72 @@ async def test_tool_use_executes_then_completes() -> None:
     types = _event_types(store, "s1")
     assert EventType.tool_call in types
     assert EventType.tool_result in types
+
+
+async def test_tool_result_persists_citations_without_projecting_them_to_provider() -> None:
+    class CitedTool:
+        name = "cited"
+        description = "Return cited content."
+        writes = False
+
+        def input_schema(self) -> dict[str, object]:
+            return {"type": "object", "additionalProperties": False}
+
+        async def run(self, args: dict[str, object], ctx: ToolContext) -> ToolResult:
+            return ToolResult(
+                ok=True,
+                output="[1] Guide.md#chunk-1\nInstall Keel.",
+                citations=[
+                    Citation(
+                        id="cite_1",
+                        label="Guide.md#chunk-1",
+                        source="knowledge",
+                        metadata={"chunk_id": "kbc_1"},
+                    )
+                ],
+                taint=ContentTaint.tainted,
+            )
+
+    store = InMemoryEventStore()
+    provider = ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(
+                    tool_call=ToolCall(id="c1", name="cited", arguments={}),
+                    finish_reason=FinishReason.tool_use,
+                )
+            ],
+            [ProviderChunk(delta="done", finish_reason=FinishReason.end_turn)],
+        ]
+    )
+    await admit(store, "s1", "u:1", "search")
+
+    await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=provider,
+        registry=ToolRegistry([CitedTool()]),
+    )
+
+    events = store.snapshot("s1")
+    tool_result = next(event for event in events if event.type is EventType.tool_result)
+    assert tool_result.payload["citations"] == [
+        {
+            "id": "cite_1",
+            "label": "Guide.md#chunk-1",
+            "source": "knowledge",
+            "metadata": {"chunk_id": "kbc_1"},
+        }
+    ]
+    tool_message = next(
+        message for message in project_messages(events) if message["role"] == "tool"
+    )
+    assert tool_message == {
+        "role": "tool",
+        "tool_call_id": "c1",
+        "content": "[1] Guide.md#chunk-1\nInstall Keel.",
+    }
 
 
 async def test_stop_reason_gate_blocks_tools_without_tool_use() -> None:
