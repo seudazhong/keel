@@ -21,6 +21,12 @@ EVAL_ENV_VAR = "KEEL_EVAL_DATABASE_URL"
 # Deletion order respects FKs: message_embeddings.event_id -> events (CASCADE) and
 # events.session_id -> sessions; children first so a scoped delete never orphans.
 EVAL_CLEANUP_TABLES: tuple[str, ...] = (
+    "kb_chunks",
+    "knowledge_idempotency",
+    "kb_document_versions",
+    "kb_documents",
+    "knowledge_bases",
+    "jobs",
     "message_embeddings",
     "events",
     "sessions",
@@ -81,6 +87,13 @@ async def cleanup_scope(engine: AsyncEngine, scope_id: str) -> None:
     """Delete every eval-owned row for ``scope_id`` (run on start and in finally)."""
     async with engine.begin() as conn:
         await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        await conn.execute(
+            text(
+                "UPDATE kb_documents SET desired_version_id = NULL, active_version_id = NULL "
+                "WHERE scope_id = :scope"
+            ),
+            {"scope": scope_id},
+        )
         for table in EVAL_CLEANUP_TABLES:
             await conn.execute(
                 text(f"DELETE FROM {table} WHERE scope_id = :scope"), {"scope": scope_id}
