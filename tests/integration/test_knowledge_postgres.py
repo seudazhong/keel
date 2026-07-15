@@ -1225,6 +1225,108 @@ async def test_terminal_fence_without_predecessor_clears_postgres_document_point
     assert document.last_error_message == "Knowledge indexing was cancelled."
 
 
+async def test_terminal_fence_without_predecessor_preserves_newer_postgres_desired_version(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "terminal-fence:none-newer")
+    base = await _base(store)
+    target = await store.create_document_version(_version(base.id, "A"), now=_NOW)
+    job_id = "job_postgres_no_predecessor_newer_desired"
+    await store.attach_version_job(base.id, target.document.id, target.version.id, job_id)
+    await _index_and_activate(
+        store,
+        base.id,
+        target.document.id,
+        target.version.id,
+        "A",
+        now=_NOW,
+    )
+    newer = await store.create_document_version(
+        _version(base.id, "B", document_id=target.document.id),
+        now=_NOW + timedelta(seconds=1),
+    )
+
+    failed = await store.mark_version_failed(
+        KnowledgeVersionFailure(
+            kb_id=base.id,
+            document_id=target.document.id,
+            document_version_id=target.version.id,
+            ingest_job_id=job_id,
+            error_kind="late_failure",
+            error_message="The active ingest failed after a newer request arrived.",
+        ),
+        now=_NOW + timedelta(seconds=2),
+    )
+
+    document = await store.get_document(base.id, target.document.id)
+    pending = await store.get_version(base.id, target.document.id, newer.version.id)
+    assert failed.status is KnowledgeVersionStatus.failed
+    assert document is not None
+    assert document.status is KnowledgeDocumentStatus.pending
+    assert document.active_version_id is None
+    assert document.desired_version_id == newer.version.id
+    assert document.last_error_kind is None
+    assert document.last_error_message is None
+    assert pending is not None and pending.status is KnowledgeVersionStatus.pending
+
+
+async def test_terminal_fence_restores_postgres_predecessor_and_preserves_newer_desired_version(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "terminal-fence:predecessor-newer")
+    base = await _base(store)
+    first = await store.create_document_version(_version(base.id, "A"), now=_NOW)
+    await _index_and_activate(
+        store,
+        base.id,
+        first.document.id,
+        first.version.id,
+        "A",
+        now=_NOW,
+    )
+    target = await store.create_document_version(
+        _version(base.id, "B", document_id=first.document.id),
+        now=_NOW + timedelta(seconds=1),
+    )
+    job_id = "job_postgres_predecessor_newer_desired"
+    await store.attach_version_job(base.id, first.document.id, target.version.id, job_id)
+    await _index_and_activate(
+        store,
+        base.id,
+        first.document.id,
+        target.version.id,
+        "B",
+        now=_NOW + timedelta(seconds=2),
+    )
+    newer = await store.create_document_version(
+        _version(base.id, "C", document_id=first.document.id),
+        now=_NOW + timedelta(seconds=3),
+    )
+
+    failed = await store.mark_version_failed(
+        KnowledgeVersionFailure(
+            kb_id=base.id,
+            document_id=first.document.id,
+            document_version_id=target.version.id,
+            ingest_job_id=job_id,
+            error_kind="late_failure",
+            error_message="The active ingest failed after a newer request arrived.",
+        ),
+        now=_NOW + timedelta(seconds=4),
+    )
+
+    document = await store.get_document(base.id, first.document.id)
+    restored = await store.get_version(base.id, first.document.id, first.version.id)
+    pending = await store.get_version(base.id, first.document.id, newer.version.id)
+    assert failed.status is KnowledgeVersionStatus.failed
+    assert document is not None
+    assert document.status is KnowledgeDocumentStatus.active
+    assert document.active_version_id == first.version.id
+    assert document.desired_version_id == newer.version.id
+    assert restored is not None and restored.status is KnowledgeVersionStatus.active
+    assert pending is not None and pending.status is KnowledgeVersionStatus.pending
+
+
 async def test_terminal_fence_does_not_disturb_newer_postgres_active_version(
     migrated_db: AsyncEngine,
 ) -> None:

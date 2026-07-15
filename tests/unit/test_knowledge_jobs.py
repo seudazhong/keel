@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -36,6 +37,7 @@ from keel_core.knowledge import (
     KnowledgeJobContext,
     KnowledgeJobHandlers,
     KnowledgeSourceType,
+    KnowledgeStorageError,
     KnowledgeVersionStatus,
     content_sha256,
     new_knowledge_base_id,
@@ -107,6 +109,20 @@ class _ActivateAfterReadStore(InMemoryKnowledgeStore):
             activation = await super().activate_version(kb_id, document_id, document_version_id)
             self.race_activated = activation.activated
         return version
+
+
+class _ClaimStorageFailureStore(InMemoryKnowledgeStore):
+    async def attach_version_job(
+        self,
+        kb_id: str,
+        document_id: str,
+        document_version_id: str,
+        job_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> KnowledgeDocumentVersionRecord:
+        del kb_id, document_id, document_version_id, job_id, now
+        raise KnowledgeStorageError
 
 
 async def _document(
@@ -225,7 +241,6 @@ async def test_ingest_uses_persisted_settings_batches_checkpoints_and_exact_resu
     store = InMemoryKnowledgeStore("web:local")
     kb_id, document_id, version_id = await _document(store)
     context = _Context()
-    await store.attach_version_job(kb_id, document_id, version_id, context.job_id)
     embedder = _Embedder()
     handlers = KnowledgeJobHandlers(
         store,
@@ -265,6 +280,7 @@ async def test_ingest_uses_persisted_settings_batches_checkpoints_and_exact_resu
     version = await store.get_version(kb_id, document_id, version_id)
     chunks = await store.list_version_chunks(kb_id, document_id, version_id)
     assert version is not None and version.status is KnowledgeVersionStatus.active
+    assert version.ingest_job_id == context.job_id
     assert [chunk.text for chunk in chunks] == [draft.text for draft in expected_drafts]
     assert {chunk.model for chunk in chunks} == {"fake/embed"}
     assert {chunk.dim for chunk in chunks} == {3}
@@ -273,15 +289,48 @@ async def test_ingest_uses_persisted_settings_batches_checkpoints_and_exact_resu
 async def test_ingest_pin_mismatch_is_permanent_before_embedding_or_chunk_write() -> None:
     store = InMemoryKnowledgeStore("web:local")
     kb_id, document_id, version_id = await _document(store)
+    context = _Context()
     embedder = _Embedder(model="wrong/model")
     handlers = KnowledgeJobHandlers(store, embedder, Settings())
 
     with pytest.raises(PermanentJobError) as caught:
-        await handlers.ingest(_Context(), _payload(kb_id, document_id, version_id))
+        await handlers.ingest(context, _payload(kb_id, document_id, version_id))
 
     assert caught.value.code == "embedding_configuration_mismatch"
     assert embedder.calls == []
     assert await store.list_version_chunks(kb_id, document_id, version_id) == []
+    claimed = await store.get_version(kb_id, document_id, version_id)
+    assert claimed is not None
+    assert claimed.ingest_job_id == context.job_id
+    assert claimed.status is KnowledgeVersionStatus.indexing
+
+    await handlers.ingest_failed(
+        _row(
+            job_id=context.job_id,
+            kind="knowledge.ingest",
+            payload=_payload(kb_id, document_id, version_id),
+            terminal_intent=JobTerminalIntent.failed,
+        ),
+        JobError(caught.value.code, caught.value.public_message),
+    )
+    failed = await store.get_version(kb_id, document_id, version_id)
+    assert failed is not None and failed.status is KnowledgeVersionStatus.failed
+    assert await store.list_version_chunks(kb_id, document_id, version_id) == []
+
+
+async def test_ingest_claim_storage_failure_is_retryable_without_mutation() -> None:
+    store = _ClaimStorageFailureStore("web:local")
+    kb_id, document_id, version_id = await _document(store)
+    handlers = KnowledgeJobHandlers(store, _Embedder(), Settings())
+
+    with pytest.raises(RetryableJobError) as caught:
+        await handlers.ingest(_Context(), _payload(kb_id, document_id, version_id))
+
+    version = await store.get_version(kb_id, document_id, version_id)
+    assert caught.value.code == "knowledge_storage_failure"
+    assert version is not None
+    assert version.ingest_job_id is None
+    assert version.status is KnowledgeVersionStatus.pending
 
 
 async def test_ingest_rejects_invalid_vectors_with_bounded_retryable_error() -> None:
@@ -322,6 +371,54 @@ async def test_ingest_duplicate_delivery_returns_active_without_reembedding() ->
     assert replay == first
     assert len(embedder.calls) == call_count
     assert [chunk.id for chunk in replay_chunks] == [chunk.id for chunk in first_chunks]
+
+
+async def test_concurrent_ingests_claim_one_job_and_reject_the_other_without_cleanup() -> None:
+    store = InMemoryKnowledgeStore("web:local")
+    kb_id, document_id, version_id = await _document(
+        store,
+        content="one chunk",
+        target_chars=100,
+    )
+    handlers = KnowledgeJobHandlers(store, _Embedder(), Settings())
+    contexts = [
+        _Context(job_id="job_first"),
+        _Context(job_id="job_second"),
+    ]
+
+    outcomes = await asyncio.gather(
+        *(
+            handlers.ingest(context, _payload(kb_id, document_id, version_id))
+            for context in contexts
+        ),
+        return_exceptions=True,
+    )
+
+    conflicts = [outcome for outcome in outcomes if isinstance(outcome, PermanentJobError)]
+    assert len(conflicts) == 1
+    assert conflicts[0].code == "idempotency_job_conflict"
+    assert sum(not isinstance(outcome, BaseException) for outcome in outcomes) == 1
+
+    version = await store.get_version(kb_id, document_id, version_id)
+    assert version is not None and version.status is KnowledgeVersionStatus.active
+    assert version.ingest_job_id in {context.job_id for context in contexts}
+    losing_context = next(
+        context for context in contexts if context.job_id != version.ingest_job_id
+    )
+    await handlers.ingest_failed(
+        _row(
+            job_id=losing_context.job_id,
+            kind="knowledge.ingest",
+            payload=_payload(kb_id, document_id, version_id),
+            terminal_intent=JobTerminalIntent.failed,
+        ),
+        JobError("idempotency_job_conflict", "The other job owns this version."),
+    )
+
+    unchanged = await store.get_version(kb_id, document_id, version_id)
+    assert unchanged is not None
+    assert unchanged.status is KnowledgeVersionStatus.active
+    assert unchanged.ingest_job_id == version.ingest_job_id
 
 
 async def test_stale_desired_version_is_superseded_without_embedding() -> None:

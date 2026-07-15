@@ -1530,6 +1530,8 @@ class InMemoryKnowledgeStore:
         )
         self._versions[version.id] = version
         if target_was_active:
+            desired_was_target = document.desired_version_id == version.id
+            has_newer_desired = document.desired_version_id is not None and not desired_was_target
             predecessors = [
                 candidate
                 for candidate in self._versions.values()
@@ -1549,15 +1551,25 @@ class InMemoryKnowledgeStore:
                 default=None,
             )
             if predecessor is None:
-                document = replace(
-                    document,
-                    status=KnowledgeDocumentStatus.failed,
-                    active_version_id=None,
-                    desired_version_id=None,
-                    last_error_kind=error_kind,
-                    last_error_message=error_message,
-                    updated_at=timestamp,
-                )
+                if has_newer_desired:
+                    document = replace(
+                        document,
+                        status=KnowledgeDocumentStatus.pending,
+                        active_version_id=None,
+                        last_error_kind=None,
+                        last_error_message=None,
+                        updated_at=timestamp,
+                    )
+                else:
+                    document = replace(
+                        document,
+                        status=KnowledgeDocumentStatus.failed,
+                        active_version_id=None,
+                        desired_version_id=None,
+                        last_error_kind=error_kind,
+                        last_error_message=error_message,
+                        updated_at=timestamp,
+                    )
             else:
                 predecessor = replace(
                     predecessor,
@@ -1570,7 +1582,9 @@ class InMemoryKnowledgeStore:
                     document,
                     status=KnowledgeDocumentStatus.active,
                     active_version_id=predecessor.id,
-                    desired_version_id=predecessor.id,
+                    desired_version_id=(
+                        predecessor.id if desired_was_target else document.desired_version_id
+                    ),
                     last_error_kind=None,
                     last_error_message=None,
                     updated_at=timestamp,
@@ -4004,6 +4018,8 @@ class PostgresKnowledgeStore:
             .one()
         )
         if target_was_active:
+            desired_was_target = document.desired_version_id == version.id
+            has_newer_desired = document.desired_version_id is not None and not desired_was_target
             predecessor_row = (
                 (
                     await conn.execute(
@@ -4027,23 +4043,39 @@ class PostgresKnowledgeStore:
                 .one_or_none()
             )
             if predecessor_row is None:
-                await conn.execute(
-                    text(
-                        "UPDATE kb_documents SET status = 'failed', "
-                        "active_version_id = NULL, desired_version_id = NULL, "
-                        "last_error_kind = :error_kind, "
-                        "last_error_message = :error_message, updated_at = :now "
-                        "WHERE scope_id = :scope AND kb_id = :kb AND id = :document"
-                    ),
-                    {
-                        "error_kind": error_kind,
-                        "error_message": error_message,
-                        "now": timestamp,
-                        "scope": self._scope_id,
-                        "kb": base.id,
-                        "document": document.id,
-                    },
-                )
+                if has_newer_desired:
+                    await conn.execute(
+                        text(
+                            "UPDATE kb_documents SET status = 'pending', "
+                            "active_version_id = NULL, last_error_kind = NULL, "
+                            "last_error_message = NULL, updated_at = :now "
+                            "WHERE scope_id = :scope AND kb_id = :kb AND id = :document"
+                        ),
+                        {
+                            "now": timestamp,
+                            "scope": self._scope_id,
+                            "kb": base.id,
+                            "document": document.id,
+                        },
+                    )
+                else:
+                    await conn.execute(
+                        text(
+                            "UPDATE kb_documents SET status = 'failed', "
+                            "active_version_id = NULL, desired_version_id = NULL, "
+                            "last_error_kind = :error_kind, "
+                            "last_error_message = :error_message, updated_at = :now "
+                            "WHERE scope_id = :scope AND kb_id = :kb AND id = :document"
+                        ),
+                        {
+                            "error_kind": error_kind,
+                            "error_message": error_message,
+                            "now": timestamp,
+                            "scope": self._scope_id,
+                            "kb": base.id,
+                            "document": document.id,
+                        },
+                    )
             else:
                 predecessor = _pg_version_record(predecessor_row)
                 await conn.execute(
@@ -4064,12 +4096,15 @@ class PostgresKnowledgeStore:
                 await conn.execute(
                     text(
                         "UPDATE kb_documents SET status = 'active', "
-                        "active_version_id = :version, desired_version_id = :version, "
+                        "active_version_id = :version, "
+                        "desired_version_id = CASE WHEN desired_version_id = :target "
+                        "THEN :version ELSE desired_version_id END, "
                         "last_error_kind = NULL, last_error_message = NULL, updated_at = :now "
                         "WHERE scope_id = :scope AND kb_id = :kb AND id = :document"
                     ),
                     {
                         "version": predecessor.id,
+                        "target": version.id,
                         "now": timestamp,
                         "scope": self._scope_id,
                         "kb": base.id,

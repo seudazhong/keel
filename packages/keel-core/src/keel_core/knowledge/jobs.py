@@ -216,12 +216,19 @@ class KnowledgeJobHandlers:
         payload = _parse_payload(KnowledgeIngestPayload, raw_payload)
         self._require_context_scope(context)
 
-        base, version = await self._load_ingest_records(payload)
-        if version.ingest_job_id is not None and version.ingest_job_id != context.job_id:
-            raise PermanentJobError(
-                "knowledge_job_mismatch",
-                "Knowledge version belongs to a different ingest job.",
+        try:
+            await self._store.attach_version_job(
+                payload.kb_id,
+                payload.document_id,
+                payload.document_version_id,
+                context.job_id,
             )
+        except KnowledgeStorageError as exc:
+            raise _retryable_from_storage(exc) from None
+        except KnowledgeError as exc:
+            raise _permanent_from_domain(exc) from None
+
+        base, version = await self._load_ingest_records(payload)
 
         try:
             indexing = await self._store.mark_indexing(
@@ -410,9 +417,7 @@ class KnowledgeJobHandlers:
                 payload.document_id,
                 payload.document_version_id,
             )
-            if version is None or (
-                version.ingest_job_id is not None and version.ingest_job_id != row.id
-            ):
+            if version is None or version.ingest_job_id != row.id:
                 return
             await self._store.mark_version_cancelled(
                 KnowledgeVersionCancellation(
@@ -445,9 +450,7 @@ class KnowledgeJobHandlers:
                 payload.document_id,
                 payload.document_version_id,
             )
-            if version is None or (
-                version.ingest_job_id is not None and version.ingest_job_id != row.id
-            ):
+            if version is None or version.ingest_job_id != row.id:
                 return
             await self._store.mark_version_failed(
                 KnowledgeVersionFailure(
