@@ -854,7 +854,11 @@ git commit -m "feat(knowledge): add durable ingest jobs" -m "Co-authored-by: Cop
 
 - [ ] **Step 1: Write RED API tests**
 
-Test viewer reads/search, viewer mutation denial, operator CRUD, missing/unsafe/oversized `Idempotency-Key`, same-key replay, different-body 409, model snapshot, first-failure update recovery, no-active reindex 409, immediate delete hide, cross-scope 404, disabled delete-job cancel 409, and crash-after-resource-commit retry attaching the same job.
+Test viewer reads/search, viewer mutation denial, operator CRUD, missing/unsafe/oversized
+`Idempotency-Key`, same-key replay, different-body 409, model snapshot, first-failure update
+recovery, no-active reindex 409, immediate delete hide, cross-scope 404, disabled delete-job
+cancel 409, crash-after-resource-commit retry attaching the same job, and malformed document
+content whose raw input must not appear in the 422 body.
 
 - [ ] **Step 2: Implement `KnowledgeService`**
 
@@ -862,7 +866,11 @@ For each mutation: validate canonical request, acquire ledger entry, create/upda
 
 - [ ] **Step 3: Implement router DTOs and error mapping**
 
-Use `Header(alias="Idempotency-Key")`, viewer router default, operator dependencies on mutations, 404 for malformed/foreign IDs, 409 for conflicts/no-active/not-cancellable, 413 for document bytes, and 503 when create-KB has no configured embedder.
+Use `Header(alias="Idempotency-Key")`, viewer router default, operator dependencies on mutations,
+404 for malformed/foreign IDs, 409 for conflicts/no-active/not-cancellable, 413 for document
+bytes, and 503 when create-KB has no configured embedder. Register a
+`RequestValidationError` sanitizer that returns only bounded `loc/type/msg` fields and strips
+Pydantic's raw `input`/unsafe context before serializing any 422 response.
 
 - [ ] **Step 4: Wire app state**
 
