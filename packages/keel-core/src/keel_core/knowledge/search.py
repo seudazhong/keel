@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import struct
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -32,20 +33,18 @@ _DEFAULT_CANDIDATE_MULTIPLIER = 3
 _MIN_CANDIDATES = 20
 _SNIPPET_MAX_CHARS = 2_000
 _MAX_SNAPSHOT_RETRIES = 2
-_FLOAT32_MAX = float.fromhex("0x1.fffffep+127")
-
 _EMBEDDING_UNAVAILABLE = "embedding_unavailable"
 _EMBEDDING_CONFIGURATION_MISMATCH = KnowledgePublicCode.embedding_configuration_mismatch.value
 
 _ACTIVE_KB = text(
-    "SELECT embedding_model, embedding_dim "
+    "SELECT embedding_model, embedding_dim, xmin::text AS row_revision "
     "FROM knowledge_bases "
     "WHERE scope_id = :scope AND id = :kb AND status = 'active'"
 )
 
 _ACTIVE_DOCUMENT_VERSIONS = text(
     """
-    SELECT d.id, d.active_version_id
+    SELECT d.id, d.active_version_id, d.xmin::text AS row_revision
     FROM kb_documents AS d
     JOIN kb_document_versions AS v
       ON v.scope_id = d.scope_id
@@ -207,7 +206,8 @@ _FINAL_CHUNKS = text(
 class _KnowledgePin:
     model: str
     dim: int
-    active_versions: tuple[tuple[str, str], ...]
+    base_revision: str
+    active_versions: tuple[tuple[str, str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,9 +280,15 @@ def _validated_vector(value: object, *, dim: int) -> list[float] | None:
             number = float(item)
         except (OverflowError, TypeError, ValueError):
             return None
-        if not math.isfinite(number) or abs(number) > _FLOAT32_MAX:
+        if not math.isfinite(number):
             return None
-        vector.append(number)
+        try:
+            float32 = struct.unpack("!f", struct.pack("!f", number))[0]
+        except (OverflowError, struct.error):
+            return None
+        if not math.isfinite(float32):
+            return None
+        vector.append(float32)
     if not any(vector):
         return None
     return vector
@@ -402,8 +408,14 @@ class KnowledgeSearcher:
         return _KnowledgePin(
             model=str(pin_row["embedding_model"]),
             dim=int(pin_row["embedding_dim"]),
+            base_revision=str(pin_row["row_revision"]),
             active_versions=tuple(
-                (str(row["id"]), str(row["active_version_id"])) for row in version_rows
+                (
+                    str(row["id"]),
+                    str(row["active_version_id"]),
+                    str(row["row_revision"]),
+                )
+                for row in version_rows
             ),
         )
 

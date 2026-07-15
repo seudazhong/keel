@@ -49,6 +49,14 @@ def test_knowledge_query_vector_accepts_float32_finite_boundary(value: float) ->
     assert _validated_vector([value, 0.0], dim=2) == [value, 0.0]
 
 
+def test_knowledge_query_vector_rejects_values_that_underflow_to_zero_in_float32() -> None:
+    assert _validated_vector([1e-50, -1e-50], dim=2) is None
+
+
+def test_knowledge_query_vector_uses_the_float32_values_pgvector_will_receive() -> None:
+    assert _validated_vector([1.0, 1e-50], dim=2) == [1.0, 0.0]
+
+
 async def test_fake_embedder_is_deterministic_and_shape_correct() -> None:
     embedder = FakeEmbedder(dim=16)
     a1 = (await embedder.embed(["hello world"]))[0]

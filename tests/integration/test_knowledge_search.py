@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 
 import psycopg
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
@@ -412,6 +412,92 @@ async def test_activation_between_lexical_and_final_retries_instead_of_false_no_
     assert status.mode is KnowledgeSearchMode.lexical
     assert final_calls == 2
     assert [hit.citation.document_version_id for hit in hits] == [second.version_id]
+
+
+async def test_active_version_aba_retries_even_when_the_version_id_returns_to_the_pin(
+    migrated_db: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "search:race-aba")
+    kb_id = await _create_base(store, name="Active version ABA")
+    first = await _index_document(
+        store,
+        kb_id,
+        [_Chunk("stable aba marker", (0.0, 1.0))],
+    )
+    second = await _index_document(
+        store,
+        kb_id,
+        [_Chunk("transient aba marker", (1.0, 0.0))],
+        document_id=first.document_id,
+        now=_NOW + timedelta(seconds=1),
+        activate=False,
+    )
+
+    async def activate_transient(call: int) -> None:
+        if call != 1:
+            return
+        activated = await store.activate_version(
+            kb_id,
+            first.document_id,
+            second.version_id,
+            now=_NOW + timedelta(seconds=2),
+        )
+        assert activated.activated
+
+    embedder = _CallbackEmbedder(activate_transient)
+    searcher = KnowledgeSearcher(migrated_db, store.scope_id, embedder)
+    original_final = searcher._final_rows_and_snapshot
+    final_calls = 0
+
+    async def restore_original_before_final(kb: str, chunk_ids: Sequence[str]) -> object:
+        nonlocal final_calls
+        final_calls += 1
+        if final_calls == 1:
+            async with migrated_db.begin() as conn:
+                await conn.execute(
+                    text("SELECT set_config('app.scope_id', :scope, true)"),
+                    {"scope": store.scope_id},
+                )
+                await conn.execute(
+                    text(
+                        "UPDATE kb_document_versions "
+                        "SET status = CASE WHEN id = :first THEN 'active' ELSE 'superseded' END "
+                        "WHERE scope_id = :scope AND kb_id = :kb AND document_id = :document "
+                        "AND id IN (:first, :second)"
+                    ),
+                    {
+                        "scope": store.scope_id,
+                        "kb": kb_id,
+                        "document": first.document_id,
+                        "first": first.version_id,
+                        "second": second.version_id,
+                    },
+                )
+                await conn.execute(
+                    text(
+                        "UPDATE kb_documents SET status = 'active', "
+                        "active_version_id = :first, desired_version_id = :first, "
+                        "updated_at = :now "
+                        "WHERE scope_id = :scope AND kb_id = :kb AND id = :document"
+                    ),
+                    {
+                        "scope": store.scope_id,
+                        "kb": kb_id,
+                        "document": first.document_id,
+                        "first": first.version_id,
+                        "now": _NOW + timedelta(seconds=3),
+                    },
+                )
+        return await original_final(kb, chunk_ids)
+
+    monkeypatch.setattr(searcher, "_final_rows_and_snapshot", restore_original_before_final)
+    hits, status = await searcher.search(kb_id, "aba marker", k=5)
+
+    assert status.mode is KnowledgeSearchMode.hybrid
+    assert embedder.calls == [("aba marker",), ("aba marker",)]
+    assert final_calls == 2
+    assert [hit.citation.document_version_id for hit in hits] == [first.version_id]
 
 
 async def test_base_deleted_during_final_boundary_retries_to_stable_absence(
