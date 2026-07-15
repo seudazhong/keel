@@ -13,7 +13,7 @@ import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -25,14 +25,19 @@ from keel_core.api import HealthResponse, ReadinessResponse
 from keel_core.approvals import InMemoryApprovalStore, PostgresApprovalStore
 from keel_core.config import Settings, get_settings, load_env_file
 from keel_core.db import make_async_engine, make_redis
+from keel_core.embeddings import Embedder
 from keel_core.jobs import (
     InMemoryJobStore,
     JobLimits,
     JobStore,
     PostgresJobStore,
 )
+from keel_core.knowledge.search import KnowledgeSearcher
+from keel_core.knowledge.service import DispatchJob, KnowledgeService
+from keel_core.knowledge.store import KnowledgeStore, PostgresKnowledgeStore
 from keel_core.providers import LiteLLMGateway
 from keel_server.api import gateway as gateway_api
+from keel_server.api import knowledge as knowledge_api
 from keel_server.api import oauth as oauth_api
 from keel_server.api import v1
 from keel_server.auth import parse_api_keys
@@ -58,6 +63,40 @@ def _build_job_store(
 
 async def _enqueue_arq(pool: Any, name: str, *args: object, **options: object) -> None:
     await pool.enqueue_job(name, *args, **options)
+
+
+def _build_knowledge_service(
+    engine: AsyncEngine | None,
+    scope_id: str,
+    settings: Settings,
+    jobs: JobStore,
+    *,
+    embedder: Embedder | None,
+    dispatch_job: DispatchJob | None = None,
+) -> KnowledgeService | None:
+    if engine is None:
+        return None
+    store = PostgresKnowledgeStore(
+        engine,
+        scope_id,
+        document_max_bytes=settings.knowledge_document_max_bytes,
+    )
+    searcher = KnowledgeSearcher(
+        engine,
+        scope_id,
+        embedder,
+        query_max_chars=settings.knowledge_search_query_max_chars,
+        k_max=settings.knowledge_search_k_max,
+    )
+    return KnowledgeService(
+        cast(KnowledgeStore, store),
+        jobs,
+        settings,
+        searcher=searcher,
+        dispatch_job=dispatch_job,
+        embedding_model=(None if embedder is None else embedder.model),
+        embedding_dim=(None if embedder is None else embedder.dim),
+    )
 
 
 @asynccontextmanager
@@ -108,6 +147,26 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.enqueue = _enqueue
     except Exception:  # noqa: BLE001 - resume enqueue is best-effort; the page still renders
         logger.warning("arq queue unavailable; durable-approval resume enqueue disabled")
+
+    async def _dispatch_knowledge_job(scope_id: str, job_id: str) -> None:
+        enqueue = getattr(app.state, "enqueue", None)
+        if enqueue is None:
+            logger.warning(
+                "knowledge job queue unavailable; dispatcher will recover scope=%s job=%s",
+                scope_id,
+                job_id,
+            )
+            return
+        await enqueue("run_job", scope_id, job_id)
+
+    app.state.knowledge = _build_knowledge_service(
+        engine,
+        _DURABLE_SCOPE,
+        settings,
+        app.state.jobs,
+        embedder=app.state.runtime.embedder,
+        dispatch_job=_dispatch_knowledge_job,
+    )
     # OneBot IM gateway (optional): only wired when an API base is configured.
     if settings.onebot_api_base:
         app.state.onebot_gateway = OneBotGateway(
@@ -145,6 +204,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 def create_app() -> FastAPI:
     """Build the Keel FastAPI application."""
     app = FastAPI(title="Keel", version=__version__, lifespan=_lifespan)
+    knowledge_api.register_exception_handlers(app)
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def index() -> str:
@@ -191,6 +251,7 @@ def create_app() -> FastAPI:
         return JSONResponse(body.model_dump(), status_code=200 if ready else 503)
 
     app.include_router(v1.router)
+    app.include_router(knowledge_api.router)
     app.include_router(oauth_api.router)
     app.include_router(gateway_api.router)
     app.include_router(pages_router)

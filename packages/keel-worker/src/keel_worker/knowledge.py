@@ -4,17 +4,18 @@ from __future__ import annotations
 
 from keel_core.config import Settings
 from keel_core.embeddings import Embedder
-from keel_core.jobs import CancelMode
 from keel_core.knowledge.jobs import (
+    KNOWLEDGE_DELETE_CANCEL_MODE,
     KNOWLEDGE_DELETE_KIND,
+    KNOWLEDGE_DELETE_MAX_ATTEMPTS,
+    KNOWLEDGE_INGEST_CANCEL_MODE,
     KNOWLEDGE_INGEST_KIND,
+    KNOWLEDGE_INGEST_MAX_ATTEMPTS,
     KnowledgeJobHandlers,
 )
 from keel_core.knowledge.store import KnowledgeStore
 
 from .jobs import JobDefinition, JobRegistry
-
-_PG_INTEGER_MAX = 2_147_483_647
 
 
 def knowledge_job_definitions(
@@ -28,18 +29,18 @@ def knowledge_job_definitions(
         JobDefinition(
             kind=KNOWLEDGE_INGEST_KIND,
             handler=handlers.ingest,
-            max_attempts=3,
+            max_attempts=KNOWLEDGE_INGEST_MAX_ATTEMPTS,
             lease_seconds=lease_seconds,
-            cancel_mode=CancelMode.cooperative,
+            cancel_mode=KNOWLEDGE_INGEST_CANCEL_MODE,
             on_cancelled=handlers.ingest_cancelled,
             on_failed=handlers.ingest_failed,
         ),
         JobDefinition(
             kind=KNOWLEDGE_DELETE_KIND,
             handler=handlers.delete,
-            max_attempts=_PG_INTEGER_MAX,
+            max_attempts=KNOWLEDGE_DELETE_MAX_ATTEMPTS,
             lease_seconds=lease_seconds,
-            cancel_mode=CancelMode.disabled,
+            cancel_mode=KNOWLEDGE_DELETE_CANCEL_MODE,
             on_failed=handlers.delete_failed,
         ),
     )

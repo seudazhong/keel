@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, StrictStr, ValidationError, field_va
 from keel_core.config import Settings
 from keel_core.embeddings import Embedder
 from keel_core.jobs import (
+    CancelMode,
     JobCancellationRequested,
     JobError,
     JobRecord,
@@ -46,6 +47,10 @@ from .store import KnowledgeStore
 
 KNOWLEDGE_INGEST_KIND = "knowledge.ingest"
 KNOWLEDGE_DELETE_KIND = "knowledge.delete"
+KNOWLEDGE_INGEST_MAX_ATTEMPTS = 3
+KNOWLEDGE_DELETE_MAX_ATTEMPTS = 2_147_483_647
+KNOWLEDGE_INGEST_CANCEL_MODE = CancelMode.cooperative
+KNOWLEDGE_DELETE_CANCEL_MODE = CancelMode.disabled
 
 _PUBLIC_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,127}$")
 _MAX_DOMAIN_ERROR_MESSAGE_CHARS = 512
@@ -699,8 +704,12 @@ def _validated_vectors(
 
 
 __all__ = [
+    "KNOWLEDGE_DELETE_CANCEL_MODE",
     "KNOWLEDGE_DELETE_KIND",
+    "KNOWLEDGE_DELETE_MAX_ATTEMPTS",
+    "KNOWLEDGE_INGEST_CANCEL_MODE",
     "KNOWLEDGE_INGEST_KIND",
+    "KNOWLEDGE_INGEST_MAX_ATTEMPTS",
     "KnowledgeDeletePayload",
     "KnowledgeIngestPayload",
     "KnowledgeJobContext",

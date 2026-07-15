@@ -9,9 +9,16 @@ from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from keel_core.config import Settings
+from keel_core.embeddings import FakeEmbedder
 from keel_core.events import Event, EventType
 from keel_core.jobs import InMemoryJobStore, PostgresJobStore
-from keel_server.app import _build_job_store, _enqueue_arq, create_app
+from keel_core.knowledge.service import KnowledgeService
+from keel_server.app import (
+    _build_job_store,
+    _build_knowledge_service,
+    _enqueue_arq,
+    create_app,
+)
 
 _NOW = datetime(2026, 7, 14, 9, 0, tzinfo=UTC)
 
@@ -168,6 +175,44 @@ async def test_server_builds_scope_bound_job_store_for_both_profiles() -> None:
         assert postgres.scope_id == "web:local"
     finally:
         await engine.dispose()
+
+
+async def test_server_builds_knowledge_service_only_for_postgres() -> None:
+    settings = Settings(
+        embedding_model="fake/server",
+        embedding_dim=3,
+    )
+    memory_jobs = _build_job_store(None, "web:local", settings)
+    assert (
+        _build_knowledge_service(
+            None,
+            "web:local",
+            settings,
+            memory_jobs,
+            embedder=FakeEmbedder(dim=3, model="fake/server"),
+        )
+        is None
+    )
+
+    engine = create_async_engine("postgresql+psycopg://localhost:5432/keel_test")
+    try:
+        postgres_jobs = _build_job_store(engine, "web:local", settings)
+        service = _build_knowledge_service(
+            engine,
+            "web:local",
+            settings,
+            postgres_jobs,
+            embedder=FakeEmbedder(dim=3, model="fake/server"),
+        )
+        assert isinstance(service, KnowledgeService)
+        assert service.scope_id == "web:local"
+    finally:
+        await engine.dispose()
+
+
+def test_knowledge_routes_are_unavailable_without_lifespan_state() -> None:
+    response = TestClient(create_app()).get("/v1/knowledge-bases")
+    assert response.status_code == 503
 
 
 async def test_server_enqueue_adapter_forwards_keyword_options() -> None:
