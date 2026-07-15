@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from typing import Any, NoReturn, Protocol, runtime_checkable
 
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from .models import (
@@ -49,6 +49,7 @@ from .models import (
     KnowledgePurgeResult,
     KnowledgeResourceKind,
     KnowledgeSourceType,
+    KnowledgeStorageError,
     KnowledgeValidationError,
     KnowledgeVersionCancellation,
     KnowledgeVersionFailure,
@@ -2021,6 +2022,7 @@ class PostgresKnowledgeStore:
                 KnowledgePublicCode.invalid_input,
                 "Knowledge database engine is invalid.",
             )
+        engine.sync_engine.hide_parameters = True
         self._engine = engine
         self._scope_id = validate_scope_id(scope_id)
         self._document_max_bytes = validate_document_max_bytes(document_max_bytes)
@@ -2041,6 +2043,8 @@ class PostgresKnowledgeStore:
                 yield conn
         except IntegrityError as exc:
             _pg_raise_integrity_error(exc)
+        except DBAPIError:
+            raise KnowledgeStorageError() from None
 
     async def _get_base_tx(
         self,

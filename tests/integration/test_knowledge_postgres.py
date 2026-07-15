@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 
+import psycopg
 import pytest
+from sqlalchemy import event
+from sqlalchemy.exc import OperationalError as SQLAlchemyOperationalError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.knowledge import (
@@ -26,6 +30,7 @@ from keel_core.knowledge import (
     KnowledgeNotFound,
     KnowledgeOperation,
     KnowledgeSourceType,
+    KnowledgeStorageError,
     KnowledgeStore,
     KnowledgeValidationError,
     KnowledgeVersionCancellation,
@@ -203,6 +208,70 @@ async def test_constructor_scope_guards_cross_kb_non_disclosure_and_byte_limit(
     )
     with pytest.raises(KnowledgeNotFound, match="knowledge_document_not_found"):
         await first_scope.list_versions(second_base.id, accepted.document.id)
+
+
+async def test_dbapi_failures_are_bounded_redacted_and_retryable(
+    migrated_db: AsyncEngine,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    migrated_db.sync_engine.hide_parameters = False
+    store = PostgresKnowledgeStore(migrated_db, "storage:scope")
+    assert migrated_db.sync_engine.hide_parameters is True
+    base = await _base(store)
+    secret = "sentinel-storage-secret"
+    command = replace(
+        _version(base.id, f"document {secret}"),
+        source_uri=f"https://example.test/{secret}",
+    )
+
+    def fail_on_secret(
+        _cursor: object,
+        _statement: str,
+        parameters: object,
+        _context: object,
+    ) -> None:
+        if secret in repr(parameters):
+            raise psycopg.OperationalError("forced storage outage")
+
+    dialect = migrated_db.sync_engine.dialect
+    event.listen(dialect, "do_execute", fail_on_secret)
+    caplog.set_level(logging.DEBUG)
+    try:
+        with pytest.raises(KnowledgeStorageError) as caught:
+            await store.create_document_version(command, now=_NOW)
+    finally:
+        event.remove(dialect, "do_execute", fail_on_secret)
+
+    error = caught.value
+    assert error.code == "knowledge_storage_failure"
+    assert error.public_message == "Knowledge storage is temporarily unavailable."
+    assert error.retryable is True
+    assert secret not in str(error)
+    assert secret not in repr(error)
+    assert error.__cause__ is None
+    assert error.__suppress_context__ is True
+    dbapi_error = error.__context__
+    assert isinstance(dbapi_error, SQLAlchemyOperationalError)
+    assert isinstance(dbapi_error.orig, psycopg.OperationalError)
+    assert secret in repr(dbapi_error.params)
+    assert dbapi_error.hide_parameters is True
+    assert "SQL parameters hidden due to hide_parameters=True" in str(dbapi_error)
+    assert secret not in str(dbapi_error)
+    assert secret not in repr(dbapi_error)
+    assert secret not in caplog.text
+
+
+async def test_integrity_errors_keep_specific_conflict_mapping(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "integrity:scope")
+    await _base(store)
+
+    with pytest.raises(KnowledgeConflict) as caught:
+        await _base(store, now=_NOW + timedelta(seconds=1))
+
+    assert type(caught.value) is KnowledgeConflict
+    assert caught.value.code == "knowledge_base_name_conflict"
 
 
 async def test_all_idempotent_mutations_are_atomic_replayable_and_recover_jobs(

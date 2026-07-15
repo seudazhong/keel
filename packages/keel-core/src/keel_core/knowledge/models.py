@@ -11,6 +11,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from typing import ClassVar, Literal
 
 from pydantic import (
     BaseModel,
@@ -141,6 +142,7 @@ class KnowledgePublicCode(StrEnum):
     no_active_version = "no_active_version"
     embedding_configuration_mismatch = "embedding_configuration_mismatch"
     embeddings_not_configured = "embeddings_not_configured"
+    storage_failure = "knowledge_storage_failure"
 
 
 KnowledgeErrorCode = KnowledgePublicCode
@@ -266,6 +268,18 @@ class KnowledgeValidationError(KnowledgeError):
         public_message: str = "Knowledge input is invalid.",
     ) -> None:
         super().__init__(code, public_message)
+
+
+class KnowledgeStorageError(KnowledgeError):
+    """Bounded, retryable failure accessing persistent Knowledge storage."""
+
+    retryable: ClassVar[Literal[True]] = True
+
+    def __init__(self) -> None:
+        super().__init__(
+            KnowledgePublicCode.storage_failure,
+            "Knowledge storage is temporarily unavailable.",
+        )
 
 
 class KnowledgeEmbeddingMismatch(KnowledgeConflict):
@@ -1417,6 +1431,7 @@ __all__ = [
     "KnowledgeSearchMode",
     "KnowledgeSearchStatus",
     "KnowledgeSourceType",
+    "KnowledgeStorageError",
     "KnowledgeValidationError",
     "KnowledgeVersionCancellation",
     "KnowledgeVersionFailure",
