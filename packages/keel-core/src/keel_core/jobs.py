@@ -47,6 +47,12 @@ class JobStatus(StrEnum):
     cancelled = "cancelled"
 
 
+class CancelMode(StrEnum):
+    immediate = "immediate"
+    cooperative = "cooperative"
+    disabled = "disabled"
+
+
 class _PublicJobException(Exception):
     def __init__(self, code: str, public_message: str) -> None:
         code = code.strip()
@@ -257,6 +263,7 @@ class JobRecord:
     scope_id: str
     kind: str
     status: JobStatus
+    cancel_mode: CancelMode
     payload: dict[str, Any]
     target_session_id: str | None
     idempotency_key: str
@@ -339,6 +346,7 @@ class JobStore(Protocol):
         target_session_id: str | None,
         idempotency_key: str,
         max_attempts: int,
+        cancel_mode: CancelMode = CancelMode.immediate,
         now: datetime | None = None,
     ) -> tuple[JobRecord, bool]: ...
 
@@ -381,6 +389,7 @@ class JobStore(Protocol):
 
     async def finish_cancelled(self, lease: JobLease, now: datetime) -> JobRecord: ...
     async def fail_exhausted(self, job_id: str, now: datetime) -> JobRecord | None: ...
+    async def finish_cancelled_exhausted(self, job_id: str, now: datetime) -> JobRecord | None: ...
 
 
 def _utcnow() -> datetime:
@@ -478,6 +487,21 @@ def _validate_enqueue_fields(kind: str, idempotency_key: str, max_attempts: int)
     return kind, idempotency_key
 
 
+def _validated_cancel_mode(value: object) -> CancelMode:
+    if not isinstance(value, str):
+        raise JobValidationError(
+            "invalid_cancel_mode",
+            "cancel_mode must be immediate, cooperative, or disabled",
+        )
+    try:
+        return CancelMode(value)
+    except (TypeError, ValueError) as exc:
+        raise JobValidationError(
+            "invalid_cancel_mode",
+            "cancel_mode must be immediate, cooperative, or disabled",
+        ) from exc
+
+
 def _optional_read_identity(value: str, *, field: str, code: str) -> str | None:
     try:
         return _validated_identity(value, field=field, code=code)
@@ -503,6 +527,7 @@ def _to_job_record(row: Mapping[Any, Any]) -> JobRecord:
         scope_id=str(row["scope_id"]),
         kind=str(row["kind"]),
         status=JobStatus(str(row["status"])),
+        cancel_mode=CancelMode(str(row["cancel_mode"])),
         payload=copy.deepcopy(payload),
         target_session_id=row["target_session_id"],
         idempotency_key=str(row["idempotency_key"]),
@@ -643,9 +668,11 @@ class InMemoryJobStore:
         target_session_id: str | None,
         idempotency_key: str,
         max_attempts: int,
+        cancel_mode: CancelMode = CancelMode.immediate,
         now: datetime | None = None,
     ) -> tuple[JobRecord, bool]:
         kind, idempotency_key = _validate_enqueue_fields(kind, idempotency_key, max_attempts)
+        cancel_mode = _validated_cancel_mode(cancel_mode)
         timestamp = _normalized_utc_timestamp(now, field="now") if now is not None else _utcnow()
         key = (self._scope_id, kind, idempotency_key)
         async with self._lock:
@@ -673,6 +700,7 @@ class InMemoryJobStore:
                 scope_id=self._scope_id,
                 kind=kind,
                 status=JobStatus.queued,
+                cancel_mode=cancel_mode,
                 payload=safe_payload,
                 target_session_id=safe_target_session_id,
                 idempotency_key=idempotency_key,
@@ -869,7 +897,21 @@ class InMemoryJobStore:
             row = self._rows.get(safe_job_id)
             if row is None:
                 return None
+            if row.cancel_mode is CancelMode.disabled:
+                raise JobValidationError(
+                    "job_not_cancellable",
+                    "job does not allow cancellation",
+                )
             if row.status is JobStatus.queued:
+                if row.cancel_mode is CancelMode.cooperative:
+                    updated = replace(
+                        row,
+                        cancel_requested_at=row.cancel_requested_at or now,
+                        next_attempt_at=min(row.next_attempt_at, now),
+                        updated_at=now,
+                    )
+                    self._rows[safe_job_id] = updated
+                    return _copy_record(updated)
                 return await self._finalize_locked(row, status=JobStatus.cancelled, now=now)
             if row.status is JobStatus.running:
                 updated = replace(
@@ -895,7 +937,7 @@ class InMemoryJobStore:
             updated = replace(
                 row,
                 status=JobStatus.queued,
-                next_attempt_at=retry_at,
+                next_attempt_at=now if row.cancel_requested_at is not None else retry_at,
                 lease_token=None,
                 lease_expires_at=None,
                 heartbeat_at=None,
@@ -941,6 +983,7 @@ class InMemoryJobStore:
                 or row.lease_expires_at is None
                 or row.lease_expires_at > now
                 or row.attempt < row.max_attempts
+                or row.cancel_requested_at is not None
             ):
                 return None
             return await self._finalize_locked(
@@ -951,6 +994,25 @@ class InMemoryJobStore:
                     "attempts_exhausted",
                     "job attempts were exhausted after worker lease expiry",
                 ),
+            )
+
+    async def finish_cancelled_exhausted(self, job_id: str, now: datetime) -> JobRecord | None:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._lock:
+            row = self._rows.get(job_id)
+            if (
+                row is None
+                or row.status is not JobStatus.running
+                or row.lease_expires_at is None
+                or row.lease_expires_at > now
+                or row.attempt < row.max_attempts
+                or row.cancel_requested_at is None
+            ):
+                return None
+            return await self._finalize_locked(
+                row,
+                status=JobStatus.cancelled,
+                now=now,
             )
 
 
@@ -986,9 +1048,11 @@ class PostgresJobStore:
         target_session_id: str | None,
         idempotency_key: str,
         max_attempts: int,
+        cancel_mode: CancelMode = CancelMode.immediate,
         now: datetime | None = None,
     ) -> tuple[JobRecord, bool]:
         kind, idempotency_key = _validate_enqueue_fields(kind, idempotency_key, max_attempts)
+        cancel_mode = _validated_cancel_mode(cancel_mode)
         timestamp = _normalized_utc_timestamp(now, field="now") if now is not None else _utcnow()
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
@@ -1035,10 +1099,10 @@ class PostgresJobStore:
                         text(
                             "INSERT INTO jobs "
                             "(id, scope_id, kind, payload, target_session_id, "
-                            "idempotency_key, max_attempts, next_attempt_at, "
+                            "idempotency_key, max_attempts, cancel_mode, next_attempt_at, "
                             "created_at, updated_at) VALUES "
                             "(:id, :scope, :kind, CAST(:payload AS jsonb), :target, "
-                            ":key, :max_attempts, :now, :now, :now) "
+                            ":key, :max_attempts, :cancel_mode, :now, :now, :now) "
                             "ON CONFLICT (scope_id, kind, idempotency_key) DO NOTHING "
                             "RETURNING *"
                         ),
@@ -1050,6 +1114,7 @@ class PostgresJobStore:
                             "target": safe_target_session_id,
                             "key": idempotency_key,
                             "max_attempts": max_attempts,
+                            "cancel_mode": cancel_mode.value,
                             "now": timestamp,
                         },
                     )
@@ -1329,7 +1394,9 @@ class PostgresJobStore:
                     await conn.execute(
                         text(
                             "UPDATE jobs SET status = 'queued', "
-                            "next_attempt_at = :retry_at, lease_token = NULL, "
+                            "next_attempt_at = CASE "
+                            "WHEN cancel_requested_at IS NULL THEN :retry_at ELSE :now END, "
+                            "lease_token = NULL, "
                             "lease_expires_at = NULL, heartbeat_at = NULL, "
                             "error_kind = :error_kind, error_message = :error_message, "
                             "updated_at = :now "
@@ -1363,7 +1430,7 @@ class PostgresJobStore:
         lease_token: str | None = None,
         result: JobResult | None = None,
         error: JobError | None = None,
-        exhaustion: bool = False,
+        exhaustion_cancel_requested: bool | None = None,
         locked: Mapping[str, Any] | None = None,
     ) -> JobRecord | None:
         if locked is None:
@@ -1381,12 +1448,13 @@ class PostgresJobStore:
         if locked is None:
             return None
         current = _to_job_record(locked)
-        if exhaustion:
+        if exhaustion_cancel_requested is not None:
             if (
                 current.status is not JobStatus.running
                 or current.lease_expires_at is None
                 or current.lease_expires_at > now
                 or current.attempt < current.max_attempts
+                or (current.cancel_requested_at is not None) is not exhaustion_cancel_requested
             ):
                 return None
         elif lease_token is not None:
@@ -1487,7 +1555,34 @@ class PostgresJobStore:
             if locked is None:
                 return None
             record = _to_job_record(locked)
+            if record.cancel_mode is CancelMode.disabled:
+                raise JobValidationError(
+                    "job_not_cancellable",
+                    "job does not allow cancellation",
+                )
             if record.status is JobStatus.queued:
+                if record.cancel_mode is CancelMode.cooperative:
+                    row = (
+                        (
+                            await conn.execute(
+                                text(
+                                    "UPDATE jobs SET "
+                                    "cancel_requested_at = COALESCE(cancel_requested_at, :now), "
+                                    "next_attempt_at = LEAST(next_attempt_at, :now), "
+                                    "updated_at = :now "
+                                    "WHERE id = :id AND scope_id = :scope RETURNING *"
+                                ),
+                                {
+                                    "now": now,
+                                    "id": safe_job_id,
+                                    "scope": self._scope_id,
+                                },
+                            )
+                        )
+                        .mappings()
+                        .one()
+                    )
+                    return _to_job_record(row)
                 return await self._finalize_in_transaction(
                     conn,
                     job_id=safe_job_id,
@@ -1584,7 +1679,19 @@ class PostgresJobStore:
                     "attempts_exhausted",
                     "job attempts were exhausted after worker lease expiry",
                 ),
-                exhaustion=True,
+                exhaustion_cancel_requested=False,
+            )
+
+    async def finish_cancelled_exhausted(self, job_id: str, now: datetime) -> JobRecord | None:
+        now = _normalized_utc_timestamp(now, field="now")
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            return await self._finalize_in_transaction(
+                conn,
+                job_id=job_id,
+                status=JobStatus.cancelled,
+                now=now,
+                exhaustion_cancel_requested=True,
             )
 
 

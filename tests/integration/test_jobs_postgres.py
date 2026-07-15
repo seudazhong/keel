@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.events import Event, EventType
 from keel_core.jobs import (
+    CancelMode,
     JobError,
     JobLeaseLostError,
     JobLimits,
@@ -54,6 +55,7 @@ async def test_jobs_migration_has_required_columns_checks_and_indexes(
     assert columns["id"] == ("text", "NO")
     assert columns["scope_id"] == ("text", "NO")
     assert columns["payload"] == ("jsonb", "NO")
+    assert columns["cancel_mode"] == ("text", "NO")
     assert columns["attempt"] == ("integer", "NO")
     assert columns["lease_expires_at"] == ("timestamp with time zone", "YES")
     assert columns["progress_current"] == ("bigint", "NO")
@@ -80,6 +82,7 @@ async def test_jobs_migration_has_required_columns_checks_and_indexes(
             ).scalars()
         }
     assert "queued" in checks and "cancelled" in checks
+    assert all(mode.value in checks for mode in CancelMode)
     assert "attempt >= 0" in checks
     assert "max_attempts >= 1" in checks
     assert {
@@ -159,6 +162,7 @@ async def test_postgres_existing_dedupe_precedes_retry_payload_and_target_valida
         target_session_id="missing-on-retry",
         idempotency_key="request-1",
         max_attempts=1,
+        cancel_mode=CancelMode.cooperative,
         now=_NOW + timedelta(seconds=1),
     )
 
@@ -168,6 +172,8 @@ async def test_postgres_existing_dedupe_precedes_retry_payload_and_target_valida
     assert duplicate.payload == {"value": 1}
     assert duplicate.target_session_id is None
     assert duplicate.max_attempts == 3
+    assert duplicate.cancel_mode is CancelMode.immediate
+    assert first.cancel_mode is CancelMode.immediate
 
 
 async def test_postgres_uncommitted_winner_serializes_duplicate_before_validation(
@@ -256,6 +262,7 @@ async def test_postgres_enqueue_validates_identities_and_utc_timestamps(
         ({"idempotency_key": "x" * 513}, "invalid_idempotency_key"),
         ({"target_session_id": "bad\x00target"}, "invalid_target_session_id"),
         ({"max_attempts": 2**31}, "invalid_max_attempts"),
+        ({"cancel_mode": "unknown"}, "invalid_cancel_mode"),
     ]:
         values = {
             "kind": "test.echo",
@@ -453,6 +460,7 @@ async def _pg_job(
     *,
     max_attempts: int = 3,
     target_session_id: str | None = None,
+    cancel_mode: CancelMode = CancelMode.immediate,
 ) -> str:
     row, _ = await store.enqueue_once(
         kind="test.echo",
@@ -460,6 +468,7 @@ async def _pg_job(
         target_session_id=target_session_id,
         idempotency_key=key,
         max_attempts=max_attempts,
+        cancel_mode=cancel_mode,
         now=_NOW,
     )
     return row.id
@@ -807,6 +816,32 @@ async def test_postgres_requeue_is_nonterminal_bounded_and_has_no_injection(
         )
 
 
+async def test_postgres_requeue_with_pending_cancel_becomes_immediately_due(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:requeue-cancelled")
+    job_id = await _pg_job(
+        store,
+        "requeue-cancelled",
+        cancel_mode=CancelMode.cooperative,
+    )
+    lease = await store.claim(job_id, _NOW, 60)
+    assert lease is not None
+    await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+
+    queued = await store.requeue(
+        lease,
+        JobError("provider_timeout", "safe"),
+        _NOW + timedelta(minutes=5),
+        _NOW + timedelta(seconds=2),
+    )
+
+    assert queued.status is JobStatus.queued
+    assert queued.cancel_requested_at == _NOW + timedelta(seconds=1)
+    assert queued.next_attempt_at == _NOW + timedelta(seconds=2)
+    assert await store.dispatchable(_NOW + timedelta(seconds=2), 100) == [job_id]
+
+
 async def test_postgres_requeue_rejects_exhausted_attempt_without_mutation(
     migrated_db: AsyncEngine,
 ) -> None:
@@ -855,6 +890,53 @@ async def test_postgres_queued_cancel_is_atomic_and_idempotent(
     assert len(events) == 1
     assert events[0].type is EventType.message_token
     assert events[0].seq == first.injected_event_seq
+
+
+async def test_postgres_cooperative_queued_cancel_waits_for_worker_and_becomes_due(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:cancel:cooperative")
+    row, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id=None,
+        idempotency_key="cancel-cooperative",
+        max_attempts=3,
+        cancel_mode=CancelMode.cooperative,
+        now=_NOW + timedelta(minutes=5),
+    )
+
+    first = await store.request_cancel(row.id, _NOW)
+    second = await store.request_cancel(row.id, _NOW + timedelta(seconds=1))
+
+    assert first is not None
+    assert first.status is JobStatus.queued
+    assert first.cancel_mode is CancelMode.cooperative
+    assert first.cancel_requested_at == _NOW
+    assert first.next_attempt_at == _NOW
+    assert first.finished_at is None
+    assert second is not None
+    assert second.cancel_requested_at == _NOW
+    assert second.next_attempt_at == _NOW
+    assert await store.dispatchable(_NOW, 100) == [row.id]
+
+
+async def test_postgres_disabled_cancel_rejects_without_mutation(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresJobStore(migrated_db, "scope:cancel:disabled")
+    job_id = await _pg_job(
+        store,
+        "cancel-disabled",
+        cancel_mode=CancelMode.disabled,
+    )
+    before = await store.get(job_id)
+
+    with pytest.raises(JobValidationError) as caught:
+        await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+
+    assert caught.value.code == "job_not_cancellable"
+    assert await store.get(job_id) == before
 
 
 async def test_postgres_running_cancel_is_persisted_and_success_can_win(
@@ -1058,6 +1140,37 @@ async def test_postgres_fail_exhausted_is_terminal_and_exactly_once(
     assert await store.claim(retryable, _NOW, 10) is not None
     assert await store.fail_exhausted(retryable, _NOW + timedelta(seconds=10)) is None
     assert await store.fail_exhausted("missing", _NOW) is None
+
+
+async def test_postgres_finish_cancelled_exhausted_is_terminal_and_exactly_once(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope, session_id = "scope:cancel-exhausted", "target-cancel-exhausted"
+    await _target(migrated_db, scope, session_id)
+    store = PostgresJobStore(migrated_db, scope)
+    job_id = await _pg_job(
+        store,
+        "cancel-exhausted",
+        max_attempts=1,
+        target_session_id=session_id,
+        cancel_mode=CancelMode.cooperative,
+    )
+    assert await store.claim(job_id, _NOW, 10) is not None
+    await store.request_cancel(job_id, _NOW + timedelta(seconds=1))
+
+    assert await store.finish_cancelled_exhausted(job_id, _NOW + timedelta(seconds=9)) is None
+    assert await store.fail_exhausted(job_id, _NOW + timedelta(seconds=10)) is None
+    cancelled = await store.finish_cancelled_exhausted(
+        job_id,
+        _NOW + timedelta(seconds=10),
+    )
+
+    assert cancelled is not None
+    assert cancelled.status is JobStatus.cancelled
+    assert cancelled.error_kind is None
+    assert cancelled.finished_at == _NOW + timedelta(seconds=10)
+    assert await store.finish_cancelled_exhausted(job_id, _NOW + timedelta(seconds=11)) is None
+    assert len(await _job_events(migrated_db, scope, session_id, job_id)) == 1
 
 
 @pytest.mark.parametrize("operation", ["succeed", "fail_terminal", "finish_cancelled"])
@@ -1280,6 +1393,8 @@ async def test_postgres_terminal_methods_reject_naive_timestamps(
         await store.finish_cancelled(lease, naive)
     with pytest.raises(JobValidationError, match="timezone_required"):
         await store.fail_exhausted(running_id, naive)
+    with pytest.raises(JobValidationError, match="timezone_required"):
+        await store.finish_cancelled_exhausted(running_id, naive)
 
     assert (await store.get(queued_id)).status is JobStatus.queued  # type: ignore[union-attr]
     assert (await store.get(running_id)).status is JobStatus.running  # type: ignore[union-attr]

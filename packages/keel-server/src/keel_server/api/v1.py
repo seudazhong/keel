@@ -32,7 +32,7 @@ from keel_core.consolidation import (
     consolidation_schedule_id,
 )
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
-from keel_core.jobs import JobStatus, JobStore
+from keel_core.jobs import JobStatus, JobStore, JobValidationError
 from keel_core.search import hybrid_search_sessions
 from keel_core.state import PostgresEventStore, list_sessions
 from keel_core.tokens import delete_token, list_connected
@@ -132,7 +132,12 @@ async def get_job(job_id: str, request: Request) -> JobResponse:
     dependencies=[Depends(require_role(Role.operator))],
 )
 async def cancel_job(job_id: str, request: Request) -> JobResponse:
-    row = await _jobs(request).request_cancel(job_id, datetime.now(UTC))
+    try:
+        row = await _jobs(request).request_cancel(job_id, datetime.now(UTC))
+    except JobValidationError as exc:
+        if exc.code == "job_not_cancellable":
+            raise HTTPException(status.HTTP_409_CONFLICT, exc.public_message) from None
+        raise
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
     return JobResponse.from_record(row)
