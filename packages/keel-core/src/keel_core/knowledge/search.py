@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from keel_core.embeddings import Embedder, rrf_fuse
 
@@ -18,6 +19,7 @@ from .models import (
     KnowledgePublicCode,
     KnowledgeSearchMode,
     KnowledgeSearchStatus,
+    KnowledgeStorageError,
     KnowledgeValidationError,
     validate_knowledge_base_id,
     validate_scope_id,
@@ -29,6 +31,8 @@ _DEFAULT_K_MAX = 10
 _DEFAULT_CANDIDATE_MULTIPLIER = 3
 _MIN_CANDIDATES = 20
 _SNIPPET_MAX_CHARS = 2_000
+_MAX_SNAPSHOT_RETRIES = 2
+_FLOAT32_MAX = float.fromhex("0x1.fffffep+127")
 
 _EMBEDDING_UNAVAILABLE = "embedding_unavailable"
 _EMBEDDING_CONFIGURATION_MISMATCH = KnowledgePublicCode.embedding_configuration_mismatch.value
@@ -37,6 +41,23 @@ _ACTIVE_KB = text(
     "SELECT embedding_model, embedding_dim "
     "FROM knowledge_bases "
     "WHERE scope_id = :scope AND id = :kb AND status = 'active'"
+)
+
+_ACTIVE_DOCUMENT_VERSIONS = text(
+    """
+    SELECT d.id, d.active_version_id
+    FROM kb_documents AS d
+    JOIN kb_document_versions AS v
+      ON v.scope_id = d.scope_id
+     AND v.kb_id = d.kb_id
+     AND v.document_id = d.id
+     AND v.id = d.active_version_id
+    WHERE d.scope_id = :scope
+      AND d.kb_id = :kb
+      AND d.status = 'active'
+      AND v.status = 'active'
+    ORDER BY d.id ASC, d.active_version_id ASC
+    """
 )
 
 _LEXICAL_CHUNKS = text(
@@ -70,11 +91,16 @@ _LEXICAL_CHUNKS = text(
       AND c.model = b.embedding_model
       AND c.dim = b.embedding_dim
       AND (
-          similarity(c.text, :query) > 0.1
+          strpos(c.text, :query) > 0
+          OR similarity(c.text, :query) > 0.1
           OR word_similarity(:query, c.text) > 0.2
           OR c.fts @@ plainto_tsquery('simple', :query)
       )
     ORDER BY GREATEST(
+        CASE
+          WHEN strpos(c.text, :query) > 0 THEN 1.0::real
+          ELSE 0.0::real
+        END,
         similarity(c.text, :query),
         ts_rank(c.fts, plainto_tsquery('simple', :query))
       ) DESC,
@@ -181,6 +207,7 @@ _FINAL_CHUNKS = text(
 class _KnowledgePin:
     model: str
     dim: int
+    active_versions: tuple[tuple[str, str], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,8 +276,11 @@ def _validated_vector(value: object, *, dim: int) -> list[float] | None:
     for item in value:
         if isinstance(item, bool) or not isinstance(item, int | float):
             return None
-        number = float(item)
-        if not math.isfinite(number):
+        try:
+            number = float(item)
+        except (OverflowError, TypeError, ValueError):
+            return None
+        if not math.isfinite(number) or abs(number) > _FLOAT32_MAX:
             return None
         vector.append(number)
     if not any(vector):
@@ -334,6 +364,49 @@ class KnowledgeSearcher:
     def candidate_multiplier(self) -> int:
         return self._candidate_multiplier
 
+    @asynccontextmanager
+    async def _snapshot_transaction(self) -> AsyncIterator[AsyncConnection]:
+        async with self._engine.connect() as conn:
+            await conn.execution_options(isolation_level="REPEATABLE READ")
+            async with conn.begin():
+                await conn.execute(_PG_SET_SCOPE, {"scope": self._scope_id})
+                yield conn
+
+    async def _active_snapshot(
+        self,
+        conn: AsyncConnection,
+        kb_id: str,
+    ) -> _KnowledgePin | None:
+        pin_row = (
+            (
+                await conn.execute(
+                    _ACTIVE_KB,
+                    {"scope": self._scope_id, "kb": kb_id},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if pin_row is None:
+            return None
+        version_rows = (
+            (
+                await conn.execute(
+                    _ACTIVE_DOCUMENT_VERSIONS,
+                    {"scope": self._scope_id, "kb": kb_id},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        return _KnowledgePin(
+            model=str(pin_row["embedding_model"]),
+            dim=int(pin_row["embedding_dim"]),
+            active_versions=tuple(
+                (str(row["id"]), str(row["active_version_id"])) for row in version_rows
+            ),
+        )
+
     async def _pin_and_lexical(
         self,
         kb_id: str,
@@ -341,24 +414,10 @@ class KnowledgeSearcher:
         *,
         candidates: int,
     ) -> tuple[_KnowledgePin | None, list[str]]:
-        async with self._engine.begin() as conn:
-            await conn.execute(_PG_SET_SCOPE, {"scope": self._scope_id})
-            pin_row = (
-                (
-                    await conn.execute(
-                        _ACTIVE_KB,
-                        {"scope": self._scope_id, "kb": kb_id},
-                    )
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if pin_row is None:
+        async with self._snapshot_transaction() as conn:
+            pin = await self._active_snapshot(conn, kb_id)
+            if pin is None:
                 return None, []
-            pin = _KnowledgePin(
-                model=str(pin_row["embedding_model"]),
-                dim=int(pin_row["embedding_dim"]),
-            )
             chunk_ids = (
                 await conn.execute(
                     _LEXICAL_CHUNKS,
@@ -421,25 +480,30 @@ class KnowledgeSearcher:
             ).scalars()
             return [str(chunk_id) for chunk_id in chunk_ids]
 
-    async def _final_rows(self, kb_id: str, chunk_ids: Sequence[str]) -> list[_SearchRow]:
-        if not chunk_ids:
-            return []
-        async with self._engine.begin() as conn:
-            await conn.execute(_PG_SET_SCOPE, {"scope": self._scope_id})
-            rows = (
-                (
-                    await conn.execute(
-                        _FINAL_CHUNKS,
-                        {
-                            "scope": self._scope_id,
-                            "kb": kb_id,
-                            "chunk_ids": list(chunk_ids),
-                        },
+    async def _final_rows_and_snapshot(
+        self,
+        kb_id: str,
+        chunk_ids: Sequence[str],
+    ) -> tuple[list[_SearchRow], _KnowledgePin | None]:
+        async with self._snapshot_transaction() as conn:
+            snapshot = await self._active_snapshot(conn, kb_id)
+            if chunk_ids and snapshot is not None:
+                rows = (
+                    (
+                        await conn.execute(
+                            _FINAL_CHUNKS,
+                            {
+                                "scope": self._scope_id,
+                                "kb": kb_id,
+                                "chunk_ids": list(chunk_ids),
+                            },
+                        )
                     )
+                    .mappings()
+                    .all()
                 )
-                .mappings()
-                .all()
-            )
+            else:
+                rows = []
 
         results: list[_SearchRow] = []
         for row in rows:
@@ -464,7 +528,7 @@ class KnowledgeSearcher:
                     source_uri=(None if row["source_uri"] is None else str(row["source_uri"])),
                 )
             )
-        return results
+        return results, snapshot
 
     @_pg_error_boundary
     async def search(
@@ -481,70 +545,77 @@ class KnowledgeSearcher:
         result_limit = _search_k(k, maximum=self._k_max)
         candidates = max(result_limit * self._candidate_multiplier, _MIN_CANDIDATES)
 
-        pin, lexical_ids = await self._pin_and_lexical(
-            base_id,
-            normalized_query,
-            candidates=candidates,
-        )
-        if pin is None:
-            mode = (
-                KnowledgeSearchMode.hybrid
-                if self._embedder is not None
-                else KnowledgeSearchMode.lexical
+        for _attempt in range(_MAX_SNAPSHOT_RETRIES + 1):
+            pin, lexical_ids = await self._pin_and_lexical(
+                base_id,
+                normalized_query,
+                candidates=candidates,
             )
-            return [], KnowledgeSearchStatus(mode=mode)
+            if pin is None:
+                mode = (
+                    KnowledgeSearchMode.hybrid
+                    if self._embedder is not None
+                    else KnowledgeSearchMode.lexical
+                )
+                return [], KnowledgeSearchStatus(mode=mode)
 
-        semantic_ids: list[str] = []
-        semantic_error: str | None = None
-        if self._embedder is None:
-            mode = KnowledgeSearchMode.lexical
-        elif not self._embedder_matches(pin):
-            mode = KnowledgeSearchMode.lexical_degraded
-            semantic_error = _EMBEDDING_CONFIGURATION_MISMATCH
-        else:
-            query_vector = await self._query_vector(normalized_query, dim=pin.dim)
-            if query_vector is None:
+            semantic_ids: list[str] = []
+            semantic_error: str | None = None
+            if self._embedder is None:
+                mode = KnowledgeSearchMode.lexical
+            elif not self._embedder_matches(pin):
                 mode = KnowledgeSearchMode.lexical_degraded
-                semantic_error = _EMBEDDING_UNAVAILABLE
+                semantic_error = _EMBEDDING_CONFIGURATION_MISMATCH
             else:
-                semantic_ids = await self._semantic(
-                    base_id,
-                    pin,
-                    query_vector,
-                    candidates=candidates,
-                )
-                mode = KnowledgeSearchMode.hybrid
+                query_vector = await self._query_vector(normalized_query, dim=pin.dim)
+                if query_vector is None:
+                    mode = KnowledgeSearchMode.lexical_degraded
+                    semantic_error = _EMBEDDING_UNAVAILABLE
+                else:
+                    semantic_ids = await self._semantic(
+                        base_id,
+                        pin,
+                        query_vector,
+                        candidates=candidates,
+                    )
+                    mode = KnowledgeSearchMode.hybrid
 
-        ranked_lists = (
-            [lexical_ids, semantic_ids] if mode is KnowledgeSearchMode.hybrid else [lexical_ids]
-        )
-        fused_ids = _fuse_chunk_ids(ranked_lists)
-        final_rows = await self._final_rows(base_id, fused_ids)
-
-        hits: list[KnowledgeHit] = []
-        for row in final_rows[:result_limit]:
-            rank = len(hits) + 1
-            hits.append(
-                KnowledgeHit(
-                    snippet=row.text[:_SNIPPET_MAX_CHARS],
-                    rank=rank,
-                    heading_path=list(row.heading_path),
-                    citation=KnowledgeCitation(
-                        id=f"cite_{rank}",
-                        kb_id=row.kb_id,
-                        document_id=row.document_id,
-                        document_version_id=row.document_version_id,
-                        chunk_id=row.chunk_id,
-                        title=row.title,
-                        source_uri=row.source_uri,
-                        ordinal=row.ordinal,
-                        char_start=row.char_start,
-                        char_end=row.char_end,
-                        label=f"{row.title}#chunk-{row.ordinal + 1}",
-                    ),
-                )
+            ranked_lists = (
+                [lexical_ids, semantic_ids] if mode is KnowledgeSearchMode.hybrid else [lexical_ids]
             )
-        return hits, KnowledgeSearchStatus(mode=mode, semantic_error=semantic_error)
+            fused_ids = _fuse_chunk_ids(ranked_lists)
+            final_rows, final_pin = await self._final_rows_and_snapshot(base_id, fused_ids)
+            if final_pin != pin:
+                continue
+
+            hits: list[KnowledgeHit] = []
+            for row in final_rows[:result_limit]:
+                rank = len(hits) + 1
+                hits.append(
+                    KnowledgeHit(
+                        snippet=row.text[:_SNIPPET_MAX_CHARS],
+                        rank=rank,
+                        heading_path=list(row.heading_path),
+                        citation=KnowledgeCitation(
+                            id=f"cite_{rank}",
+                            kb_id=row.kb_id,
+                            document_id=row.document_id,
+                            document_version_id=row.document_version_id,
+                            chunk_id=row.chunk_id,
+                            title=row.title,
+                            source_uri=row.source_uri,
+                            ordinal=row.ordinal,
+                            char_start=row.char_start,
+                            char_end=row.char_end,
+                            label=f"{row.title}#chunk-{row.ordinal + 1}",
+                        ),
+                    )
+                )
+            return hits, KnowledgeSearchStatus(
+                mode=mode,
+                semantic_error=semantic_error,
+            )
+        raise KnowledgeStorageError()
 
 
 __all__ = ["KnowledgeSearcher"]

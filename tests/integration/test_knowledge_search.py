@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Sequence
+import math
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -56,12 +57,31 @@ class _MeaningEmbedder:
     model = _MODEL
     dim = _DIM
 
-    def __init__(self, vector: tuple[float, float] = (1.0, 0.0)) -> None:
-        self.vector = vector
+    def __init__(self, vector: Sequence[float] = (1.0, 0.0)) -> None:
+        self.vector = tuple(vector)
         self.calls: list[tuple[str, ...]] = []
 
     async def embed(self, texts: Sequence[str]) -> list[list[float]]:
         self.calls.append(tuple(texts))
+        return [list(self.vector) for _ in texts]
+
+
+class _CallbackEmbedder:
+    model = _MODEL
+    dim = _DIM
+
+    def __init__(
+        self,
+        callback: Callable[[int], Awaitable[None]],
+        vector: Sequence[float] = (1.0, 0.0),
+    ) -> None:
+        self._callback = callback
+        self.vector = tuple(vector)
+        self.calls: list[tuple[str, ...]] = []
+
+    async def embed(self, texts: Sequence[str]) -> list[list[float]]:
+        self.calls.append(tuple(texts))
+        await self._callback(len(self.calls))
         return [list(self.vector) for _ in texts]
 
 
@@ -308,6 +328,194 @@ async def test_active_version_switch_deleted_and_purged_content_never_leaks(
     assert deleted_base_hits == []
 
 
+async def test_activation_between_lexical_and_semantic_retries_complete_search(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "search:race-semantic")
+    kb_id = await _create_base(store, name="Semantic activation race")
+    first = await _index_document(
+        store,
+        kb_id,
+        [_Chunk("legacy activation marker", (1.0, 0.0))],
+    )
+    second = await _index_document(
+        store,
+        kb_id,
+        [_Chunk("current activation marker", (1.0, 0.0))],
+        document_id=first.document_id,
+        now=_NOW + timedelta(seconds=1),
+        activate=False,
+    )
+
+    async def activate_current(call: int) -> None:
+        if call != 1:
+            return
+        activated = await store.activate_version(
+            kb_id,
+            first.document_id,
+            second.version_id,
+            now=_NOW + timedelta(seconds=2),
+        )
+        assert activated.activated
+
+    embedder = _CallbackEmbedder(activate_current)
+    hits, status = await KnowledgeSearcher(
+        migrated_db,
+        store.scope_id,
+        embedder,
+    ).search(kb_id, "activation marker", k=5)
+
+    assert status.mode is KnowledgeSearchMode.hybrid
+    assert embedder.calls == [("activation marker",), ("activation marker",)]
+    assert [hit.citation.document_version_id for hit in hits] == [second.version_id]
+
+
+async def test_activation_between_lexical_and_final_retries_instead_of_false_no_answer(
+    migrated_db: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "search:race-final")
+    kb_id = await _create_base(store, name="Final activation race")
+    first = await _index_document(
+        store,
+        kb_id,
+        [_Chunk("legacy final boundary marker", (1.0, 0.0))],
+    )
+    second = await _index_document(
+        store,
+        kb_id,
+        [_Chunk("current final boundary marker", (1.0, 0.0))],
+        document_id=first.document_id,
+        now=_NOW + timedelta(seconds=1),
+        activate=False,
+    )
+    searcher = KnowledgeSearcher(migrated_db, store.scope_id)
+    original_final = searcher._final_rows_and_snapshot
+    final_calls = 0
+
+    async def activate_before_final(kb: str, chunk_ids: Sequence[str]) -> object:
+        nonlocal final_calls
+        final_calls += 1
+        if final_calls == 1:
+            activated = await store.activate_version(
+                kb_id,
+                first.document_id,
+                second.version_id,
+                now=_NOW + timedelta(seconds=2),
+            )
+            assert activated.activated
+        return await original_final(kb, chunk_ids)
+
+    monkeypatch.setattr(searcher, "_final_rows_and_snapshot", activate_before_final)
+    hits, status = await searcher.search(kb_id, "final boundary marker", k=5)
+
+    assert status.mode is KnowledgeSearchMode.lexical
+    assert final_calls == 2
+    assert [hit.citation.document_version_id for hit in hits] == [second.version_id]
+
+
+async def test_base_deleted_during_final_boundary_retries_to_stable_absence(
+    migrated_db: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "search:race-delete")
+    kb_id = await _create_base(store, name="Deletion race")
+    await _index_document(
+        store,
+        kb_id,
+        [_Chunk("deletion boundary marker", (1.0, 0.0))],
+    )
+    searcher = KnowledgeSearcher(migrated_db, store.scope_id)
+    original_pin = searcher._pin_and_lexical
+    original_final = searcher._final_rows_and_snapshot
+    pin_calls = 0
+    final_calls = 0
+
+    async def count_pin(
+        kb: str,
+        query: str,
+        *,
+        candidates: int,
+    ) -> object:
+        nonlocal pin_calls
+        pin_calls += 1
+        return await original_pin(kb, query, candidates=candidates)
+
+    async def delete_before_final(kb: str, chunk_ids: Sequence[str]) -> object:
+        nonlocal final_calls
+        final_calls += 1
+        if final_calls == 1:
+            await store.tombstone_base(kb_id, now=_NOW + timedelta(seconds=1))
+        return await original_final(kb, chunk_ids)
+
+    monkeypatch.setattr(searcher, "_pin_and_lexical", count_pin)
+    monkeypatch.setattr(searcher, "_final_rows_and_snapshot", delete_before_final)
+    hits, status = await searcher.search(kb_id, "deletion boundary marker", k=5)
+
+    assert hits == []
+    assert status.mode is KnowledgeSearchMode.lexical
+    assert pin_calls == 2
+    assert final_calls == 1
+
+
+async def test_persistent_activation_churn_is_bounded_and_retryable(
+    migrated_db: AsyncEngine,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "search:race-churn")
+    kb_id = await _create_base(store, name="Persistent activation churn")
+    first = await _index_document(
+        store,
+        kb_id,
+        [_Chunk("persistent churn marker initial", (1.0, 0.0))],
+    )
+    embedder = _MeaningEmbedder()
+    searcher = KnowledgeSearcher(migrated_db, store.scope_id, embedder)
+    original_pin = searcher._pin_and_lexical
+    original_final = searcher._final_rows_and_snapshot
+    pin_calls = 0
+    final_calls = 0
+
+    async def count_pin(
+        kb: str,
+        query: str,
+        *,
+        candidates: int,
+    ) -> object:
+        nonlocal pin_calls
+        pin_calls += 1
+        return await original_pin(kb, query, candidates=candidates)
+
+    async def churn_before_final(kb: str, chunk_ids: Sequence[str]) -> object:
+        nonlocal final_calls
+        final_calls += 1
+        await _index_document(
+            store,
+            kb_id,
+            [_Chunk(f"persistent churn marker version {final_calls}", (1.0, 0.0))],
+            document_id=first.document_id,
+            now=_NOW + timedelta(seconds=final_calls),
+        )
+        return await original_final(kb, chunk_ids)
+
+    monkeypatch.setattr(searcher, "_pin_and_lexical", count_pin)
+    monkeypatch.setattr(searcher, "_final_rows_and_snapshot", churn_before_final)
+    with pytest.raises(KnowledgeStorageError) as caught:
+        await searcher.search(kb_id, "persistent churn marker", k=5)
+
+    assert caught.value.code == "knowledge_storage_failure"
+    assert caught.value.retryable is True
+    assert pin_calls == 3
+    assert final_calls == 3
+    assert embedder.calls == [("persistent churn marker",)] * 3
+    _assert_detached_storage_error(
+        caught.value,
+        "persistent churn marker",
+        first.document_id,
+        first.version_id,
+    )
+
+
 async def test_scope_and_same_scope_cross_kb_content_is_not_disclosed(
     migrated_db: AsyncEngine,
 ) -> None:
@@ -394,6 +602,37 @@ async def test_lexical_cjk_search_returns_bounded_exact_citation_data(
     assert hit.citation.label == "安装指南.md#chunk-1"
 
 
+async def test_lexical_exact_substrings_cover_short_cjk_and_latin_without_false_hits(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "search:lexical-substrings")
+    kb_id = await _create_base(store, name="Lexical substrings")
+    indexed = await _index_document(
+        store,
+        kb_id,
+        [
+            _Chunk("关于安装的简短说明", (1.0, 0.0)),
+            _Chunk("An ordinary Latin installation guide.", (0.0, 1.0)),
+        ],
+    )
+    searcher = KnowledgeSearcher(migrated_db, store.scope_id)
+
+    for query, expected_chunk_id in (
+        ("安", indexed.chunk_ids[0]),
+        ("安装", indexed.chunk_ids[0]),
+        ("installation", indexed.chunk_ids[1]),
+        ("Latin guide", indexed.chunk_ids[1]),
+    ):
+        hits, status = await searcher.search(kb_id, query, k=5)
+        assert status.mode is KnowledgeSearchMode.lexical
+        assert [hit.citation.chunk_id for hit in hits] == [expected_chunk_id]
+
+    for query in ("部署", "qzxv-no-substring-match"):
+        hits, status = await searcher.search(kb_id, query, k=5)
+        assert hits == []
+        assert status.mode is KnowledgeSearchMode.lexical
+
+
 async def test_hybrid_search_uses_exact_cosine_candidates(
     migrated_db: AsyncEngine,
 ) -> None:
@@ -446,6 +685,39 @@ async def test_embedding_runtime_failure_preserves_lexical_hits_without_message_
     assert status.mode is KnowledgeSearchMode.lexical_degraded
     assert status.semantic_error == "embedding_unavailable"
     assert "provider-secret-message" not in caplog.text
+
+
+async def test_invalid_pgvector_query_values_preserve_lexical_degraded_hits(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresKnowledgeStore(migrated_db, "search:invalid-query-vector")
+    kb_id = await _create_base(store, name="Invalid query vectors")
+    indexed = await _index_document(
+        store,
+        kb_id,
+        [_Chunk("invalid vector degradation marker", (1.0, 0.0))],
+    )
+
+    invalid_vectors: tuple[Sequence[float], ...] = (
+        (1e308, 0.0),
+        (-1e308, 0.0),
+        (math.nan, 0.0),
+        (math.inf, 0.0),
+        (1.0,),
+        (0.0, 0.0),
+    )
+    for vector in invalid_vectors:
+        embedder = _MeaningEmbedder(vector)
+        hits, status = await KnowledgeSearcher(
+            migrated_db,
+            store.scope_id,
+            embedder,
+        ).search(kb_id, "invalid vector degradation", k=5)
+
+        assert [hit.citation.chunk_id for hit in hits] == list(indexed.chunk_ids)
+        assert status.mode is KnowledgeSearchMode.lexical_degraded
+        assert status.semantic_error == "embedding_unavailable"
+        assert embedder.calls == [("invalid vector degradation",)]
 
 
 @pytest.mark.parametrize(
@@ -543,19 +815,19 @@ async def test_constructor_and_search_validate_limits_before_sql(
             KnowledgeSearcher(
                 migrated_db,
                 "search:validation",
-                query_max_chars=invalid_limit,  # type: ignore[arg-type]
+                query_max_chars=invalid_limit,
             )
         with pytest.raises(KnowledgeValidationError, match="result limit"):
             KnowledgeSearcher(
                 migrated_db,
                 "search:validation",
-                k_max=invalid_limit,  # type: ignore[arg-type]
+                k_max=invalid_limit,
             )
         with pytest.raises(KnowledgeValidationError, match="candidate multiplier"):
             KnowledgeSearcher(
                 migrated_db,
                 "search:validation",
-                candidate_multiplier=invalid_limit,  # type: ignore[arg-type]
+                candidate_multiplier=invalid_limit,
             )
     with pytest.raises(KnowledgeValidationError, match="result limit"):
         KnowledgeSearcher(migrated_db, "search:validation", k_max=11)

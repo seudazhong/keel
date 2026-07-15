@@ -2043,6 +2043,8 @@ def _pg_error_boundary[**P, R](
         storage_failure = False
         try:
             return await operation(*args, **kwargs)
+        except KnowledgeStorageError:
+            storage_failure = True
         except IntegrityError as exc:
             conflict_code = _pg_integrity_error_code(exc)
         except _PG_INFRASTRUCTURE_ERRORS:

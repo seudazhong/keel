@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from keel_core.embeddings import FakeEmbedder, rrf_fuse
+from keel_core.knowledge.search import _validated_vector
 
 _DUMMY_URL = "postgresql+psycopg://localhost:5432/keel"
 
@@ -22,6 +23,30 @@ def test_rrf_prefers_items_ranked_high_by_either_arm() -> None:
 def test_rrf_empty() -> None:
     assert rrf_fuse([]) == []
     assert rrf_fuse([[], []]) == []
+
+
+@pytest.mark.parametrize(
+    "vector",
+    [
+        [1e308, 0.0],
+        [-1e308, 0.0],
+        [float("nan"), 0.0],
+        [float("inf"), 0.0],
+        [1.0],
+        [0.0, 0.0],
+    ],
+)
+def test_knowledge_query_vector_rejects_values_pgvector_cannot_store(
+    vector: list[float],
+) -> None:
+    assert _validated_vector(vector, dim=2) is None
+
+
+@pytest.mark.parametrize(
+    "value", [float.fromhex("0x1.fffffep+127"), -float.fromhex("0x1.fffffep+127")]
+)
+def test_knowledge_query_vector_accepts_float32_finite_boundary(value: float) -> None:
+    assert _validated_vector([value, 0.0], dim=2) == [value, 0.0]
 
 
 async def test_fake_embedder_is_deterministic_and_shape_correct() -> None:
