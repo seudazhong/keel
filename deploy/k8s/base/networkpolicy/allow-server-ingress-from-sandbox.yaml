@@ -1,0 +1,27 @@
+# Sandbox Jobs are allowed to egress to keel-server for the internal control-plane<->sandbox
+# RPC (../networkpolicy/allow-sandbox-egress-proxy-only.yaml grants that egress), but egress
+# on the sandbox side alone is not enough — NetworkPolicy is directional, and
+# ../networkpolicy/default-deny-all.yaml also blocks all INGRESS to keel-server until an
+# Ingress policy explicitly allows the sandbox Pods as a source. This file is that missing
+# ingress-side half; without it the RPC callback would be silently dropped despite the
+# egress rule existing on the sandbox side.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-server-ingress-from-sandbox
+  labels:
+    app.kubernetes.io/part-of: keel
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: keel-server
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: sandbox
+      ports:
+        - protocol: TCP
+          port: 8000

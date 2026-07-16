@@ -2,16 +2,20 @@
 
 Three physically distinct stores back a Keel Kubernetes deployment, matching the split in the
 managed-code-projects design doc's
-[§2.3](../../../docs/designs/2026-07-16-managed-code-projects-and-coding-agents-design.md#23-git-object-storage-vs-working-volumes-the-key-split):
+[§2.3](../../../docs/designs/2026-07-16-managed-code-projects-and-coding-agents-design.md#23-git-object-storage-vs-working-volumes-the-key-split).
+**Only Postgres/Redis are actually consumed by current application code** — the Git/object
+storage rows are dormant templates for the not-yet-implemented managed-code-projects feature
+(see "Git storage and object storage are dormant" below).
 
-| Layer | Contents | Manifest | Durability | Lifecycle |
-|---|---|---|---|---|
-| **Relational metadata** | events, projections, jobs, schedules, connectors, quotas | `base/datastores/postgres-external-service.example.yaml` (points at a managed Postgres) | authoritative; requires PITR-capable backups | long-lived, migrated via Alembic |
-| **Cache/queue/lock** | arq queue, scheduler leader lock, pub/sub | `base/datastores/redis-external-service.example.yaml` | operationally important but reconstructable from Postgres state on total loss | long-lived |
-| **Active Git repository** | mutable bare repo: objects, refs, packfiles | `base/datastores/git-pvc.yaml` | authoritative active state; back up regularly | lives with the project; serialized maintenance/GC |
-| **Git snapshots/backups** | immutable bundles/snapshots | object storage (`base/datastores/objectstorage-secret.example.yaml`) | durable recovery copy, not directly mutated | versioned/retained by policy |
-| **Working volume (worktree)** | one writable checkout + build outputs, per run | sandbox Job's `emptyDir` (`base/sandbox/job-template.yaml`) | **disposable** | created per run; reclaimed on run end; hard TTL (`activeDeadlineSeconds`) |
-| **Spilled tool output / artifacts** | large tool output, diffs, build reports | object storage | scoped, purgeable (retention_class) | per-run/per-artifact |
+| Layer | Contents | Manifest | Active? | Durability | Lifecycle |
+|---|---|---|---|---|---|
+| **Relational metadata** | events, projections, jobs, schedules, connectors, quotas | `base/datastores/postgres-external-service.example.yaml` (points at a managed Postgres) | consumed via `KEEL_DATABASE_URL`/`KEEL_DATABASE_HOST` | authoritative; requires PITR-capable backups | long-lived, migrated via Alembic |
+| **Cache/queue/lock** | arq queue, scheduler leader lock, pub/sub | `base/datastores/redis-external-service.example.yaml` | consumed via `KEEL_REDIS_URL`/`KEEL_REDIS_HOST` | operationally important but reconstructable from Postgres state on total loss | long-lived |
+| **Active Git repository** | mutable bare repo: objects, refs, packfiles | `base/datastores/git-pvc.example.yaml` | **dormant — not mounted by any Deployment; no app config references it** | authoritative active state; back up regularly, once real | lives with the project; serialized maintenance/GC |
+| **Git snapshots/backups** | immutable bundles/snapshots | object storage (`base/datastores/objectstorage-secret.example.yaml`) | **dormant — no app config references an object-storage endpoint today** | durable recovery copy, not directly mutated | versioned/retained by policy |
+| **Working volume (worktree)** | one writable checkout + build outputs, per run | sandbox Job's `emptyDir` (`base/sandbox/job-template.yaml`) | dormant along with the Job template itself (see `docs/security-model.md` "Sandbox Job creation is not wired up") | **disposable** | created per run; reclaimed on run end; hard TTL (`activeDeadlineSeconds`) |
+| **Server/worker tool workspace** | `ShellTool`/file-tool scratch for today's in-process execution | `base/server/deployment.yaml` `emptyDir` at `/workspace` | **active** — this is real, and distinct from the Git/object storage rows above | disposable | Pod lifetime |
+| **Spilled tool output / artifacts** | large tool output, diffs, build reports | object storage | dormant (see above) | scoped, purgeable (retention_class) | per-run/per-artifact |
 
 ## Why no in-cluster Postgres/Redis StatefulSet ships here
 
@@ -31,26 +35,41 @@ If you must self-host in-cluster, replace the `ExternalName` Service with your o
 Service of the same name/namespace and follow its own backup/DR documentation instead of this
 scaffold's.
 
-## Git storage: PVC vs. Git-smart service
+## Git storage and object storage are dormant
 
-`base/datastores/git-pvc.yaml` requests `ReadWriteMany` so multiple `keel-server`/`keel-worker`
-replicas can serve concurrent repository operations, assuming a CSI driver that supports RWX
-(NFS-backed classes, EFS, Filestore, Azure Files). If your cluster's storage only supports
-`ReadWriteOnce`:
+Unlike Postgres/Redis, `base/datastores/git-pvc.example.yaml` and
+`base/datastores/objectstorage-secret.example.yaml` are **not** part of the active Kustomize
+build, and nothing in `packages/keel-core/src/keel_core/config.py` has a Git-storage or
+object-storage setting today. Shipping an unconsumed PVC/Secret as an applied resource would
+create a volume/credential nothing ever reads or writes — a nonfunctional claim of capability
+that does not exist yet (see `docs/security-model.md`).
+
+Promote them back into `base/kustomization.yaml`'s `resources:` — and add the corresponding
+`volumeMounts`/env wiring to the service that will own them — once the managed-code-projects
+Git-storage feature (design doc §2.3) actually lands. Until then, treat the descriptions below
+as the *target* shape, not current behavior.
+
+### Git storage: PVC vs. Git-smart service (target design)
+
+`base/datastores/git-pvc.example.yaml` requests `ReadWriteMany` so multiple
+`keel-server`/`keel-worker` replicas could serve concurrent repository operations, assuming a
+CSI driver that supports RWX (NFS-backed classes, EFS, Filestore, Azure Files). If your
+cluster's storage only supports `ReadWriteOnce`:
 
 - run a single writer with correct repository locking (accept reduced availability), or
 - front the volume with an external Git-smart service (e.g. a dedicated Git server/service
   layer) instead of a directly-mounted PVC, matching the design doc's stated alternative.
 
-Either way, the **authoritative repository is never mounted into a sandbox Pod** — sandbox
-Jobs only ever receive an ephemeral worktree materialized from an immutable object-storage
-snapshot by the `keel-worktree-init` init container. This is enforced structurally (the Job
-template has no volume referencing `keel-git-storage`) and checked by
-`scripts/validate_manifests.py`.
+Either way, the **authoritative repository must never be mounted into a sandbox Pod** —
+sandbox Jobs are designed to only ever receive an ephemeral worktree materialized from an
+immutable object-storage snapshot by the `keel-worktree-init` init container. This is enforced
+structurally today (the Job template has no volume referencing `keel-git-storage`) and checked
+by `scripts/validate_manifests.py`, even though the Job template itself is not currently
+submitted by anything (`docs/security-model.md` "Sandbox Job creation is not wired up").
 
-## Object storage
+## Object storage (target design)
 
-Any S3-compatible endpoint works (AWS S3, MinIO, GCS via S3 interop). It holds:
+Any S3-compatible endpoint would work (AWS S3, MinIO, GCS via S3 interop), intended to hold:
 
 - immutable Git bundles/snapshots (recovery source, never a directly-mutated mirror),
 - backups,
@@ -61,10 +80,19 @@ Prefer workload identity (IRSA / GCP Workload Identity / Azure Managed Identity)
 access keys where your cloud provider supports it — see the comment in
 `base/datastores/objectstorage-secret.example.yaml`.
 
+## Server/worker tool workspace (active today)
+
+Distinct from the dormant Git/object storage above: `base/server/deployment.yaml` mounts a
+real, active `emptyDir` at `/workspace` and sets `workingDir: /workspace` so keel-server's
+`ShellTool`/file-tool scratch space (today's in-process execution;
+`packages/keel-server/src/keel_server/app.py` defaults it to `Path.cwd()`) has somewhere
+writable to use that is not the read-only `/app` source tree. This is disposable, Pod-lifetime
+scratch — it is not durable storage and is unrelated to the Git PVC.
+
 ## Encryption
 
-- At rest: object store server-side encryption (SSE) + volume encryption for the Git PVC
-  (your CSI driver's encryption-at-rest option, or LUKS/provider KMS underneath it).
+- At rest: object store server-side encryption (SSE) + volume encryption for the Git PVC, once
+  real (your CSI driver's encryption-at-rest option, or LUKS/provider KMS underneath it).
 - In transit: TLS to managed Postgres/Redis/object storage; the control-plane↔sandbox RPC is
   mTLS internally (design doc §8.4) — not yet implemented (see `docs/security-model.md`
   "Pending gates").

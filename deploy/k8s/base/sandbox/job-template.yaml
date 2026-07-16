@@ -1,14 +1,26 @@
 # Per-run sandbox Job template — NOT applied directly with `kubectl apply`/kustomize.
 #
-# This is the canonical shape the control plane (keel-server) renders and submits (via the
-# keel-control-plane ServiceAccount, ../serviceaccount-control-plane.yaml) once per agent run
-# that needs shell/code execution, substituting the RUN_ID_PLACEHOLDER / *_PLACEHOLDER tokens
-# below with real per-run values, injecting the run's resource quota
-# (`project_quotas`, see the managed-code-projects design doc §2/§8.4), and deleting the Job
-# when the run's worktree is reclaimed. It is intentionally excluded from
-# ../kustomization.yaml's resources so `kubectl kustomize build` never needs to fill it in —
-# ../../scripts/validate_manifests.py still statically checks it for the required hardening
-# properties below.
+# This is the canonical shape a FUTURE, narrowly-scoped sandbox-controller renders and
+# submits once per agent run that needs shell/code execution, substituting the
+# RUN_ID_PLACEHOLDER / *_PLACEHOLDER tokens below with real per-run values, injecting the
+# run's resource quota (`project_quotas`, see the managed-code-projects design doc §2/§8.4),
+# and deleting the Job when the run's worktree is reclaimed.
+#
+# THIS DOES NOT EXIST YET. keel-server holds no RBAC grant to create Jobs/Pods anywhere in
+# this scaffold (see ../../docs/security-model.md "Pending gates") — a prior version of this
+# scaffold granted `create`/`delete` on `jobs` directly to keel-server's own ServiceAccount,
+# which was removed because that permission is equivalent to broad node/Secret/PVC
+# exfiltration risk in most clusters (a Job can mount arbitrary Secrets/PVCs and run as
+# arbitrary images/service accounts unless constrained by an admission policy). Standing this
+# up safely requires either (a) a dedicated sandbox-controller Deployment, in its own
+# namespace, with an admission policy (e.g. Kyverno/OPA Gatekeeper, or Kubernetes' built-in
+# ValidatingAdmissionPolicy) that restricts exactly which Job shapes it may submit — not
+# keel-server itself calling the Kubernetes API — or (b) an equivalently constrained indirect
+# submission contract. Neither is implemented here.
+#
+# This template is excluded from ../kustomization.yaml's resources so `kubectl kustomize
+# build` never needs to fill it in — ../../scripts/validate_manifests.py still statically
+# checks it for the required hardening properties below.
 #
 # Hardening applied to every rendered Job:
 # - no ServiceAccount token (keel-sandbox-run, automountServiceAccountToken: false)
@@ -20,16 +32,17 @@
 # - `activeDeadlineSeconds` enforces a hard wall-clock ceiling independent of the in-process
 #   agent loop's own budgets/timeouts (defense in depth)
 # - ephemeral-only scratch (`emptyDir`); the sandbox is never mounted onto the durable Git PVC
-#   (../datastores/git-pvc.yaml) — only a per-run worktree materialized into this Pod by the
-#   `keel-worktree-init` init container from an immutable object-storage snapshot
+#   (../datastores/git-pvc.example.yaml, itself dormant/unconsumed today) — only a per-run
+#   worktree materialized into this Pod by the `keel-worktree-init` init container from an
+#   immutable object-storage snapshot
 # - `runtimeClassName` is deliberately OMITTED here. Stronger-isolation runtimes (gVisor/
 #   Kata/a microVM backend) are opt-in: install the matching node-level runtime, apply the
 #   single matching object from ../sandbox/runtimeclass.example.yaml, and set the
-#   `KEEL_SANDBOX_RUNTIME_CLASS` config key (see ../configmap-app.yaml) so the control plane
-#   sets `spec.template.spec.runtimeClassName` when rendering this template. Wiring that
-#   config key through to Job creation is pending real sandbox integration — see
-#   ../../docs/security-model.md "Pending gates". Do not treat the default runc runtime as
-#   sufficient for hostile multi-tenant workloads in the meantime.
+#   `KEEL_SANDBOX_RUNTIME_CLASS` config key (see ../configmap-app.yaml) so the future
+#   sandbox-controller sets `spec.template.spec.runtimeClassName` when rendering this
+#   template. Wiring that config key through to Job creation is pending real sandbox
+#   integration — see ../../docs/security-model.md "Pending gates". Do not treat the default
+#   runc runtime as sufficient for hostile multi-tenant workloads in the meantime.
 apiVersion: batch/v1
 kind: Job
 metadata:

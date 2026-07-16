@@ -1,7 +1,22 @@
+# NOT DEPLOYABLE YET — dormant example, excluded from ../kustomization.yaml on purpose.
+#
+# `packages/keel-scheduler/src/keel_scheduler/main.py` is currently a stub: it logs one line
+# and returns (`asyncio.run(run())` where `run()` just logs and exits). Applying this as a
+# long-lived `Deployment` today would crash-loop forever — Kubernetes would restart a process
+# that exits almost immediately, over and over, for no benefit. Scheduling currently happens
+# inside `keel-worker`'s own `scheduler_tick` cron, coordinated across replicas via a Redis
+# lock (see `docker-compose.yml` comments, ADR-0006) — that is the real, working mechanism
+# today, not this file.
+#
+# Promote this file back into ../kustomization.yaml's `resources:` only once
+# `keel-scheduler`'s entrypoint is a real long-lived, leader-elected loop (M3.8 —
+# "scheduler service/leadership" in docs/ROADMAP.md). Until then this file is a forward-looking
+# shape, not a working manifest.
+#
 # keel-scheduler: leader-elected cron singleton (ADR-0006, ARCHITECTURE §15). Exactly one
 # active replica should perform scheduling; `replicas: 1` here is a placeholder until leader
-# election is implemented (M3.8 — "scheduler service/leadership" in docs/ROADMAP.md). Do not
-# scale this beyond 1 replica before that lands, or schedules may double-fire.
+# election is implemented. Do not scale this beyond 1 replica before that lands, or schedules
+# may double-fire.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

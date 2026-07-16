@@ -1,15 +1,21 @@
-# Control-plane workloads (keel-server, keel-worker, keel-scheduler; selected by the
-# `app.kubernetes.io/component: control-plane` label all three Deployments carry) may reach
-# the managed Postgres/Redis endpoints and outbound HTTPS (LLM providers, object storage,
-# GitHub App API, etc.).
+# Control-plane workloads (keel-server, keel-worker; selected by the
+# `app.kubernetes.io/component: control-plane` label) may reach outbound HTTPS (LLM
+# providers, GitHub App API, managed data services once you fill in
+# ./allow-control-plane-egress-managed-data.example.yaml, etc.).
 #
-# KNOWN LIMITATION: standard `networking.k8s.io/v1` NetworkPolicy cannot select traffic by
-# Service name/DNS for out-of-cluster endpoints (ExternalName Services such as
-# ../datastores/postgres-external-service.example.yaml have no pod IP to select) — only by
-# `ipBlock` CIDR, `podSelector`, or `namespaceSelector`. Fill in the CIDR(s) for your managed
-# Postgres/Redis/object-storage endpoints below. If your CNI supports FQDN-based egress
-# policies (e.g. Cilium `CiliumNetworkPolicy`), prefer that for tighter, name-based control
-# instead of a broad HTTPS allow — see ../../docs/security-model.md "NetworkPolicy caveats".
+# This file intentionally ships with NO placeholder values so it is safe to apply as-is —
+# `scripts/validate_manifests.py` fails the build if any actively-applied resource contains
+# an unresolved placeholder. The Postgres/Redis/object-storage-specific rule (which needs a
+# real CIDR you can only know for your own cluster/VPC) lives in the separate, dormant
+# ./allow-control-plane-egress-managed-data.example.yaml — copy it into your own overlay,
+# fill in the CIDR, and add it there instead of editing this file.
+#
+# No rule here grants access to the Kubernetes API server: this scaffold does not bind any
+# RBAC Role to keel-server/keel-worker (see ../../docs/security-model.md "Pending gates" —
+# per-run sandbox Job creation needs a narrowly separated controller, not broad RBAC on the
+# app's own ServiceAccount), so there is nothing for it to call the API server for. Do not
+# add a Kubernetes-API-server egress rule here unless a real, narrowly-scoped RBAC grant is
+# added alongside it.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -23,16 +29,6 @@ spec:
   policyTypes:
     - Egress
   egress:
-    - to:
-        - ipBlock:
-            cidr: REPLACE_WITH_MANAGED_DATA_SERVICES_CIDR/32 # Postgres/Redis/object storage
-      ports:
-        - protocol: TCP
-          port: 5432
-        - protocol: TCP
-          port: 6379
-        - protocol: TCP
-          port: 443
     - to:
         - ipBlock:
             cidr: 0.0.0.0/0

@@ -1,7 +1,19 @@
 # keel-server: stateless FastAPI control-plane API. Horizontally scalable (ARCHITECTURE §15).
-# Creates/manages per-run sandbox Jobs, so it is the only workload bound to the
-# keel-control-plane ServiceAccount (../serviceaccount-control-plane.yaml) with its token
-# mounted. It never runs untrusted/model-chosen code directly.
+#
+# SECURITY-CRITICAL: keel-server currently executes `ShellTool`/model-chosen tool calls
+# **in-process** (there is no deployed sandbox service yet — see
+# ../../docs/security-model.md "Isolation levels"). A process that can run arbitrary shell
+# commands must never also hold a Kubernetes ServiceAccount token: that token would let an
+# attacker who reaches shell execution pivot straight into the cluster API. This Pod
+# therefore carries NO ServiceAccount token at all (`automountServiceAccountToken: false`,
+# no `serviceAccountName`) and no RBAC grant exists anywhere in this scaffold for it — see
+# ../../docs/security-model.md "Pending gates" for why per-run sandbox Job creation is not
+# wired to this Deployment.
+#
+# `KEEL_API_KEYS` (in `../secret-app.example.yaml`) MUST be set to a non-empty value before
+# this is deployed: empty/unset makes every request an implicit, unauthenticated admin
+# (`packages/keel-core/src/keel_core/config.py` `api_keys`, see ../../docs/OPERATIONS.md).
+# `scripts/validate_manifests.py` fails the build if it is missing or empty.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -22,8 +34,7 @@ spec:
         app.kubernetes.io/part-of: keel
         app.kubernetes.io/component: control-plane
     spec:
-      serviceAccountName: keel-control-plane
-      automountServiceAccountToken: true # needed to create/watch per-run sandbox Jobs
+      automountServiceAccountToken: false # never mount a token into a shell-hosting process
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -35,6 +46,14 @@ spec:
         - name: keel-server
           image: ghcr.io/OWNER/keel-app:REPLACE_WITH_PINNED_DIGEST
           command: ["keel-server"]
+          # The image's WORKDIR is /app (its own read-only source tree, see
+          # deploy/docker/app.Dockerfile). keel-server's tool workspace defaults to
+          # `Path.cwd()` (packages/keel-server/src/keel_server/app.py) — without this
+          # override that resolves to /app, i.e. the read-only root filesystem below would
+          # make every write/edit/shell tool call fail against the app's OWN source
+          # directory. Redirecting cwd to a dedicated writable scratch volume keeps /app
+          # read-only while giving today's in-process tool execution a real place to write.
+          workingDir: /workspace
           ports:
             - name: http
               containerPort: 8000
@@ -51,6 +70,8 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: workspace
+              mountPath: /workspace
           resources:
             requests:
               cpu: "250m"
@@ -73,3 +94,6 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: workspace
+          emptyDir:
+            sizeLimit: 2Gi

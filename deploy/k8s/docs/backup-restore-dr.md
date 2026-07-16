@@ -10,10 +10,15 @@ gate: "restore drill meets RPO/RTO", `docs/ROADMAP.md`).
 | Store | Backup mechanism | Target RPO | Target RTO |
 |---|---|---|---|
 | Postgres (events, projections, jobs, schedules, connectors) | managed provider's automated snapshots + WAL/PITR, or `pg_dump` + WAL archiving if self-hosted | ≤ 15 min (via PITR) | ≤ 1 hour to a new instance |
-| Active Git repository (PVC) | volume snapshot (CSI `VolumeSnapshot`) on a schedule, plus continuous Git bundle export to object storage | ≤ 1 hour | ≤ 1 hour to a fresh PVC + restored bundle |
-| Object storage (Git snapshots, artifacts) | provider-level versioning/replication (S3 versioning + cross-region replication, or MinIO mirroring) | near-zero for already-durable objects | depends on provider; typically minutes |
-| Redis | none required for durability — the queue/lock state is reconstructable: in-flight jobs are re-derived from Postgres job rows on worker restart, and the scheduler lock is re-acquired on next tick | n/a | n/a (re-populates on restart) |
+| Redis | none required for durability — the queue/lock state is reconstructable: in-flight jobs are re-derived from Postgres job rows on worker restart, and the next cron tick simply re-acquires the lock | n/a | n/a (re-populates on restart) |
 | Kubernetes manifests / config | this Git repository (`deploy/k8s`) + your filled-in overlay (kept in your own private/secret-managed location) | n/a (source-controlled) | time to `kubectl apply -k` |
+| Active Git repository (PVC) — **not active in this scaffold** | *(target, once real)* volume snapshot (CSI `VolumeSnapshot`) on a schedule, plus continuous Git bundle export to object storage | *(target)* ≤ 1 hour | *(target)* ≤ 1 hour to a fresh PVC + restored bundle |
+| Object storage (Git snapshots, artifacts) — **not active in this scaffold** | *(target, once real)* provider-level versioning/replication (S3 versioning + cross-region replication, or MinIO mirroring) | *(target)* near-zero for already-durable objects | *(target)* depends on provider; typically minutes |
+
+The last two rows are aspirational: `base/datastores/git-pvc.example.yaml` and
+`base/datastores/objectstorage-secret.example.yaml` are dormant templates that no current
+application code consumes (`docs/storage-topology.md`). Do not plan a real DR drill around
+backing them up until the feature they support actually exists and is deployed.
 
 ## Restore runbook (target sequence — unverified until drilled)
 
@@ -22,18 +27,23 @@ gate: "restore drill meets RPO/RTO", `docs/ROADMAP.md`).
 2. **Restore Postgres** to the desired point-in-time on your managed provider (or via
    `pg_restore` + WAL replay if self-hosted). Confirm `alembic current` matches the expected
    migration head before proceeding.
-3. **Restore the Git PVC** from the most recent `VolumeSnapshot`, or provision a fresh PVC and
-   replay the latest immutable bundle from object storage for each active project.
-4. **Point `base/datastores/*-external-service.example.yaml`-derived Services** at the restored
+3. **Point `base/datastores/*-external-service.example.yaml`-derived Services** at the restored
    Postgres/Redis endpoints (update the copies in your overlay, not the checked-in examples).
-5. **Apply the control plane** (`keel-migrate` equivalent job, then `keel-server`,
-   `keel-worker`, `keel-scheduler`, `keel-web`) and verify `/health` and `/readiness` are green
-   on `keel-server` before allowing sandbox Job creation.
-6. **Verify data integrity**: spot-check that recent runs/jobs/schedules referenced in
-   Postgres resolve to Git refs that exist in the restored repository, and that no orphaned
-   sandbox Jobs remain from before the incident (`kubectl get jobs -l app.kubernetes.io/component=sandbox`).
-7. **Record the actual RPO/RTO achieved** in this file, and file a gap if either target was
+4. **Apply the control plane** (`keel-migrate` equivalent job, then `keel-server`,
+   `keel-worker`, `keel-web`) and verify `/health` and `/readiness` are green on `keel-server`,
+   and that an unauthenticated request to a non-health route is rejected (confirms
+   `KEEL_API_KEYS` restored correctly).
+5. **Verify data integrity**: spot-check that recent runs/jobs/schedules referenced in
+   Postgres are internally consistent, and that no orphaned sandbox Jobs remain from before the
+   incident (`kubectl get jobs -l app.kubernetes.io/component=sandbox` — expected to be empty,
+   since this scaffold does not currently create any).
+6. **Record the actual RPO/RTO achieved** in this file, and file a gap if either target was
    missed.
+
+If/when the Git-storage feature above is actually deployed, insert a Git PVC / object-storage
+restore step between (3) and (4): restore the PVC from the most recent `VolumeSnapshot` (or a
+fresh PVC replayed from the latest immutable bundle in object storage) before bringing up
+`keel-server`/`keel-worker`.
 
 ## Disaster recovery scope this scaffold does not cover
 
@@ -45,3 +55,5 @@ gate: "restore drill meets RPO/RTO", `docs/ROADMAP.md`).
   managed backup service exists when it does not.
 - Erasure/right-to-be-forgotten guarantees across backups (event versions exist but upcasters,
   retention, and full erasure are not implemented — `docs/OPERATIONS.md`).
+- Git/object-storage backup and restore, until that feature is actually implemented and
+  deployed (see "What must be backed up" above).

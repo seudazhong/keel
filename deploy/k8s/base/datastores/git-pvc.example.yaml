@@ -1,3 +1,14 @@
+# NOT DEPLOYABLE YET — dormant example, excluded from ../kustomization.yaml on purpose.
+#
+# No shipped Deployment in this scaffold mounts this PVC, and no current application code
+# (`packages/keel-core/src/keel_core/config.py`) has any Git-storage or object-storage
+# setting — the "managed code projects" Git-storage design
+# (`docs/designs/2026-07-16-managed-code-projects-and-coding-agents-design.md` §2.3) is not
+# implemented yet. Shipping this as an active, applied resource would create a volume nothing
+# ever reads or writes: a nonfunctional claim of capability that does not exist. Promote it
+# back into ../kustomization.yaml (and wire an actual `volumeMounts` entry on the service that
+# will own it) once that feature lands.
+#
 # Durable, authoritative Git storage (mutable bare repositories: objects, refs, packfiles).
 # This is NOT the ephemeral per-run worktree (that lives in the sandbox Job's `emptyDir`,
 # ../sandbox/job-template.yaml) and it is NEVER mounted into a sandbox Pod — only trusted

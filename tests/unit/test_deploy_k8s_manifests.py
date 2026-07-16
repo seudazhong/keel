@@ -74,3 +74,69 @@ def test_example_and_rendered_templates_excluded_from_kustomize_build(
     entries = validator._resource_entries(kustomization_text)
     assert not any(entry.endswith("example.yaml") for entry in entries)
     assert not any(entry.endswith("job-template.yaml") for entry in entries)
+
+
+def test_no_rbac_ships_as_an_active_resource(validator: types.ModuleType) -> None:
+    """Arbitrary Job-create RBAC on the app's own ServiceAccount was a review finding: it is
+    equivalent to broad Secret/PVC/node exfiltration risk. This scaffold must ship none.
+    """
+    for path in validator._active_resource_files():
+        text = path.read_text(encoding="utf-8")
+        for kind in ("Role", "ClusterRole", "RoleBinding", "ClusterRoleBinding"):
+            assert f"kind: {kind}" not in text, f"{path} must not define a {kind}"
+    assert not (
+        REPO_ROOT / "deploy" / "k8s" / "base" / "serviceaccount-control-plane.yaml"
+    ).exists()
+
+
+def test_server_never_mounts_a_service_account_token(validator: types.ModuleType) -> None:
+    server = (REPO_ROOT / "deploy" / "k8s" / "base" / "server" / "deployment.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "automountServiceAccountToken: false" in server
+    assert "serviceAccountName:" not in server
+
+
+def test_server_workspace_is_writable_and_not_app_source(validator: types.ModuleType) -> None:
+    server = (REPO_ROOT / "deploy" / "k8s" / "base" / "server" / "deployment.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "workingDir: /workspace" in server
+    assert "mountPath: /workspace" in server
+
+
+def test_api_keys_required_in_secret_and_absent_from_configmap() -> None:
+    secret = (REPO_ROOT / "deploy" / "k8s" / "base" / "secret-app.example.yaml").read_text(
+        encoding="utf-8"
+    )
+    configmap = (REPO_ROOT / "deploy" / "k8s" / "base" / "configmap-app.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "KEEL_API_KEYS:" in secret
+    assert 'KEEL_API_KEYS: ""' not in secret
+    assert not any(line.strip().startswith("KEEL_API_KEYS:") for line in configmap.splitlines()), (
+        "KEEL_API_KEYS must live only in the Secret, never the ConfigMap's `data:`"
+    )
+
+
+def test_scheduler_and_git_pvc_are_dormant_not_active() -> None:
+    k8s_base = REPO_ROOT / "deploy" / "k8s" / "base"
+    assert not (k8s_base / "scheduler" / "deployment.yaml").exists()
+    assert (k8s_base / "scheduler" / "deployment.example.yaml").exists()
+    assert not (k8s_base / "datastores" / "git-pvc.yaml").exists()
+    assert (k8s_base / "datastores" / "git-pvc.example.yaml").exists()
+
+
+def test_networkpolicy_directional_rules_present() -> None:
+    networkpolicy_dir = REPO_ROOT / "deploy" / "k8s" / "base" / "networkpolicy"
+    combined = "\n".join(p.read_text(encoding="utf-8") for p in networkpolicy_dir.glob("*.yaml"))
+    assert "allow-web-egress-to-server" in combined
+    assert "allow-server-ingress-from-sandbox" in combined
+
+
+def test_cidr_and_reference_checks_are_clean(validator: types.ModuleType) -> None:
+    findings: list[str] = []
+    validator.check_cidrs_are_valid(findings)
+    validator.check_no_placeholders_in_active_resources(findings)
+    hard_failures = [f for f in findings if not f.startswith("SKIPPED")]
+    assert not hard_failures, "\n".join(hard_failures)
