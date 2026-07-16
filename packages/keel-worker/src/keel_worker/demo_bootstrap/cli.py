@@ -100,9 +100,7 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_CONFIRMATION_REQUIRED
 
     try:
-        result = asyncio.run(
-            run_bootstrap(settings=settings, scope_id=args.scope, mode=args.mode)
-        )
+        result = asyncio.run(run_bootstrap(settings=settings, scope_id=args.scope, mode=args.mode))
     except DemoGuardError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_GUARD_REFUSED

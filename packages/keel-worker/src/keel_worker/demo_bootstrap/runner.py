@@ -23,6 +23,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any, cast
 
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from keel_core.config import Settings
@@ -463,10 +464,11 @@ async def run_bootstrap(
 
 def describe_plan(*, scope_id: str, mode: str, settings: Settings) -> str:
     """Human-readable preview of what a real run would do (used by --dry-run)."""
+    database_url = make_url(settings.database_url).render_as_string(hide_password=True)
     lines = [
         "Demo bootstrap plan (no changes have been made):",
         f"  scope:            {scope_id}",
-        f"  database:         {settings.database_url}",
+        f"  database:         {database_url}",
         f"  embedding mode:   {mode}",
         f"  knowledge base:   {_KB_NAME!r} (create-if-missing, reused on repeat runs)",
         "  documents:",

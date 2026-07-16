@@ -96,7 +96,7 @@ async def test_seeded_documents_are_searchable_with_citations(migrated_db: Async
     assert len(result.search_samples) == len(result.documents) == 3
     for sample in result.search_samples:
         assert sample.hit_count > 0, f"expected at least one hit for query {sample.query!r}"
-        assert sample.mode in {"hybrid", "lexical", "lexical_degraded"}
+        assert sample.mode in {"hybrid", "lexical", "lexical-degraded"}
 
     # Independently verify citation fields via the same production search
     # contract the HTTP API uses, rather than trusting the bootstrap's own
