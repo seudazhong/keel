@@ -9,16 +9,18 @@ import pytest
 from fastapi import Depends, FastAPI
 from httpx import ASGITransport
 
-from keel_server.auth import Principal, Role, parse_api_keys, require_role
+from keel_server.auth import Principal, Role, hash_api_key, parse_api_keys, require_role
 
 
 def test_parse_api_keys_maps_roles_and_skips_junk() -> None:
     keys = parse_api_keys("adm:admin, op:operator ,vw:VIEWER,bad:notarole,, norole")
+    # Keys are hashed at rest; the map is keyed by the SHA-256 digest, never plaintext.
     assert {k: p.role for k, p in keys.items()} == {
-        "adm": Role.admin,
-        "op": Role.operator,
-        "vw": Role.viewer,  # role name is case-insensitive
+        hash_api_key("adm"): Role.admin,
+        hash_api_key("op"): Role.operator,
+        hash_api_key("vw"): Role.viewer,  # role name is case-insensitive
     }
+    assert "adm" not in keys  # plaintext key never stored
 
 
 def _app() -> FastAPI:
@@ -81,3 +83,20 @@ async def test_keyed_mode_rejects_missing_and_invalid_keys() -> None:
         assert (
             await client.get("/read", headers={"Authorization": "Bearer adm"})
         ).status_code == 200
+
+
+async def test_cloud_mode_fails_closed_without_keys() -> None:
+    """Cloud mode + no keys is a misconfiguration: every request is rejected (503)."""
+    app = _app()
+    app.state.auth_required = True  # cloud mode
+    async with await _client(app) as client:
+        assert (await client.get("/read")).status_code == 503
+        assert (await client.post("/mutate")).status_code == 503
+
+
+async def test_open_mode_still_allows_when_auth_not_required() -> None:
+    """Without cloud mode and no keys, the local open path stays (implicit admin)."""
+    app = _app()
+    app.state.auth_required = False
+    async with await _client(app) as client:
+        assert (await client.get("/read")).json()["role"] == "admin"

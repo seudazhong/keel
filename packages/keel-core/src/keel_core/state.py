@@ -17,7 +17,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from keel_core.errors import CrossScopeError
-from keel_core.events import Event, EventType
+from keel_core.events import Event
+from keel_core.evolution import EVENT_UPCASTERS, upcast_event
 from keel_core.types import ScopeId, SessionId
 
 
@@ -38,7 +39,7 @@ class InMemoryEventStore:
     async def _read(self, session_id: SessionId, after: int | None) -> AsyncIterator[Event]:
         for event in self._events.get(session_id, []):
             if after is None or event.seq > after:
-                yield event
+                yield upcast_event(event)
 
     def has_session(self, session_id: SessionId, scope_id: ScopeId) -> bool:
         return any(event.scope_id == scope_id for event in self._events.get(session_id, []))
@@ -167,15 +168,17 @@ class PostgresEventStore:
                 payload: dict[str, Any] = {}
                 if isinstance(row.payload, dict):
                     payload = {str(key): value for key, value in row.payload.items()}
-                yield Event(
-                    type=EventType(row.type),
-                    version=row.version,
-                    seq=row.seq,
-                    session_id=row.session_id,
-                    scope_id=row.scope_id,
-                    run_id=row.run_id,
-                    ts=row.ts,
-                    payload=payload,
+                yield EVENT_UPCASTERS.decode(
+                    {
+                        "type": row.type,
+                        "version": row.version,
+                        "seq": row.seq,
+                        "session_id": row.session_id,
+                        "scope_id": row.scope_id,
+                        "run_id": row.run_id,
+                        "ts": row.ts,
+                        "payload": payload,
+                    }
                 )
 
 

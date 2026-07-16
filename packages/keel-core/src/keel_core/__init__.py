@@ -115,7 +115,14 @@ from .search import (
     search_sessions,
     session_search,
 )
-from .secrets import EnvelopeCipher, SecretsError, cipher_from_settings
+from .secrets import (
+    EncryptedSecret,
+    EnvelopeCipher,
+    KeyRing,
+    SecretsError,
+    cipher_from_settings,
+    keyring_from_settings,
+)
 from .state import InMemoryEventStore, PostgresEventStore
 from .tokens import InMemoryTokenStore, PostgresTokenStore
 from .tools import ExecRequest, execute
@@ -236,8 +243,11 @@ __all__ = [
     "ConfusedDeputyEngine",
     "taint_from_events",
     "EnvelopeCipher",
+    "KeyRing",
+    "EncryptedSecret",
     "SecretsError",
     "cipher_from_settings",
+    "keyring_from_settings",
     "InMemoryTokenStore",
     "PostgresTokenStore",
     # search + archival (WS-D)

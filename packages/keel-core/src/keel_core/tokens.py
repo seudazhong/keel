@@ -5,6 +5,10 @@ Tokens are envelope-encrypted (:mod:`keel_core.secrets`) and keyed by
 or writes that scope's rows (application-layer isolation, ADR-0009), with Postgres
 RLS as defense-in-depth. On scope deletion, :meth:`purge` revokes every token
 (G18: revoke + purge). Plaintext tokens never touch the database.
+
+Each row records the ``key_id`` that encrypted its ciphertext, so a :class:`KeyRing`
+can decrypt across a rotation and :meth:`PostgresTokenStore.reencrypt_stale` can
+re-wrap rows onto the active key without any downtime (M3.3).
 """
 
 from __future__ import annotations
@@ -15,10 +19,15 @@ from datetime import datetime
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
-from keel_core.secrets import EnvelopeCipher
+from keel_core.secrets import EnvelopeCipher, KeyRing
 from keel_core.types import ScopeId
 
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
+
+
+def _as_keyring(cipher: EnvelopeCipher | KeyRing) -> KeyRing:
+    """Accept either a legacy single cipher or a versioned ring."""
+    return cipher if isinstance(cipher, KeyRing) else KeyRing.from_cipher(cipher)
 
 
 @dataclass(frozen=True)
@@ -59,17 +68,22 @@ async def delete_token(engine: AsyncEngine, scope_id: ScopeId, connector_id: str
 class InMemoryTokenStore:
     """Non-durable, scope-bound encrypted token store (tests / lite profile)."""
 
-    def __init__(self, scope_id: ScopeId, cipher: EnvelopeCipher) -> None:
+    def __init__(self, scope_id: ScopeId, cipher: EnvelopeCipher | KeyRing) -> None:
         self._scope_id = scope_id
-        self._cipher = cipher
-        self._rows: dict[tuple[str, str], str] = {}  # (scope, connector) -> ciphertext
+        self._ring = _as_keyring(cipher)
+        # (scope, connector) -> (key_id, ciphertext)
+        self._rows: dict[tuple[str, str], tuple[str, str]] = {}
 
     async def put(self, connector_id: str, secret: str) -> None:
-        self._rows[(self._scope_id, connector_id)] = self._cipher.encrypt(secret)
+        enc = self._ring.encrypt(secret)
+        self._rows[(self._scope_id, connector_id)] = (enc.key_id, enc.ciphertext)
 
     async def get(self, connector_id: str) -> str | None:
-        ciphertext = self._rows.get((self._scope_id, connector_id))
-        return None if ciphertext is None else self._cipher.decrypt(ciphertext)
+        row = self._rows.get((self._scope_id, connector_id))
+        if row is None:
+            return None
+        key_id, ciphertext = row
+        return self._ring.decrypt(key_id, ciphertext)
 
     async def delete(self, connector_id: str) -> None:
         self._rows.pop((self._scope_id, connector_id), None)
@@ -82,23 +96,31 @@ class InMemoryTokenStore:
 class PostgresTokenStore:
     """Durable, scope-bound, encrypted token store over Postgres."""
 
-    def __init__(self, engine: AsyncEngine, scope_id: ScopeId, cipher: EnvelopeCipher) -> None:
+    def __init__(
+        self, engine: AsyncEngine, scope_id: ScopeId, cipher: EnvelopeCipher | KeyRing
+    ) -> None:
         self._engine = engine
         self._scope_id = scope_id
-        self._cipher = cipher
+        self._ring = _as_keyring(cipher)
 
     async def put(self, connector_id: str, secret: str) -> None:
-        ciphertext = self._cipher.encrypt(secret)
+        enc = self._ring.encrypt(secret)
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             await conn.execute(
                 text(
-                    "INSERT INTO connector_tokens (scope_id, connector_id, ciphertext) "
-                    "VALUES (:scope, :cid, :ct) "
+                    "INSERT INTO connector_tokens "
+                    "(scope_id, connector_id, ciphertext, key_id) "
+                    "VALUES (:scope, :cid, :ct, :kid) "
                     "ON CONFLICT (scope_id, connector_id) DO UPDATE "
-                    "SET ciphertext = :ct, updated_at = now()"
+                    "SET ciphertext = :ct, key_id = :kid, updated_at = now()"
                 ),
-                {"scope": self._scope_id, "cid": connector_id, "ct": ciphertext},
+                {
+                    "scope": self._scope_id,
+                    "cid": connector_id,
+                    "ct": enc.ciphertext,
+                    "kid": enc.key_id,
+                },
             )
 
     async def get(self, connector_id: str) -> str | None:
@@ -107,7 +129,7 @@ class PostgresTokenStore:
             row = (
                 await conn.execute(
                     text(
-                        "SELECT ciphertext FROM connector_tokens "
+                        "SELECT ciphertext, key_id FROM connector_tokens "
                         "WHERE scope_id = :scope AND connector_id = :cid"
                     ),
                     {"scope": self._scope_id, "cid": connector_id},
@@ -115,7 +137,7 @@ class PostgresTokenStore:
             ).one_or_none()
         if row is None:
             return None
-        return self._cipher.decrypt(row.ciphertext)
+        return self._ring.decrypt(row.key_id, row.ciphertext)
 
     async def delete(self, connector_id: str) -> None:
         async with self._engine.begin() as conn:
@@ -135,3 +157,43 @@ class PostgresTokenStore:
                 text("DELETE FROM connector_tokens WHERE scope_id = :scope"),
                 {"scope": self._scope_id},
             )
+
+    async def reencrypt_stale(self) -> int:
+        """Re-wrap this scope's tokens not on the active key onto it (M3.3 rotation).
+
+        Reads each stale row, decrypts with its recorded ``key_id``, re-encrypts under
+        the ring's active key, and writes back the new ciphertext + key id. Runs one row
+        per transaction so a partial rotation is always consistent and resumable. Returns
+        the number of rows rotated. Safe to run repeatedly (idempotent once on the active
+        key).
+        """
+        active = self._ring.active_id
+        rotated = 0
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            stale = (
+                await conn.execute(
+                    text(
+                        "SELECT connector_id, ciphertext, key_id FROM connector_tokens "
+                        "WHERE scope_id = :scope AND key_id <> :active"
+                    ),
+                    {"scope": self._scope_id, "active": active},
+                )
+            ).all()
+            for row in stale:
+                plaintext = self._ring.decrypt(row.key_id, row.ciphertext)
+                enc = self._ring.encrypt(plaintext)
+                await conn.execute(
+                    text(
+                        "UPDATE connector_tokens SET ciphertext = :ct, key_id = :kid, "
+                        "updated_at = now() WHERE scope_id = :scope AND connector_id = :cid"
+                    ),
+                    {
+                        "ct": enc.ciphertext,
+                        "kid": enc.key_id,
+                        "scope": self._scope_id,
+                        "cid": row.connector_id,
+                    },
+                )
+                rotated += 1
+        return rotated

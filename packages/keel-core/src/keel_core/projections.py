@@ -16,6 +16,7 @@ from collections.abc import Iterable
 from typing import Any
 
 from keel_core.events import Event, EventType
+from keel_core.evolution import upcast_event
 
 
 def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
@@ -123,7 +124,8 @@ def project_messages(events: Iterable[Event]) -> list[dict[str, Any]]:
         flush_deferred_before_run()
         active_run_ids.add(run_id)
 
-    for event in events:
+    for stored_event in events:
+        event = upcast_event(stored_event)
         role = event.payload.get("role")
         is_user_boundary = event.type is EventType.message_token and role in (
             "user",

@@ -3,8 +3,10 @@
 ``GET /v1/connectors/gmail/connect`` builds a Google consent URL (server callback as the
 redirect) and 302s the browser to Google; ``GET /v1/connectors/gmail/callback`` exchanges
 the code and stores ``Credentials.to_json()`` via the scope-bound, encrypted token store.
-CSRF ``state`` is validated against an in-memory set on ``app.state``. Requires the OAuth
-client JSON (``KEEL_GMAIL_CLIENT_SECRETS_PATH``) + ``KEEL_SECRET_KEY`` on the server.
+CSRF ``state`` is validated against a **durable, expiring, one-time** store (Postgres when
+an engine is configured, else in-memory) so a legitimate callback survives a restart or a
+second replica while a replayed/unknown state is rejected. Requires the OAuth client JSON
+(``KEEL_GMAIL_CLIENT_SECRETS_PATH``) + ``KEEL_SECRET_KEY`` on the server.
 """
 
 from __future__ import annotations
@@ -16,7 +18,12 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from keel_core.config import get_settings
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
-from keel_core.secrets import cipher_from_settings
+from keel_core.oauth_state import (
+    InMemoryOAuthStateStore,
+    OAuthState,
+    PostgresOAuthStateStore,
+)
+from keel_core.secrets import keyring_from_settings
 from keel_core.tokens import PostgresTokenStore
 
 router = APIRouter(prefix="/v1/connectors/gmail", tags=["oauth"])
@@ -29,11 +36,23 @@ _SUCCESS_HTML = (
 )
 
 
-def _oauth_states(request: Request) -> dict[str, str]:
-    states: dict[str, str] | None = getattr(request.app.state, "oauth_states", None)
-    if states is None:
-        states = request.app.state.oauth_states = {}
-    return states
+def _oauth_state_store(request: Request) -> Any:
+    """The durable OAuth state store (Postgres when an engine is wired, else in-memory).
+
+    Cached on ``app.state`` so the in-memory fallback is shared across the connect and
+    callback requests within one process.
+    """
+    store = getattr(request.app.state, "oauth_state_store", None)
+    if store is not None:
+        return store
+    settings = get_settings()
+    engine = getattr(request.app.state, "engine", None)
+    if engine is not None:
+        store = PostgresOAuthStateStore(engine, ttl_seconds=settings.oauth_state_ttl_seconds)
+    else:
+        store = InMemoryOAuthStateStore(ttl_seconds=settings.oauth_state_ttl_seconds)
+    request.app.state.oauth_state_store = store
+    return store
 
 
 def _flow(redirect_uri: str) -> Any:
@@ -56,7 +75,8 @@ async def gmail_oauth_connect(request: Request) -> RedirectResponse:
     auth_url, state = flow.authorization_url(
         access_type="offline", prompt="consent", include_granted_scopes="true"
     )
-    _oauth_states(request)[state] = getattr(request.app.state, "durable_scope", "web:local")
+    scope = getattr(request.app.state, "durable_scope", "web:local")
+    await _oauth_state_store(request).put(state, scope, GMAIL_CONNECTOR_ID)
     return RedirectResponse(auth_url)
 
 
@@ -65,8 +85,8 @@ async def gmail_oauth_callback(
     request: Request, state: str = Query(...), code: str | None = Query(None)
 ) -> HTMLResponse:
     """Exchange the authorization code and store the connector token for the scope."""
-    scope = _oauth_states(request).pop(state, None)
-    if scope is None:
+    consumed: OAuthState | None = await _oauth_state_store(request).consume(state)
+    if consumed is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid or expired oauth state")
     engine = getattr(request.app.state, "engine", None)
     if engine is None or not code:
@@ -74,6 +94,6 @@ async def gmail_oauth_callback(
 
     flow = _flow(_callback_uri(request))
     flow.fetch_token(code=code)
-    store = PostgresTokenStore(engine, scope, cipher_from_settings(get_settings()))
-    await store.put(GMAIL_CONNECTOR_ID, flow.credentials.to_json())
+    store = PostgresTokenStore(engine, consumed.scope_id, keyring_from_settings(get_settings()))
+    await store.put(consumed.connector_id, flow.credentials.to_json())
     return HTMLResponse(_SUCCESS_HTML)

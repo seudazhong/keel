@@ -1,9 +1,13 @@
-"""Keel SDK (stub).
-
-The decorator-based tool/agent authoring API (P8 footprint ladder) lands with
-extensibility in M1 and the plugin SDK in M3.
-"""
+"""Typed async client and DTOs for Keel's additive `/v1` API."""
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from keel_sdk.client import KeelClient
+from keel_sdk.models import CreateMessageRequest, CreateMessageResponse, InterruptRunResponse
+
+__all__ = [
+    "CreateMessageRequest",
+    "CreateMessageResponse",
+    "InterruptRunResponse",
+    "KeelClient",
+]

@@ -29,6 +29,7 @@ from keel_core.approvals import ApprovalStore
 from keel_core.connectors import taint_from_events
 from keel_core.errors import KeelError
 from keel_core.events import Event, EventType
+from keel_core.evolution import current_event_version
 from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.projections import project_messages
 from keel_core.protocols import (
@@ -185,6 +186,7 @@ async def _emit(
     await store.append(
         Event(
             type=event_type,
+            version=current_event_version(event_type),
             seq=0,  # assigned by the store
             session_id=session_id,
             scope_id=scope_id,

@@ -14,6 +14,7 @@ from typing import Any
 import redis.asyncio as redis
 
 from keel_core.events import Event
+from keel_core.evolution import EVENT_UPCASTERS
 from keel_core.types import SessionId
 
 
@@ -38,7 +39,7 @@ class RedisEventStore:
     async def _read(self, session_id: SessionId, after: int | None) -> AsyncIterator[Event]:
         entries: list[tuple[Any, dict[Any, Any]]] = await self._redis.xrange(self._key(session_id))
         for _entry_id, fields in entries:
-            event = Event.model_validate_json(fields["data"])
+            event = EVENT_UPCASTERS.decode(fields["data"])
             if after is None or event.seq > after:
                 yield event
 
@@ -60,7 +61,7 @@ class RedisEventStore:
         backlog: list[tuple[Any, dict[Any, Any]]] = await self._redis.xrange(key)
         for entry_id, fields in backlog:
             last_id = entry_id
-            event = Event.model_validate_json(fields["data"])
+            event = EVENT_UPCASTERS.decode(fields["data"])
             if after is None or event.seq > after:
                 yield event
 
@@ -71,4 +72,4 @@ class RedisEventStore:
             for _stream_key, entries in response:
                 for entry_id, fields in entries:
                     last_id = entry_id
-                    yield Event.model_validate_json(fields["data"])
+                    yield EVENT_UPCASTERS.decode(fields["data"])

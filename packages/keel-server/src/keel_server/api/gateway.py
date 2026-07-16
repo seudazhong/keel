@@ -1,8 +1,11 @@
-"""OneBot (QQ) IM webhook (WS-E/J).
+"""OneBot (QQ) + Telegram IM webhooks (WS-E/J), authenticated + replay-safe (M3.3).
 
-``POST /v1/gateway/onebot`` receives OneBot v11 events. Handling runs in a background
-task so the bot framework gets an immediate ack; the reply is sent back over the
-OneBot HTTP API. Namespaced under ``/v1`` (additive-only, G14).
+``POST /v1/gateway/onebot`` and ``POST /v1/gateway/telegram`` receive IM events. Each
+request is **verified before dispatch**: a OneBot HMAC-SHA1 body signature or Telegram
+shared-secret header (constant-time), then a durable replay check that drops a re-sent
+delivery. Handling runs in a background task so the bot framework gets an immediate ack;
+the reply is sent back over the platform's HTTP API. Namespaced under ``/v1``
+(additive-only, G14).
 """
 
 from __future__ import annotations
@@ -12,6 +15,15 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 
+from keel_core.config import get_settings
+from keel_core.webhooks import (
+    InMemoryWebhookReplayStore,
+    WebhookReplayStore,
+    onebot_delivery_id,
+    telegram_delivery_id,
+    verify_onebot_signature,
+    verify_telegram_secret,
+)
 from keel_server.gateway import OneBotGateway, TelegramGateway
 
 router = APIRouter(prefix="/v1/gateway", tags=["gateway"])
@@ -31,12 +43,34 @@ def _telegram_gateway(request: Request) -> TelegramGateway:
     return gateway
 
 
+def _replay_store(request: Request) -> WebhookReplayStore:
+    """The durable replay store (set at startup); falls back to a shared in-memory one."""
+    store = getattr(request.app.state, "webhook_replay_store", None)
+    if store is None:
+        store = request.app.state.webhook_replay_store = InMemoryWebhookReplayStore()
+    return store
+
+
 @router.post("/onebot", status_code=status.HTTP_202_ACCEPTED, summary="OneBot v11 event webhook")
 async def onebot_webhook(
     payload: dict[str, Any], request: Request, background: BackgroundTasks
 ) -> dict[str, bool]:
-    """Ack immediately; process the event (wake -> run -> reply) in the background."""
+    """Verify the signature + replay, ack, then process the event in the background."""
     gateway = _gateway(request)
+    settings = get_settings()
+    raw = await request.body()
+    secret = settings.onebot_signing_secret
+    if secret:
+        if not verify_onebot_signature(secret, raw, request.headers.get("x-signature")):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid webhook signature")
+    elif settings.cloud_mode:
+        # Cloud mode fails closed: an unauthenticated public webhook is a misconfiguration.
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "onebot webhook signing secret is required in cloud mode",
+        )
+    if await _replay_store(request).seen_before("onebot", onebot_delivery_id(raw)):
+        return {"accepted": False}  # replay: drop silently
     background.add_task(gateway.handle, payload)
     return {"accepted": True}
 
@@ -45,8 +79,24 @@ async def onebot_webhook(
 async def telegram_webhook(
     payload: dict[str, Any], request: Request, background: BackgroundTasks
 ) -> dict[str, bool]:
-    """Ack immediately; process the update (wake -> run -> reply) in the background."""
+    """Verify the secret header + replay, ack, then process the update in the background."""
     gateway = _telegram_gateway(request)
+    settings = get_settings()
+    secret = settings.telegram_webhook_secret
+    if secret:
+        header = request.headers.get("x-telegram-bot-api-secret-token")
+        if not verify_telegram_secret(secret, header):
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid webhook secret")
+    elif settings.cloud_mode:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "telegram webhook secret is required in cloud mode",
+        )
+    delivery_id = telegram_delivery_id(payload)
+    if delivery_id is not None and await _replay_store(request).seen_before(
+        "telegram", delivery_id
+    ):
+        return {"accepted": False}  # replay: drop silently
     background.add_task(gateway.handle, payload)
     return {"accepted": True}
 
