@@ -1,4 +1,5 @@
-# keel-server: stateless FastAPI control-plane API. Horizontally scalable (ARCHITECTURE §15).
+# keel-server: stateless FastAPI control-plane API. Architecturally horizontally scalable
+# (ARCHITECTURE §15), but held at a single replica here — see the `replicas:` comment below.
 #
 # SECURITY-CRITICAL: keel-server currently executes `ShellTool`/model-chosen tool calls
 # **in-process** (there is no deployed sandbox service yet — see
@@ -23,7 +24,15 @@ metadata:
     app.kubernetes.io/part-of: keel
     app.kubernetes.io/component: control-plane
 spec:
-  replicas: 2
+  # Held at 1 until durable interactive run/approval coordination lands: interactive runs and
+  # pending tool-approval state are currently process-local (docs/OPERATIONS.md "Current
+  # production-readiness limits"; M3.6 exit gate "restart/scale-out preserves run and approval
+  # ownership"; M3.3 exit gate "Server restart does not lose an admitted run or pending
+  # approval" — docs/ROADMAP.md). A second replica today would let a client's SSE stream or an
+  # in-flight approval land on a Pod that never admitted that run, silently losing it. Raise
+  # this only once that work ships, and update
+  # ../../overlays/production/patch-server-single-replica.yaml to match.
+  replicas: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: keel-server

@@ -30,10 +30,13 @@ it does not by itself satisfy the hostile multi-tenant gates in
 
 2. **Fill in placeholders:**
    - `base/secret-app.example.yaml` → copy to `secret-app.yaml` (your overlay, not this repo).
-     **Set a real, non-empty `KEEL_API_KEYS`** — empty/missing means every request is treated
-     as an implicit, unauthenticated admin (`packages/keel-core/src/keel_core/config.py`
-     `api_keys`). Fill the rest of the real values or point an external-secret operator at
-     this name/shape.
+     **Set a real, non-empty `KEEL_API_KEYS`** with at least one valid `key:role` entry (role
+     one of `viewer`/`operator`/`admin`) — empty/missing/malformed means every request is
+     treated as an implicit, unauthenticated admin (`packages/keel-core/src/keel_core/config.py`
+     `api_keys`; format matches `packages/keel-server/src/keel_server/auth.py`
+     `parse_api_keys`). Fill the rest of the real values or point an external-secret operator
+     at this name/shape. Leave `KEEL_CLOUD_MODE: "true"` in `base/configmap-app.yaml`
+     unchanged — do not set it to `"false"`.
    - `base/datastores/postgres-external-service.example.yaml` /
      `redis-external-service.example.yaml` → copy, set the real `externalName` (or replace
      with your operator's Service if self-hosting in-cluster).
@@ -76,7 +79,9 @@ it does not by itself satisfy the hostile multi-tenant gates in
    ```
    `keel-scheduler` is not part of this list: this scaffold does not deploy it (its entrypoint
    is currently a stub — see `docs/security-model.md` "Why `keel-scheduler` is not deployed").
-   Scheduling happens inside `keel-worker`'s own cron tick.
+   Scheduling happens inside `keel-worker`'s own cron tick. Do not scale `keel-server` beyond
+   1 replica (see `docs/security-model.md` "Why `keel-server` is pinned to one replica") — only
+   `keel-worker` is meant to be scaled.
 
 7. **Smoke-test:**
    ```powershell

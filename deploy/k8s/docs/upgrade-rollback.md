@@ -17,9 +17,15 @@ Repeat for `keel-worker` and `keel-web`. Order matters when a release includes a
    must be additive/backward-compatible with the currently-running previous version for the
    duration of the rollout (standard expand/contract migration discipline) since old and new
    Pods run concurrently mid-rollout.
-2. **Roll `keel-server`**, then `keel-worker`, then `keel-web`. `keel-server` is stateless and
-   horizontally scalable, so a rolling update here causes no downtime as long as
-   `readinessProbe` gates traffic correctly (it does — see `base/server/deployment.yaml`).
+2. **Roll `keel-server`**, then `keel-worker`, then `keel-web`. `keel-server` is architecturally
+   stateless and horizontally scalable, but is pinned to 1 replica in this scaffold today
+   (`docs/security-model.md` "Why `keel-server` is pinned to one replica" — interactive
+   run/approval state is process-local). A single-replica `RollingUpdate` still briefly runs
+   an old and a new Pod together while the new one becomes ready, which carries the same
+   caveat: an in-flight run/approval could still land on the Pod that gets terminated. This
+   is an accepted gap pending the same durable-coordination work, not a hidden regression —
+   avoid rolling `keel-server` during a window with known in-flight interactive runs/approvals
+   until M3.3/M3.6 close this gate.
 
 `keel-scheduler` is not part of this rollout: this scaffold does not deploy it (its entrypoint
 is currently a stub that would crash-loop as a long-lived Deployment — see

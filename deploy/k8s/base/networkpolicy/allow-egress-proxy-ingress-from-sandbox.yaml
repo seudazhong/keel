@@ -1,0 +1,32 @@
+# Ingress-side counterpart to ../networkpolicy/allow-sandbox-egress-proxy-only.yaml's
+# sandbox -> egress-proxy egress rule. NetworkPolicy is directional (see
+# ../../docs/security-model.md "NetworkPolicy caveats"): the egress allow on the sandbox side
+# alone would still be silently dropped by default-deny-all.yaml without a matching ingress
+# allow on the egress-proxy side.
+#
+# No `keel-egress-proxy` Deployment ships in this scaffold (it is application-layer, not a
+# manifest-only concern — see the egress policy's own header comment); this NetworkPolicy is
+# still shipped active because its `podSelector` only ever matches Pods your own platform team
+# labels `app.kubernetes.io/component: egress-proxy` when they stand one up — until then it
+# selects zero Pods and has no effect, so shipping it now costs nothing and avoids an
+# easy-to-forget manual step (adding the ingress half) the day a real proxy is deployed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-egress-proxy-ingress-from-sandbox
+  labels:
+    app.kubernetes.io/part-of: keel
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: egress-proxy
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: sandbox
+      ports:
+        - protocol: TCP
+          port: 3128

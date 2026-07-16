@@ -15,14 +15,36 @@ and §8 "Threat model & tenancy invariants" of the
 | Restricted Pod `securityContext` | every Deployment + the sandbox Job template | non-root, dropped `ALL` Linux capabilities (web adds back only `NET_BIND_SERVICE` to bind port 80), no privilege escalation, `seccompProfile: RuntimeDefault`, read-only root filesystem with `emptyDir` scratch for the few writable paths each process needs |
 | No ServiceAccount token anywhere | every workload, `base/sandbox/serviceaccount.yaml`, `base/sandbox/job-template.yaml` | `automountServiceAccountToken: false` everywhere, including `keel-server` (which executes shell/code tools in-process today — see "Isolation levels" below); `scripts/validate_manifests.py` fails the build if any workload omits this |
 | No Kubernetes RBAC at all | (nothing — deliberately) | this scaffold grants **zero** Role/ClusterRole/RoleBinding/ClusterRoleBinding to any of its own ServiceAccounts; `scripts/validate_manifests.py` fails the build if one is ever added back as an active resource. See "Sandbox Job creation is not wired up" below for why |
-| Required externally-supplied auth | `base/secret-app.example.yaml` (`KEEL_API_KEYS`), `base/configmap-app.yaml` | `KEEL_API_KEYS` must be non-empty and lives only in a Secret, never the plaintext ConfigMap — empty/missing makes every request an implicit, unauthenticated admin (`packages/keel-core/src/keel_core/config.py` `api_keys`). `scripts/validate_manifests.py` fails the build if it is missing, empty, or present in the ConfigMap |
+| Required externally-supplied auth | `base/secret-app.example.yaml` (`KEEL_API_KEYS`), `base/configmap-app.yaml` (`KEEL_CLOUD_MODE`) | `KEEL_API_KEYS` must be non-empty, contain at least one syntactically valid `key:role` entry, and lives only in a Secret, never the plaintext ConfigMap — empty/missing/malformed makes every request an implicit, unauthenticated admin (`packages/keel-core/src/keel_core/config.py` `api_keys`; role parsing mirrors `packages/keel-server/src/keel_server/auth.py` `parse_api_keys`). `KEEL_CLOUD_MODE: "true"` is forced in the active config so a future fail-closed enforcement of that setting is already correctly configured. `scripts/validate_manifests.py` fails the build if any of this regresses, and never logs the key value itself when it does |
+| Single-replica `keel-server` | `base/server/deployment.yaml`, `overlays/production/patch-server-single-replica.yaml` | held at exactly 1 replica in both base and production — see "Why `keel-server` is pinned to one replica" below |
 | Non-source-tree tool workspace | `base/server/deployment.yaml` (`workingDir: /workspace` + matching `emptyDir`) | keeps the read-only root filesystem consistent with the app's actual `Path.cwd()`-based tool workspace (`packages/keel-server/src/keel_server/app.py`) instead of pointing it at the read-only `/app` source tree |
 | Bounded resources | every container | explicit `requests`/`limits`; sandbox Jobs additionally set `activeDeadlineSeconds` and `backoffLimit: 0` so a stuck or misbehaving run cannot retry indefinitely or run unbounded |
-| Default-deny network, both directions | `base/networkpolicy/default-deny-all.yaml` + narrow, paired allows | every Pod denies all ingress/egress unless an explicit policy allows it; because `NetworkPolicy` is directional, every cross-Pod path ships **both** halves — `allow-web-egress-to-server.yaml` (egress) pairs with `allow-ingress-to-web-and-server.yaml` (ingress), and `allow-sandbox-egress-proxy-only.yaml` (egress) pairs with `allow-server-ingress-from-sandbox.yaml` (ingress) for the sandbox RPC callback |
+| Default-deny network, both directions | `base/networkpolicy/default-deny-all.yaml` + narrow, paired allows | every Pod denies all ingress/egress unless an explicit policy allows it; because `NetworkPolicy` is directional, every cross-Pod path ships **both** halves — `allow-web-egress-to-server.yaml` (egress) pairs with `allow-ingress-to-web-and-server.yaml` (ingress); `allow-sandbox-egress-proxy-only.yaml` (egress) pairs with `allow-server-ingress-from-sandbox.yaml` (ingress) for the sandbox RPC callback; and the same egress rule's proxy leg pairs with `allow-egress-proxy-ingress-from-sandbox.yaml` (ingress) for the egress-proxy's side |
+| DNS egress scoped to `kube-system` | `base/networkpolicy/allow-dns-egress.yaml` | `namespaceSelector` matches the `kube-system` namespace by its automatic `kubernetes.io/metadata.name` label, not `{}` (any namespace) — a same-labeled Pod outside `kube-system` cannot become an egress target |
 | Namespace-per-org guidance | `base/namespace.yaml` | one namespace per tenant is the documented blast-radius boundary; this scaffold does not ship a controller that provisions those namespaces for you |
 | Pod Security Admission | `base/namespace.yaml` (`warn`/`audit`), `overlays/production` (`enforce: restricted`) | production enforces the Kubernetes-defined "restricted" profile at admission time, independent of whether an individual manifest regresses |
 
-## Sandbox Job creation is not wired up (and why that is deliberate)
+## Why `keel-server` is pinned to one replica
+
+`keel-server` is architecturally stateless and horizontally scalable (ARCHITECTURE §15), but
+both `base/server/deployment.yaml` and the production overlay's
+`patch-server-single-replica.yaml` hold it at exactly 1 replica today. Interactive runs and
+pending tool-approval state are currently **process-local**
+(`docs/OPERATIONS.md` "Current production-readiness limits"): a client's SSE stream or an
+in-flight approval is only known to the Pod that admitted it. A second replica behind a
+Service would load-balance new requests across both Pods, and a request that lands on the
+"wrong" replica for an existing run/approval would silently lose it — worse than refusing to
+scale at all. Raise this only once durable interactive run/approval coordination lands
+(`docs/ROADMAP.md` M3.3 exit gate "Server restart does not lose an admitted run or pending
+approval"; M3.6 exit gate "restart/scale-out preserves run and approval ownership") — update
+both the base default and the production patch together so they cannot drift apart.
+
+`keel-worker` has no such constraint: arq gives each job to exactly one worker and coordinates
+the `scheduler_tick` cron across replicas via a Redis lock, so it scales freely
+(`docker-compose.yml` comments) — the production overlay raises its replica floor
+independently of `keel-server`.
+
+
 
 An earlier version of this scaffold granted `keel-server`'s own ServiceAccount RBAC to
 `create`/`get`/`list`/`watch`/`delete` `Jobs` and read `Pods`/`Pod` logs, reasoning that this
@@ -96,11 +118,26 @@ that for materially tighter control instead of the IP-range allow.
 
 **NetworkPolicy is directional.** An egress allow on the source Pod and an ingress allow on
 the destination Pod are both required — one without the other is silently dropped by
-`default-deny-all.yaml`. This scaffold ships both halves for every cross-Pod path it defines
-(`allow-web-egress-to-server.yaml` / `allow-ingress-to-web-and-server.yaml`, and
-`allow-sandbox-egress-proxy-only.yaml` / `allow-server-ingress-from-sandbox.yaml`); if you add
-a new cross-Pod path, add both halves too — `scripts/validate_manifests.py`'s directionality
-check only knows about the paths this scaffold itself defines.
+`default-deny-all.yaml`. This scaffold ships both halves for every cross-Pod path it defines:
+`allow-web-egress-to-server.yaml` / `allow-ingress-to-web-and-server.yaml`;
+`allow-sandbox-egress-proxy-only.yaml` / `allow-server-ingress-from-sandbox.yaml` for the
+sandbox RPC callback; and the same egress rule's proxy leg /
+`allow-egress-proxy-ingress-from-sandbox.yaml` for the sandbox-to-egress-proxy path — the
+latter is shipped active even though no `keel-egress-proxy` Deployment exists in this scaffold,
+because its `podSelector` matches zero Pods until your platform team labels one
+`app.kubernetes.io/component: egress-proxy`, so it costs nothing to ship now and avoids an
+easy-to-forget manual step later. If you add a new cross-Pod path, add both halves too —
+`scripts/validate_manifests.py`'s directionality check only knows about the paths this
+scaffold itself defines.
+
+**DNS egress is scoped to `kube-system` by name**
+(`allow-dns-egress.yaml`'s `namespaceSelector` matches the `kubernetes.io/metadata.name:
+kube-system` label every namespace gets automatically since Kubernetes 1.21), not
+`namespaceSelector: {}` (any namespace) — the broader form would let every Pod in this
+namespace reach any same-labeled Pod (`k8s-app: kube-dns` or `app.kubernetes.io/name: coredns`)
+in *any* namespace, not just the cluster's real DNS. If your cluster's DNS Pods carry a
+different label, add a third `to:` entry scoped to `kube-system` rather than widening the
+`namespaceSelector`.
 
 Since this scaffold grants **no RBAC** to `keel-server`/`keel-worker` (see above), it also adds
 **no NetworkPolicy egress rule to the Kubernetes API server** — there is nothing for these
@@ -160,23 +197,36 @@ rollout language (§8.4, §9):
    DB role can bypass it); there is no user/org model, so "namespace-per-org" is a Kubernetes
    convention this scaffold documents, not an automated per-tenant provisioning/authorization
    system.
-5. **Egress allow-list proxy.** `allow-sandbox-egress-proxy-only.yaml` assumes a
-   `keel-egress-proxy` workload exists; this scaffold does not ship that proxy's Deployment or
-   its allow-list/registry-mirror logic (design doc §9 "Egress") — only the NetworkPolicy that
-   would constrain it once it exists.
-6. **A real, long-lived `keel-scheduler`.** Its current entrypoint is a stub (see "Why
+5. **Durable interactive run/approval coordination.** This is *why* `keel-server` is pinned to
+   1 replica (see "Why `keel-server` is pinned to one replica" above) rather than scaled out
+   like the architecture target — M3.3/M3.6 exit gates in `docs/ROADMAP.md` ("Server restart
+   does not lose an admitted run or pending approval"; "restart/scale-out preserves run and
+   approval ownership") are not yet met.
+6. **Cloud-mode enforcement in application code.** `KEEL_CLOUD_MODE` is shipped `"true"` in
+   `base/configmap-app.yaml` so the correct value is already in place, but
+   `packages/keel-core/src/keel_core/config.py` has no such setting yet — nothing currently
+   reads or enforces it. Do not treat setting this key as equivalent to fail-closed auth being
+   implemented; `KEEL_API_KEYS` being non-empty and correctly formatted is what actually gates
+   access today (see "authenticate()"/`parse_api_keys` in
+   `packages/keel-server/src/keel_server/auth.py`).
+7. **Egress allow-list proxy.** `allow-sandbox-egress-proxy-only.yaml` /
+   `allow-egress-proxy-ingress-from-sandbox.yaml` assume a `keel-egress-proxy` workload exists;
+   this scaffold does not ship that proxy's Deployment or its allow-list/registry-mirror logic
+   (design doc §9 "Egress") — only the NetworkPolicy pair that would constrain it once it
+   exists.
+8. **A real, long-lived `keel-scheduler`.** Its current entrypoint is a stub (see "Why
    `keel-scheduler` is not deployed" above); the leader-elected cron service in
    `docs/ROADMAP.md` M3.8 does not exist in code yet.
-7. **Vertical/observability integration.** OTel, Prometheus, and Langfuse are referenced in
+9. **Vertical/observability integration.** OTel, Prometheus, and Langfuse are referenced in
    `docs/slo-alerting.md` as targets; no metrics/alerting stack ships in this scaffold, and
    reconciled usage/100%-required-run-tracing (M3.8 exit gate) is not implemented.
-8. **Backup/restore/DR drills.** `docs/backup-restore-dr.md` documents the intended procedure
-   and RPO/RTO targets; no drill has been executed against a real cluster, and no automation
-   exists to run one.
-9. **NetworkPolicy enforcement verification.** As noted above, this scaffold cannot verify a
-   given cluster's CNI actually enforces the policies it ships — that requires a live cluster
-   test this repo's cluster-free validation deliberately does not perform.
+10. **Backup/restore/DR drills.** `docs/backup-restore-dr.md` documents the intended procedure
+    and RPO/RTO targets; no drill has been executed against a real cluster, and no automation
+    exists to run one.
+11. **NetworkPolicy enforcement verification.** As noted above, this scaffold cannot verify a
+    given cluster's CNI actually enforces the policies it ships — that requires a live cluster
+    test this repo's cluster-free validation deliberately does not perform.
 
-Until (1)–(5) are closed, treat any Kubernetes deployment of this scaffold as, at best, the
+Until (1)–(6) are closed, treat any Kubernetes deployment of this scaffold as, at best, the
 same **trusted single-org preview** tier as the Compose `full` profile
 ([`docs/OPERATIONS.md`](../../../docs/OPERATIONS.md)) — not a hostile multi-tenant platform.

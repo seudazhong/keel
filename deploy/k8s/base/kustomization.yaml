@@ -35,6 +35,7 @@ resources:
   - networkpolicy/allow-dns-egress.yaml
   - networkpolicy/allow-control-plane-egress.yaml
   - networkpolicy/allow-sandbox-egress-proxy-only.yaml
+  - networkpolicy/allow-egress-proxy-ingress-from-sandbox.yaml
   - networkpolicy/allow-ingress-to-web-and-server.yaml
   - networkpolicy/allow-web-egress-to-server.yaml
   - networkpolicy/allow-server-ingress-from-sandbox.yaml

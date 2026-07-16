@@ -15,6 +15,20 @@ data:
   KEEL_DEFAULT_MODEL: "gpt-4o-mini"
   KEEL_SERVER_HOST: "0.0.0.0"
   KEEL_SERVER_PORT: "8000"
+  # Force fail-closed auth in every environment this scaffold deploys to. Keel's own default
+  # (packages/keel-core/src/keel_core/config.py `api_keys` empty -> implicit open admin) exists
+  # for local/self-hosted single-user convenience (ADR-0008); a Kubernetes deployment is never
+  # that use case, so it must not silently fall back to open mode if `KEEL_API_KEYS`
+  # (../secret-app.example.yaml) is ever missing/emptied/misconfigured after this scaffold's
+  # own validation has passed (e.g. an operator's own pipeline strips it later).
+  #
+  # NOT YET CONSUMED BY APPLICATION CODE — there is no `cloud_mode`/`KEEL_CLOUD_MODE` setting
+  # in `packages/keel-core/src/keel_core/config.py` today; enforcing it is `docs/ROADMAP.md`
+  # M3.3 "Cloud Safety Foundation" work ("explicit fail-closed permission defaults"). Shipping
+  # the key now, set to the safe value, means deployments already carry the correct
+  # configuration the day that gate closes, instead of every existing overlay needing an edit
+  # to opt in. Until then this key is inert. See ../docs/security-model.md "Pending gates".
+  KEEL_CLOUD_MODE: "true"
   # DB/Redis hostnames resolve to the Service references in base/datastores/. Point them at a
   # managed Postgres/Redis (recommended) or an in-cluster StatefulSet you operate yourself;
   # this scaffold does not ship a stock in-cluster database (see ../docs/storage-topology.md).

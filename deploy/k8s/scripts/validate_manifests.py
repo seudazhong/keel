@@ -33,9 +33,12 @@ What this checks (see docs/security-model.md for the rationale behind each rule)
        - no active (deployable) resource anywhere grants RBAC (Role/ClusterRole/RoleBinding/
          ClusterRoleBinding) at all — this scaffold intentionally ships no Kubernetes API
          access for the app's own ServiceAccounts (see docs/security-model.md);
-       - `base/secret-app.example.yaml` requires a non-empty `KEEL_API_KEYS`, and
-         `base/configmap-app.yaml` never sets it (auth must come from an externally supplied
-         Secret, never a default-empty/open-admin config);
+       - `base/secret-app.example.yaml` requires a non-empty, syntactically valid
+         (`key:role`, role one of viewer/operator/admin) `KEEL_API_KEYS` entry (without ever
+         logging the key material itself), `base/configmap-app.yaml` never sets that key
+         (auth must come from an externally supplied Secret, never a default-empty/open-admin
+         config), and the active config forces `KEEL_CLOUD_MODE: "true"` so fail-closed auth
+         is the shipped default even before that setting is consumed by application code;
        - keel-server's tool workspace (`workingDir`) is never the read-only `/app` source
          tree, and is backed by a real writable volume mount;
        - the sandbox ServiceAccount and Job template disable ServiceAccount token automount
@@ -44,7 +47,10 @@ What this checks (see docs/security-model.md for the rationale behind each rule)
          `runtimeClassName` (it must stay opt-in/configurable, not silently required);
        - a default-deny NetworkPolicy exists and every other NetworkPolicy narrows rather than
          widens it, and both directions (egress on the source, ingress on the destination) are
-         present for keel-web -> keel-server and sandbox -> keel-server;
+         present for keel-web -> keel-server, sandbox -> keel-server, and sandbox -> the
+         egress-proxy;
+       - DNS egress is scoped to the `kube-system` namespace by name, never `namespaceSelector: {}`
+         (any namespace);
        - example/template files (secret*.example.yaml, datastores/*.example.yaml) only contain
          placeholder credential markers, never a value that looks like a real secret.
 
@@ -314,13 +320,20 @@ def check_workspace_is_not_readonly_app(findings: list[Finding]) -> None:
 
 
 def check_auth_secret_required(findings: list[Finding]) -> None:
-    """Auth must come from an externally supplied, non-empty `KEEL_API_KEYS`.
+    """Auth must come from an externally supplied, non-empty, syntactically valid
+    `KEEL_API_KEYS`, and every active config must force fail-closed cloud mode.
 
     Empty/missing `KEEL_API_KEYS` makes every request an implicit, unauthenticated admin
     (`packages/keel-core/src/keel_core/config.py` `api_keys`; docs/OPERATIONS.md). The
     scaffold cannot force an operator to fill in a real value, but it can and must (a) require
-    the key to exist with a non-empty placeholder in the shipped template, and (b) never let
-    it leak into the plaintext ConfigMap.
+    the key to exist with a non-empty, correctly-shaped (`key:role`) placeholder in the
+    shipped template, (b) never let it leak into the plaintext ConfigMap, and (c) ship
+    `KEEL_CLOUD_MODE: "true"` in the active config so a future fail-closed enforcement of that
+    setting has the right value from day one (see base/configmap-app.yaml's own comment for
+    why this is not yet consumed by application code).
+
+    Deliberately never includes the actual key value in a finding message — only whether a
+    validly-shaped entry was found — so this check cannot leak key material into CI logs.
     """
     secret_path = K8S_ROOT / "base/secret-app.example.yaml"
     secret_text = read(secret_path)
@@ -333,6 +346,15 @@ def check_auth_secret_required(findings: list[Finding]) -> None:
                 "means open, unauthenticated admin mode"
             )
         )
+    elif not _has_valid_key_role_entry(match.group(1)):
+        findings.append(
+            Finding(
+                f"{secret_label}: `KEEL_API_KEYS` must contain at least one syntactically "
+                "valid `key:role` entry (role one of viewer/operator/admin, matching "
+                "packages/keel-server/src/keel_server/auth.py parse_api_keys) — value shape "
+                "omitted from this message on purpose"
+            )
+        )
 
     configmap_path = K8S_ROOT / "base/configmap-app.yaml"
     configmap_text = read(configmap_path)
@@ -343,6 +365,28 @@ def check_auth_secret_required(findings: list[Finding]) -> None:
                 f"{configmap_label}: `KEEL_API_KEYS` must live only in a Secret, never a ConfigMap"
             )
         )
+
+    cloud_mode_match = re.search(
+        r'^\s*KEEL_CLOUD_MODE:\s*"?(\w+)"?\s*$', configmap_text, re.MULTILINE
+    )
+    if not cloud_mode_match or cloud_mode_match.group(1).lower() != "true":
+        findings.append(
+            Finding(
+                f'{configmap_label}: must set `KEEL_CLOUD_MODE: "true"` so auth fails closed '
+                "rather than falling back to open admin mode"
+            )
+        )
+
+
+_KEY_ROLE_ENTRY = re.compile(r"^[^\s,:]+:(viewer|operator|admin)$", re.IGNORECASE)
+
+
+def _has_valid_key_role_entry(raw: str) -> bool:
+    """Mirror `parse_api_keys`'s `key:role` grammar (packages/keel-server/src/keel_server/auth.py)
+    closely enough to catch an obviously-malformed template value, without being a full
+    reimplementation of that parser.
+    """
+    return any(_KEY_ROLE_ENTRY.match(entry.strip()) for entry in raw.split(",") if entry.strip())
 
 
 def check_sandbox_isolation(findings: list[Finding]) -> None:
@@ -433,6 +477,39 @@ def check_network_policy_directionality(findings: list[Finding]) -> None:
                 "base/networkpolicy: missing an ingress allow on keel-server from sandbox "
                 "Pods (egress-only rules do not let the sandbox RPC callback reach keel-server)"
             )
+        )
+    if "allow-egress-proxy-ingress-from-sandbox" not in combined:
+        findings.append(
+            Finding(
+                "base/networkpolicy: missing an ingress allow on the egress-proxy from "
+                "sandbox Pods (allow-sandbox-egress-proxy-only.yaml's egress rule has no "
+                "matching ingress half)"
+            )
+        )
+
+
+def check_dns_policy_scoped_to_kube_system(findings: list[Finding]) -> None:
+    """DNS egress must be scoped to `kube-system`, not any namespace.
+
+    `namespaceSelector: {}` matches every namespace in the cluster — a Pod anywhere with a
+    matching DNS label (`k8s-app: kube-dns`, etc.) outside `kube-system` would also become a
+    legitimate egress target, which is broader than "let Pods resolve cluster DNS".
+    """
+    path = K8S_ROOT / "base/networkpolicy/allow-dns-egress.yaml"
+    text = read(path)
+    label = str(path.relative_to(REPO_ROOT))
+    code_lines = [line for line in text.splitlines() if not line.strip().startswith("#")]
+    code_text = "\n".join(code_lines)
+    if "namespaceSelector: {}" in code_text:
+        findings.append(
+            Finding(
+                f"{label}: DNS egress must scope `namespaceSelector` to `kube-system` "
+                "(kubernetes.io/metadata.name), not `{}` (any namespace)"
+            )
+        )
+    if "kubernetes.io/metadata.name: kube-system" not in code_text:
+        findings.append(
+            Finding(f"{label}: DNS egress must restrict namespaceSelector to kube-system")
         )
 
 
@@ -687,6 +764,7 @@ def run_all_checks() -> list[Finding]:
     check_sandbox_isolation(findings)
     check_network_policy_default_deny(findings)
     check_network_policy_directionality(findings)
+    check_dns_policy_scoped_to_kube_system(findings)
     check_no_leaked_secrets(findings)
     check_example_files_excluded_from_kustomization(findings)
     check_no_placeholders_in_active_resources(findings)

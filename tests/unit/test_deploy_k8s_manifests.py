@@ -132,6 +132,7 @@ def test_networkpolicy_directional_rules_present() -> None:
     combined = "\n".join(p.read_text(encoding="utf-8") for p in networkpolicy_dir.glob("*.yaml"))
     assert "allow-web-egress-to-server" in combined
     assert "allow-server-ingress-from-sandbox" in combined
+    assert "allow-egress-proxy-ingress-from-sandbox" in combined
 
 
 def test_cidr_and_reference_checks_are_clean(validator: types.ModuleType) -> None:
@@ -140,3 +141,57 @@ def test_cidr_and_reference_checks_are_clean(validator: types.ModuleType) -> Non
     validator.check_no_placeholders_in_active_resources(findings)
     hard_failures = [f for f in findings if not f.startswith("SKIPPED")]
     assert not hard_failures, "\n".join(hard_failures)
+
+
+def test_server_pinned_to_single_replica_in_base_and_production() -> None:
+    server = (REPO_ROOT / "deploy" / "k8s" / "base" / "server" / "deployment.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "replicas: 1" in server
+
+    production_patch = (
+        REPO_ROOT
+        / "deploy"
+        / "k8s"
+        / "overlays"
+        / "production"
+        / "patch-server-single-replica.yaml"
+    ).read_text(encoding="utf-8")
+    assert "value: 1" in production_patch
+
+    production_kustomization = (
+        REPO_ROOT / "deploy" / "k8s" / "overlays" / "production" / "kustomization.yaml"
+    ).read_text(encoding="utf-8")
+    assert "patch-server-single-replica.yaml" in production_kustomization
+
+
+def test_cloud_mode_forced_true_and_api_keys_have_valid_role(
+    validator: types.ModuleType,
+) -> None:
+    findings: list[str] = []
+    validator.check_auth_secret_required(findings)
+    hard_failures = [f for f in findings if not f.startswith("SKIPPED")]
+    assert not hard_failures, "\n".join(hard_failures)
+
+    configmap = (REPO_ROOT / "deploy" / "k8s" / "base" / "configmap-app.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert 'KEEL_CLOUD_MODE: "true"' in configmap
+
+
+def test_dns_egress_scoped_to_kube_system() -> None:
+    dns_policy = (
+        REPO_ROOT / "deploy" / "k8s" / "base" / "networkpolicy" / "allow-dns-egress.yaml"
+    ).read_text(encoding="utf-8")
+    code_lines = [line for line in dns_policy.splitlines() if not line.strip().startswith("#")]
+    code_text = "\n".join(code_lines)
+    assert "namespaceSelector: {}" not in code_text
+    assert "kubernetes.io/metadata.name: kube-system" in code_text
+
+
+def test_api_key_format_check_never_leaks_key_material(validator: types.ModuleType) -> None:
+    findings: list[str] = []
+    validator._has_valid_key_role_entry("supersecretvalue123:admin")
+    validator.check_auth_secret_required(findings)
+    for finding in findings:
+        assert "supersecretvalue123" not in finding

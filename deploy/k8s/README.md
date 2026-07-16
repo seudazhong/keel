@@ -32,7 +32,8 @@ deploy/k8s/
                             data-layer examples (Git PVC, Postgres/Redis, object storage)
   overlays/
     dev/                   Smaller footprint, PSA warn/audit only — trusted preview use only
-    production/            PSA enforce=restricted, higher replica floors
+    production/            PSA enforce=restricted; keel-worker replica floor raised, but
+                            keel-server pinned to 1 replica (see below)
   docs/                    Storage topology, backup/restore/DR, upgrade/rollback,
                             SLO/alerting, clean-install runbook, security model
   scripts/
@@ -48,12 +49,12 @@ kubectl kustomize deploy\k8s\overlays\production | Out-Null
 ```
 
 To actually install, copy `base/secret-app.example.yaml` (set a real, non-empty
-`KEEL_API_KEYS` — required, see "What is (and is not) enforced here" below) and
-`base/datastores/objectstorage-secret.example.yaml` (fill from your secret manager, do not
-commit the result), point `base/datastores/*-external-service.example.yaml` at your managed
-Postgres/Redis, add those to your own overlay's `resources:`, then `kubectl apply -k <overlay>`
-against a real cluster. See [`docs/clean-install-runbook.md`](docs/clean-install-runbook.md)
-for the full sequence.
+`KEEL_API_KEYS` with at least one valid `key:role` entry — required, see "What is (and is
+not) enforced here" below) and `base/datastores/objectstorage-secret.example.yaml` (fill from
+your secret manager, do not commit the result), point
+`base/datastores/*-external-service.example.yaml` at your managed Postgres/Redis, add those to
+your own overlay's `resources:`, then `kubectl apply -k <overlay>` against a real cluster. See
+[`docs/clean-install-runbook.md`](docs/clean-install-runbook.md) for the full sequence.
 
 ## Validation
 
@@ -85,19 +86,30 @@ Kubernetes cluster, kind/minikube, or any credentials.
   resource. Per-run sandbox Job creation therefore is **not wired up**: it needs a
   narrowly-scoped, separately-namespaced sandbox-controller with an admission policy, which
   this scaffold documents as a pending gate rather than implementing.
-- `KEEL_API_KEYS` is **required**, non-empty, and lives only in a Secret (never the
-  ConfigMap) — empty/missing means every request is an implicit, unauthenticated admin.
+- `KEEL_API_KEYS` is **required**, non-empty, contains at least one syntactically valid
+  `key:role` entry (role one of `viewer`/`operator`/`admin`), and lives only in a Secret
+  (never the ConfigMap) — empty/missing/malformed means every request is an implicit,
+  unauthenticated admin. `KEEL_CLOUD_MODE: "true"` is forced in the active config so
+  fail-closed auth is the shipped default the day that setting is consumed by application
+  code (not yet — see [`docs/security-model.md`](docs/security-model.md) "Pending gates").
 - `keel-server`'s tool workspace is redirected to a dedicated writable `emptyDir` at
   `/workspace` via `workingDir`, so its read-only root filesystem never has to make the app's
   own `/app` source tree the place model-chosen tool calls write to.
+- `keel-server` is pinned to **1 replica** in both `base/` and the production overlay, even
+  though it is architecturally stateless and horizontally scalable — interactive runs and
+  pending tool-approval state are currently process-local (see
+  [`docs/security-model.md`](docs/security-model.md) "Pending gates"), so a second replica
+  today would silently drop an in-flight run or approval. Only `keel-worker` scales up in the
+  production overlay.
 - No ServiceAccount token in sandbox Jobs; the sandbox `ServiceAccount` has no Role/RoleBinding
   anywhere in this scaffold.
 - Explicit `resources.requests`/`limits` on every container; sandbox Jobs additionally carry
   `activeDeadlineSeconds` and `backoffLimit: 0`.
-- Default-deny `NetworkPolicy` plus narrow, explicit, **directional** allows: DNS,
-  control-plane data/HTTPS egress, `keel-web` ingress-to-server *and* the matching
-  egress-from-web, sandbox-to-egress-proxy-only *and* the matching ingress-on-server for the
-  RPC callback.
+- Default-deny `NetworkPolicy` plus narrow, explicit, **directional** allows: DNS (scoped to
+  the `kube-system` namespace by name, not any namespace), control-plane data/HTTPS egress,
+  `keel-web` ingress-to-server *and* the matching egress-from-web,
+  sandbox-to-egress-proxy-only *and* the matching ingress-on-server for the RPC callback, and
+  the matching ingress-on-egress-proxy for the sandbox's proxy traffic.
 - `runtimeClassName` hooks for gVisor/Kata/microVM (`base/sandbox/runtimeclass.example.yaml`)
   that are opt-in and cluster-support-gated, never silently required.
 - Namespace-per-org isolation guidance (label + doc), not a namespace-provisioning controller.
