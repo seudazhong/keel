@@ -1,7 +1,34 @@
 # Keel — Architecture & Design
 
-> **Status:** Draft v1.0 · **Companion to:** [`PRD.md`](./PRD.md) · **Decisions:** [`adr/`](./adr)
-> This document fixes the **technology selection** and the **system architecture** for Keel. It is written to be directly buildable and is grounded in the project's field manual (*How to Develop an AI Agent*); manual principles are cited as **[P#]** and patterns as **[pattern]**.
+> **Status:** Living target architecture · **Companion to:** [`PRD.md`](./PRD.md) · **Decisions:** [`adr/`](./adr)
+> **Current fidelity:** this document describes the intended end state unless the
+> implementation-status section says otherwise. See [`STATUS.md`](./STATUS.md) for verified
+> evidence and [`ROADMAP.md`](./ROADMAP.md) for remediation order.
+
+---
+
+## 0. Implementation status and fidelity
+
+Keel's core runtime/data work is materially ahead of its product and deployment topology.
+The target architecture below remains useful, but these substitutions and gaps are current:
+
+| Area | Current implementation | Target / remediation |
+|---|---|---|
+| Scope/identity | One hard-coded `web:local` scope; no users, organizations, or persisted Agents CRUD. | User identity, single-organization-v1 membership, private personal Agents, explicit team grants ([Roadmap M3.4](./ROADMAP.md#m34--multi-user-identity-agents-and-durable-run-topology)). |
+| RLS | Scoped rows and RLS policies exist, but the runtime role owns the DB/schema and can bypass RLS. | Non-owner runtime role plus audited fail-closed isolation ([M3.1](./ROADMAP.md#m31--cloud-safety-foundation)). |
+| Execution | `ShellTool` executes in the server/CLI process; there is no deployed sandbox service. | Isolated execution backend with egress/path/capability controls (ADR-0005, M3.1). |
+| Runs/approvals | Interactive execution and some approvals are server-local/in-memory; durable unattended approvals and jobs exist. | Worker-owned durable interactive topology and restart-safe cross-surface approvals (M3.1/M3.4). |
+| Server/worker/scheduler | Server runs interactive turns; worker runs arq jobs and cron scheduling. `keel-scheduler` is a stub, not a separately elected service. | Stateless API, durable worker ownership, elected scheduler, scale-out validation (M3.4/M3.6). |
+| Auth/secrets | Optional plaintext configured API keys; empty config means implicit admin. OAuth state is process-local. | Human identity/OIDC, hashed/scoped machine credentials, durable OAuth state and key rotation (M3.1/M3.4). |
+| Gateways/outbound | OneBot/Telegram webhook handlers are unauthenticated; outbound idempotency is process-local. | Authenticated/replay-safe webhooks and durable outbound idempotency (M3.1). |
+| Permissions | Main CLI profile is fail-closed, but APIs permit construction paths where an omitted default can become allow-all. | Explicit non-allow default as an invariant in every policy constructor (M3.1). |
+| Events/data lifecycle | Event rows have versions; no upcaster registry, retention policy, or complete erasure path. | M3.2 event evolution, then M3.3 retention/erasure. |
+| Web delivery | React/Vite app exists and runs separately; Compose `keel-web` serves a static stub. | Built React delivery image and accurate profiles (M3.6). |
+| Observability/SDK/CI | Deterministic evals and basic tracing exist; full OTel/metrics/SLOs, generated SDK/version diff, and documented production CI gates do not. | Production delivery and compatibility gates (M3.2/M3.6). |
+
+Architecture statements using present tense below should be read as **target contracts** unless
+this table or [Status](./STATUS.md) confirms current fidelity. ADRs record decisions; they do
+not by themselves prove implementation.
 
 ---
 
@@ -112,7 +139,11 @@ Each decision lists the choice, why, and the main alternative rejected. Deeper r
    └────────┘ │lock/bus│  └──────────────┘   └──────────────┘   └──────────────┘
               └────────┘
 ```
-- **keel-server** is stateless and horizontally scalable; it *admits* runs (durable) and streams events, but heavy execution happens in **keel-worker** (also stateless, scale-out). **keel-scheduler** is a singleton-by-election. **keel-sandbox** isolates dangerous tool execution.
+- **Target topology:** `keel-server` is stateless and horizontally scalable; it admits runs
+  and streams events while `keel-worker` owns execution, `keel-scheduler` is
+  singleton-by-election, and `keel-sandbox` isolates dangerous tools. **Current fidelity:**
+  interactive runs and shell execution remain in the server process, worker cron performs
+  scheduling, and no sandbox service is deployed.
 
 ### 3.3 Components inside `keel-core` (level 3)
 ```
@@ -265,7 +296,10 @@ Session search and archival search share this pipeline. CJK handled via trigram 
 ### 8.3 State / event sourcing [pattern]
 - **Append-only `events`** are the source of truth; **projectors** fold them into read models (`messages`, `parts`, `session` rollups, `todos`). Gives resume, replay, live streaming, and audit from one primitive.
 - **Durable prompt admission:** `session_input` row written before execution; a coordinator promotes it; crash → pending & retryable.
-- **Event schema evolution [G3]:** each event carries a `version` per `type`; an **upcaster registry** migrates old payloads to the current shape on read, so **projections rebuild from v0** and replay never breaks on drift. Event shapes are contract-tested old→new; upcasters are append-only.
+- **Event schema evolution target [G3]:** events carry a `version` per `type`, but the
+  upcaster registry and old→new projection-rebuild contract suite are not implemented.
+  [Roadmap M3.2](./ROADMAP.md#m32--event-evolution) adds append-only upcasters and proves
+  rebuild compatibility.
 
 ---
 
@@ -305,7 +339,11 @@ memory.updated · turn.ended · run.ended{reason} · error · lifecycle{phase}
 ---
 
 ## 10. Agents, scope & multi-agent (`keel-core/agents`)
-- **An agent is a scoped, persisted entity [ADR-0009]:** persona + memory + toolset + **connectors** + permission boundary + provider + trust level. A **group agent** (chat-scoped, shared memory, safe toolset, no personal connectors, untrusted input) and a **personal agent** (user-scoped, private memory, the user's connectors, trusted) are the *same* abstraction with a different **scope**. **Per-scope data isolation is enforced:** a group agent can never read a personal agent's connectors, memory, or tokens.
+- **Target [ADR-0009]:** an Agent is a scoped, persisted entity with persona, memory,
+  toolset, connectors, permission boundary, provider, and trust level. Personal and team
+  Agents share the abstraction but differ in grants. **Current fidelity:** the product uses
+  the fixed `web:local` scope and has no users/Agents CRUD; current RLS is not a hard boundary
+  because the runtime DB owner can bypass it.
 - **Sub-agent = tool** (`task`): parent calls it; child runs an isolated loop (fresh context, reduced toolset, own workspace); parent gets the final summary [pattern].
 - **Shared budget** across the whole delegation tree (Redis-tracked); bounded `max_depth`; **leaf** vs **orchestrator** roles (leaf can't delegate). Foreground (blocking) and background (job) delegation; child cost rolls up.
 - **Topologies:** supervisor + handoff (`transfer_to_<agent>`) v1; round-robin/groups P1. Coordination via shared task lists / optional shared memory blocks (kept small). Handoffs are bounded by a **max-handoff cap** and **A→B→A cycle detection** in the delegation tree, alongside `max_depth` [G13].
@@ -313,8 +351,11 @@ memory.updated · turn.ended · run.ended{reason} · error · lifecycle{phase}
 ---
 
 ## 11. Scheduling & jobs (`keel-scheduler`, `keel-worker`)
-- **`schedules`** table (cron/interval/one-shot/ISO). The scheduler is **leader-elected** (Redis lock); every tick it selects due rows, **advances `next_run_at` before enqueueing** (at-most-once even on crash) [pattern], and pushes a job to **arq**.
-- **Workers** consume agent-run jobs and background jobs, report progress via events, support cancellation, and inject results back into the target session. Overrun → hard interrupt.
+- **Current:** schedules are persisted and worker cron uses compare-and-set advancement before
+  enqueue. Durable background jobs provide DB leases/reclaim, retries, progress,
+  cancellation, and exactly-once terminal result injection.
+- **Not yet target-complete:** `keel-scheduler` is not a separately elected service, and
+  interactive Web runs are not worker-owned. Scale-out/topology gates are in M3.4/M3.6.
 
 ---
 
@@ -326,7 +367,11 @@ memory.updated · turn.ended · run.ended{reason} · error · lifecycle{phase}
 Typer + Rich/Textual. Thin client of the API: interactive TUI (streaming, approvals, `/slash`), one-shot (`keel "…"`), headless (`--json`). An **embedded mode** (import `keel-core` directly, SQLite `lite`) for offline single-user use.
 
 ### 12.2 Web app (`web/`)
-React + Vite + TS + Tailwind + shadcn/ui + TanStack Query + Zustand. Chat with streaming + tool/step timeline; approvals; session list & **search**; memory/skills/mcp/schedule/connection admin; run **traces** (embeds Langfuse or a local view). Served by nginx, proxying `keel-server`. A **Tauri** desktop shell (P2) reuses the same web bundle.
+The React + Vite + TypeScript app currently provides chat, sessions, connectors, Knowledge,
+schedules, approvals, overview, and settings during Vite development. Compose `keel-web`
+still serves a static stub; it does not package the React build. Memory/Agents/admin
+governance completeness, responsive/i18n/a11y work, production nginx delivery, and Tauri
+remain targets.
 
 ### 12.3 IM gateway (`adapters/`)
 - **Topology [G11]:** adapters are **hosted in `keel-server`** by default (all profiles, as the container diagram shows); a standalone **`keel-gateway`** container is an **opt-in scale-out split** for high-volume channels.
@@ -337,16 +382,25 @@ React + Vite + TS + Tailwind + shadcn/ui + TanStack Query + Zustand. Chat with s
 ---
 
 ## 13. Security architecture
-- **Permission engine [P5]:** rules → `allow/ask/deny`; last-match wins; `deny > ask > allow`; default ask; layered (global → agent → session → sandbox). Denied tools stripped pre-prompt.
-- **Approval protocol [G5]:** approvals are **persisted as `events`** (a durable pending store), not only Redis pub/sub, and carry a correlation ID; identical on CLI/web/IM. If no surface responds within a **TTL**, the request **fails closed (deny)**; on resume, pending approvals are re-surfaced. Modes `plan/default/auto` (auto requires sandbox).
-- **Two-level sandbox [P5]:** process/container isolation (`keel-sandbox`: read-only root, tmpfs, dropped caps, network-deny default, workspace bind, CPU/mem limits) + per-command policy. Advanced: per-session ephemeral containers or gVisor.
+- **Permission target [P5]:** rules resolve to `allow/ask/deny` with an explicit fail-closed
+  default. The main CLI profile asks for mutations, but every construction path has not yet
+  been hardened against an omitted/permissive default.
+- **Approval target [G5]:** one durable pending store and TTL applies identically across
+  CLI/Web/IM. Durable unattended approvals exist; interactive approval/run state is still
+  process-local.
+- **Sandbox target [P5]:** isolated executor container plus command policy. Current
+  `ShellTool` executes in process, so the target sandbox claims are not yet satisfied.
 - **Egress/paths:** SSRF-safe fetch; workspace-only file access; deny `.git`/`.env`/secrets; artifact path-traversal guard.
 - **Secrets [G9]:** app-level **envelope encryption** — a per-record data key encrypts each secret and is wrapped by a **master key** sourced from env/Docker secret (v1), pluggable to Vault/KMS; keys never ship in images and a rotation procedure is documented. `connections`/`config` hold secret *refs*; values are redacted in logs & telemetry; `.env` is secrets-only.
 - **Trust-gating:** untrusted IM/web content confined to a safe toolset; project skills/MCP gated on trust; **import ≠ trust** (MCP allow-list) [P6].
 - **Scope isolation & confused-deputy defense [ADR-0009]:** per-agent/scope data boundaries — a group/untrusted agent can never access a personal agent's connectors, memory, or tokens. **Cross-scope data exfiltration** (injection coercing an agent to leak private data) is the **headline threat** for the primary use cases, ranked *above* sandbox escape. Personal-agent connectors require explicit per-connector grants; a personal agent's outbound actions (send email, post) pass approval and are audited; co-hosting a public group bot with a private personal agent is allowed only under hard scope isolation (separate instances recommended for the most sensitive use).
 - **Injection scanning [G6]:** tool/skill/MCP **descriptions and imported instructions** are scanned for prompt-injection at import/discovery time; a hit **quarantines** the item (excluded from the prompt) pending review.
-- **AuthN/Z:** OAuth2/OIDC + hashed API keys; RBAC roles; audit log of tool actions & approvals.
-- **Data governance [G4]:** per-agent/session **retention** windows; **PII redaction** in traces/telemetry (extends secret redaction); **right-to-erasure** via event **tombstones** + projection rebuild + vector purge; a documented data map (what is stored where) for self-hosted (incl. EU) deployments.
+- **AuthN/Z target:** OAuth2/OIDC for humans, hashed/scoped API credentials, RBAC, and
+  complete audit. Current API-key configuration is optional plaintext and empty means
+  implicit admin.
+- **Data governance target [G4]:** retention windows, trace/telemetry PII redaction,
+  documented data map, and complete erasure across events/projections/vectors/Knowledge/
+  tokens/artifacts. These are M3.3 work, not current capability.
 
 ---
 
@@ -354,7 +408,9 @@ React + Vite + TS + Tailwind + shadcn/ui + TanStack Query + Zustand. Chat with s
 - **OpenTelemetry** spans across services → OTel Collector; **Langfuse** for LLM **trace → observation (span/generation/tool/retriever/agent) → score**, prompt versioning, datasets/evals.
 - **Cost/token accounting** per run/session/agent (incl. cache-read) stored on `sessions` and mirrored to Langfuse.
 - **Prometheus** metrics (latency, queue depth, tool durations, error rates) + optional Grafana; **structlog** JSON logs; health/readiness probes.
-- **Durable-first:** telemetry is emitted async and never blocks the loop; failures degrade, not crash.
+- **Current fidelity:** deterministic Memory/Knowledge evals and basic tracing/cost fields
+  exist. Full cross-service OTel, Prometheus/SLO coverage, reconciled usage, and production
+  dashboards remain below this target.
 
 ---
 
@@ -370,9 +426,14 @@ profiles:
   full  → dev + scheduler, sandbox, minio, langfuse, otel, prometheus, adapters
   lite  → single 'keel' container (embedded core + SQLite + local FS)  # CLI/offline
 ```
-- **One command:** `docker compose --profile full up -d`. First-run bootstrap (Alembic migrate, seed default agent + admin) is idempotent.
-- **Config:** `.env` + mounted `deploy/config/`; secrets via env/Docker secrets. Images carry no secrets. Every service exposes health/readiness; graceful drain on shutdown.
-- **Scale-out:** `keel-worker` scales horizontally; `keel-server` behind a load balancer; single elected `keel-scheduler`.
+- **Current Compose:** `docker compose --profile dev up -d --build` starts Postgres, Redis,
+  migration, server, worker, Ollama, and a static web stub. The `full` profile currently
+  selects the same implemented services; MinIO, Langfuse, OTel, Prometheus, separate
+  scheduler, and sandbox services are aspirational.
+- **Current bootstrap:** Alembic migration is idempotent; users/default Agents/admin are not
+  seeded because those product models do not yet exist.
+- **Target scale-out:** worker/server scale-out and elected scheduler require the durable
+  topology and production-delivery gates in M3.4/M3.6.
 
 ### 15.2 Repository layout (uv monorepo)
 ```
@@ -446,14 +507,18 @@ OneBot → adapter → normalize → InboundEvent(session_key) → wake rules/ra
 
 ---
 
-## 19. Phasing (maps to PRD milestones)
-- **M0 Foundations:** monorepo skeleton, `keel-core` interfaces, compose `dev`, CI, migrations.
-- **M1 MVP:** loop + providers + tools(sandbox,permissions) + **connectors (email/calendar/docs via OAuth)** + **agent scope & per-scope data isolation** + sessions+search + memory + **web + IM (QQ/OneBot)** + CLI (admin) + skills + MCP + discovery + tracing. *(Local files/desktop deferred behind `LocalDaemon`.)*
-- **M2 Autonomy & scale:** scheduler + jobs + worker scale-out + failover/routing + admin dashboards + RBAC + **more connectors + WeCom/Telegram adapters**.
-- **M3 Knowledge & quality:** RAG/KB + consolidation + evals + plugin SDK + desktop shell.
-- **M4 Hardening:** security review, perf, multi-tenant groundwork, docs/examples.
+## 19. Phasing
+
+The original M0–M4 phasing is retained in
+[`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md) as history. Active execution is defined
+only by [`ROADMAP.md`](./ROADMAP.md): cloud safety, event evolution, retention/erasure,
+multi-user identity/Agents and durable topology, connector/product experience, then
+production delivery/scale. Plugin SDK and Desktop follow those gates.
 
 ---
 
 ## 20. Design-review convergence
-This spec is reconciled with [`DESIGN-REVIEW.md`](./DESIGN-REVIEW.md). **Folded into the design now** (cheap to decide, expensive to retrofit): **G3** event versioning/upcasters (§8.3, §9.1), **G5** durable fail-closed approvals (§13), **G6** injection scanning (§13), **G7** cost reserve/reconcile (§5), **G8** embedding `(model,dim)` pinning (§5, §8.2, §9.1, ADR-0007), **G9** secret envelope encryption (§13), **G10** rate-limit design (§5), **G11** gateway topology default (§12.3), **G13** handoff cycle cap (§10), **G14** `/v1` + additive API (§9.2), **G4** data governance (§13), **G15** backup/DR (§17). **Scheduled** into the milestone that first needs them per the [implementation plan](./IMPLEMENTATION-PLAN.md): G7/G10 → M2; G4 build-out → M3; G6/G9 hardening & G15 runbook → M4. Open questions **Q1/Q3/Q4/Q5** are resolved by ADR-0007/0008 (Q2 by ADR-0004). The review's §5 invariant checklist is the acceptance backbone for M0/M1. The review's **§3A pivot addendum** (G16 scope-guard, G17 confused-deputy, G18 token lifecycle, G20 outbound idempotency) and the new **per-scope data isolation** invariant are threaded into the [implementation plan](./IMPLEMENTATION-PLAN.md) (M0 seam + spike S5; M1 scope/connectors steps); folding their detail into §6.5/§8/§9/§13 is tracked for the next spec pass.
+This target spec incorporates the decisions and risks recorded in the historical
+[`DESIGN-REVIEW.md`](./DESIGN-REVIEW.md). Implementation is intentionally not inferred from
+that convergence: the fidelity table in §0 and [Status](./STATUS.md) identify what is real,
+while [Roadmap](./ROADMAP.md) owns remediation and sequencing.

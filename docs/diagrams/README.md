@@ -1,6 +1,12 @@
 # Keel — Diagrams
 
-Source diagrams for the architecture, authored in **Mermaid** (renders natively on GitHub). They visualise what `ARCHITECTURE.md` describes in prose/ASCII, and incorporate the accepted refinements from `DESIGN-REVIEW.md` (event `version`, embedding `(model, dim)` pinning, durable + fail-closed approvals) and the **ADR-0009 pivot** (scoped agents, first-class connectors, pluggable execution).
+> These diagrams primarily visualize the **target architecture**. Read
+> [`../ARCHITECTURE.md`](../ARCHITECTURE.md), especially its implementation-fidelity table,
+> before treating a container, boundary, or flow as deployed.
+
+Source diagrams are authored in **Mermaid** (renders natively on GitHub). They visualize
+the architecture and accepted decisions, including event versions, embedding pinning,
+durable approvals, scoped Agents, connectors, and pluggable execution.
 
 | # | Diagram | View |
 |---|---|---|

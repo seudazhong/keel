@@ -1,7 +1,19 @@
 # Mounted configuration
 
-Files here are mounted into services (see `docker-compose.yml`) as the
-file-based config layer (DR-3). Precedence: defaults → these files → `KEEL_*`
-env → runtime overrides (see `keel_core.config`).
+This directory is reserved for non-secret configuration files mounted into Keel services.
+The current Compose stack does not yet mount a complete production configuration set; most
+runtime settings come from defaults, `.env`, and `KEEL_*` environment variables.
 
-Empty in M0; layered file sources are wired when config grows in M1.
+Configuration precedence is intended to be:
+
+1. package defaults;
+2. mounted configuration files;
+3. environment variables;
+4. durable/runtime overrides where implemented.
+
+Do not store provider keys, OAuth client secrets/tokens, `KEEL_SECRET_KEY`, or API keys
+here. Use environment variables or an external secret manager. Production-grade secret
+envelope/KMS integration and rotation remain roadmap work.
+
+See [Operations](../../docs/OPERATIONS.md), [`.env.example`](../../.env.example), and the
+current settings model in `packages/keel-core/src/keel_core/config.py`.

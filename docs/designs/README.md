@@ -1,4 +1,15 @@
-# Feature Designs
+# Historical feature designs
 
-Reviewed feature and product/UX designs live here. Date-prefixed filenames preserve the
-decision timeline; implementation checklists live in [`../plans/`](../plans/).
+These date-prefixed documents preserve feature and product/UX design snapshots. They can
+contain superseded sequencing, names, architecture assumptions, and "will" statements.
+They are supporting evidence, not living product or implementation truth.
+
+Use:
+
+- [`../STATUS.md`](../STATUS.md) for current capability;
+- [`../ROADMAP.md`](../ROADMAP.md) for active work;
+- [`../PRD.md`](../PRD.md) and [`../ARCHITECTURE.md`](../ARCHITECTURE.md) for the current
+  target and fidelity;
+- [`../plans/`](../plans/) for the corresponding historical implementation checklists.
+
+Do not update every dated design as the product evolves; update this index and living canon.

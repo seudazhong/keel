@@ -1,185 +1,126 @@
-# Keel 当前状态与里程碑
+# Keel implementation status
 
-> **快照日期：** 2026-07-16
-> **代码基线：** `feat/rag-knowledge-base@cd153f6`（RAG/KB verified baseline）
-> **路线来源：** [`PRD.md`](./PRD.md) §11、[`ARCHITECTURE.md`](./ARCHITECTURE.md) §19、
-> [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md)
+> **Snapshot:** 2026-07-16 · **Branch:** `main`
+> **Target:** [PRD](./PRD.md) · **Architecture fidelity:** [ARCHITECTURE](./ARCHITECTURE.md#0-implementation-status-and-fidelity) · **Active execution:** [ROADMAP](./ROADMAP.md)
 
-本文档是 Keel 的 living status。PRD/Architecture/Implementation Plan 定义目标与边界；
-本文档记录已经落地的能力、尚未满足的 exit criteria，以及当前执行顺序。每个 epic 合并
-到 `main` 后都应更新这里。
+## Summary
 
-## 1. 一句话结论
+Keel has **late-M3 engine/data maturity**, an **early-M1 product surface**, and
+**pre-production operational readiness**. Durable Jobs and the Memory/Knowledge/Quality
+track are complete. The current product remains a hard-coded single-scope/single-agent
+system and should not be presented as the target multi-user platform.
 
-Keel 当前处于 **M3（Knowledge & quality）后段**：
+## Maturity by track
 
-- M0 已完成。
-- M1 的主要产品能力已经可用，但仍有少量正式 KPI/exit-evidence 债务。
-- M2 已完成调度、durable background jobs、审批、RBAC、基础 provider failover 与
-  Telegram 等切片；N-worker scale-out、per-task routing 和 WeCom 尚未完成。
-- M3 的 **Memory、Knowledge 与 Quality 主线**已经完成；Plugin SDK/hooks、
-  event upcasters、retention/erasure 与 Tauri Desktop 尚未完成。
-
-## 2. 当前可工作的产品能力
-
-### Agent runtime 与 surfaces
-
-- 持久化 agent loop、streaming、tool calling、interrupt、approval/resume。
-- LiteLLM provider gateway，同时支持 chat-completions 与 Responses API 路径。
-- CLI、React Web/SSE、QQ/OneBot 与 Telegram gateway。
-- 文件、shell、web 等工具经过 permission/sandbox 边界。
-
-### Scope、connectors 与 autonomy
-
-- `scope_id` + Postgres RLS 的数据隔离。
-- Gmail OAuth、真实 inbox read/send、token revoke/purge。
-- Durable approvals、RBAC/API keys、admin overview。
-- Cron/interval/one-shot schedules、daily digest、daily memory consolidation。
-- Durable background jobs：
-  - Postgres/RLS lifecycle source of truth；
-  - at-least-once arq delivery + DB lease/reclaim；
-  - durable progress、cooperative cancellation、bounded retry；
-  - crash/duplicate-delivery recovery；
-  - terminal assistant result injection exactly once；
-  - list/detail/cancel API + RBAC。
-
-### Memory、search 与 quality
-
-- Core memory blocks：每轮加载、版本/history、自编辑工具。
-- Archival memory：pgvector + lexical/semantic hybrid retrieval。
-- Session recall：lexical + semantic + RRF，显式
-  `hybrid / lexical / lexical-degraded`。
-- Memory consolidation：
-  - constrained agent；
-  - Archival 高置信自动写；
-  - Core 只生成待人工批准 proposal；
-  - lease/cursor、证据约束、stale CAS、retry dedupe。
-- Memory Evals：
-  - 12-case JSONL dataset；
-  - Consolidation / Recall / Safety 三个 suites；
-  - provider + embedding cassettes；
-  - live/record 与 fail-closed replay；
-  - JSON/JUnit/terminal reports、optional judge、optional Langfuse。
-- RAG / Knowledge Base：
-  - scope-bound KB/document/version/chunk lifecycle；
-  - text/Markdown create、update、reindex、immediate-hide delete + durable purge；
-  - deterministic chunking + pinned embedding model/dim；
-  - lexical/semantic hybrid retrieval、stable structured citations；
-  - always-tainted `kb_search`，normal/resume event paths preserve citations + taint；
-  - idempotent REST API、RBAC、React Knowledge management/search page；
-  - durable `knowledge.ingest` / `knowledge.delete` jobs with ownership fencing、
-    active/desired rollback safety and zombie-write prevention。
-
-## 3. 当前验证基线
-
-- Python test suite：**1036 passed / 1 skipped**（1037 collected）。
-- React/Vitest：**49 passed**。
-- Ruff lint + format：通过。
-- mypy strict：通过。
-- Memory golden replay：
-  - **12/12 cases PASS**；
-  - **7/7 gates PASS**；
-  - weighted overall：**0.982**；
-  - replay 不回退到 live provider。
-- Integration/eval destructive fixtures 只允许显式 `keel_test`/`keel_eval`。
-- Durable Jobs acceptance：真实 Postgres + Redis/arq，覆盖丢投递、重复投递、retry、
-  worker crash/reclaim、attempt exhaustion、cancel 与 exactly-once injection。
-- Knowledge replay：
-  - **8/8 cases PASS**；
-  - **7/7 gates PASS**；
-  - Recall@5 / MRR / citation precision / taint / degraded / deletion leakage 全部 **1.000**；
-  - weighted overall：**1.000**；
-  - replay 不回退 live embedding。
-- Knowledge isolated live smoke：真实 Postgres + Redis/arq，覆盖 create → ingest →
-  cited/tainted search → update while old active remains → activate new version →
-  immediate-hide delete → durable purge。
-
-## 4. Milestone 状态
-
-| Milestone | 状态 | 已完成 | 主要剩余 |
+| Track | Maturity | Evidence | Main gap |
 |---|---|---|---|
-| **M0 Foundations** | 完成 | monorepo、compose、CI、contracts、migrations、S1-S5 | 无阻塞项 |
-| **M1 Core that talks** | 功能性完成 | loop、providers、tools、memory、search、CLI/Web/IM、connectors、skills/MCP、observability | 通用 task-suite/KPI 证据、SDK 使用体验收尾 |
-| **M2 Autonomy & scale** | 部分完成 | schedules、durable background jobs、digest、durable approvals、RBAC、admin overview、Telegram、基础 failover | N-worker demo、per-task routing、WeCom |
-| **M3 Knowledge & quality** | 进行中 | retrieval foundation、memory consolidation、memory evals、RAG/KB | event upcasters、retention/erasure、Plugin SDK/hooks、Tauri Desktop |
-| **M4 Hardening** | 未正式开始 | 已有部分 security/DB safety 基础 | security review、perf、backup/DR、multi-tenant groundwork、docs/examples |
+| Agent runtime and data engine | Late M3 | Bounded loop, durable event/session state, tools, approvals, schedules, Durable Jobs, memory/search/consolidation, deterministic evals, Knowledge lifecycle/search/citations/taint. | Event upcasters, retention/erasure, isolated execution, durable interactive topology. |
+| Product surface | Early M1 | Minimal chat, React development UI, sessions, approvals, Gmail status, schedules, admin overview, Knowledge UI, OneBot/Telegram slices. | Identity, Agents CRUD/switcher, Calendar, onboarding, Memory/Admin governance UI, Web/IM parity, responsive/i18n/a11y. |
+| Production readiness | Pre-production | Compose dev stack, migrations, health/readiness, RBAC tiers, core CI, durable jobs recovery tests. | Enforced RLS role, real sandbox, durable auth/OAuth/webhook/idempotency, accurate delivery profiles, scale/SLO/DR/security gates. |
 
-## 5. M3 已完成与未完成边界
+## Verified completed capabilities
 
-### 已完成：Memory/Knowledge/Quality
+### Runtime and autonomy
 
-1. Core + Archival + Recall 的生产链。
-2. Semantic session search 与 embedding degradation。
-3. Proposal-first Memory Consolidation。
-4. 可在 CI 重放的 deterministic Memory Evals。
-5. 完整 RAG/KB vertical slice：
-   - KB/document/version/chunk lifecycle；
-   - durable ingest/delete；
-   - hybrid retrieval + citations + taint；
-   - REST/RBAC + React management/search；
-   - deterministic Knowledge Evals。
+- Persisted agent loop, streaming/tool events, interrupt, permission/approval paths.
+- LiteLLM gateway with chat-completions and Responses API paths.
+- Cron/interval/one-shot schedules run by worker cron.
+- Durable Jobs:
+  - Postgres lifecycle source of truth with scoped rows/RLS policies;
+  - at-least-once arq delivery with DB lease/reclaim;
+  - progress, cooperative cancellation, bounded retries;
+  - duplicate/crash recovery and attempt exhaustion;
+  - exactly-once terminal result injection;
+  - list/detail/cancel API and RBAC.
 
-### 尚未完成：Data lifecycle/Extensibility/Desktop
+### Memory, search, and quality
 
-1. **Event/data lifecycle**
-   - event upcaster registry；
-   - retention policy；
-   - scope/session erasure；
-   - memory/vector/KB purge 与审计。
-2. **Plugin SDK + hooks**
-   - manifest；
-   - lifecycle hooks；
-   - validation、hot-load、rollback；
-   - SDK examples。
-3. **Tauri Desktop**
-   - 复用稳定 Web/API；
-   - 不在第一版引入 LocalDaemon/local-file execution。
+- Versioned core memory and self-editing tools.
+- Archival pgvector plus lexical/semantic hybrid retrieval.
+- Hybrid session recall with explicit `hybrid`, `lexical`, or degraded mode.
+- Proposal-first memory consolidation with evidence constraints, cursor/lease, CAS, and
+  retry deduplication.
+- Deterministic Memory eval datasets, replay cassettes, reports, gates, optional judge, and
+  optional Langfuse reporting.
 
-## 6. 执行顺序
+### Knowledge Base
 
-### 1. Durable background jobs（已完成）
+- Scope-bound KB/document/version/chunk lifecycle.
+- Text/Markdown create, update, reindex, immediate-hide delete, and durable purge.
+- Deterministic chunking and pinned embedding model/dimension.
+- Hybrid retrieval, stable structured citations, and always-tainted `kb_search`.
+- REST/RBAC and React management/search UI.
+- Durable ingest/delete jobs with ownership fencing, active/desired rollback safety, and
+  zombie-write prevention.
 
-RAG ingestion 所依赖的通用执行底座已经落地：
+### Current surfaces/integrations
 
-- durable job row 与 scope/RLS；
-- enqueue + lease/claim；
-- queued/running/succeeded/failed/cancelled 状态机；
-- progress；
-- cooperative cancellation；
-- bounded retry；
-- result injection 回目标 session，且只能注入一次；
-- list/detail/cancel API；
-- crash/retry/idempotency acceptance tests。
+- Server-rendered minimal chat and management pages.
+- React app runnable through Vite; Compose web service is not the React app.
+- Gmail is the only native connector; OAuth/read/status/revoke paths exist, with optional
+  approval-gated real send.
+- OneBot and Telegram gateway code exists.
 
-第一版没有引入 N-worker benchmark、完整 Jobs UI 或假的 production job kind；第一个真实
-consumer 将是 RAG document ingest/reindex。
+## Verified baselines
 
-### 2. RAG/KB vertical slice（已完成）
+The latest completed feature audits reported:
 
-text/Markdown 首版已经完成：
+- Python: **1036 passed / 1 skipped** (1037 collected).
+- React/Vitest: **49 passed**.
+- Ruff lint/format and strict mypy: passed.
+- Memory replay: **12/12 cases**, **7/7 gates**, weighted overall **0.982**, no live fallback.
+- Knowledge replay: **8/8 cases**, **7/7 gates**, all named retrieval/citation/taint/deletion
+  measures **1.000**, no live embedding fallback.
+- Durable Jobs acceptance: real Postgres + Redis/arq covering lost/duplicate delivery,
+  retry, crash/reclaim, exhaustion, cancel, and exactly-once injection.
+- Knowledge live smoke: create → ingest → cited/tainted search → safe update/activation →
+  immediate-hide delete → durable purge.
 
-`create KB -> ingest -> chunk -> embed -> hybrid retrieve -> cited tool result -> update/delete/reindex`
+These are retained baselines, not a claim that every current-main dependency/environment
+was re-run for this documentation change.
 
-后续 connector ingestion 将复用当前 version/job/citation/taint 边界，优先接
-Google Drive/OneDrive/Notion 等来源。
+## Critical and high blockers
 
-### 3. Event upcasters + retention/erasure（下一步）
+1. **RLS bypass:** the runtime DB role owns the schema/database and can bypass RLS.
+2. **No real sandbox:** shell executes inside server/CLI processes.
+3. **Process-local interaction:** interactive runs and some approvals are not restart-safe
+   or worker-owned.
+4. **No identity/Agents:** fixed `web:local`; no users, organizations, persisted Agents,
+   memberships, or grants.
+5. **Weak API credential model:** configured keys are plaintext/unscoped; empty means
+   implicit admin.
+6. **OAuth/gateway safety:** OAuth state is process-local; gateway webhooks are
+   unauthenticated.
+7. **Outbound retry safety:** idempotency is process-local.
+8. **Permission construction:** a default can become allow-all when omitted in some paths;
+   explicit fail-closed defaults are not universal.
+9. **Event/data lifecycle:** event versions exist, but no upcasters, retention, or complete
+   erasure.
+10. **Scheduler/topology:** scheduler package is a stub; worker cron schedules jobs;
+    interactive runtime is not the target server/worker topology.
+11. **Delivery mismatch:** Compose `:3000` is a static stub; `full` does not deliver the
+    documented observability/object-store/sandbox stack.
+12. **SDK/operations:** no generated-client/versioning pipeline; observability, CI security/
+    performance coverage, backup/restore, and DR are below target.
 
-在知识数据继续增长前，完成 schema evolution 与完整数据删除边界。
+## Current product gaps
 
-### 4. Plugin SDK + lifecycle hooks
+- User sign-in/session identity and single-organization-v1 membership/RBAC.
+- Agents CRUD, persisted personal/team Agents, explicit resource grants, real switcher.
+- Calendar and a reusable connector/trigger framework.
+- Web/IM runtime and approval parity.
+- Memory UI, complete Admin/RBAC UI, onboarding.
+- Correct current copy, responsive behavior, internationalization, and accessibility.
 
-复用现有 Skills/MCP/ImportGuard 基础，增加 manifest validation、hot-load 与 rollback。
+## Next work
 
-### 5. Tauri Desktop shell
+Follow [Roadmap](./ROADMAP.md), in order:
 
-待 API、data lifecycle 与 plugin boundary 稳定后封装现有 Web shell。
+1. M3.1 Cloud Safety Foundation
+2. M3.2 Event Evolution
+3. M3.3 Retention/Erasure
+4. M3.4 Multi-user Identity + Agents + durable run topology
+5. M3.5 Connector/Product Experience
+6. M3.6 Production Delivery/Scale
 
-### 6. M4 hardening
-
-Security review、performance、backup/restore drill、multi-tenant groundwork 与发布文档。
-
-## 7. 当前下一步
-
-立即进入 **Event Upcasters + Retention/Erasure**，先稳定事件演进与完整删除边界，
-再扩大 connector ingestion 与知识数据规模。
+Plugin SDK and Desktop are deferred until those gates.

@@ -1,4 +1,9 @@
-# Implementation Plans
+# Historical implementation plans
 
-Executable task breakdowns and validation checklists live here. Plans are repository
-documents and do not depend on an external orchestration skill or plugin.
+These date-prefixed plans are completed or superseded task breakdowns retained for
+traceability and validation detail. They are **not** an active backlog or roadmap.
+
+For current decisions use [`../STATUS.md`](../STATUS.md) and
+[`../ROADMAP.md`](../ROADMAP.md). A dated plan may mention an old branch, worktree,
+baseline, command, or intended behavior; verify all of those against current code before
+reuse.

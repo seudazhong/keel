@@ -1,6 +1,11 @@
 # Keel — Design Review
 
-> **Status:** Draft v1.0 · **Date:** 2026-07-06 · **Reviews:** [`PRD.md`](./PRD.md), [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`adr/`](./adr)
+> **Historical/supporting review:** Draft v1.0 · **Date:** 2026-07-06
+> This is a pre-implementation design review plus later addenda. It records design intent
+> and risks, not current implementation fidelity. Use [`STATUS.md`](./STATUS.md) for current
+> truth and [`ROADMAP.md`](./ROADMAP.md) for active remediation.
+>
+> **Reviews:** [`PRD.md`](./PRD.md), [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`adr/`](./adr)
 > Scope: a critical read of the product + architecture specs before implementation. It records what is strong, what is missing or under-specified, resolves the PRD's open questions, and checks the non-negotiable invariants. Findings feed [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md) and two new ADRs (0007, 0008).
 
 ---

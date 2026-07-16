@@ -1,32 +1,33 @@
-# React + TypeScript + Vite
+# Keel React web application
 
-This template provides a minimal setup to get React working in Vite with HMR and some Oxlint rules.
+This directory contains the React 19 + TypeScript + Vite application. It is the current
+product UI source, but it is **not** served by the Compose `keel-web` service: Compose still
+mounts `web/stub/` into nginx as a static placeholder.
 
-Currently, two official plugins are available:
+## Run locally
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+Start the API at `http://localhost:8000`, then:
 
-## React Compiler
-
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the Oxlint configuration
-
-If you are developing a production application, we recommend enabling type-aware lint rules by installing `oxlint-tsgolint` and editing `.oxlintrc.json`:
-
-```json
-{
-  "$schema": "./node_modules/oxlint/configuration_schema.json",
-  "plugins": ["react", "typescript", "oxc"],
-  "options": {
-    "typeAware": true
-  },
-  "rules": {
-    "react/rules-of-hooks": "error",
-    "react/only-export-components": ["warn", { "allowConstantExport": true }]
-  }
-}
+```powershell
+npm ci
+npm run dev
 ```
 
-See the [Oxlint rules documentation](https://oxc.rs/docs/guide/usage/linter/rules) for the full list of rules and categories.
+Vite normally serves `http://localhost:5173` and proxies `/v1` and `/health` to the API.
+
+## Checks
+
+```powershell
+npm run lint
+npm run test
+npm run build
+```
+
+Current routes cover chat, sessions/history, connectors, Knowledge, schedules, approvals,
+overview, and model settings. The UI still uses the server's hard-coded `web:local` scope.
+Identity, Agents CRUD/switching, Calendar, onboarding, Memory/Admin governance completeness,
+responsive/i18n/a11y work, and production nginx packaging are on the
+[roadmap](../docs/ROADMAP.md).
+
+API access is centralized in `src/lib/api.ts`; feature requests/hooks live under
+`src/features/`. The running server's `/docs` is authoritative for endpoint schemas.

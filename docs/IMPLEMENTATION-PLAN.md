@@ -1,11 +1,16 @@
-# Keel — Implementation Plan
+# Keel — Original Implementation Plan (historical)
 
-> **Status:** Plan of record v1.0 · **Date:** 2026-07-06 · **Current execution status:** [`STATUS.md`](./STATUS.md) · **Maps to:** PRD §11 milestones, ARCHITECTURE §19 · **Inputs:** [`DESIGN-REVIEW.md`](./DESIGN-REVIEW.md)
-> A phased, milestone-aligned plan of record. **No code in this document** — it sequences the work, fixes exit criteria, and names the gating acceptance tests. Deliverables map to the PRD's M0–M4.
+> **Historical snapshot:** v1.0 · **Date:** 2026-07-06
+> **Active roadmap:** [`ROADMAP.md`](./ROADMAP.md) · **Current status:** [`STATUS.md`](./STATUS.md)
+>
+> This document preserves the original M0–M4 workstreams, sequencing, and acceptance intent.
+> It is **not** the current execution plan, and completion claims in it must not be used as
+> current implementation evidence. The active roadmap supersedes its ordering where they
+> differ.
 
 ---
 
-## 1. Strategy
+## 1. Original strategy
 
 1. **Contract-first.** Freeze `keel-core` Protocols (Tool, EventStore, ProviderGateway, PermissionEngine, PromptAssembler, AgentSpec, **ScopeGuard** [ADR-0009]) and the **event vocabulary + REST schema** before implementing behind them. Surfaces consume a generated SDK.
 2. **Thin vertical slice, then breadth [P2].** M1 first lights up **one** path end-to-end (CLI → server → worker → `keel-core.run` → provider → file/shell tool → events → session), then adds web, IM, search, skills, MCP around the proven spine.
@@ -32,7 +37,7 @@
 
 ---
 
-## 3. Milestones
+## 3. Original M0–M4 milestones
 
 ### M0 — Foundations
 **Goal:** an empty but real system that boots, streams one lifecycle event end-to-end, and has the seams + CI to build against.
@@ -117,7 +122,7 @@ Critical path to a usable product: **seams → loop → provider → tools/sandb
 
 ---
 
-## 6. First two weeks (plan of record)
+## 6. Original first-two-weeks plan
 
 1. **Freeze the contracts** — event vocabulary + `keel-core` Protocol signatures + REST v0, **including `scope_id` + the `ScopeGuard` seam** [ADR-0009] (one review).
 2. **Stand up** compose `dev` + CI skeleton (lint/type/unit/build + record-replay stub).

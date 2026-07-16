@@ -1,56 +1,95 @@
-<!-- Keel — general-purpose AI agent platform -->
+<!-- Keel — cloud-native personal and team agent platform -->
 <h1 align="center">⛵ Keel</h1>
-<p align="center"><em>One capable AI agent, everywhere you talk to it — CLI, web, and chat apps — self-hosted in Docker.</em></p>
+<p align="center"><em>A durable agent runtime for private personal agents and explicitly shared team agents, reached through web, IM, and operator tools.</em></p>
 
 ---
 
-**Keel** is a general-purpose, self-hostable **AI agent platform**. A single frontend-agnostic *agent core* is exposed through a **CLI**, a **web app**, and **IM gateways** (QQ, Telegram, WeCom…), equipped with a real toolbox (files, shell, web), parallel/async tool execution, multi-agent collaboration, durable memory, session persistence & search, scheduled autonomy, skills, MCP, agentic tool discovery, and first-class observability — deployable with a single `docker compose up`.
+Keel's target is a **multi-user, cloud-native agent platform**:
 
-The design follows the project's own field manual, *How to Develop an AI Agent*: **a stable "keel" (the core runtime) with narrow seams onto which surfaces, tools, and providers bolt.**
+- every user has a private, persisted personal agent;
+- team agents share only resources explicitly granted to them;
+- web and IM are surfaces of the same durable runtime, memory, permissions, approvals, and
+  audit trail;
+- native connectors provide depth for core services, while MCP and automation platforms
+  cover the integration long tail.
 
-## Status
-🚧 **M3 — Knowledge & quality (in progress).** M0 is complete; the main M1 product
-surfaces are usable; M2 autonomy foundations are partially complete; and the M3
-Memory/Quality track (semantic recall, consolidation, deterministic evals) is complete.
-The next execution slice is durable background jobs followed by RAG/Knowledge Base.
-See the living [`docs/STATUS.md`](./docs/STATUS.md) snapshot.
+That is the product direction, not the current feature claim. Today Keel has a strong
+single-scope engine: a bounded tool-using runtime, durable sessions and jobs, approvals,
+schedules, Gmail, memory/search/consolidation/evals, and a RAG/Knowledge Base vertical
+slice. The product still lacks real user identity, persisted Agents CRUD, hard multi-user
+isolation, Calendar, complete Web/IM parity, onboarding, and production delivery controls.
 
-## Documentation
-| Doc | What |
+## Current maturity
+
+| Track | Maturity |
 |---|---|
-| [`docs/PRD.md`](./docs/PRD.md) | Product Requirements — vision, personas, requirements, scope, milestones, risks |
-| [`docs/ARCHITECTURE.md`](./docs/ARCHITECTURE.md) | Technology selection & system design — C4 views, components, data model, protocol, deployment |
-| [`docs/adr/`](./docs/adr) | Architecture Decision Records (language, datastore, runtime, frontend, sandbox, scheduler, embeddings, deployment, **product form**) |
-| [`docs/DESIGN-REVIEW.md`](./docs/DESIGN-REVIEW.md) | Critical design review — gaps, risks, resolved open questions, invariant acceptance checklist |
-| [`docs/IMPLEMENTATION-PLAN.md`](./docs/IMPLEMENTATION-PLAN.md) | Phased plan (M0–M4) — workstreams, sequencing, exit criteria |
-| [`docs/STATUS.md`](./docs/STATUS.md) | Living implementation status — completed capabilities, milestone gaps, current execution order |
-| [`docs/INVARIANTS.md`](./docs/INVARIANTS.md) | The ten non-negotiable invariant acceptance specs (merge-blocking gates) |
-| [`docs/designs/`](./docs/designs) | Reviewed feature designs and product/UX specifications |
-| [`docs/plans/`](./docs/plans) | Executable implementation plans and validation checklists |
-| [`docs/diagrams/`](./docs/diagrams) | Mermaid architecture diagrams — C4, agent loop, sequences, ER, deployment |
+| Agent/data engine | Late M3: Durable Jobs and Memory/Knowledge/Quality slices are complete and tested. |
+| Product surface | Early M1: useful single-scope chat and management surfaces, but no real users or Agents model. |
+| Production readiness | Pre-production: critical isolation, sandbox, durability, auth, webhook, delivery, and operations gaps remain. |
 
-## What Keel will do (highlights)
-Primary form (see [ADR-0009](./docs/adr/0009-product-form-and-primary-use-cases.md)): a **server-side, connected conversational assistant** — for teams/IM and for personal use — where an *agent is a scoped entity* (a group agent and your personal agent are the same thing with different scope).
-- **One core, many surfaces** — **web app + IM gateway** (QQ/Telegram/WeCom…) primary · CLI for admin/power-use
-- **Connectors** — email · calendar · docs · knowledge via OAuth, **scoped per agent**, with per-scope data isolation
-- **Real tools** — web fetch/scrape/search, file ops, `bash`/`powershell` — sandboxed, permissioned, parallel (execution environment is pluggable)
-- **Multi-agent** — sub-agents as tools, shared budgets, isolation
-- **Memory** — editable memory blocks + session persistence + hybrid (full-text + semantic) session search
-- **Autonomy** — cron/interval scheduled tasks with at-most-once guarantees
-- **Extensible** — Skills, MCP, agentic tool discovery, plugin SDK
-- **Observable** — trace/observation/score, cost/token accounting (OpenTelemetry + Langfuse)
-- **Deployable** — every component containerised; `docker compose up` for the whole stack
+Read [`docs/STATUS.md`](./docs/STATUS.md) for verified evidence and blockers, and
+[`docs/ROADMAP.md`](./docs/ROADMAP.md) for the active sequence.
 
-## Planned stack
-Python 3.12 (asyncio) · FastAPI · LiteLLM · PostgreSQL + pgvector · Redis · arq · MinIO · React + Vite + Tailwind · OpenTelemetry + Langfuse · Docker Compose. See [ADRs](./docs/adr) for the rationale.
+## What works now
 
-## Quickstart (planned)
-```bash
-git clone <repo> keel && cd keel
-cp .env.example .env            # add provider API keys (or use the bundled Ollama for zero-key)
-docker compose --profile full up -d
-# open the web app, or:  keel "summarise today's changes in ./repo"
+- FastAPI minimal chat with SSE, tool timeline, and approvals
+- sessions/history and hybrid session search
+- schedules, durable background jobs, cancellation/retry/recovery
+- Gmail OAuth/status/read flow and approval-gated send path
+- core/archival memory, consolidation proposals, deterministic memory evals
+- Knowledge Base lifecycle, durable ingest/delete, hybrid retrieval, citations, and taint
+- React application runnable with Vite
+- OneBot and Telegram gateway slices
+- CLI local runtime with file, shell, and provider tools
+
+Important limits: the server scope is hard-coded to `web:local`; open mode is implicit
+admin; the runtime DB owner can bypass RLS; shell execution is not isolated in a real
+sandbox; interactive run state is process-local; Compose `:3000` serves a static stub
+rather than the React bundle.
+
+## Run the development stack
+
+Prerequisites: Docker Desktop and a configured model/provider in `.env`.
+
+```powershell
+Copy-Item .env.example .env
+# Edit .env: set KEEL_DEFAULT_MODEL and its provider credentials.
+docker compose --profile dev up -d --build
+Invoke-RestMethod http://localhost:8000/readiness
 ```
 
+Open `http://localhost:8000/` for minimal chat or
+`http://localhost:8000/docs` for the current API. For the actual React UI:
+
+```powershell
+Set-Location web
+npm ci
+npm run dev
+```
+
+Use [`docs/DEMO.md`](./docs/DEMO.md) for a safe 10–15 minute walkthrough and
+[`docs/USAGE.md`](./docs/USAGE.md) for CLI/API details.
+
+## Documentation
+
+Start with the canonical [`docs/README.md`](./docs/README.md) index.
+
+- [Demo](./docs/DEMO.md)
+- [Status](./docs/STATUS.md)
+- [Roadmap](./docs/ROADMAP.md)
+- [Product requirements](./docs/PRD.md)
+- [Architecture and implementation fidelity](./docs/ARCHITECTURE.md)
+- [Operations](./docs/OPERATIONS.md)
+- [Development](./docs/DEVELOPMENT.md)
+
+## Stack
+
+Implemented foundations use Python 3.12/asyncio, FastAPI, LiteLLM, PostgreSQL + pgvector,
+Redis/arq, React + Vite, and Docker Compose. The broader target architecture includes
+separate sandbox/scheduler services, full observability, generated SDKs, and production
+delivery profiles; those remain roadmap work.
+
 ## License
-Apache-2.0 (planned).
+
+No repository license file has been added yet. Do not assume a license from historical
+planning text.
