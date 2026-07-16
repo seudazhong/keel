@@ -1,4 +1,5 @@
 import { http, HttpResponse } from "msw";
+import type { Agent } from "../features/agents/types";
 import type { Approval } from "../features/approvals/types";
 import type { SseEvent } from "../features/chat/types";
 import type { Connector } from "../features/connectors/types";
@@ -9,6 +10,8 @@ import type {
 } from "../features/knowledge/types";
 import type { Job } from "../features/jobs/types";
 import type { MemoryProposal } from "../features/memory/types";
+import type { Project } from "../features/projects/types";
+import type { DiffFile, Run, RunApproval } from "../features/projects/runs/types";
 import type { Schedule } from "../features/schedules/types";
 import type { SessionSummary } from "../features/sessions/types";
 
@@ -295,6 +298,143 @@ let schedules: Schedule[] = defaultSchedules.map((s) => ({ ...s }));
 export function resetSchedules(): void {
   schedules = defaultSchedules.map((s) => ({ ...s }));
 }
+
+const defaultAgents: Agent[] = [
+  {
+    id: "agent_personal",
+    name: "Personal assistant",
+    description: "General-purpose day-to-day helper for email, calendar, and notes.",
+    model: "github_copilot/claude-sonnet-4.5",
+    tools: ["calendar_list", "email_send"],
+    active: true,
+    created_at: now,
+    updated_at: now,
+  },
+  {
+    id: "agent_researcher",
+    name: "Researcher",
+    description: "Digs through knowledge bases and cites sources.",
+    model: "github_copilot/gpt-4o",
+    tools: ["knowledge_search"],
+    active: false,
+    created_at: now,
+    updated_at: now,
+  },
+];
+
+let agents: Agent[] = defaultAgents.map((a) => ({ ...a }));
+let agentMutation = 1;
+
+export function resetAgents(): void {
+  agents = defaultAgents.map((a) => ({ ...a }));
+  agentMutation = 1;
+}
+
+export const sampleAgents = defaultAgents;
+
+const defaultProjects: Project[] = [
+  {
+    id: "proj_keel",
+    name: "Keel",
+    description: "Personal assistant monorepo used for the coding-agent preview.",
+    repository: "https://github.com/example/keel",
+    default_branch: "main",
+    agent_id: "agent_researcher",
+    created_at: now,
+    updated_at: now,
+  },
+];
+
+let projects: Project[] = defaultProjects.map((p) => ({ ...p }));
+let projectMutation = 1;
+
+const defaultRuns: Record<string, Run[]> = {
+  proj_keel: [
+    {
+      id: "run_1",
+      project_id: "proj_keel",
+      status: "succeeded",
+      summary: "Add i18n foundation",
+      started_at: now,
+      finished_at: now,
+      steps: [
+        { id: "s1", label: "Plan", status: "done", timestamp: now },
+        { id: "s2", label: "Edit files", status: "done", timestamp: now },
+        { id: "s3", label: "Run tests", status: "done", timestamp: now },
+      ],
+    },
+    {
+      id: "run_2",
+      project_id: "proj_keel",
+      status: "awaiting_approval",
+      summary: "Rotate CI credentials",
+      started_at: now,
+      finished_at: null,
+      steps: [
+        { id: "s1", label: "Plan", status: "done", timestamp: now },
+        { id: "s2", label: "Edit files", status: "running", timestamp: now },
+      ],
+    },
+  ],
+};
+
+const defaultDiffs: Record<string, DiffFile[]> = {
+  run_1: [
+    {
+      path: "web/src/lib/i18n/en.ts",
+      additions: 5,
+      deletions: 0,
+      hunks: [
+        {
+          header: "@@ -0,0 +1,5 @@",
+          lines: [
+            { type: "add", text: "export const en = {" },
+            { type: "add", text: '  "app.title": "Keel",' },
+            { type: "add", text: "};" },
+          ],
+        },
+      ],
+    },
+  ],
+  run_2: [],
+};
+
+const defaultRunApprovals: Record<string, RunApproval[]> = {
+  run_1: [],
+  run_2: [
+    {
+      id: "ra_1",
+      run_id: "run_2",
+      tool: "credentials_rotate",
+      summary: "Rotate the GitHub token used by CI.",
+      status: "pending",
+    },
+  ],
+};
+
+let runs: Record<string, Run[]> = Object.fromEntries(
+  Object.entries(defaultRuns).map(([k, v]) => [k, v.map((r) => ({ ...r, steps: [...r.steps] }))]),
+);
+let diffs: Record<string, DiffFile[]> = Object.fromEntries(
+  Object.entries(defaultDiffs).map(([k, v]) => [k, v.map((f) => ({ ...f }))]),
+);
+let runApprovals: Record<string, RunApproval[]> = Object.fromEntries(
+  Object.entries(defaultRunApprovals).map(([k, v]) => [k, v.map((a) => ({ ...a }))]),
+);
+
+export function resetProjects(): void {
+  projects = defaultProjects.map((p) => ({ ...p }));
+  projectMutation = 1;
+  runs = Object.fromEntries(
+    Object.entries(defaultRuns).map(([k, v]) => [k, v.map((r) => ({ ...r, steps: [...r.steps] }))]),
+  );
+  diffs = Object.fromEntries(Object.entries(defaultDiffs).map(([k, v]) => [k, v.map((f) => ({ ...f }))]));
+  runApprovals = Object.fromEntries(
+    Object.entries(defaultRunApprovals).map(([k, v]) => [k, v.map((a) => ({ ...a }))]),
+  );
+}
+
+export const sampleProjects = defaultProjects;
 
 export const handlers = [
   http.get("/v1/approvals", () => HttpResponse.json(pending)),
@@ -628,5 +768,117 @@ export const handlers = [
         semantic_error: "embedding_unavailable",
       },
     });
+  }),
+
+  http.get("/v1/agents", () => HttpResponse.json(agents)),
+  http.post("/v1/agents", async ({ request }) => {
+    const body = (await request.json()) as {
+      name: string;
+      description: string;
+      model: string;
+      tools: string[];
+    };
+    const agent: Agent = {
+      id: `agent_new_${++agentMutation}`,
+      name: body.name,
+      description: body.description,
+      model: body.model,
+      tools: body.tools,
+      active: false,
+      created_at: now,
+      updated_at: now,
+    };
+    agents = [...agents, agent];
+    return HttpResponse.json(agent, { status: 201 });
+  }),
+  http.put("/v1/agents/:id", async ({ params, request }) => {
+    const id = String(params.id);
+    const existing = agents.find((a) => a.id === id);
+    if (!existing) return HttpResponse.json({ detail: "not found" }, { status: 404 });
+    const body = (await request.json()) as {
+      name: string;
+      description: string;
+      model: string;
+      tools: string[];
+    };
+    const updated: Agent = { ...existing, ...body, updated_at: now };
+    agents = agents.map((a) => (a.id === id ? updated : a));
+    return HttpResponse.json(updated);
+  }),
+  http.delete("/v1/agents/:id", ({ params }) => {
+    const id = String(params.id);
+    agents = agents.filter((a) => a.id !== id);
+    return HttpResponse.json({ ok: true });
+  }),
+  http.post("/v1/agents/:id/activate", ({ params }) => {
+    const id = String(params.id);
+    const target = agents.find((a) => a.id === id);
+    if (!target) return HttpResponse.json({ detail: "not found" }, { status: 404 });
+    agents = agents.map((a) => ({ ...a, active: a.id === id, updated_at: now }));
+    return HttpResponse.json(agents.find((a) => a.id === id));
+  }),
+
+  http.get("/v1/projects", () => HttpResponse.json(projects)),
+  http.get("/v1/projects/:id", ({ params }) => {
+    const project = projects.find((p) => p.id === String(params.id));
+    return project
+      ? HttpResponse.json(project)
+      : HttpResponse.json({ detail: "not found" }, { status: 404 });
+  }),
+  http.post("/v1/projects", async ({ request }) => {
+    const body = (await request.json()) as {
+      name: string;
+      repository: string;
+      default_branch: string;
+    };
+    const project: Project = {
+      id: `proj_new_${++projectMutation}`,
+      name: body.name,
+      description: "",
+      repository: body.repository,
+      default_branch: body.default_branch || "main",
+      agent_id: null,
+      created_at: now,
+      updated_at: now,
+    };
+    projects = [...projects, project];
+    runs[project.id] = [];
+    return HttpResponse.json(project, { status: 201 });
+  }),
+  http.delete("/v1/projects/:id", ({ params }) => {
+    const id = String(params.id);
+    projects = projects.filter((p) => p.id !== id);
+    return HttpResponse.json({ ok: true });
+  }),
+  http.get("/v1/projects/:id/runs", ({ params }) =>
+    HttpResponse.json(runs[String(params.id)] ?? []),
+  ),
+  http.get("/v1/runs/:id/diff", ({ params }) => HttpResponse.json(diffs[String(params.id)] ?? [])),
+  http.get("/v1/runs/:id/approvals", ({ params }) =>
+    HttpResponse.json(runApprovals[String(params.id)] ?? []),
+  ),
+  http.post("/v1/runs/:runId/approvals/:approvalId/approve", ({ params }) => {
+    const runId = String(params.runId);
+    const approvalId = String(params.approvalId);
+    const list = runApprovals[runId] ?? [];
+    runApprovals[runId] = list.map((a) =>
+      a.id === approvalId ? { ...a, status: "approved" } : a,
+    );
+    const updated = runApprovals[runId].find((a) => a.id === approvalId);
+    return updated
+      ? HttpResponse.json(updated)
+      : HttpResponse.json({ detail: "not found" }, { status: 404 });
+  }),
+  http.post("/v1/runs/:runId/approvals/:approvalId/reject", ({ params }) => {
+    const runId = String(params.runId);
+    const approvalId = String(params.approvalId);
+    const list = runApprovals[runId] ?? [];
+    runApprovals[runId] = list.map((a) =>
+      a.id === approvalId ? { ...a, status: "rejected" } : a,
+    );
+    const updated = runApprovals[runId].find((a) => a.id === approvalId);
+    return updated
+      ? HttpResponse.json(updated)
+      : HttpResponse.json({ detail: "not found" }, { status: 404 });
   }),
 ];

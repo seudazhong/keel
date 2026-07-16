@@ -25,7 +25,7 @@ function shellAt(path: string) {
   );
 }
 
-test("the shell exposes real navigation including Jobs and Memory", () => {
+test("the shell exposes real navigation including Jobs, Memory, Agents, and Projects", () => {
   renderWithClient(<RouterProvider router={shellAt("/approvals")} />);
   const labels = screen.getAllByRole("link").map((l) => l.textContent ?? "");
   for (const name of [
@@ -38,18 +38,32 @@ test("the shell exposes real navigation including Jobs and Memory", () => {
     "Schedules",
     "Approvals",
     "Observability",
+    "Agents",
+    "Projects",
   ]) {
     expect(labels.some((l) => l.includes(name))).toBe(true);
   }
 });
 
-test("unfinished nav items remain disabled while shipped surfaces are enabled", () => {
+test("roadmap nav items remain non-interactive while shipped and preview surfaces are enabled", () => {
   renderWithClient(<RouterProvider router={shellAt("/approvals")} />);
   const disabled = Array.from(document.querySelectorAll("[aria-disabled='true']"));
-  expect(disabled.some((el) => el.textContent?.includes("Agents"))).toBe(true);
+  expect(disabled.some((el) => el.textContent?.includes("Agents"))).toBe(false);
+  expect(disabled.some((el) => el.textContent?.includes("Projects"))).toBe(false);
   expect(disabled.some((el) => el.textContent?.includes("Knowledge"))).toBe(false);
   expect(disabled.some((el) => el.textContent?.includes("Memory"))).toBe(false);
   expect(disabled.some((el) => el.textContent?.includes("Jobs"))).toBe(false);
   expect(disabled.some((el) => el.textContent?.includes("Admin"))).toBe(true);
   expect(disabled.some((el) => el.textContent?.includes("Multi-agent"))).toBe(true);
+  expect(disabled.some((el) => el.textContent?.includes("Extensions"))).toBe(true);
+});
+
+test("Agents and Projects links are labeled as preview rather than pretending to be finished", () => {
+  renderWithClient(<RouterProvider router={shellAt("/approvals")} />);
+  const agentsLink = screen.getAllByRole("link").find((l) => l.textContent?.includes("Agents"));
+  const projectsLink = screen
+    .getAllByRole("link")
+    .find((l) => l.textContent?.includes("Projects"));
+  expect(agentsLink?.textContent).toContain("Preview");
+  expect(projectsLink?.textContent).toContain("Preview");
 });
