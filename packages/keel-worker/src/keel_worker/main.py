@@ -69,16 +69,27 @@ def _digest_registry(ctx: dict[str, Any], settings: Settings, scope_id: str) -> 
     """
     inbox_action = None
     send_action = None
+    idempotency_store = None
+    engine = ctx.get("engine")
+    if engine is not None:
+        from keel_core.outbox import PostgresOutboundStore
+
+        idempotency_store = PostgresOutboundStore(engine)
     if settings.gmail_enabled:
         from keel_core.gmail import make_gmail_inbox_action, make_gmail_send_action
-        from keel_core.secrets import cipher_from_settings
+        from keel_core.secrets import keyring_from_settings
         from keel_core.tokens import PostgresTokenStore
 
-        store = PostgresTokenStore(ctx["engine"], scope_id, cipher_from_settings(settings))
+        store = PostgresTokenStore(ctx["engine"], scope_id, keyring_from_settings(settings))
         inbox_action = make_gmail_inbox_action(store, settings.gmail_max_messages)
         if settings.gmail_send_enabled:
             send_action = make_gmail_send_action(store)
-    return digest_registry(ctx.get("sent"), inbox_action=inbox_action, send_action=send_action)
+    return digest_registry(
+        ctx.get("sent"),
+        inbox_action=inbox_action,
+        send_action=send_action,
+        idempotency_store=idempotency_store,
+    )
 
 
 async def _run_digest(ctx: dict[str, Any], row: ScheduleRow, settings: Settings) -> str:

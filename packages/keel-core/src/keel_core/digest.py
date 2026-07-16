@@ -11,6 +11,7 @@ from typing import Any
 from keel_core.agents import AgentSpec, Scope
 from keel_core.connectors import ActionFn, ConfusedDeputyEngine, ConnectorTool
 from keel_core.loop import ToolRegistry
+from keel_core.outbox import OutboundIdempotencyStore
 from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.protocols import ToolContext
 from keel_core.types import PermissionDecision, ScopeKind, TrustLevel
@@ -49,6 +50,7 @@ def digest_registry(
     *,
     inbox_action: ActionFn | None = None,
     send_action: ActionFn | None = None,
+    idempotency_store: OutboundIdempotencyStore | None = None,
 ) -> ToolRegistry:
     """The digest toolset. ``sent`` (if given) records outbound sends for tests.
 
@@ -57,6 +59,9 @@ def digest_registry(
     an in-memory outbox are used. Either way ``inbox_list`` taints its output (G17) and
     ``email_send`` stays ``outbound=True``, so the confused-deputy guard behaves
     identically — a real send still requires approval once tainted content is ingested.
+
+    ``idempotency_store`` makes ``email_send`` at-most-once across restarts/workers when a
+    durable store (Postgres) is supplied; the default is in-process (single run).
     """
     outbox = sent if sent is not None else []
 
@@ -81,6 +86,7 @@ def digest_registry(
                 description="Send an email.",
                 action=send_action or fake_email_send,
                 outbound=True,
+                idempotency_store=idempotency_store,
                 input_schema={
                     "type": "object",
                     "properties": {

@@ -20,6 +20,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from typing import Any, Protocol, runtime_checkable
 
 from keel_core.events import Event, EventType
+from keel_core.outbox import InMemoryOutboundStore, OutboundIdempotencyStore
 from keel_core.protocols import PermissionEngine, ToolContext, ToolResult
 from keel_core.types import ContentTaint, PermissionDecision
 
@@ -40,7 +41,10 @@ class ConnectorTool:
 
     ``outbound`` marks a side-effecting action (send/post) — the confused-deputy
     guard watches these. Inbound results are tainted so downstream outbound actions
-    can be gated. Outbound calls are idempotent on ``idempotency_key`` (G20).
+    can be gated. Outbound calls are idempotent on ``idempotency_key`` (G20) via an
+    injected :class:`~keel_core.outbox.OutboundIdempotencyStore`; the default in-memory
+    store keeps single-process at-most-once, while a durable store (Postgres) makes it
+    safe across restarts and workers.
     """
 
     def __init__(
@@ -51,6 +55,7 @@ class ConnectorTool:
         action: ActionFn,
         outbound: bool = False,
         input_schema: dict[str, Any] | None = None,
+        idempotency_store: OutboundIdempotencyStore | None = None,
     ) -> None:
         self.name = name
         self.description = description
@@ -58,24 +63,36 @@ class ConnectorTool:
         self.writes = outbound  # executor schedules outbound actions like writes
         self._action = action
         self._schema = input_schema or {"type": "object"}
-        self._sent: dict[str, ToolResult] = {}  # idempotency cache (outbound)
+        self._idempotency = idempotency_store or InMemoryOutboundStore()
 
     def input_schema(self) -> dict[str, Any]:
         return self._schema
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         if self.outbound:
-            key = str(args.get("idempotency_key", ""))
-            if key and key in self._sent:
-                return self._sent[key]  # at-most-once: replay the prior result
-            output = await self._action(args, ctx)
-            result = ToolResult(ok=True, output=output, taint=ContentTaint.clean)
-            if key:
-                self._sent[key] = result
-            return result
+            return await self._run_outbound(args, ctx)
         # Inbound: external content is untrusted -> taint it (G17).
         output = await self._action(args, ctx)
         return ToolResult(ok=True, output=output, taint=ContentTaint.tainted)
+
+    async def _run_outbound(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        key = str(args.get("idempotency_key", ""))
+        if not key:
+            output = await self._action(args, ctx)
+            return ToolResult(ok=True, output=output, taint=ContentTaint.clean)
+        claim = await self._idempotency.claim(ctx.scope_id, self.name, key)
+        if not claim.owner:
+            # Replay a finalized result; a still-pending concurrent claim replays empty
+            # rather than re-sending (at-most-once wins over completeness).
+            return ToolResult(ok=True, output=claim.result or "", taint=ContentTaint.clean)
+        try:
+            output = await self._action(args, ctx)
+        except Exception:
+            # Release the claim so a later retry may re-send; the side effect did not land.
+            await self._idempotency.release(ctx.scope_id, self.name, key)
+            raise
+        await self._idempotency.finalize(ctx.scope_id, self.name, key, output)
+        return ToolResult(ok=True, output=output, taint=ContentTaint.clean)
 
 
 def taint_from_events(events: Iterable[Event]) -> ContentTaint:

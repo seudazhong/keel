@@ -107,7 +107,8 @@ async def migrated_db(pg_engine: AsyncEngine) -> AsyncIterator[AsyncEngine]:
                 "TRUNCATE kb_chunks, knowledge_idempotency, kb_document_versions, "
                 "kb_documents, knowledge_bases, jobs, consolidation_cursors, "
                 "memory_proposals, message_embeddings, events, sessions, memory_blocks, "
-                "memory_block_versions, connector_tokens, archival, schedules, approvals"
+                "memory_block_versions, connector_tokens, connector_outbox, oauth_states, "
+                "webhook_deliveries, archival, schedules, approvals"
             )
         )
     yield pg_engine

@@ -83,8 +83,15 @@ class Settings(BaseSettings):
     job_error_message_max_chars: int = Field(default=2_000, gt=0)
 
     # RBAC (B3): comma-separated ``key:role`` pairs (roles: viewer|operator|admin).
-    # Empty -> open single-user mode (every request is an implicit admin).
+    # Keys are hashed at rest (never compared in plaintext) and verified in constant
+    # time. Empty -> open single-user mode, allowed ONLY when ``cloud_mode`` is off
+    # (local/self-hosted posture). See ``cloud_mode`` below.
     api_keys: str = ""
+
+    # Cloud-safety posture (M3.3). When true the server fails **closed**: an empty
+    # ``api_keys`` is a hard misconfiguration (every request is rejected) instead of the
+    # implicit-admin open mode. Leave false only for local/self-hosted single-user use.
+    cloud_mode: bool = False
 
     # Durable event store backend: "postgres" (default) or "memory". The in-memory
     # store is a single-process "lite" profile — and the way to run the server on a
@@ -92,8 +99,26 @@ class Settings(BaseSettings):
     event_store: str = "postgres"
 
     # Envelope-encryption key for connector OAuth tokens at rest (G18). Any string;
-    # a Fernet key is derived from it. Empty -> the token store fails closed.
+    # a Fernet key is derived from it. Empty -> the token store fails closed. This is
+    # the legacy single-key form; it is registered under key id ``v1``.
     secret_key: str = ""
+
+    # Versioned envelope keys for rotation (M3.3). Comma-separated ``key_id:secret``
+    # pairs; every id that has ever encrypted a stored token MUST stay listed so old
+    # ciphertext still decrypts. ``secret_key_active_id`` selects which id encrypts new
+    # writes (default ``v1``; falls back to the sole configured id when unset). When
+    # empty the legacy ``secret_key`` is used as key id ``v1``.
+    secret_keys: str = ""
+    secret_key_active_id: str = ""
+
+    # Durable OAuth CSRF ``state`` lifetime (M3.3). A connect ``state`` is single-use
+    # and expires after this many seconds; the callback rejects unknown/expired states.
+    oauth_state_ttl_seconds: int = Field(default=600, gt=0)
+
+    # Durable webhook replay-protection window (M3.3): how long a seen delivery id is
+    # remembered so a replayed IM webhook is dropped. Also the outbound-idempotency and
+    # oauth-state sweeper horizon.
+    webhook_replay_ttl_seconds: int = Field(default=86_400, gt=0)
 
     # Langfuse tracing (WS-H). Tracing is enabled only when both keys are set;
     # otherwise a no-op tracer is used (zero overhead, no network).
@@ -106,11 +131,19 @@ class Settings(BaseSettings):
     onebot_access_token: str = ""
     onebot_self_id: int = 0
     im_rate_limit: int = 5  # max messages per chat per minute
+    # Inbound webhook signing secret (M3.3). When set, ``POST /v1/gateway/onebot``
+    # requires a valid ``X-Signature: sha1=<hmac>`` over the raw body; when
+    # ``cloud_mode`` is on it is REQUIRED (unsigned requests are rejected).
+    onebot_signing_secret: str = ""
 
     # Telegram IM gateway (WS-E/J). Empty bot token -> the gateway is disabled. The
     # username (without '@') is used for group @-mention wake detection.
     telegram_bot_token: str = ""
     telegram_bot_username: str = ""
+    # Inbound webhook secret (M3.3): compared to Telegram's
+    # ``X-Telegram-Bot-Api-Secret-Token`` header in constant time. Required when
+    # ``cloud_mode`` is on.
+    telegram_webhook_secret: str = ""
 
     # psycopg3 driver works for both sync (Alembic) and async (app) engines.
     database_url: str = "postgresql+psycopg://keel:keel@localhost:5432/keel"
