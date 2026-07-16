@@ -11,6 +11,10 @@ test("api.get returns the approvals list", async () => {
 });
 
 test("api.get throws on a non-2xx response", async () => {
-  server.use(http.get("/v1/approvals", () => new HttpResponse(null, { status: 500 })));
-  await expect(api.get("/v1/approvals")).rejects.toThrow("HTTP 500");
+  server.use(
+    http.get("/v1/approvals", () =>
+      HttpResponse.json({ detail: "datastore unavailable" }, { status: 503 }),
+    ),
+  );
+  await expect(api.get("/v1/approvals")).rejects.toThrow("datastore unavailable");
 });

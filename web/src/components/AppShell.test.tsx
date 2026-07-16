@@ -15,6 +15,8 @@ function shellAt(path: string) {
           { path: "sessions", element: <div>sessions</div> },
           { path: "connectors", element: <div>connectors</div> },
           { path: "knowledge", element: <div>knowledge</div> },
+          { path: "memory", element: <div>memory</div> },
+          { path: "jobs", element: <div>jobs</div> },
           { path: "approvals", element: <ApprovalsPage /> },
         ],
       },
@@ -23,7 +25,7 @@ function shellAt(path: string) {
   );
 }
 
-test("the shell exposes real navigation including Knowledge", () => {
+test("the shell exposes real navigation including Jobs and Memory", () => {
   renderWithClient(<RouterProvider router={shellAt("/approvals")} />);
   const labels = screen.getAllByRole("link").map((l) => l.textContent ?? "");
   for (const name of [
@@ -31,6 +33,8 @@ test("the shell exposes real navigation including Knowledge", () => {
     "Sessions",
     "Connectors",
     "Knowledge",
+    "Memory",
+    "Jobs",
     "Schedules",
     "Approvals",
     "Observability",
@@ -39,9 +43,13 @@ test("the shell exposes real navigation including Knowledge", () => {
   }
 });
 
-test("unfinished nav items remain disabled while Knowledge is enabled", () => {
+test("unfinished nav items remain disabled while shipped surfaces are enabled", () => {
   renderWithClient(<RouterProvider router={shellAt("/approvals")} />);
   const disabled = Array.from(document.querySelectorAll("[aria-disabled='true']"));
   expect(disabled.some((el) => el.textContent?.includes("Agents"))).toBe(true);
   expect(disabled.some((el) => el.textContent?.includes("Knowledge"))).toBe(false);
+  expect(disabled.some((el) => el.textContent?.includes("Memory"))).toBe(false);
+  expect(disabled.some((el) => el.textContent?.includes("Jobs"))).toBe(false);
+  expect(disabled.some((el) => el.textContent?.includes("Admin"))).toBe(true);
+  expect(disabled.some((el) => el.textContent?.includes("Multi-agent"))).toBe(true);
 });

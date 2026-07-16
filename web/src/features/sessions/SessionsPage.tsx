@@ -40,16 +40,16 @@ export function SessionsPage() {
       <Topbar title="Sessions" sub="· 跨 Web / IM 的历史会话" />
       <div className="w-full max-w-[900px] p-[22px]">
         <input
+          aria-label="搜索会话"
           className="mb-4 w-full rounded-sm border border-border bg-surface-2 px-3 py-2 text-sm outline-none focus:border-accent"
-          placeholder="🔍 混合检索（trigram + FTS）：会话消息内容…"
+          placeholder="🔍 语义 + 词法混合检索：会话消息内容…"
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
         <Banner tone="info" className="mb-4">
           <span>🔎</span>
           <div>
-            服务端词法混合检索（<b>pg_trgm + tsvector</b>，取较高分）。语义臂（pgvector
-            KNN）在 M3 接入。
+            服务端语义与词法混合检索已启用；语义服务暂不可用时会安全降级到词法结果。
           </div>
         </Banner>
 
@@ -58,7 +58,15 @@ export function SessionsPage() {
         {isError && (
           <Banner tone="danger">
             <span>⚠️</span>
-            <div>加载会话失败。</div>
+            <div>
+              加载会话失败。
+              <button
+                className="ml-2 underline"
+                onClick={() => void (searching ? search.refetch() : list.refetch())}
+              >
+                重试
+              </button>
+            </div>
           </Banner>
         )}
 

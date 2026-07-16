@@ -7,11 +7,11 @@ import { ChatThread } from "./ChatThread";
 import { Composer } from "./Composer";
 import { RunBar } from "./RunBar";
 import { useChat } from "./useChat";
-
-const MODEL = "github_copilot / claude-sonnet-4.5";
+import { useModel } from "../settings/useModel";
 
 export function ChatPage() {
   const { items, running, reason, usage, send, resolve, interrupt } = useChat();
+  const model = useModel();
   const endRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -26,7 +26,7 @@ export function ChatPage() {
           sub="· 个人助理"
           right={
             <Link to="/settings" title="切换模型">
-              <Badge tone="violet">{MODEL}</Badge>
+              <Badge tone="violet">{model.data?.current ?? "Model unavailable"}</Badge>
             </Link>
           }
         />
@@ -51,7 +51,7 @@ export function ChatPage() {
         </div>
       </div>
 
-      <ChatContext items={items} usage={usage} />
+      <ChatContext items={items} usage={usage} model={model.data?.current} />
     </div>
   );
 }

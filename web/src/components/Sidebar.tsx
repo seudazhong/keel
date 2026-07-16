@@ -7,7 +7,8 @@ const groups = [
     items: [
       { icon: "💬", label: "Chat", to: "/chat" },
       { icon: "🗂️", label: "Sessions", to: "/sessions" },
-      { icon: "🧠", label: "Knowledge", to: "/knowledge" },
+      { icon: "🧠", label: "Memory", to: "/memory" },
+      { icon: "📚", label: "Knowledge", to: "/knowledge" },
     ],
   },
   {
@@ -30,6 +31,7 @@ const groups = [
     label: "运维",
     items: [
       { icon: "📊", label: "Observability", to: "/observability" },
+      { icon: "🧰", label: "Jobs", to: "/jobs" },
       { icon: "⚙️", label: "Admin" },
     ],
   },
