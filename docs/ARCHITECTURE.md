@@ -296,10 +296,11 @@ Session search and archival search share this pipeline. CJK handled via trigram 
 ### 8.3 State / event sourcing [pattern]
 - **Append-only `events`** are the source of truth; **projectors** fold them into read models (`messages`, `parts`, `session` rollups, `todos`). Gives resume, replay, live streaming, and audit from one primitive.
 - **Durable prompt admission:** `session_input` row written before execution; a coordinator promotes it; crash → pending & retryable.
-- **Event schema evolution target [G3]:** events carry a `version` per `type`, but the
-  upcaster registry and old→new projection-rebuild contract suite are not implemented.
-  [Roadmap M3.4](./ROADMAP.md#m34--event-evolution) adds append-only upcasters and proves
-  rebuild compatibility.
+- **Event schema evolution [G3]:** typed, append-only upcasters convert persisted
+  events before replay or projection; unknown types, malformed historical payloads,
+  missing transitions, and future versions fail closed. Rebuilds can dry-run and
+  resume from checkpoints, with tombstone hooks for future lifecycle policy. See
+  [event/API versioning](./EVENT-VERSIONING.md).
 
 ---
 

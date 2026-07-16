@@ -1200,12 +1200,14 @@ name = "keel-sdk"
 version = "0.0.0"
 source = { editable = "packages/keel-sdk" }
 dependencies = [
+    { name = "httpx" },
     { name = "keel-core" },
     { name = "pydantic" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
     { name = "keel-core", editable = "packages/keel-core" },
     { name = "pydantic", specifier = ">=2.7" },
 ]

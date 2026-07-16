@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from keel_core.config import Settings
 from keel_core.events import Event, EventType
+from keel_core.evolution import current_event_version
 from keel_core.state import InMemoryEventStore, append_event_in_transaction
 
 _MAX_JSON_DEPTH = 100
@@ -505,6 +506,7 @@ def _injection_event(record: JobRecord, status: JobStatus, text_value: str, now:
     assert record.target_session_id is not None
     return Event(
         type=EventType.message_token,
+        version=current_event_version(EventType.message_token),
         seq=0,
         session_id=record.target_session_id,
         scope_id=record.scope_id,
