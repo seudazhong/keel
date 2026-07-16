@@ -1,0 +1,80 @@
+# keel-web: nginx serving the built React app + proxying /v1, /health, /readiness, SSE to
+# keel-server (see deploy/docker/web.nginx.conf for the proxy rules this image bakes in).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keel-web
+  labels:
+    app.kubernetes.io/name: keel-web
+    app.kubernetes.io/part-of: keel
+    app.kubernetes.io/component: web
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keel-web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keel-web
+        app.kubernetes.io/part-of: keel
+        app.kubernetes.io/component: web
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101 # nginx image's non-root user; adjust to match the built image
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keel-web
+          image: ghcr.io/OWNER/keel-web:REPLACE_WITH_PINNED_DIGEST
+          ports:
+            - name: http
+              containerPort: 80 # matches deploy/docker/web.nginx.conf `listen 80`
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              # NET_BIND_SERVICE lets the non-root nginx user bind port 80 without running
+              # as root. Switching the image to an unprivileged >=1024 listen port (and
+              # dropping this capability) is a cleaner target; tracked as follow-up, not a
+              # blocker for this scaffold.
+              add: ["NET_BIND_SERVICE"]
+          volumeMounts:
+            # nginx needs a few writable paths even with a read-only rootfs.
+            - name: nginx-cache
+              mountPath: /var/cache/nginx
+            - name: nginx-run
+              mountPath: /var/run
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "250m"
+              memory: "128Mi"
+          readinessProbe:
+            httpGet:
+              path: /web-health
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /web-health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+      volumes:
+        - name: nginx-cache
+          emptyDir: {}
+        - name: nginx-run
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

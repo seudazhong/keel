@@ -4,6 +4,10 @@ Keel's Compose setup is a development deployment, not a production reference arc
 It runs one hard-coded scope, exposes local ports, and defaults to unauthenticated implicit
 admin when `KEEL_API_KEYS` is empty.
 
+For a Kubernetes-based deployment scaffold (hardened manifests, storage/backup/DR, upgrade/
+rollback, and clean-install runbooks), see [`deploy/k8s`](../deploy/k8s/README.md). It is a
+scaffold toward the M3.8 production-delivery gates below, not evidence those gates are closed.
+
 ## Lifecycle and probes
 
 ```powershell

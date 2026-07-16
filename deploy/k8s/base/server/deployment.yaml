@@ -1,0 +1,75 @@
+# keel-server: stateless FastAPI control-plane API. Horizontally scalable (ARCHITECTURE §15).
+# Creates/manages per-run sandbox Jobs, so it is the only workload bound to the
+# keel-control-plane ServiceAccount (../serviceaccount-control-plane.yaml) with its token
+# mounted. It never runs untrusted/model-chosen code directly.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keel-server
+  labels:
+    app.kubernetes.io/name: keel-server
+    app.kubernetes.io/part-of: keel
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keel-server
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keel-server
+        app.kubernetes.io/part-of: keel
+        app.kubernetes.io/component: control-plane
+    spec:
+      serviceAccountName: keel-control-plane
+      automountServiceAccountToken: true # needed to create/watch per-run sandbox Jobs
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keel-server
+          image: ghcr.io/OWNER/keel-app:REPLACE_WITH_PINNED_DIGEST
+          command: ["keel-server"]
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: keel-app-config
+            - secretRef:
+                name: keel-app-secret
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+          readinessProbe:
+            httpGet:
+              path: /readiness
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+      volumes:
+        - name: tmp
+          emptyDir: {}

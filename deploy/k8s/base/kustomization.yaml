@@ -1,0 +1,36 @@
+# Base Kustomize resources for a single Keel org/tenant namespace. Overlays in ../overlays/*
+# patch this base for an environment (dev/production). See ../README.md for validation and
+# ../docs/ for storage, backup/DR, upgrade/rollback, and SLO runbooks.
+#
+# Deliberately NOT listed here (see each file's own header comment for why):
+#   - secret-app.example.yaml, datastores/*.example.yaml   — templates with placeholder
+#     credentials/hostnames; copy, fill from a real secret manager, and reference the copy
+#     from your own overlay instead.
+#   - sandbox/job-template.yaml                       — rendered per-run by keel-server, not
+#     applied once at install time.
+#   - sandbox/runtimeclass.example.yaml               — opt-in stronger-isolation runtimes;
+#     add only if your cluster has the matching node runtime installed.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: keel
+resources:
+  - namespace.yaml
+  - configmap-app.yaml
+  - serviceaccount-control-plane.yaml
+  - server/deployment.yaml
+  - server/service.yaml
+  - worker/deployment.yaml
+  - scheduler/deployment.yaml
+  - web/deployment.yaml
+  - web/service.yaml
+  - sandbox/serviceaccount.yaml
+  - datastores/git-pvc.yaml
+  - networkpolicy/default-deny-all.yaml
+  - networkpolicy/allow-dns-egress.yaml
+  - networkpolicy/allow-control-plane-egress.yaml
+  - networkpolicy/allow-sandbox-egress-proxy-only.yaml
+  - networkpolicy/allow-ingress-to-web-and-server.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: keel
+    includeSelectors: false

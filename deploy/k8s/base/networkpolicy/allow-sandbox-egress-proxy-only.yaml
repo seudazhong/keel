@@ -1,0 +1,37 @@
+# Sandbox Jobs (label app.kubernetes.io/component: sandbox, see ../sandbox/job-template.yaml)
+# may reach ONLY the in-cluster egress-proxy Service — never the internet or any other
+# in-cluster Service directly. The proxy is the single, auditable point where an allow-list
+# and registry mirror are enforced (design doc §9 "Egress"); this scaffold does not ship the
+# proxy's Deployment itself (it is application-layer, not a manifest-only concern) — treat
+# `keel-egress-proxy` as an integration point your platform team stands up and points this
+# policy's podSelector at, or adjust the selector/port to your chosen proxy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-sandbox-egress-proxy-only
+  labels:
+    app.kubernetes.io/part-of: keel
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: sandbox
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: egress-proxy
+      ports:
+        - protocol: TCP
+          port: 3128
+    - to:
+        # Internal control-plane<->sandbox RPC (mTLS, capability-token-bound; design doc
+        # §8.4) — status/log reporting and worktree materialization callbacks, not a general
+        # network path. Not the public keel-web/Ingress path.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: keel-server
+      ports:
+        - protocol: TCP
+          port: 8000

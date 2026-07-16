@@ -1,0 +1,61 @@
+# keel-scheduler: leader-elected cron singleton (ADR-0006, ARCHITECTURE §15). Exactly one
+# active replica should perform scheduling; `replicas: 1` here is a placeholder until leader
+# election is implemented (M3.8 — "scheduler service/leadership" in docs/ROADMAP.md). Do not
+# scale this beyond 1 replica before that lands, or schedules may double-fire.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keel-scheduler
+  labels:
+    app.kubernetes.io/name: keel-scheduler
+    app.kubernetes.io/part-of: keel
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate # avoid two schedulers running concurrently during a rollout
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keel-scheduler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keel-scheduler
+        app.kubernetes.io/part-of: keel
+        app.kubernetes.io/component: control-plane
+    spec:
+      automountServiceAccountToken: false # no Kubernetes API access needed
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keel-scheduler
+          image: ghcr.io/OWNER/keel-app:REPLACE_WITH_PINNED_DIGEST
+          command: ["keel-scheduler"]
+          envFrom:
+            - configMapRef:
+                name: keel-app-config
+            - secretRef:
+                name: keel-app-secret
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      volumes:
+        - name: tmp
+          emptyDir: {}

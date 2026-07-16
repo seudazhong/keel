@@ -1,0 +1,43 @@
+# RuntimeClass examples for stronger-isolation sandbox execution — gVisor, Kata Containers,
+# and a microVM (e.g. Firecracker-based) backend. NONE of these are referenced by
+# ../job-template.yaml or included in ../../base/kustomization.yaml by default: a cluster
+# without the corresponding node-level runtime installed would fail to schedule any Pod that
+# requested one of these classes, so adoption is opt-in and cluster-operator-driven.
+#
+# To adopt one:
+#   1. Install and validate the runtime on your nodes/node pool (gVisor `runsc`, Kata's
+#      containerd shim, or your microVM provider's integration) — out of scope for this
+#      manifest scaffold.
+#   2. Apply the single RuntimeClass object below that matches what you installed.
+#   3. Point the production overlay's sandbox patch at it
+#      (../../overlays/production/patch-sandbox-runtimeclass.yaml).
+#
+# See docs/adr/0005-sandbox.md and the managed-code-projects design doc §8.4/§9 for why this
+# is staged rather than defaulted: rootless-OCI is the accepted floor for a trusted
+# single-org preview, and one of these stronger runtimes is the accepted gate for hostile
+# multi-tenant workloads (still pending real sandbox integration — see
+# ../../docs/security-model.md "Pending gates").
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+  labels:
+    app.kubernetes.io/part-of: keel
+handler: runsc
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: kata
+  labels:
+    app.kubernetes.io/part-of: keel
+handler: kata
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: microvm
+  labels:
+    app.kubernetes.io/part-of: keel
+handler: firecracker # replace with your microVM provider's containerd handler name

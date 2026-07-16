@@ -434,6 +434,11 @@ profiles:
   seeded because those product models do not yet exist.
 - **Target scale-out:** worker/server scale-out and elected scheduler require the durable
   topology and production-delivery gates in M3.6/M3.8.
+- **Kubernetes scaffold:** [`deploy/k8s`](../deploy/k8s/README.md) provides hardened manifests/
+  Kustomize bases toward this target topology (restricted security contexts, default-deny
+  `NetworkPolicy`, a per-run sandbox Job template, gVisor/Kata/microVM `runtimeClassName`
+  hooks). It is explicitly not a claim of hostile multi-tenant readiness — see
+  [`deploy/k8s/docs/security-model.md`](../deploy/k8s/docs/security-model.md) "Pending gates".
 
 ### 15.2 Repository layout (uv monorepo)
 ```

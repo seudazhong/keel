@@ -1,0 +1,24 @@
+# DNS is otherwise blocked by default-deny-all.yaml. Applies to every Pod in the namespace,
+# including sandbox Jobs, since even the sandbox's constrained egress-proxy path needs to
+# resolve the proxy's in-cluster Service name.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  labels:
+    app.kubernetes.io/part-of: keel
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector: {} # cluster DNS lives in kube-system; allow to any namespace's
+          podSelector: # DNS pods since label conventions vary by CNI/cluster
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

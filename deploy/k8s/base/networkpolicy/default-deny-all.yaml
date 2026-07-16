@@ -1,0 +1,19 @@
+# Default-deny for every Pod in the namespace: no ingress, no egress unless explicitly
+# allowed by another NetworkPolicy below. This is the baseline every other policy in this
+# directory adds narrow exceptions to — do not remove it without replacing the equivalent
+# guarantee some other way.
+#
+# Requires a NetworkPolicy-enforcing CNI (Calico, Cilium, etc.); a cluster without one will
+# accept this object but not actually enforce it — verify enforcement out-of-band
+# (see ../../docs/security-model.md "Verifying NetworkPolicy enforcement").
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  labels:
+    app.kubernetes.io/part-of: keel
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
