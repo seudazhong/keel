@@ -7,5 +7,7 @@ export default defineConfig({
     environment: "jsdom",
     globals: false,
     setupFiles: ["./src/test/setup.ts"],
+    // Playwright owns ./e2e (browser smoke); keep it out of the Vitest run.
+    exclude: ["node_modules/**", "dist/**", "e2e/**"],
   },
 });

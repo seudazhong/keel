@@ -42,7 +42,26 @@ npm run test
 npm run build
 ```
 
-Run `npm run dev` for the actual React UI. Compose `keel-web` is only a static stub.
+Run `npm run dev` for the actual React UI against an already-running `:8000` API, or use the
+built Compose `keel-web` bundle directly (see [Demo guide](./DEMO.md)).
+
+### Playwright demo smoke
+
+A read-only Playwright smoke covers the documented 10-15 minute demo (see
+[Demo guide](./DEMO.md#6-automated-browser-smoke-23-minutes)). It targets the Compose React
+surface on `http://127.0.0.1:3000` by default and requires an already-running stack — it does
+not start/stop Compose or delete volumes:
+
+```powershell
+docker compose --profile dev up -d
+Set-Location web
+npm run test:e2e:install   # first run only: installs the Chromium browser
+npm run test:e2e
+```
+
+Override the target with `$env:SMOKE_BASE_URL` (e.g. a Vite dev server on `:5173`). The suite
+fails fast with an actionable error if the target is unreachable or is a stale pre-M3.1 build
+(missing current-main routes like `/v1/jobs`) rather than silently skipping current routes.
 
 ## Local services
 
