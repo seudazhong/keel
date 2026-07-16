@@ -49,7 +49,7 @@ export function ConnectorsPage() {
             <Card className="mb-[22px] overflow-hidden">
               {connected.length === 0 ? (
                 <p className="p-4 text-sm text-text-muted">
-                  还没有已连接的连接器。通过 CLI 授权后会出现在这里。
+                  还没有已连接的连接器。可用的 OAuth 连接器支持从本页发起浏览器授权。
                 </p>
               ) : (
                 <table className="w-full text-sm">

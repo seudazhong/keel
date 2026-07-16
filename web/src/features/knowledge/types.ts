@@ -1,3 +1,6 @@
+import type { Job } from "../jobs/types";
+export type { Job, JobStatus } from "../jobs/types";
+
 export type KnowledgeBaseStatus = "active" | "deleted";
 export type KnowledgeDocumentStatus = "pending" | "active" | "failed" | "deleted";
 export type KnowledgeVersionStatus =
@@ -11,7 +14,6 @@ export type KnowledgeVersionStatus =
   | "purged";
 export type KnowledgeSourceType = "text" | "markdown";
 export type KnowledgeSearchMode = "hybrid" | "lexical" | "lexical-degraded";
-export type JobStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
 
 export interface KnowledgeBase {
   id: string;
@@ -66,32 +68,6 @@ export interface KnowledgeVersion {
 export interface KnowledgeDocumentDetail {
   document: KnowledgeDocument;
   versions: KnowledgeVersion[];
-}
-
-export interface Job {
-  id: string;
-  kind: string;
-  status: JobStatus;
-  cancel_mode: "immediate" | "cooperative" | "disabled";
-  target_session_id: string | null;
-  attempt: number;
-  max_attempts: number;
-  next_attempt_at: string;
-  lease_expires_at: string | null;
-  cancel_requested: boolean;
-  progress_current: number;
-  progress_total: number | null;
-  progress_message: string | null;
-  progress_updated_at: string | null;
-  result: Record<string, unknown> | null;
-  result_message: string | null;
-  error_kind: string | null;
-  error_message: string | null;
-  injected_event_seq: number | null;
-  created_at: string;
-  updated_at: string;
-  started_at: string | null;
-  finished_at: string | null;
 }
 
 export interface KnowledgeDocumentJobResponse {

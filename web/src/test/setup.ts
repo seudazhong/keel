@@ -7,6 +7,8 @@ import {
   resetApprovals,
   resetConnectors,
   resetKnowledge,
+  resetJobs,
+  resetMemory,
   resetModel,
   resetSchedules,
 } from "./handlers";
@@ -20,6 +22,8 @@ afterEach(() => {
   resetApprovals();
   resetConnectors();
   resetKnowledge();
+  resetJobs();
+  resetMemory();
   resetModel();
   resetSchedules();
 });

@@ -3,11 +3,12 @@ import type { Approval } from "../features/approvals/types";
 import type { SseEvent } from "../features/chat/types";
 import type { Connector } from "../features/connectors/types";
 import type {
-  Job,
   KnowledgeBase,
   KnowledgeDocument,
   KnowledgeVersion,
 } from "../features/knowledge/types";
+import type { Job } from "../features/jobs/types";
+import type { MemoryProposal } from "../features/memory/types";
 import type { Schedule } from "../features/schedules/types";
 import type { SessionSummary } from "../features/sessions/types";
 
@@ -157,6 +158,39 @@ function makeJob(id: string, kind = "knowledge.ingest"): Job {
   };
 }
 
+const defaultJobs: Job[] = [
+  {
+    ...makeJob("job_running_1", "memory.consolidation"),
+    status: "running",
+    cancel_mode: "cooperative",
+    progress_current: 4,
+    progress_total: 10,
+    progress_message: "Reviewing recent events",
+    result: null,
+    result_message: null,
+    started_at: now,
+    finished_at: null,
+  },
+  {
+    ...makeJob("job_failed_1", "knowledge.ingest"),
+    status: "failed",
+    progress_current: 2,
+    progress_total: 3,
+    result: null,
+    result_message: null,
+    error_kind: "embedding_unavailable",
+    error_message: "Embedding provider did not respond.",
+  },
+];
+
+let jobs = new Map(defaultJobs.map((job) => [job.id, { ...job }]));
+
+export const sampleJobs = defaultJobs;
+
+export function resetJobs(): void {
+  jobs = new Map(defaultJobs.map((job) => [job.id, { ...job }]));
+}
+
 let knowledgeBases: KnowledgeBase[] = [{ ...sampleKnowledgeBase }];
 let knowledgeDocuments: KnowledgeDocument[] = [{ ...sampleKnowledgeDocument }];
 let knowledgeVersions = new Map<string, KnowledgeVersion[]>([
@@ -176,6 +210,43 @@ export function resetKnowledge(): void {
   knowledgeJobs = new Map([["job_knowledge_1", makeJob("job_knowledge_1")]]);
   knowledgeMutation = 1;
   knowledgeIdempotencyKeys.length = 0;
+}
+
+const defaultMemoryProposals: MemoryProposal[] = [
+  {
+    id: "mp_1",
+    block: "user_preferences",
+    expected_version: 3,
+    proposed_value: "Prefers concise weekly status summaries.",
+    reason: "The preference was stated consistently across recent sessions.",
+    confidence: 0.92,
+    source_event_ids: [101, 118, 125],
+    status: "pending",
+    created_at: now,
+    resolved_at: null,
+    resolved_by: null,
+  },
+  {
+    id: "mp_2",
+    block: "working_context",
+    expected_version: 5,
+    proposed_value: "Current project is Keel.",
+    reason: "Resolved proposal retained for audit history.",
+    confidence: 0.81,
+    source_event_ids: [88],
+    status: "applied",
+    created_at: now,
+    resolved_at: now,
+    resolved_by: "web",
+  },
+];
+
+let memoryProposals = defaultMemoryProposals.map((proposal) => ({ ...proposal }));
+
+export const sampleMemoryProposals = defaultMemoryProposals;
+
+export function resetMemory(): void {
+  memoryProposals = defaultMemoryProposals.map((proposal) => ({ ...proposal }));
 }
 
 function recordIdempotency(request: Request) {
@@ -297,6 +368,77 @@ export const handlers = [
       },
     }),
   ),
+  http.get("/v1/jobs", () =>
+    HttpResponse.json([...jobs.values(), ...knowledgeJobs.values()]),
+  ),
+  http.post("/v1/jobs/:jobId/cancel", ({ params }) => {
+    const id = String(params.jobId);
+    const source = jobs.has(id) ? jobs : knowledgeJobs;
+    const job = source.get(id);
+    if (!job) return HttpResponse.json({ detail: "job not found" }, { status: 404 });
+    if (
+      (job.status !== "queued" && job.status !== "running") ||
+      job.cancel_mode === "disabled"
+    ) {
+      return HttpResponse.json(
+        { detail: "job does not allow cancellation" },
+        { status: 409 },
+      );
+    }
+    const updated: Job = { ...job, cancel_requested: true, updated_at: now };
+    source.set(id, updated);
+    return HttpResponse.json(updated);
+  }),
+  http.get("/v1/memory/proposals", () => HttpResponse.json(memoryProposals)),
+  http.post("/v1/memory/proposals/:proposalId/approve", ({ params }) => {
+    const id = String(params.proposalId);
+    const proposal = memoryProposals.find((row) => row.id === id);
+    if (!proposal) {
+      return HttpResponse.json(
+        { ok: false, status: "not_found", version: null },
+        { status: 404 },
+      );
+    }
+    if (proposal.status !== "pending") {
+      return HttpResponse.json(
+        { ok: false, status: "already_resolved", version: null },
+        { status: 409 },
+      );
+    }
+    memoryProposals = memoryProposals.map((row) =>
+      row.id === id
+        ? { ...row, status: "applied", resolved_at: now, resolved_by: "web" }
+        : row,
+    );
+    return HttpResponse.json({
+      ok: true,
+      status: "applied",
+      version: proposal.expected_version + 1,
+    });
+  }),
+  http.post("/v1/memory/proposals/:proposalId/reject", ({ params }) => {
+    const id = String(params.proposalId);
+    const proposal = memoryProposals.find((row) => row.id === id);
+    if (!proposal) {
+      return HttpResponse.json(
+        { ok: false, status: "not_found", version: null },
+        { status: 404 },
+      );
+    }
+    if (proposal.status !== "pending") {
+      return HttpResponse.json(
+        { ok: false, status: "already_resolved", version: null },
+        { status: 409 },
+      );
+    }
+    memoryProposals = memoryProposals.map((row) =>
+      row.id === id
+        ? { ...row, status: "rejected", resolved_at: now, resolved_by: "web" }
+        : row,
+    );
+    return HttpResponse.json({ ok: true, status: "rejected", version: null });
+  }),
+  http.post("/v1/memory/consolidation/run", () => HttpResponse.json({ ok: true })),
   http.get("/v1/knowledge-bases", () => HttpResponse.json(knowledgeBases)),
   http.post("/v1/knowledge-bases", async ({ request }) => {
     const missing = recordIdempotency(request);
@@ -450,7 +592,8 @@ export const handlers = [
     },
   ),
   http.get("/v1/jobs/:jobId", ({ params }) => {
-    const job = knowledgeJobs.get(String(params.jobId));
+    const id = String(params.jobId);
+    const job = jobs.get(id) ?? knowledgeJobs.get(id);
     return job
       ? HttpResponse.json(job)
       : HttpResponse.json({ detail: "not found" }, { status: 404 });

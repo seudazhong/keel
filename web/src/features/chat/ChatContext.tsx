@@ -1,7 +1,5 @@
 import type { ChatItem, ChatUsage } from "./types";
 
-const MODEL = "github_copilot / claude-sonnet-4.5";
-
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-center justify-between py-1 text-sm">
@@ -11,7 +9,15 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-export function ChatContext({ items, usage }: { items: ChatItem[]; usage: ChatUsage }) {
+export function ChatContext({
+  items,
+  usage,
+  model,
+}: {
+  items: ChatItem[];
+  usage: ChatUsage;
+  model?: string;
+}) {
   const tools = items.filter((i) => i.kind === "tool");
   const totalTokens = usage.promptTokens + usage.completionTokens;
   const cachePct =
@@ -22,7 +28,7 @@ export function ChatContext({ items, usage }: { items: ChatItem[]; usage: ChatUs
       <div className="mb-1 text-xs font-semibold uppercase tracking-wide text-text-muted">
         本次运行
       </div>
-      <Row label="模型" value="claude-sonnet-4.5" />
+      <Row label="模型" value={model ?? "API 未返回"} />
       <Row label="Tokens" value={totalTokens.toLocaleString()} />
       <Row label="成本" value={`$${usage.costUsd.toFixed(4)}`} />
       <Row
@@ -39,9 +45,8 @@ export function ChatContext({ items, usage }: { items: ChatItem[]; usage: ChatUs
         连接器 / 记忆
       </div>
       <p className="text-xs text-text-muted">
-        本次运行使用的连接器与触及的记忆将在此展示（记忆接线 + consolidation 计划于 M3）。
+        记忆 consolidation 已启用；提案可在 Memory 页面审核。本次运行的逐项记忆引用尚未由 API 返回。
       </p>
-      <p className="mt-4 text-[11px] text-text-muted">模型 {MODEL}</p>
     </aside>
   );
 }
