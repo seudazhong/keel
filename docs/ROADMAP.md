@@ -4,7 +4,18 @@
 
 Keel has a mature agent/data engine relative to its product and production surfaces.
 Durable Jobs, memory consolidation/evals, and the RAG/Knowledge vertical slice are complete.
-The next milestones close safety and lifecycle gaps before adding multi-user product breadth.
+Execution now prioritizes **visible, usable product value** in a clearly labeled local/single-
+organization preview, then closes production-safety and multi-user gates before external rollout.
+
+## Execution policy
+
+- Ship visible vertical slices early: real React delivery, truthful product states, Agent/Memory
+  management, onboarding, Calendar, and useful routines.
+- M3.1–M3.2 remain **trusted-environment previews**. They do not imply production or multi-user
+  readiness and must not be exposed to untrusted networks.
+- User login, OIDC, and platform OAuth authentication are deferred to M3.6. Connector-specific
+  OAuth remains in the milestone that introduces that connector because Gmail/Calendar require it.
+- Cloud safety, event evolution, and erasure remain mandatory gates before multi-user rollout.
 
 ## Completed foundation
 
@@ -17,93 +28,130 @@ Knowledge Base lifecycle, durable ingest/delete, hybrid retrieval, citations, an
 **Evidence:** verified baselines and exact capability boundaries are in
 [Status](./STATUS.md). Completion does not imply multi-user or production readiness.
 
-## M3.1 — Cloud Safety Foundation
+## M3.1 — Demo-ready Product Surface
 
-**Goal:** make the current single-scope cloud runtime safe enough to extend.
+**Goal:** make the capabilities already implemented visible, coherent, and easy to demonstrate.
 
-**Scope:** non-owner runtime DB role with enforced RLS; explicit fail-closed permission
-defaults; real isolated execution backend; durable interactive run/approval coordination;
-hashed/scoped API credentials; durable OAuth state; authenticated gateway webhooks; durable
-outbound idempotency; secrets/key-rotation design; safety regression suite.
+**Scope:** serve the real React application from the dev/demo Compose path; remove stale product
+copy; add demo seed/bootstrap data; improve empty/loading/error states; expose current Memory
+proposals and Knowledge/jobs clearly; add a lightweight local first-run wizard for provider,
+secret, default Agent profile, and optional connector setup; add Playwright smoke coverage.
 
-**Dependencies:** current jobs/event/RBAC foundations.
+**Dependencies:** completed Durable Jobs, Memory, Knowledge, and React source.
+
+**Exit gates:**
+
+- One documented command launches the current React application rather than `web/stub`.
+- A clean demo profile can show Chat, Sessions, Memory/Knowledge, Jobs, Schedules, Approvals,
+  Connectors, and Observability without manually editing database rows.
+- Product copy and capability badges come from current API state, not milestone-era constants.
+- The safe 10–15 minute demo passes as an automated browser smoke.
+
+## M3.2 — Personal Agent Experience Preview
+
+**Goal:** deliver a useful personal-assistant loop before implementing full user authentication.
+
+**Scope:** persisted Agent profiles owned by the implicit local operator; Agents CRUD and a real
+switcher; Memory blocks/history/proposal UI; Calendar as the second native connector; natural-
+language routines/triggers; improved approval explanations; local onboarding; responsive and
+accessibility fixes for the primary journey.
+
+**Dependencies:** M3.1 product surface. This milestone may use current open/API-key local mode;
+it does not add public user accounts or claim tenant isolation.
+
+**Exit gates:**
+
+- A local operator creates/selects an Agent, reviews/edits its memory, grants Gmail/Calendar,
+  and runs a useful inbox/meeting routine from the React UI.
+- Agent selection changes persona, memory, connector grants, and tool policy without code edits.
+- Calendar read/draft/create behavior has least-scope consent and approval tests.
+- Core flows work at narrow desktop/mobile widths and pass keyboard/critical a11y checks.
+
+## M3.3 — Cloud Safety Foundation
+
+**Goal:** make the product preview safe enough to become a durable cloud runtime.
+
+**Scope:** non-owner runtime DB role with enforced RLS; explicit fail-closed permission defaults;
+real isolated execution backend; durable interactive run/approval coordination; hashed/scoped API
+credentials; durable connector OAuth state; authenticated gateway webhooks; durable outbound
+idempotency; secrets/key-rotation design; safety regression suite.
+
+**Dependencies:** M3.1–M3.2. Safety work may begin earlier in parallel, but the milestone closes
+before public exposure or multi-user development.
 
 **Exit gates:**
 
 - Cross-scope reads fail even for the runtime application role and are audited.
 - Shell/file execution cannot run in the API process and passes escape/egress tests.
 - Server restart does not lose an admitted run or pending approval.
-- OAuth callback and gateway replay/forgery tests fail closed.
+- Connector OAuth callback and gateway replay/forgery tests fail closed.
 - Every permission engine has an explicit non-allow default.
 
-## M3.2 — Event Evolution
+## M3.4 — Event Evolution
 
 **Goal:** preserve replay and projection rebuilds across schema changes.
 
-**Scope:** upcaster registry, event compatibility policy, fixtures for every historical
-version, projection rebuild tooling, and additive API/schema checks.
+**Scope:** upcaster registry, event compatibility policy, fixtures for every historical version,
+projection rebuild tooling, and additive API/schema checks.
 
-**Dependencies:** M3.1 durable runtime boundaries.
+**Dependencies:** M3.3 durable runtime boundaries.
 
-**Exit gates:** event streams from v0 through current rebuild identical projections; CI
-requires old→new contract fixtures; incompatible event changes cannot merge.
+**Exit gates:** event streams from v0 through current rebuild identical projections; CI requires
+old→new contract fixtures; incompatible event changes cannot merge.
 
-## M3.3 — Retention and Erasure
+## M3.5 — Retention and Erasure
 
 **Goal:** give operators complete, testable control over persisted user data.
 
-**Scope:** data map; retention policies; scope/session erasure; event tombstones where
-required; projection, memory, vector, Knowledge, token, artifact, and telemetry purge;
-audited deletion jobs and operator runbook.
+**Scope:** data map; retention policies; scope/session erasure; event tombstones where required;
+projection, memory, vector, Knowledge, token, artifact, and telemetry purge; audited deletion jobs
+and operator runbook.
 
-**Dependencies:** M3.2 replay/upcasters and M3.1 secrets/identity-safe boundaries.
+**Dependencies:** M3.3–M3.4.
 
 **Exit gates:** seeded data is removed from every documented store; rebuild cannot resurrect
-erased content; connector tokens are revoked/purged; retention jobs are idempotent and
-observable.
+erased content; connector tokens are revoked/purged; retention jobs are idempotent and observable.
 
-## M3.4 — Multi-user Identity, Agents, and Durable Run Topology
+## M3.6 — Multi-user Identity, Access, and Durable Run Topology
 
-**Goal:** turn the single hard-coded scope into the target persisted personal/team-agent
-model.
+**Goal:** evolve the visible single-operator Agent experience into the target multi-user model.
 
-**Scope:** users and sessions; single-organization-v1 membership/RBAC; Agents CRUD; real
-agent/scope switcher; personal versus explicitly shared team agents; connector/resource
-grants; worker-owned interactive runs; cross-surface approvals; audit UX.
+**Scope:** users and login sessions; local accounts plus OIDC/OAuth where required; single-
+organization-v1 membership/RBAC; bind existing Agent profiles to users; personal versus explicitly
+shared team Agents; connector/resource grants; worker-owned interactive runs; cross-surface
+approvals; audit UX.
 
-**Dependencies:** M3.1–M3.3.
+**Dependencies:** M3.3–M3.5.
 
-**Exit gates:** two users and one shared team agent pass isolation/grant tests; no route
-depends on `web:local`; restart/scale-out preserves run and approval ownership; Web and IM
-operate the same durable runtime.
+**Exit gates:** two users and one shared team Agent pass isolation/grant tests; no route depends on
+`web:local`; restart/scale-out preserves run and approval ownership; Web and IM operate the same
+durable runtime; authentication cannot expand connector/resource authority.
 
 Multi-organization SaaS, billing, and hard organizational tenancy remain later work.
 
-## M3.5 — Connector and Product Experience
+## M3.7 — Connector and Team Experience
 
-**Goal:** make the durable runtime usable as a personal and team assistant.
+**Goal:** expand from the personal preview to governed personal and team workflows.
 
-**Scope:** Calendar plus a connector framework; native depth for core connectors and
-MCP/n8n for the long tail; connector triggers; IM/Web parity; Memory and Admin/RBAC UI;
-onboarding; current product copy; responsive design, accessibility, and i18n foundations.
+**Scope:** connector framework hardening; native depth for core connectors and MCP/n8n for the
+long tail; event triggers; Web/IM parity; team Agent grants; Admin/RBAC UI; connector health and
+reauth; internationalization foundations.
 
-**Dependencies:** M3.4 identity/Agents and grants.
+**Dependencies:** M3.6 identity, Agents, and grants.
 
-**Exit gates:** a new user completes onboarding, creates/selects an agent, grants Gmail and
-Calendar, receives a trigger-driven draft, and approves it from Web or IM; no personal
-resource is visible to an ungranted team agent; key flows meet documented a11y/responsive
-checks.
+**Exit gates:** an authenticated user grants Gmail/Calendar to a personal Agent, receives a
+trigger-driven draft, and approves it from Web or IM; no personal resource is visible to an
+ungranted team Agent; admins can govern connector availability and audit actions.
 
-## M3.6 — Production Delivery and Scale
+## M3.8 — Production Delivery and Scale
 
 **Goal:** provide a supportable cloud-native deployment.
 
-**Scope:** real React delivery image; accurate Compose/deployment profiles; scheduler
-service/leadership; N-worker and multi-server topology; generated/versioned SDK; OTel,
-metrics, alerts, and SLOs; CI security/performance gates; backup/restore and DR drills;
-upgrade/rollback runbooks.
+**Scope:** production React image; accurate deployment profiles; scheduler service/leadership;
+N-worker and multi-server topology; generated/versioned SDK; OTel, metrics, alerts, and SLOs; CI
+security/performance gates; backup/restore and DR drills; upgrade/rollback runbooks.
 
-**Dependencies:** M3.1–M3.5.
+**Dependencies:** M3.3–M3.7.
 
 **Exit gates:** repeatable clean install and upgrade; N-worker load/chaos demonstration;
 100% required run traces and reconciled usage; restore drill meets RPO/RTO; production
@@ -126,6 +174,8 @@ fail-closed trust boundary.
 ## Roadmap rules
 
 - [Status](./STATUS.md) supplies completion evidence; dated plans do not.
-- New connector breadth cannot bypass M3.1 safety or M3.4 grants.
+- M3.1–M3.2 are preview milestones, not authorization to expose open mode publicly.
+- Connector OAuth may ship with its connector; user login/OIDC remains deferred to M3.6.
+- New connector breadth cannot bypass M3.3 safety or M3.6 grants.
 - Plugin SDK/Desktop do not displace safety, lifecycle, identity, or delivery gates.
 - Milestone completion requires measurable exit evidence, not only merged code.

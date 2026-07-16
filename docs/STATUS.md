@@ -116,11 +116,13 @@ was re-run for this documentation change.
 
 Follow [Roadmap](./ROADMAP.md), in order:
 
-1. M3.1 Cloud Safety Foundation
-2. M3.2 Event Evolution
-3. M3.3 Retention/Erasure
-4. M3.4 Multi-user Identity + Agents + durable run topology
-5. M3.5 Connector/Product Experience
-6. M3.6 Production Delivery/Scale
+1. M3.1 Demo-ready Product Surface
+2. M3.2 Personal Agent Experience Preview
+3. M3.3 Cloud Safety Foundation
+4. M3.4 Event Evolution
+5. M3.5 Retention/Erasure
+6. M3.6 Multi-user Identity, Access, and durable run topology
+7. M3.7 Connector and Team Experience
+8. M3.8 Production Delivery and Scale
 
 Plugin SDK and Desktop are deferred until those gates.

@@ -36,7 +36,7 @@ spec frozen here; the enforcement + its acceptance test land in M1.
 - **I5 — deterministic parallel executor.** *(proven)* Independent read-only tools run concurrently; writes to overlapping resources serialize; results always emit in source order. Test: [`tests/unit/test_tools_executor.py`](../tests/unit/test_tools_executor.py).
 - **I6 — two-level sandbox.** *(policy layer proven; deployed topology open)* Policy tests
   cover loopback/link-local/private/SSRF and workspace path restrictions, but current
-  `ShellTool` execution remains in the server/CLI process. M3.1 must add the isolated
+  `ShellTool` execution remains in the server/CLI process. M3.3 must add the isolated
   executor and escape/egress acceptance evidence. Test:
   [`tests/unit/test_spike_s3_sandbox_policy.py`](../tests/unit/test_spike_s3_sandbox_policy.py).
 - **I7 — shared budget.** A delegation tree shares one budget; children cannot exceed the parent's remaining allowance; depth and handoff cycles are capped (G13).
@@ -44,7 +44,7 @@ spec frozen here; the enforcement + its acceptance test land in M1.
 - **I9 — at-most-once schedule.** *(proven — S2)* The cursor advances (atomic CAS claim) **before** enqueue, so a crash between claim and enqueue yields 0/1 runs and two leaders enqueue exactly once. Promoted to a durable service by the `PostgresClaimStore` (CAS on `schedules.next_run_at`) + `due_tick`. Tests: [`tests/unit/test_spike_s2_at_most_once.py`](../tests/unit/test_spike_s2_at_most_once.py), [`tests/unit/test_scheduler_store.py`](../tests/unit/test_scheduler_store.py), [`tests/integration/test_scheduler_approvals_postgres.py`](../tests/integration/test_scheduler_approvals_postgres.py).
 - **I10 — per-scope isolation.** *(query/RLS tests proven; deployed owner-bypass open)*
   Application filters and RLS tests deny cross-scope access, but the current runtime DB role
-  owns the schema and can bypass RLS. M3.1 requires a non-bypass runtime role and audited
+  owns the schema and can bypass RLS. M3.3 requires a non-bypass runtime role and audited
   adversarial proof. Tests: [`tests/unit/test_spike_s5_scope_guard.py`](../tests/unit/test_spike_s5_scope_guard.py),
   [`tests/integration/test_spike_s5_rls.py`](../tests/integration/test_spike_s5_rls.py).
   The confused-deputy extension taints connector content and escalates influenced outbound

@@ -50,7 +50,7 @@ implemented in Compose.
 - Observability, generated SDK/version checks, CI coverage, backup/restore, and delivery
   profiles remain below the target architecture.
 
-Treat [Roadmap M3.1](./ROADMAP.md#m31--cloud-safety-foundation) as a prerequisite for
+Treat [Roadmap M3.3](./ROADMAP.md#m33--cloud-safety-foundation) as a prerequisite for
 internet exposure or sensitive multi-user data.
 
 ## Data safety

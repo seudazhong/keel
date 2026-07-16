@@ -243,13 +243,18 @@ KPIs apply only after their prerequisite milestone:
 
 The active release plan is [Roadmap](./ROADMAP.md):
 
-1. Cloud Safety Foundation
-2. Event Evolution
-3. Retention/Erasure
-4. Multi-user Identity + Agents + durable run topology
-5. Connector/Product Experience
-6. Production Delivery/Scale
-7. Plugin SDK and Desktop only after their gates
+1. Demo-ready Product Surface
+2. Personal Agent Experience Preview (trusted local/single-organization mode)
+3. Cloud Safety Foundation
+4. Event Evolution
+5. Retention/Erasure
+6. Multi-user Identity, Access, and durable run topology
+7. Connector and Team Experience
+8. Production Delivery and Scale
+9. Plugin SDK and Desktop only after their gates
+
+User login/OIDC/OAuth authentication is intentionally deferred until the multi-user milestone.
+Connector-specific OAuth remains part of the connector that needs it.
 
 ## 10. Risks
 

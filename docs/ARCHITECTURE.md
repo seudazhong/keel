@@ -14,17 +14,17 @@ The target architecture below remains useful, but these substitutions and gaps a
 
 | Area | Current implementation | Target / remediation |
 |---|---|---|
-| Scope/identity | One hard-coded `web:local` scope; no users, organizations, or persisted Agents CRUD. | User identity, single-organization-v1 membership, private personal Agents, explicit team grants ([Roadmap M3.4](./ROADMAP.md#m34--multi-user-identity-agents-and-durable-run-topology)). |
-| RLS | Scoped rows and RLS policies exist, but the runtime role owns the DB/schema and can bypass RLS. | Non-owner runtime role plus audited fail-closed isolation ([M3.1](./ROADMAP.md#m31--cloud-safety-foundation)). |
-| Execution | `ShellTool` executes in the server/CLI process; there is no deployed sandbox service. | Isolated execution backend with egress/path/capability controls (ADR-0005, M3.1). |
-| Runs/approvals | Interactive execution and some approvals are server-local/in-memory; durable unattended approvals and jobs exist. | Worker-owned durable interactive topology and restart-safe cross-surface approvals (M3.1/M3.4). |
-| Server/worker/scheduler | Server runs interactive turns; worker runs arq jobs and cron scheduling. `keel-scheduler` is a stub, not a separately elected service. | Stateless API, durable worker ownership, elected scheduler, scale-out validation (M3.4/M3.6). |
-| Auth/secrets | Optional plaintext configured API keys; empty config means implicit admin. OAuth state is process-local. | Human identity/OIDC, hashed/scoped machine credentials, durable OAuth state and key rotation (M3.1/M3.4). |
-| Gateways/outbound | OneBot/Telegram webhook handlers are unauthenticated; outbound idempotency is process-local. | Authenticated/replay-safe webhooks and durable outbound idempotency (M3.1). |
-| Permissions | Main CLI profile is fail-closed, but APIs permit construction paths where an omitted default can become allow-all. | Explicit non-allow default as an invariant in every policy constructor (M3.1). |
-| Events/data lifecycle | Event rows have versions; no upcaster registry, retention policy, or complete erasure path. | M3.2 event evolution, then M3.3 retention/erasure. |
-| Web delivery | React/Vite app exists and runs separately; Compose `keel-web` serves a static stub. | Built React delivery image and accurate profiles (M3.6). |
-| Observability/SDK/CI | Deterministic evals and basic tracing exist; full OTel/metrics/SLOs, generated SDK/version diff, and documented production CI gates do not. | Production delivery and compatibility gates (M3.2/M3.6). |
+| Scope/identity | One hard-coded `web:local` scope; no users, organizations, or persisted Agents CRUD. | Local Agent profiles in M3.2, then user identity, single-organization-v1 membership, private personal Agents, and explicit team grants in [M3.6](./ROADMAP.md#m36--multi-user-identity-access-and-durable-run-topology). |
+| RLS | Scoped rows and RLS policies exist, but the runtime role owns the DB/schema and can bypass RLS. | Non-owner runtime role plus audited fail-closed isolation ([M3.3](./ROADMAP.md#m33--cloud-safety-foundation)). |
+| Execution | `ShellTool` executes in the server/CLI process; there is no deployed sandbox service. | Isolated execution backend with egress/path/capability controls (ADR-0005, M3.3). |
+| Runs/approvals | Interactive execution and some approvals are server-local/in-memory; durable unattended approvals and jobs exist. | Worker-owned durable interactive topology and restart-safe cross-surface approvals (M3.3/M3.6). |
+| Server/worker/scheduler | Server runs interactive turns; worker runs arq jobs and cron scheduling. `keel-scheduler` is a stub, not a separately elected service. | Durable worker ownership in M3.6; elected scheduler and scale-out validation in M3.8. |
+| Auth/secrets | Optional plaintext configured API keys; empty config means implicit admin. OAuth state is process-local. | Hashed/scoped machine credentials and durable connector OAuth state in M3.3; human identity/OIDC in M3.6. |
+| Gateways/outbound | OneBot/Telegram webhook handlers are unauthenticated; outbound idempotency is process-local. | Authenticated/replay-safe webhooks and durable outbound idempotency (M3.3). |
+| Permissions | Main CLI profile is fail-closed, but APIs permit construction paths where an omitted default can become allow-all. | Explicit non-allow default as an invariant in every policy constructor (M3.3). |
+| Events/data lifecycle | Event rows have versions; no upcaster registry, retention policy, or complete erasure path. | M3.4 event evolution, then M3.5 retention/erasure. |
+| Web delivery | React/Vite app exists and runs separately; Compose `keel-web` serves a static stub. | Demo React delivery in M3.1; production image and accurate profiles in M3.8. |
+| Observability/SDK/CI | Deterministic evals and basic tracing exist; full OTel/metrics/SLOs, generated SDK/version diff, and documented production CI gates do not. | Event/API compatibility in M3.4 and production delivery gates in M3.8. |
 
 Architecture statements using present tense below should be read as **target contracts** unless
 this table or [Status](./STATUS.md) confirms current fidelity. ADRs record decisions; they do
@@ -298,7 +298,7 @@ Session search and archival search share this pipeline. CJK handled via trigram 
 - **Durable prompt admission:** `session_input` row written before execution; a coordinator promotes it; crash → pending & retryable.
 - **Event schema evolution target [G3]:** events carry a `version` per `type`, but the
   upcaster registry and old→new projection-rebuild contract suite are not implemented.
-  [Roadmap M3.2](./ROADMAP.md#m32--event-evolution) adds append-only upcasters and proves
+  [Roadmap M3.4](./ROADMAP.md#m34--event-evolution) adds append-only upcasters and proves
   rebuild compatibility.
 
 ---
@@ -355,7 +355,7 @@ memory.updated · turn.ended · run.ended{reason} · error · lifecycle{phase}
   enqueue. Durable background jobs provide DB leases/reclaim, retries, progress,
   cancellation, and exactly-once terminal result injection.
 - **Not yet target-complete:** `keel-scheduler` is not a separately elected service, and
-  interactive Web runs are not worker-owned. Scale-out/topology gates are in M3.4/M3.6.
+  interactive Web runs are not worker-owned. Durable-run and scale-out gates are in M3.6/M3.8.
 
 ---
 
@@ -400,7 +400,7 @@ remain targets.
   implicit admin.
 - **Data governance target [G4]:** retention windows, trace/telemetry PII redaction,
   documented data map, and complete erasure across events/projections/vectors/Knowledge/
-  tokens/artifacts. These are M3.3 work, not current capability.
+  tokens/artifacts. These are M3.5 work, not current capability.
 
 ---
 
@@ -433,7 +433,7 @@ profiles:
 - **Current bootstrap:** Alembic migration is idempotent; users/default Agents/admin are not
   seeded because those product models do not yet exist.
 - **Target scale-out:** worker/server scale-out and elected scheduler require the durable
-  topology and production-delivery gates in M3.4/M3.6.
+  topology and production-delivery gates in M3.6/M3.8.
 
 ### 15.2 Repository layout (uv monorepo)
 ```
