@@ -47,14 +47,21 @@ test.describe("responsive shell", () => {
   }) => {
     await freshVisit(page, "/chat");
 
-    // Sidebar is off-canvas on narrow viewports until the hamburger button opens it.
+    // Sidebar is off-canvas AND non-visible (visibility:hidden) on narrow
+    // viewports until the hamburger button opens it — visibility:hidden also
+    // removes its links from the tab order, unlike transform alone.
     await expect(sidebar(page)).not.toBeInViewport();
+    await expect(sidebar(page)).not.toBeVisible();
+    await expect(sidebar(page).getByRole("link", { name: "Chat" })).not.toBeVisible();
 
     await page.getByRole("button", { name: "Open navigation menu" }).click();
     await expect(sidebar(page)).toBeInViewport();
+    await expect(sidebar(page)).toBeVisible();
+    await expect(sidebar(page).getByRole("link", { name: "Chat" })).toBeVisible();
 
     await page.getByRole("button", { name: "Close navigation menu" }).click();
     await expect(sidebar(page)).not.toBeInViewport();
+    await expect(sidebar(page)).not.toBeVisible();
 
     const skipLink = page.getByText("Skip to main content");
     await expect(skipLink).toHaveAttribute("href", "#main-content");
@@ -86,6 +93,20 @@ test.describe("responsive shell", () => {
     await expect(main).not.toHaveAttribute("aria-hidden", "true");
     await expect(main).toHaveJSProperty("inert", false);
     await expect(page.getByRole("heading", { name: "Chat" })).toBeVisible();
+  });
+});
+
+test.describe("desktop shell", () => {
+  test("the persistent desktop sidebar stays visible regardless of the mobile drawer's closed state", async ({
+    page,
+  }) => {
+    await freshVisit(page, "/chat");
+
+    // No mobile hamburger button is reachable at desktop widths — the
+    // sidebar is always visible via the lg:visible override.
+    await expect(page.getByRole("button", { name: "Open navigation menu" })).toBeHidden();
+    await expect(sidebar(page)).toBeVisible();
+    await expect(sidebar(page).getByRole("link", { name: "Chat" })).toBeVisible();
   });
 });
 

@@ -35,6 +35,16 @@ function RunDiffSection({ runId }: { runId: string }) {
 
 export function ProjectDetailPage() {
   const { id } = useParams<{ id: string }>();
+  // Keying on `id` forces React to fully unmount/remount the view whenever the
+  // route's project changes, so `tab`/`selectedRunId` always start fresh
+  // (initial useState values) before anything renders — there is no
+  // intermediate render where the new project's id coexists with the
+  // previous project's selected run, so no query for the wrong project's run
+  // can ever be instantiated during the transition.
+  return <ProjectDetailView key={id ?? "unknown"} id={id} />;
+}
+
+function ProjectDetailView({ id }: { id: string | undefined }) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const project = useProject(id);
@@ -42,15 +52,6 @@ export function ProjectDetailPage() {
   const runs = useRuns(id);
   const [tab, setTab] = useState<Tab>("overview");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-
-  // Without this, navigating from one project's detail page to another (the
-  // route element isn't remounted, only `id` changes) would keep the
-  // previous project's tab/selected run around, which then drives diff and
-  // approval requests for a run that belongs to a different project.
-  useEffect(() => {
-    setTab("overview");
-    setSelectedRunId(null);
-  }, [id]);
 
   useEffect(() => {
     if (!selectedRunId && runs.data?.length) setSelectedRunId(runs.data[0].id);

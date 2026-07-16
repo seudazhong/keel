@@ -3,6 +3,7 @@ import { createMemoryRouter, RouterProvider } from "react-router-dom";
 import { expect, test, vi } from "vitest";
 import { renderWithClient } from "../../test/utils";
 import { ProjectDetailPage } from "./ProjectDetailPage";
+import * as useRunsModule from "./runs/useRuns";
 
 function renderDetail(projectId = "proj_keel") {
   const router = createMemoryRouter(
@@ -95,5 +96,60 @@ test("navigating to a different project without remounting resets the tab and se
   expect(requestedUrls.some((u) => u.includes("/v1/runs/run_2/"))).toBe(false);
   expect(requestedUrls.some((u) => u.includes("/v1/runs/run_1/"))).toBe(false);
 
+  fetchSpy.mockRestore();
+});
+
+test("navigating back and forth between two already-visited projects never renders/queries the other project's leftover selected run", async () => {
+  // Pre-warm the cache for BOTH projects (including a selected run's diff and
+  // approvals for each) so that, on the next navigation, react-query can
+  // synchronously return cached data for the destination project on the very
+  // first render — this is precisely the condition under which a one-render
+  // (or one-effect-tick) stale reset would still let a mismatched
+  // (project, run) pairing reach a query hook before being corrected.
+  const { router } = renderDetail("proj_keel");
+
+  await screen.findByText("https://github.com/example/keel");
+  fireEvent.click(screen.getByRole("tab", { name: "Runs" }));
+  fireEvent.click(await screen.findByText("Rotate CI credentials"));
+  await screen.findByText("credentials_rotate"); // run_2's diff + approvals now cached
+
+  await act(async () => {
+    await router.navigate("/projects/proj_marketing");
+  });
+  await screen.findByText("https://github.com/example/marketing-site");
+  fireEvent.click(screen.getByRole("tab", { name: "Runs" }));
+  fireEvent.click(await screen.findByText("Update pricing page copy"));
+  await screen.findByText("publish_page"); // run_marketing_1's diff + approvals now cached
+
+  // Spy on the actual data hooks (not just `fetch`) so a stale render that
+  // instantiates a query for the wrong run is caught even if react-query
+  // happens to answer it from cache without a network round trip.
+  const diffSpy = vi.spyOn(useRunsModule, "useRunDiff");
+  const approvalsSpy = vi.spyOn(useRunsModule, "useRunApprovals");
+  const fetchSpy = vi.spyOn(window, "fetch");
+
+  // Navigate back to the first project. Both projects' own data, and both
+  // runs' diff/approvals, are already cached at this point.
+  await act(async () => {
+    await router.navigate("/projects/proj_keel");
+  });
+
+  // The view must never show the other project's leftover selected run.
+  expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+  expect(screen.queryByText("publish_page")).not.toBeInTheDocument();
+  expect(screen.queryByText("docs/pricing.md")).not.toBeInTheDocument();
+  expect(screen.queryByText("Update pricing page copy")).not.toBeInTheDocument();
+
+  // The smoking gun: no render — not even a transient one superseded within
+  // the same commit — may ever call useRunDiff/useRunApprovals with the
+  // other project's run id once we've navigated to this project.
+  expect(diffSpy.mock.calls.some(([runId]) => runId === "run_marketing_1")).toBe(false);
+  expect(approvalsSpy.mock.calls.some(([runId]) => runId === "run_marketing_1")).toBe(false);
+
+  const requestedUrls = fetchSpy.mock.calls.map((args) => String(args[0]));
+  expect(requestedUrls.some((u) => u.includes("/v1/runs/run_marketing_1/"))).toBe(false);
+
+  diffSpy.mockRestore();
+  approvalsSpy.mockRestore();
   fetchSpy.mockRestore();
 });

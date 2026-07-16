@@ -116,9 +116,9 @@ export function Sidebar({
         aria-modal={isOpen ? true : undefined}
         aria-label={isOpen ? t("shell.menuDialogLabel") : undefined}
         className={cn(
-          "fixed inset-y-0 left-0 z-40 flex h-screen w-72 max-w-[85vw] flex-col border-r border-border bg-surface transition-transform duration-200 ease-out",
-          "lg:sticky lg:top-0 lg:z-auto lg:inset-auto lg:w-60 lg:max-w-none lg:translate-x-0",
-          isOpen ? "translate-x-0" : "-translate-x-full",
+          "fixed inset-y-0 left-0 z-40 flex h-screen w-72 max-w-[85vw] flex-col border-r border-border bg-surface transition-[transform,visibility] duration-200 ease-out",
+          "lg:visible lg:sticky lg:top-0 lg:z-auto lg:inset-auto lg:w-60 lg:max-w-none lg:translate-x-0",
+          isOpen ? "visible translate-x-0" : "invisible -translate-x-full",
         )}
       >
         <div className="flex items-center gap-2.5 border-b border-border px-4 py-4">

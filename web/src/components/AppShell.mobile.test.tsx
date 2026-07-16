@@ -89,6 +89,32 @@ test("opening the drawer makes background main content inert/aria-hidden, and cl
   expect(screen.getByRole("heading", { name: "Chat" })).toBeInTheDocument();
 });
 
+test("the closed drawer carries mobile-only visibility classes so it's non-visible/non-focusable on narrow screens, while staying lg:visible for the persistent desktop sidebar", () => {
+  const { container } = renderWithClient(<RouterProvider router={shellAt("/chat")} />);
+  const aside = container.querySelector("aside")!;
+
+  // Closed: hidden via `invisible` (removes it from layout/focus on mobile),
+  // but `lg:visible` always wins at the desktop breakpoint so the persistent
+  // sidebar is never affected.
+  expect(aside.className).toContain("invisible");
+  expect(aside.className).not.toMatch(/(?<!lg:)\bvisible\b/);
+  expect(aside.className).toContain("lg:visible");
+  expect(aside.className).toContain("-translate-x-full");
+
+  fireEvent.click(screen.getByRole("button", { name: "Open navigation menu" }));
+
+  // Open: `visible` overrides `invisible` on mobile; `lg:visible` is unchanged.
+  expect(aside.className).toContain("visible");
+  expect(aside.className).not.toContain("invisible");
+  expect(aside.className).toContain("lg:visible");
+  expect(aside.className).toContain("translate-x-0");
+
+  fireEvent.click(screen.getByRole("button", { name: "Close navigation menu" }));
+
+  expect(aside.className).toContain("invisible");
+  expect(aside.className).toContain("-translate-x-full");
+});
+
 test("clicking the backdrop closes the mobile sidebar drawer", () => {
   const { container } = renderWithClient(<RouterProvider router={shellAt("/chat")} />);
   const openButton = screen.getByRole("button", { name: "Open navigation menu" });
