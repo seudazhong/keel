@@ -64,14 +64,17 @@ subprocess behavior is better exercised in Linux containers.
 
 ```powershell
 @'
-from pathlib import Path
 import re
+import subprocess
+from pathlib import Path
 from urllib.parse import unquote
 
 bad = []
-for path in Path(".").rglob("*.md"):
-    if ".git" in path.parts:
-        continue
+md_files = subprocess.run(
+    ["git", "ls-files", "*.md"], capture_output=True, text=True, check=True
+).stdout.splitlines()
+for rel in md_files:
+    path = Path(rel)
     text = path.read_text(encoding="utf-8")
     for target in re.findall(r"\[[^\]]*\]\(([^)]+)\)", text):
         target = target.split("#", 1)[0].strip()
@@ -86,3 +89,7 @@ print("relative Markdown links: OK")
 '@ | python -
 git diff --check
 ```
+
+Using `git ls-files` (rather than an unfiltered filesystem walk) keeps the check scoped to
+tracked documentation and avoids false failures from `node_modules/`, `.venv/`, `.worktrees/`,
+and similar untracked/vendored directories that also contain Markdown files.
