@@ -13,8 +13,13 @@ ProjectId = NewType("ProjectId", str)
 CodingRunId = NewType("CodingRunId", str)
 ObjectKey = NewType("ObjectKey", str)
 
-_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z")
+_IDENTIFIER = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 _GIT_REF = re.compile(r"(?:HEAD|refs/(?:heads|tags)/)?[A-Za-z0-9][A-Za-z0-9._/-]{0,254}\Z")
+_WINDOWS_RESERVED = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{number}" for number in range(1, 10)}
+    | {f"lpt{number}" for number in range(1, 10)}
+)
 
 
 class CodingStorageError(RuntimeError):
@@ -97,9 +102,15 @@ class ReapResult:
 
 
 def validate_identifier(value: str, *, kind: str) -> str:
-    if not _IDENTIFIER.fullmatch(value) or value in {".", ".."}:
+    reserved_stem = value.split(".", 1)[0]
+    if (
+        not _IDENTIFIER.fullmatch(value)
+        or value in {".", ".."}
+        or value.endswith((".", " "))
+        or reserved_stem in _WINDOWS_RESERVED
+    ):
         raise InvalidStorageInput(
-            f"{kind} must be 1-64 ASCII letters, digits, dots, underscores, or hyphens"
+            f"{kind} must be a portable lowercase identifier of 1-64 characters"
         )
     return value
 

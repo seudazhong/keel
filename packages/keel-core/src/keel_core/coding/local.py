@@ -37,7 +37,6 @@ from .models import (
     WorktreeRecord,
     validate_artifact_name,
     validate_git_ref,
-    validate_identifier,
 )
 from .models import (
     project_id as checked_project_id,
@@ -53,6 +52,9 @@ _SHA256_LENGTH = 64
 class StorageQuotas:
     max_artifact_bytes: int = 25 * 1024 * 1024
     max_project_artifact_bytes: int = 250 * 1024 * 1024
+    max_repository_bytes: int = 2 * 1024 * 1024 * 1024
+    max_snapshot_bytes: int = 2 * 1024 * 1024 * 1024
+    max_project_snapshot_bytes: int = 10 * 1024 * 1024 * 1024
     max_snapshots_per_project: int = 100
     max_worktrees_per_project: int = 16
 
@@ -145,6 +147,30 @@ def _timestamp(value: datetime | None) -> str | None:
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _hash_file(path: Path, *, max_bytes: int | None = None) -> tuple[str, int]:
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            size += len(chunk)
+            if max_bytes is not None and size > max_bytes:
+                raise StorageQuotaExceeded("file exceeds the configured size limit")
+            digest.update(chunk)
+    return digest.hexdigest(), size
+
+
+def _tree_size(path: Path, *, max_bytes: int | None = None) -> int:
+    size = 0
+    for item in path.rglob("*"):
+        if item.is_symlink():
+            raise InvalidStorageInput("symlinks are not allowed in managed repositories")
+        if item.is_file():
+            size += item.stat().st_size
+            if max_bytes is not None and size > max_bytes:
+                raise StorageQuotaExceeded("repository exceeds the configured size limit")
+    return size
 
 
 def _validate_hash(value: str) -> str:
@@ -402,6 +428,96 @@ class LocalCodingStorage:
         result = self._git_dir(repo, "rev-parse", "--verify", "HEAD", check=False)
         return result.stdout.strip() if result.returncode == 0 else None
 
+    def _head_target(self, repo: Path) -> str | None:
+        result = self._git_dir(repo, "symbolic-ref", "-q", "HEAD", check=False)
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def _set_head(self, repo: Path, target: str | None, commit: str | None) -> None:
+        if target is not None:
+            validate_git_ref(target)
+            self._git_dir(repo, "symbolic-ref", "HEAD", target)
+        elif commit is not None:
+            self._git_dir(repo, "update-ref", "--no-deref", "HEAD", commit)
+
+    def _list_refs(self, repo: Path) -> dict[str, str]:
+        result = self._git_dir(repo, "for-each-ref", "--format=%(refname)\t%(objectname)")
+        refs: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            name, separator, object_id = line.partition("\t")
+            if not separator or not name.startswith("refs/"):
+                raise StorageConflict("Git returned an invalid reference listing")
+            refs[name] = object_id
+        return refs
+
+    def _init_bare(self, path: Path, *, default_branch: str) -> None:
+        branch = validate_git_ref(default_branch)
+        if branch == "HEAD" or branch.startswith("refs/"):
+            raise InvalidStorageInput("default_branch must be an unqualified branch name")
+        self.git.run(["init", "--bare", f"--initial-branch={branch}", str(path)])
+
+    def _atomic_fetch(self, repo: Path, remote: str) -> None:
+        self._git_dir(
+            repo,
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "http.followRedirects=false",
+            "fetch",
+            "--atomic",
+            "--prune",
+            "--force",
+            remote,
+            "+refs/*:refs/*",
+        )
+
+    def _set_default_head(self, repo: Path, *candidates: str) -> None:
+        if self._head(repo) is not None:
+            return
+        for branch in candidates:
+            probe = self._git_dir(repo, "show-ref", "--verify", f"refs/heads/{branch}", check=False)
+            if probe.returncode == 0:
+                self._git_dir(repo, "symbolic-ref", "HEAD", f"refs/heads/{branch}")
+                return
+
+    def _verify_repository_quota(self, repo: Path) -> None:
+        _tree_size(repo, max_bytes=self.quotas.max_repository_bytes)
+
+    def _stage_repository(self, project: ProjectId, source: Path) -> Path:
+        temporary = _safe_child(self.projects_root, f".{project}.stage.{uuid.uuid4().hex}.tmp")
+        self._init_bare(temporary, default_branch="main")
+        try:
+            if self._list_refs(source):
+                self._atomic_fetch(temporary, str(source))
+            self._set_head(temporary, self._head_target(source), self._head(source))
+            return temporary
+        except Exception:
+            _remove_tree(temporary, ignore_errors=True)
+            raise
+
+    def _replace_repository(self, project: ProjectId, repo: Path, staged: Path) -> None:
+        backup = _safe_child(self.projects_root, f".{project}.backup.{uuid.uuid4().hex}")
+        try:
+            os.replace(repo, backup)
+            try:
+                os.replace(staged, repo)
+            except Exception:
+                os.replace(backup, repo)
+                raise
+            _fsync_directory(self.projects_root)
+        finally:
+            _remove_tree(staged, ignore_errors=True)
+            if repo.exists():
+                _remove_tree(backup, ignore_errors=True)
+
+    def _active_workspaces(self, project: ProjectId) -> list[Path]:
+        root = _safe_child(self.worktrees_root, str(project))
+        if not root.exists():
+            return []
+        return [path for path in root.iterdir() if path.is_dir() and not path.is_symlink()]
+
+    def _workspace_marker(self, project: ProjectId, run: CodingRunId) -> Path:
+        return _safe_child(self.worktrees_root, str(project), f".{run}.json")
+
     def _record(self, project: ProjectId, repo: Path) -> ProjectRecord:
         return ProjectRecord(project, repo, self._head(repo))
 
@@ -458,14 +574,14 @@ class LocalCodingStorage:
         self, project_id: ProjectId, *, default_branch: str = "main"
     ) -> ProjectRecord:
         project = self._project(project_id)
-        branch = validate_identifier(default_branch, kind="default_branch")
         repo = self._repo(project)
         with self._lock(project).acquire():
             if repo.exists():
                 raise StorageConflict(f"project already exists: {project}")
             temporary = _safe_child(self.projects_root, f".{project}.{uuid.uuid4().hex}.tmp")
             try:
-                self.git.run(["init", "--bare", f"--initial-branch={branch}", str(temporary)])
+                self._init_bare(temporary, default_branch=default_branch)
+                self._verify_repository_quota(temporary)
                 os.replace(temporary, repo)
                 _fsync_directory(self.projects_root)
             finally:
@@ -481,38 +597,36 @@ class LocalCodingStorage:
     ) -> ProjectRecord:
         project = self._project(project_id)
         safe_remote = self._validated_remote(remote)
-        self.create_project(project, default_branch=default_branch)
-        try:
-            return self.fetch(project, safe_remote)
-        except Exception:
-            with self._lock(project).acquire():
-                _remove_tree(self._repo(project), ignore_errors=True)
-            raise
+        repo = self._repo(project)
+        with self._lock(project).acquire():
+            if repo.exists():
+                raise StorageConflict(f"project already exists: {project}")
+            temporary = _safe_child(self.projects_root, f".{project}.import.{uuid.uuid4().hex}.tmp")
+            try:
+                self._init_bare(temporary, default_branch=default_branch)
+                self._atomic_fetch(temporary, safe_remote)
+                self._set_default_head(temporary, default_branch, "main", "master")
+                self._verify_repository_quota(temporary)
+                os.replace(temporary, repo)
+                _fsync_directory(self.projects_root)
+            finally:
+                _remove_tree(temporary, ignore_errors=True)
+            return self._record(project, repo)
 
     def fetch(self, project_id: ProjectId, remote: str | Path) -> ProjectRecord:
         project = self._project(project_id)
         safe_remote = self._validated_remote(remote)
         with self._lock(project).acquire():
             repo = self._require_repo(project)
-            self._git_dir(
-                repo,
-                "-c",
-                "protocol.file.allow=always",
-                "-c",
-                "http.followRedirects=false",
-                "fetch",
-                "--no-tags",
-                "--prune",
-                safe_remote,
-                "+refs/heads/*:refs/heads/*",
-            )
-            for branch in ("main", "master"):
-                probe = self._git_dir(
-                    repo, "show-ref", "--verify", f"refs/heads/{branch}", check=False
-                )
-                if probe.returncode == 0:
-                    self._git_dir(repo, "symbolic-ref", "HEAD", f"refs/heads/{branch}")
-                    break
+            staged = self._stage_repository(project, repo)
+            try:
+                self._atomic_fetch(staged, safe_remote)
+                self._set_default_head(staged, "main", "master")
+                self._verify_repository_quota(staged)
+                self._replace_repository(project, repo, staged)
+            except Exception:
+                _remove_tree(staged, ignore_errors=True)
+                raise
             return self._record(project, repo)
 
     def get_project(self, project_id: ProjectId) -> ProjectRecord:
@@ -532,14 +646,29 @@ class LocalCodingStorage:
             temporary = project_root / f".{uuid.uuid4().hex}.bundle.tmp"
             try:
                 self._git_dir(repo, "bundle", "create", str(temporary), "--all")
-                data = temporary.read_bytes()
-                snapshot_id = _sha256(data)
+                snapshot_id, bundle_size = _hash_file(
+                    temporary, max_bytes=self.quotas.max_snapshot_bytes
+                )
                 bundle = _safe_child(project_root, f"{snapshot_id}.bundle")
                 metadata = _safe_child(project_root, f"{snapshot_id}.json")
                 if metadata.exists():
-                    return self._snapshot_record(project, metadata)
+                    existing_record = self._snapshot_record(project, metadata)
+                    existing_digest, existing_size = _hash_file(
+                        existing_record.bundle_path,
+                        max_bytes=self.quotas.max_snapshot_bytes,
+                    )
+                    if existing_digest != snapshot_id or existing_size != bundle_size:
+                        raise StorageConflict("existing snapshot bundle verification failed")
+                    return existing_record
                 if len(existing) >= self.quotas.max_snapshots_per_project:
                     raise StorageQuotaExceeded("project snapshot quota exceeded")
+                snapshot_usage = sum(
+                    path.stat().st_size
+                    for path in project_root.glob("*.bundle")
+                    if path.is_file() and not path.is_symlink()
+                )
+                if snapshot_usage + bundle_size > self.quotas.max_project_snapshot_bytes:
+                    raise StorageQuotaExceeded("project snapshot byte quota exceeded")
                 created = _utc_now()
                 if not bundle.exists():
                     os.replace(temporary, bundle)
@@ -550,13 +679,13 @@ class LocalCodingStorage:
                         "project_id": str(project),
                         "snapshot_id": snapshot_id,
                         "commit": commit,
-                        "size_bytes": bundle.stat().st_size,
+                        "head_target": self._head_target(repo),
+                        "refs": self._list_refs(repo),
+                        "size_bytes": bundle_size,
                         "created_at": created.isoformat(),
                     },
                 )
-                return SnapshotRecord(
-                    project, snapshot_id, commit, bundle.stat().st_size, created, bundle
-                )
+                return SnapshotRecord(project, snapshot_id, commit, bundle_size, created, bundle)
             finally:
                 temporary.unlink(missing_ok=True)
 
@@ -591,34 +720,41 @@ class LocalCodingStorage:
         metadata = _safe_child(self.snapshots_root, str(project), f"{digest}.json")
         if not metadata.is_file() or metadata.is_symlink():
             raise StorageNotFound(f"snapshot not found: {digest}")
-        snapshot = self._snapshot_record(project, metadata)
-        if _sha256(snapshot.bundle_path.read_bytes()) != digest:
-            raise StorageConflict("snapshot bundle hash verification failed")
         with self._lock(project).acquire():
             repo = self._require_repo(project)
+            if self._active_workspaces(project):
+                raise StorageConflict("cannot restore while active workspaces exist")
+            snapshot = self._snapshot_record(project, metadata)
+            actual_digest, actual_size = _hash_file(
+                snapshot.bundle_path, max_bytes=self.quotas.max_snapshot_bytes
+            )
+            if actual_digest != digest or actual_size != snapshot.size_bytes:
+                raise StorageConflict("snapshot bundle hash verification failed")
+            value = _read_json(metadata)
+            refs_value = value.get("refs")
+            if not isinstance(refs_value, dict) or any(
+                not isinstance(name, str) or not isinstance(object_id, str)
+                for name, object_id in refs_value.items()
+            ):
+                raise StorageConflict("snapshot reference metadata is invalid")
+            expected_refs = dict(refs_value)
+            head_target = value.get("head_target")
+            if head_target is not None and not isinstance(head_target, str):
+                raise StorageConflict("snapshot HEAD metadata is invalid")
             temporary = _safe_child(self.projects_root, f".{project}.restore.{uuid.uuid4().hex}")
-            backup = _safe_child(self.projects_root, f".{project}.backup.{uuid.uuid4().hex}")
-            swapped = False
             try:
-                self.git.run(
-                    ["clone", "--bare", "--no-local", str(snapshot.bundle_path), str(temporary)]
-                )
+                self._init_bare(temporary, default_branch="main")
+                self._atomic_fetch(temporary, str(snapshot.bundle_path))
+                self._set_head(temporary, head_target, snapshot.commit)
                 restored = self._head(temporary)
                 if restored != snapshot.commit:
                     raise StorageConflict("restored snapshot HEAD does not match metadata")
-                os.replace(repo, backup)
-                os.replace(temporary, repo)
-                swapped = True
-                _remove_tree(backup)
-                _fsync_directory(self.projects_root)
-            except Exception:
-                if not repo.exists() and backup.exists():
-                    os.replace(backup, repo)
-                raise
+                if self._list_refs(temporary) != expected_refs:
+                    raise StorageConflict("restored snapshot reference set does not match metadata")
+                self._verify_repository_quota(temporary)
+                self._replace_repository(project, repo, temporary)
             finally:
                 _remove_tree(temporary, ignore_errors=True)
-                if swapped:
-                    _remove_tree(backup, ignore_errors=True)
             return self._record(project, repo)
 
     def materialize(
@@ -642,11 +778,25 @@ class LocalCodingStorage:
             if path.exists():
                 raise StorageConflict(f"worktree already exists: {run}")
             try:
-                self._git_dir(repo, "worktree", "add", "--detach", str(path), safe_ref)
-                commit = self.git.run(["rev-parse", "HEAD"], cwd=path).stdout.strip()
+                resolved = self._git_dir(repo, "rev-parse", "--verify", f"{safe_ref}^{{commit}}")
+                commit = resolved.stdout.strip()
+                self.git.run(["init", "--initial-branch=keel-workspace", str(path)])
+                self.git.run(
+                    [
+                        "-c",
+                        "protocol.file.allow=always",
+                        "fetch",
+                        "--atomic",
+                        "--force",
+                        str(repo),
+                        "+refs/*:refs/*",
+                    ],
+                    cwd=path,
+                )
+                self.git.run(["checkout", "--detach", commit], cwd=path)
                 created = _utc_now()
                 _atomic_json(
-                    path / ".keel-worktree.json",
+                    self._workspace_marker(project, run),
                     {
                         "project_id": str(project),
                         "run_id": str(run),
@@ -656,24 +806,21 @@ class LocalCodingStorage:
                 )
                 return WorktreeRecord(project, run, commit, path, created)
             except Exception:
-                self._git_dir(repo, "worktree", "remove", "--force", str(path), check=False)
                 _remove_tree(path, ignore_errors=True)
-                self._git_dir(repo, "worktree", "prune", check=False)
                 raise
 
     def remove(self, project_id: ProjectId, run_id: CodingRunId) -> bool:
         project = self._project(project_id)
         run = self._run(run_id)
         path = _safe_child(self.worktrees_root, str(project), str(run))
+        marker = self._workspace_marker(project, run)
         with self._lock(project).acquire():
-            repo = self._require_repo(project)
             existed = path.exists()
-            self._git_dir(repo, "worktree", "remove", "--force", str(path), check=False)
             if path.exists():
                 if path.is_symlink():
                     raise InvalidStorageInput("refusing to remove symlinked worktree")
                 _remove_tree(path)
-            self._git_dir(repo, "worktree", "prune")
+            marker.unlink(missing_ok=True)
             return existed
 
     def reap_worktrees(self, *, older_than: datetime) -> ReapResult:
@@ -696,7 +843,7 @@ class LocalCodingStorage:
                     run = checked_run_id(path.name)
                     if path != _safe_child(self.worktrees_root, str(project), str(run)):
                         continue
-                    marker = path / ".keel-worktree.json"
+                    marker = self._workspace_marker(project, run)
                     created = datetime.fromtimestamp(path.stat().st_mtime, UTC)
                     if marker.is_file() and not marker.is_symlink():
                         value = _read_json(marker)
@@ -892,15 +1039,21 @@ class LocalCodingStorage:
                 project = checked_project_id(str(value["project_id"]))
                 run = checked_run_id(str(value["run_id"]))
                 digest = _validate_hash(str(value["content_hash"]))
-                record = self._artifact_record(project, run, digest)
-                if record.created_at >= cutoff:
-                    continue
-                if record.retention is ArtifactRetention.retained and (
-                    record.retained_until is None or record.retained_until > _utc_now()
-                ):
-                    continue
-                reclaimed += record.size_bytes
-                if self.delete_artifact(project, run, digest):
+                _, _, directory = self._artifact_dir(project, run, digest)
+                with self._lock(project).acquire():
+                    record = self._artifact_record(project, run, digest)
+                    if record.created_at >= cutoff:
+                        continue
+                    if record.retention is ArtifactRetention.retained and (
+                        record.retained_until is None or record.retained_until > _utc_now()
+                    ):
+                        continue
+                    reclaimed_path = directory.with_name(
+                        f".delete-{directory.name}-{uuid.uuid4().hex}"
+                    )
+                    os.replace(directory, reclaimed_path)
+                    _remove_tree(reclaimed_path)
+                    reclaimed += record.size_bytes
                     removed += 1
             except (KeyError, OSError, ValueError, json.JSONDecodeError, CodingStorageError):
                 continue

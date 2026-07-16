@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import threading
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +17,7 @@ from keel_core.coding import (
     ActiveGitStore,
     ArtifactRetention,
     ArtifactStore,
+    GitCommandError,
     GitRunner,
     InvalidStorageInput,
     LocalActiveGitStore,
@@ -33,8 +37,25 @@ from keel_core.coding import (
     project_id,
     run_id,
 )
+from keel_core.coding import local as coding_local
 
 _OLD = datetime(2020, 1, 1, tzinfo=UTC)
+
+
+class RecordingGitRunner(GitRunner):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, ...]] = []
+
+    def run(
+        self,
+        args: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(tuple(args))
+        return super().run(args, cwd=cwd, check=check)
 
 
 def _run(git: GitRunner, cwd: Path, *args: str) -> str:
@@ -89,7 +110,21 @@ def test_protocol_views_and_project_import_are_typed(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "bad",
-    ["../other", "..", "/absolute", r"other\escape", "-leading", "a" * 65, "x\x00y"],
+    [
+        "../other",
+        "..",
+        "/absolute",
+        r"other\escape",
+        "-leading",
+        "Uppercase",
+        "con",
+        "con.txt",
+        "com1",
+        "lpt9.log",
+        "trailing.",
+        "a" * 65,
+        "x\x00y",
+    ],
 )
 def test_t1_identifiers_cannot_escape_storage_roots(tmp_path: Path, bad: str) -> None:
     storage = _storage(tmp_path)
@@ -152,6 +187,71 @@ def test_concurrent_project_locking_keeps_worktree_state_consistent(tmp_path: Pa
     assert storage_b.remove(project_id("alpha"), run_id("run-2"))
 
 
+def test_materialized_workspace_is_an_isolated_normal_git_clone(tmp_path: Path) -> None:
+    remote, git = _remote(tmp_path)
+    storage = _storage(tmp_path)
+    project = storage.import_project(project_id("alpha"), remote)
+    workspace = storage.materialize(project_id("alpha"), run_id("sandbox"))
+
+    assert _run(git, workspace.path, "status", "--porcelain") == ""
+    assert _run(git, workspace.path, "remote") == ""
+    assert not (workspace.path / ".git" / "objects" / "info" / "alternates").exists()
+    (workspace.path / "sandbox.txt").write_text("sandbox\n", encoding="utf-8")
+    _run(git, workspace.path, "add", "sandbox.txt")
+    _run(
+        git,
+        workspace.path,
+        "-c",
+        "user.name=Sandbox",
+        "-c",
+        "user.email=sandbox@example.test",
+        "commit",
+        "-m",
+        "sandbox-only",
+    )
+    _run(git, workspace.path, "branch", "sandbox-only")
+
+    assert (
+        git.run(
+            [
+                "--git-dir",
+                str(project.repository_path),
+                "show-ref",
+                "--verify",
+                "refs/heads/sandbox-only",
+            ],
+            check=False,
+        ).returncode
+        != 0
+    )
+    assert storage.get_project(project_id("alpha")).head == project.head
+
+
+def test_concurrent_failed_import_cannot_delete_successful_install(tmp_path: Path) -> None:
+    remote, _git = _remote(tmp_path)
+    invalid_remote = tmp_path / "not-a-repository"
+    invalid_remote.mkdir()
+    storage_a = _storage(tmp_path)
+    storage_b = LocalCodingStorage(storage_a.root, allow_local_remotes=True)
+
+    def attempt(storage: LocalCodingStorage, source: Path) -> object:
+        try:
+            return storage.import_project(project_id("alpha"), source)
+        except Exception as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(
+            pool.map(
+                lambda pair: attempt(*pair),
+                ((storage_a, invalid_remote), (storage_b, remote)),
+            )
+        )
+
+    assert any(not isinstance(outcome, Exception) for outcome in outcomes)
+    assert storage_a.get_project(project_id("alpha")).head is not None
+
+
 def test_snapshot_restores_authoritative_repository_after_new_fetch(tmp_path: Path) -> None:
     remote, git = _remote(tmp_path)
     storage = _storage(tmp_path)
@@ -179,6 +279,70 @@ def test_snapshot_restores_authoritative_repository_after_new_fetch(tmp_path: Pa
     assert restored.head == original.head
     worktree = storage.materialize(project_id("alpha"), run_id("recovered"))
     assert (worktree.path / "README.md").read_text(encoding="utf-8") == "one\n"
+
+
+def test_snapshot_restore_preserves_complete_refs_and_streams_bundle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote, git = _remote(tmp_path)
+    head = _run(git, remote, "rev-parse", "HEAD")
+    _run(git, remote, "tag", "v1")
+    _run(git, remote, "update-ref", "refs/notes/review", head)
+    storage = _storage(tmp_path)
+    project = storage.import_project(project_id("alpha"), remote)
+
+    original_read_bytes = Path.read_bytes
+
+    def guarded_read_bytes(path: Path) -> bytes:
+        if path.suffix == ".bundle":
+            raise AssertionError("bundle files must be streamed")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read_bytes)
+    snapshot = storage.create_snapshot(project_id("alpha"))
+    _run(
+        git,
+        tmp_path,
+        "--git-dir",
+        str(project.repository_path),
+        "update-ref",
+        "-d",
+        "refs/notes/review",
+    )
+    _run(
+        git, tmp_path, "--git-dir", str(project.repository_path), "update-ref", "-d", "refs/tags/v1"
+    )
+    storage.restore_snapshot(project_id("alpha"), snapshot.snapshot_id)
+
+    assert (
+        _run(
+            git,
+            tmp_path,
+            "--git-dir",
+            str(project.repository_path),
+            "rev-parse",
+            "refs/notes/review",
+        )
+        == head
+    )
+    assert (
+        _run(git, tmp_path, "--git-dir", str(project.repository_path), "rev-parse", "refs/tags/v1")
+        == head
+    )
+
+
+def test_restore_refuses_to_invalidate_active_workspace(tmp_path: Path) -> None:
+    remote, _git = _remote(tmp_path)
+    storage = _storage(tmp_path)
+    storage.import_project(project_id("alpha"), remote)
+    snapshot = storage.create_snapshot(project_id("alpha"))
+    workspace = storage.materialize(project_id("alpha"), run_id("active"))
+
+    with pytest.raises(StorageConflict, match="active workspaces"):
+        storage.restore_snapshot(project_id("alpha"), snapshot.snapshot_id)
+    assert workspace.path.exists()
+    storage.remove(project_id("alpha"), run_id("active"))
+    storage.restore_snapshot(project_id("alpha"), snapshot.snapshot_id)
 
 
 def test_snapshot_tampering_is_detected_without_replacing_active_repo(tmp_path: Path) -> None:
@@ -210,7 +374,7 @@ def test_worktree_reaper_uses_owned_markers_only(tmp_path: Path) -> None:
     storage = _storage(tmp_path)
     storage.import_project(project_id("alpha"), remote)
     worktree = storage.materialize(project_id("alpha"), run_id("old-run"))
-    marker = worktree.path / ".keel-worktree.json"
+    marker = storage.worktrees_root / "alpha" / ".old-run.json"
     value = json.loads(marker.read_text(encoding="utf-8"))
     value["created_at"] = _OLD.isoformat()
     marker.write_text(json.dumps(value), encoding="utf-8")
@@ -245,6 +409,40 @@ def test_artifact_hashes_retention_reaping_and_idempotent_delete(tmp_path: Path)
     assert not artifacts.delete(project_id("alpha"), run_id("run-1"), first.content_hash)
 
 
+def test_artifact_reaper_rechecks_retention_under_project_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = _storage(tmp_path)
+    project = project_id("alpha")
+    run = run_id("run-1")
+    storage.create_project(project)
+    artifact = storage.put_artifact(project, run, b"old", name="old.bin")
+    metadata = storage.artifacts_root / "alpha" / "run-1" / artifact.content_hash / "metadata.json"
+    value = json.loads(metadata.read_text(encoding="utf-8"))
+    value["created_at"] = _OLD.isoformat()
+    metadata.write_text(json.dumps(value), encoding="utf-8")
+    discovered = threading.Event()
+    original_read_json = coding_local._read_json
+
+    def observed_read_json(path: Path) -> dict[str, object]:
+        result = original_read_json(path)
+        if threading.current_thread().name.startswith("artifact-reaper") and path == metadata:
+            discovered.set()
+        return result
+
+    monkeypatch.setattr(coding_local, "_read_json", observed_read_json)
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="artifact-reaper") as pool:
+        with storage._lock(project).acquire():
+            future = pool.submit(storage.reap_artifacts, older_than=_OLD + timedelta(days=1))
+            assert discovered.wait(timeout=5)
+            retained = original_read_json(metadata)
+            retained["retention"] = ArtifactRetention.retained.value
+            retained["retained_until"] = None
+            coding_local._atomic_json(metadata, retained)
+        assert future.result(timeout=5).removed == 0
+    assert storage.read_artifact(project, run, artifact.content_hash) == b"old"
+
+
 def test_artifact_size_and_project_quotas_are_enforced(tmp_path: Path) -> None:
     quotas = StorageQuotas(
         max_artifact_bytes=4,
@@ -260,6 +458,48 @@ def test_artifact_size_and_project_quotas_are_enforced(tmp_path: Path) -> None:
     artifacts.put(project_id("alpha"), run_id("one"), b"1234", name="one.bin")
     with pytest.raises(StorageQuotaExceeded, match="project"):
         artifacts.put(project_id("alpha"), run_id("two"), b"5678", name="two.bin")
+
+
+def test_repository_and_snapshot_byte_quotas_are_enforced(tmp_path: Path) -> None:
+    tiny_repository = _storage(
+        tmp_path / "repository",
+        quotas=StorageQuotas(max_repository_bytes=1),
+    )
+    with pytest.raises(StorageQuotaExceeded, match="repository"):
+        tiny_repository.create_project(project_id("alpha"))
+    assert not (tiny_repository.projects_root / "alpha.git").exists()
+
+    remote, _git = _remote(tmp_path)
+    tiny_snapshot = _storage(
+        tmp_path / "snapshot",
+        quotas=StorageQuotas(max_snapshot_bytes=1),
+    )
+    tiny_snapshot.import_project(project_id("alpha"), remote)
+    with pytest.raises(StorageQuotaExceeded, match="file"):
+        tiny_snapshot.create_snapshot(project_id("alpha"))
+    assert list((tiny_snapshot.snapshots_root / "alpha").glob("*.bundle")) == []
+
+
+def test_failed_fetch_leaves_authoritative_refs_unchanged(tmp_path: Path) -> None:
+    remote, git = _remote(tmp_path)
+    runner = RecordingGitRunner()
+    storage = LocalCodingStorage(
+        tmp_path / "coding",
+        git=runner,
+        allow_local_remotes=True,
+    )
+    project = storage.import_project(project_id("alpha"), remote)
+    before = _run(git, tmp_path, "--git-dir", str(project.repository_path), "show-ref")
+    invalid_remote = tmp_path / "invalid-fetch"
+    invalid_remote.mkdir()
+
+    with pytest.raises(GitCommandError):
+        storage.fetch(project_id("alpha"), invalid_remote)
+    after = _run(git, tmp_path, "--git-dir", str(project.repository_path), "show-ref")
+    assert after == before
+    fetch_calls = [call for call in runner.calls if "fetch" in call]
+    assert fetch_calls
+    assert all("--atomic" in call for call in fetch_calls)
 
 
 def test_local_object_store_has_s3_shaped_keys_but_confines_paths(tmp_path: Path) -> None:
