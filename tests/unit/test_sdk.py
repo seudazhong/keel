@@ -27,3 +27,24 @@ async def test_client_uses_typed_message_dtos() -> None:
 
     assert response.session_id == "session-1"
     assert response.run_id == "run-1"
+
+
+async def test_client_sends_bearer_api_key_without_exposing_it() -> None:
+    observed_authorization: list[str | None] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        observed_authorization.append(request.headers.get("Authorization"))
+        return httpx.Response(
+            202,
+            json={"session_id": "session-1", "run_id": "run-1", "accepted": True},
+        )
+
+    api_key = "test-key"
+    async with httpx.AsyncClient(
+        base_url="https://keel.test",
+        transport=httpx.MockTransport(handler),
+    ) as transport:
+        client = KeelClient("https://ignored.test", api_key=api_key, client=transport)
+        await client.create_message("session-1", CreateMessageRequest(content="hello"))
+
+    assert observed_authorization == [f"Bearer {api_key}"]
