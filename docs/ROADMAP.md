@@ -30,6 +30,8 @@ Knowledge Base lifecycle, durable ingest/delete, hybrid retrieval, citations, an
 
 ## M3.1 — Demo-ready Product Surface
 
+**Status:** **In progress.**
+
 **Goal:** make the capabilities already implemented visible, coherent, and easy to demonstrate.
 
 **Scope:** serve the real React application from the dev/demo Compose path; remove stale product
@@ -38,6 +40,15 @@ proposals and Knowledge/jobs clearly; add a lightweight local first-run wizard f
 secret, default Agent profile, and optional connector setup; add Playwright smoke coverage.
 
 **Dependencies:** completed Durable Jobs, Memory, Knowledge, and React source.
+
+**Completed increment:** the dev/demo Compose path serves the built React application through
+nginx with API/health/readiness/SSE proxying and SPA fallback; Jobs and Memory proposals have
+truthful React pages; an opt-in guarded/idempotent bootstrap seeds searchable demo content; and
+a read-only Playwright smoke detects stale stacks and covers empty or populated states.
+
+**Remaining before milestone completion:** implement the lightweight local first-run wizard for
+provider, secret, default Agent profile, and optional connector setup; complete the product-state
+copy/badge exit-gate audit. Until then, M3.1 is not complete.
 
 **Exit gates:**
 

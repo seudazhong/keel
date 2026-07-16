@@ -18,10 +18,10 @@ Open:
 - `http://localhost:8000/` — minimal chat
 - `http://localhost:8000/docs` — OpenAPI
 - `http://localhost:8000/approvals` — server-rendered durable approvals page
-- `http://localhost:3000/` — Compose static stub only
+- `http://localhost:3000/` — built React application
 
-Sessions, connector status, schedules, and admin overview are available through `/v1` APIs
-and the separately run React UI; they are not standalone server-rendered pages.
+Sessions, connector status, schedules, Jobs, Memory proposals, Knowledge, and admin overview are
+available through `/v1` APIs and the React UI; they are not standalone server-rendered pages.
 
 See [Demo](./DEMO.md) for a safe walkthrough.
 
@@ -66,7 +66,7 @@ Then follow `GET /v1/sessions/{id}/events` as SSE. If `KEEL_API_KEYS` is configu
 
 ## React UI
 
-The React app is developed independently from Compose:
+Compose serves the production-built React bundle on `:3000`. For frontend-only iteration:
 
 ```powershell
 Set-Location web
@@ -95,5 +95,18 @@ leave it off for development and demos.
 ## Knowledge and jobs
 
 Current-main exposes Knowledge Base CRUD/search and durable job list/detail/cancel APIs.
-Ingestion needs Postgres, Redis/arq, a worker, and an embedding provider. New stacks contain
-no Knowledge data. Use the OpenAPI schemas rather than copying old dated plans.
+Ingestion needs Postgres, Redis/arq, and a worker. New stacks contain no Knowledge data.
+
+To populate an unmistakably local dev/demo stack without editing database rows, preview and run
+the guarded, idempotent bootstrap:
+
+```powershell
+$env:KEEL_APP_ENV = "dev"
+uv run python scripts/seed_demo_data.py --dry-run
+uv run python scripts/seed_demo_data.py --yes
+```
+
+The guard refuses non-loopback or production-labelled targets. `--mode auto` falls back to a
+deterministic offline embedder when the configured provider is unavailable; use `--mode fake`
+to force an offline run. Replays reuse the same Knowledge Base, documents, jobs, and welcome
+session. Use the OpenAPI schemas rather than copying old dated plans.

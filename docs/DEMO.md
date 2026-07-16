@@ -108,6 +108,22 @@ Invoke-RestMethod "$base/v1/knowledge-bases" | ConvertTo-Json -Depth 6
 Expected: services become healthy; jobs and Knowledge endpoints return JSON. Empty arrays
 are correct on an unseeded stack.
 
+### 4a. Optional guarded demo data (1–3 minutes)
+
+For a local demo stack, seed searchable Knowledge content plus a welcome session without editing
+database rows. Preview first; the command refuses non-loopback or production-labelled targets:
+
+```powershell
+$env:KEEL_APP_ENV = "dev"
+uv run python scripts/seed_demo_data.py --dry-run
+uv run python scripts/seed_demo_data.py --yes
+```
+
+The default `auto` embedding mode falls back to a deterministic offline embedder if the configured
+provider is unavailable. Use `--mode fake` to force the offline path. Re-running is idempotent:
+the same Knowledge Base, documents, jobs, and session are reused, and unrelated data is not
+modified or deleted.
+
 ### 5. React application on `:3000` (2 minutes)
 
 After a current-main rebuild (step 4), `http://localhost:3000` serves the built React app

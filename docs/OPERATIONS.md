@@ -19,8 +19,8 @@ Do not add `-v` to `down` unless permanent deletion of Postgres and Ollama volum
 intended.
 
 `keel-migrate` runs `alembic upgrade head` before server/worker startup. `keel-server`,
-`keel-worker`, Postgres, Redis, Ollama, and the static web stub are in both current `dev`
-and `full` profiles; documented full observability/object-store/sandbox services are not
+`keel-worker`, Postgres, Redis, Ollama, and the nginx-served React web app are in both current
+`dev` and `full` profiles; documented full observability/object-store/sandbox services are not
 implemented in Compose.
 
 ## Configuration and secrets

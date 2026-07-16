@@ -123,7 +123,7 @@ test.describe("Keel demo smoke (read-only)", () => {
     const response = await page.goto("/knowledge");
     expect(response?.status(), "deep link should not 404").toBeLessThan(400);
     await assertReactShellRendered(page);
-    await expect(page.getByRole("heading", { name: "Knowledge" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Knowledge", exact: true })).toBeVisible();
   });
 
   test("primary navigation exposes the documented sections", async ({ page }) => {
@@ -134,7 +134,7 @@ test.describe("Keel demo smoke (read-only)", () => {
     for (const item of NAV_ITEMS) {
       await nav.getByRole("link", { name: item.label }).click();
       await expect(page).toHaveURL(new RegExp(`${item.path}$`));
-      await expect(page.getByRole("heading", { name: item.label })).toBeVisible();
+      await expect(page.getByRole("heading", { name: item.label, exact: true })).toBeVisible();
     }
 
     // Settings is reached from the Chat model badge rather than the sidebar.
