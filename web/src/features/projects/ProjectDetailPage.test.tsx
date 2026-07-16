@@ -1,6 +1,6 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { createMemoryRouter, RouterProvider } from "react-router-dom";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { renderWithClient } from "../../test/utils";
 import { ProjectDetailPage } from "./ProjectDetailPage";
 
@@ -9,7 +9,7 @@ function renderDetail(projectId = "proj_keel") {
     [{ path: "/projects/:id", element: <ProjectDetailPage /> }],
     { initialEntries: [`/projects/${projectId}`] },
   );
-  return renderWithClient(<RouterProvider router={router} />);
+  return { router, ...renderWithClient(<RouterProvider router={router} />) };
 }
 
 test("shows project overview fields", async () => {
@@ -55,4 +55,45 @@ test("approving a run's pending approval clears it from the panel", async () => 
     expect(screen.queryByText("credentials_rotate")).not.toBeInTheDocument();
     expect(screen.getByText("Decision recorded for this preview session.")).toBeInTheDocument();
   });
+});
+
+test("navigating to a different project without remounting resets the tab and selected run, and only requests the new project's run data", async () => {
+  const { router } = renderDetail("proj_keel");
+
+  await screen.findByText("https://github.com/example/keel");
+  fireEvent.click(screen.getByRole("tab", { name: "Runs" }));
+  fireEvent.click(await screen.findByText("Rotate CI credentials"));
+  expect(await screen.findByText("credentials_rotate")).toBeInTheDocument();
+
+  const fetchSpy = vi.spyOn(window, "fetch");
+
+  // Same route element, only the :id param changes — this is the scenario
+  // where stale component state previously leaked across projects.
+  await act(async () => {
+    await router.navigate("/projects/proj_marketing");
+  });
+
+  await screen.findByText("https://github.com/example/marketing-site");
+  expect(screen.getByRole("tab", { name: "Overview" })).toHaveAttribute("aria-selected", "true");
+  expect(screen.queryByText("credentials_rotate")).not.toBeInTheDocument();
+  expect(screen.queryByText("Rotate CI credentials")).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("tab", { name: "Runs" }));
+
+  expect(await screen.findByText("Update pricing page copy")).toBeInTheDocument();
+  expect(screen.queryByText("Rotate CI credentials")).not.toBeInTheDocument();
+  expect(screen.queryByText("Add i18n foundation")).not.toBeInTheDocument();
+
+  await screen.findByText("publish_page");
+  expect(screen.queryByText("credentials_rotate")).not.toBeInTheDocument();
+  expect(screen.queryByText("web/src/lib/i18n/en.ts")).not.toBeInTheDocument();
+
+  const requestedUrls = fetchSpy.mock.calls.map((args) => String(args[0]));
+  expect(requestedUrls.some((u) => u.includes("/v1/projects/proj_marketing/runs"))).toBe(true);
+  expect(requestedUrls.some((u) => u.includes("/v1/runs/run_marketing_1/diff"))).toBe(true);
+  expect(requestedUrls.some((u) => u.includes("/v1/runs/run_marketing_1/approvals"))).toBe(true);
+  expect(requestedUrls.some((u) => u.includes("/v1/runs/run_2/"))).toBe(false);
+  expect(requestedUrls.some((u) => u.includes("/v1/runs/run_1/"))).toBe(false);
+
+  fetchSpy.mockRestore();
 });

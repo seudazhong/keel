@@ -31,6 +31,8 @@ export const zhCN: Record<MessageKey, string> = {
   "shell.workspaceHint": "本地预览范围",
   "shell.openMenu": "打开导航菜单",
   "shell.closeMenu": "关闭导航菜单",
+  "shell.nav.label": "主导航",
+  "shell.menuDialogLabel": "导航菜单",
   "shell.nav.workspace": "工作区",
   "shell.nav.configuration": "配置",
   "shell.nav.automation": "自动化",

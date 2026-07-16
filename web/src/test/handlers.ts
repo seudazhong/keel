@@ -343,6 +343,16 @@ const defaultProjects: Project[] = [
     created_at: now,
     updated_at: now,
   },
+  {
+    id: "proj_marketing",
+    name: "Marketing site",
+    description: "Public marketing site content.",
+    repository: "https://github.com/example/marketing-site",
+    default_branch: "main",
+    agent_id: null,
+    created_at: now,
+    updated_at: now,
+  },
 ];
 
 let projects: Project[] = defaultProjects.map((p) => ({ ...p }));
@@ -376,6 +386,17 @@ const defaultRuns: Record<string, Run[]> = {
       ],
     },
   ],
+  proj_marketing: [
+    {
+      id: "run_marketing_1",
+      project_id: "proj_marketing",
+      status: "awaiting_approval",
+      summary: "Update pricing page copy",
+      started_at: now,
+      finished_at: null,
+      steps: [{ id: "s1", label: "Plan", status: "done", timestamp: now }],
+    },
+  ],
 };
 
 const defaultDiffs: Record<string, DiffFile[]> = {
@@ -397,6 +418,23 @@ const defaultDiffs: Record<string, DiffFile[]> = {
     },
   ],
   run_2: [],
+  run_marketing_1: [
+    {
+      path: "docs/pricing.md",
+      additions: 2,
+      deletions: 1,
+      hunks: [
+        {
+          header: "@@ -1,1 +1,2 @@",
+          lines: [
+            { type: "del", text: "Old price: $9/mo" },
+            { type: "add", text: "New price: $12/mo" },
+            { type: "add", text: "Annual billing now available." },
+          ],
+        },
+      ],
+    },
+  ],
 };
 
 const defaultRunApprovals: Record<string, RunApproval[]> = {
@@ -407,6 +445,15 @@ const defaultRunApprovals: Record<string, RunApproval[]> = {
       run_id: "run_2",
       tool: "credentials_rotate",
       summary: "Rotate the GitHub token used by CI.",
+      status: "pending",
+    },
+  ],
+  run_marketing_1: [
+    {
+      id: "ra_marketing_1",
+      run_id: "run_marketing_1",
+      tool: "publish_page",
+      summary: "Publish the updated pricing page.",
       status: "pending",
     },
   ],

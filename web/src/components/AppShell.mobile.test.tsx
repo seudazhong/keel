@@ -52,6 +52,43 @@ test("the mobile menu button opens the sidebar drawer, traps focus, and Escape r
   expect(document.activeElement).toBe(openButton);
 });
 
+test("the open drawer exposes dialog/navigation semantics: role=dialog, aria-modal, and a labeled nav landmark", () => {
+  renderWithClient(<RouterProvider router={shellAt("/chat")} />);
+
+  // Closed (desktop-persistent) sidebar is a plain complementary landmark, not a dialog.
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(screen.getByRole("navigation", { name: "Primary navigation" })).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Open navigation menu" }));
+
+  const dialog = screen.getByRole("dialog", { name: "Navigation menu" });
+  expect(dialog).toHaveAttribute("aria-modal", "true");
+  // The primary nav landmark still exists inside the dialog with its own accessible name.
+  expect(screen.getByRole("navigation", { name: "Primary navigation" })).toBeInTheDocument();
+});
+
+test("opening the drawer makes background main content inert/aria-hidden, and closing restores it", () => {
+  renderWithClient(<RouterProvider router={shellAt("/chat")} />);
+  const main = document.getElementById("main-content")!;
+
+  expect(main).not.toHaveAttribute("aria-hidden");
+  expect(main.hasAttribute("inert")).toBe(false);
+  expect(screen.getByRole("heading", { name: "Chat" })).toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Open navigation menu" }));
+
+  expect(main).toHaveAttribute("aria-hidden", "true");
+  expect(main.hasAttribute("inert")).toBe(true);
+  // Content behind the modal drawer is excluded from the accessibility tree while open.
+  expect(screen.queryByRole("heading", { name: "Chat" })).not.toBeInTheDocument();
+
+  fireEvent.click(screen.getByRole("button", { name: "Close navigation menu" }));
+
+  expect(main).not.toHaveAttribute("aria-hidden");
+  expect(main.hasAttribute("inert")).toBe(false);
+  expect(screen.getByRole("heading", { name: "Chat" })).toBeInTheDocument();
+});
+
 test("clicking the backdrop closes the mobile sidebar drawer", () => {
   const { container } = renderWithClient(<RouterProvider router={shellAt("/chat")} />);
   const openButton = screen.getByRole("button", { name: "Open navigation menu" });

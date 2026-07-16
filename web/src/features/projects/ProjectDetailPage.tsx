@@ -43,6 +43,15 @@ export function ProjectDetailPage() {
   const [tab, setTab] = useState<Tab>("overview");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
 
+  // Without this, navigating from one project's detail page to another (the
+  // route element isn't remounted, only `id` changes) would keep the
+  // previous project's tab/selected run around, which then drives diff and
+  // approval requests for a run that belongs to a different project.
+  useEffect(() => {
+    setTab("overview");
+    setSelectedRunId(null);
+  }, [id]);
+
   useEffect(() => {
     if (!selectedRunId && runs.data?.length) setSelectedRunId(runs.data[0].id);
   }, [runs.data, selectedRunId]);

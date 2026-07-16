@@ -58,6 +58,11 @@ export function AppShell() {
           id="main-content"
           ref={mainRef}
           tabIndex={-1}
+          // While the mobile drawer is open it behaves as a modal dialog, so
+          // the rest of the page must be inert/hidden from assistive tech and
+          // unfocusable until the drawer closes (state flips back automatically).
+          inert={sidebarOpen ? true : undefined}
+          aria-hidden={sidebarOpen ? "true" : undefined}
           className="flex min-w-0 flex-col focus:outline-none"
         >
           <Outlet />

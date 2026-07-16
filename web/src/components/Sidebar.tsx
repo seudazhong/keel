@@ -112,6 +112,9 @@ export function Sidebar({
       )}
       <aside
         ref={asideRef}
+        role={isOpen ? "dialog" : undefined}
+        aria-modal={isOpen ? true : undefined}
+        aria-label={isOpen ? t("shell.menuDialogLabel") : undefined}
         className={cn(
           "fixed inset-y-0 left-0 z-40 flex h-screen w-72 max-w-[85vw] flex-col border-r border-border bg-surface transition-transform duration-200 ease-out",
           "lg:sticky lg:top-0 lg:z-auto lg:inset-auto lg:w-60 lg:max-w-none lg:translate-x-0",
@@ -155,7 +158,7 @@ export function Sidebar({
           </Link>
         )}
 
-        <nav aria-label={t("shell.brand")} className="flex flex-1 flex-col gap-0.5 overflow-y-auto p-2">
+        <nav aria-label={t("shell.nav.label")} className="flex flex-1 flex-col gap-0.5 overflow-y-auto p-2">
           {groups.map((g) => (
             <div key={g.labelKey}>
               <div className="px-2.5 pb-1 pt-3 text-[11px] uppercase tracking-wide text-text-muted">

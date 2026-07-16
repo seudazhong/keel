@@ -59,6 +59,34 @@ test.describe("responsive shell", () => {
     const skipLink = page.getByText("Skip to main content");
     await expect(skipLink).toHaveAttribute("href", "#main-content");
   });
+
+  test("the open drawer has dialog semantics and inerts the background main content until closed", async ({
+    page,
+  }) => {
+    await freshVisit(page, "/chat");
+
+    const main = page.locator("#main-content");
+    await expect(main).not.toHaveAttribute("aria-hidden", "true");
+    await expect(page.getByRole("heading", { name: "Chat" })).toBeVisible();
+
+    await page.getByRole("button", { name: "Open navigation menu" }).click();
+
+    const dialog = page.getByRole("dialog", { name: "Navigation menu" });
+    await expect(dialog).toHaveAttribute("aria-modal", "true");
+    await expect(page.getByRole("navigation", { name: "Primary navigation" })).toBeVisible();
+
+    // The background content is inert while the modal drawer is open: it must
+    // drop out of the accessibility tree and stop accepting focus/clicks.
+    await expect(main).toHaveAttribute("aria-hidden", "true");
+    await expect(page.getByRole("heading", { name: "Chat" })).toBeHidden();
+    await expect(main).toHaveJSProperty("inert", true);
+
+    await page.getByRole("button", { name: "Close navigation menu" }).click();
+
+    await expect(main).not.toHaveAttribute("aria-hidden", "true");
+    await expect(main).toHaveJSProperty("inert", false);
+    await expect(page.getByRole("heading", { name: "Chat" })).toBeVisible();
+  });
 });
 
 test.describe("first-run onboarding", () => {

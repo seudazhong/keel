@@ -29,6 +29,8 @@ export const en = {
   "shell.workspaceHint": "Local preview scope",
   "shell.openMenu": "Open navigation menu",
   "shell.closeMenu": "Close navigation menu",
+  "shell.nav.label": "Primary navigation",
+  "shell.menuDialogLabel": "Navigation menu",
   "shell.nav.workspace": "Workspace",
   "shell.nav.configuration": "Configuration",
   "shell.nav.automation": "Automation",
