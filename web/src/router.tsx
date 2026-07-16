@@ -4,6 +4,8 @@ import { ApprovalsPage } from "./features/approvals/ApprovalsPage";
 import { ChatPage } from "./features/chat/ChatPage";
 import { ConnectorsPage } from "./features/connectors/ConnectorsPage";
 import { KnowledgePage } from "./features/knowledge/KnowledgePage";
+import { JobsPage } from "./features/jobs/JobsPage";
+import { MemoryPage } from "./features/memory/MemoryPage";
 import { ObservabilityPage } from "./features/observability/ObservabilityPage";
 import { SchedulesPage } from "./features/schedules/SchedulesPage";
 import { SessionDetailPage } from "./features/sessions/SessionDetailPage";
@@ -20,6 +22,8 @@ export const router = createBrowserRouter([
       { path: "sessions/:id", element: <SessionDetailPage /> },
       { path: "connectors", element: <ConnectorsPage /> },
       { path: "knowledge", element: <KnowledgePage /> },
+      { path: "memory", element: <MemoryPage /> },
+      { path: "jobs", element: <JobsPage /> },
       { path: "schedules", element: <SchedulesPage /> },
       { path: "approvals", element: <ApprovalsPage /> },
       { path: "observability", element: <ObservabilityPage /> },

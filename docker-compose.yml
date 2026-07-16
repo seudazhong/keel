@@ -107,12 +107,18 @@ services:
     profiles: ["dev", "full"]
 
   keel-web:
-    image: nginx:alpine
+    build:
+      context: .
+      dockerfile: deploy/docker/web.Dockerfile
+      args:
+        NPM_CONFIG_REGISTRY: ${NPM_CONFIG_REGISTRY:-https://registry.npmjs.org/}
+    image: keel-web:dev
     ports: ["3000:80"]
-    volumes:
-      - ./web/stub:/usr/share/nginx/html:ro
+    depends_on:
+      keel-server:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost/"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost/web-health"]
       interval: 5s
       timeout: 5s
       retries: 20

@@ -5,7 +5,7 @@
 
 ## Summary
 
-Keel has **late-M3 engine/data maturity**, an **early-M1 product surface**, and
+Keel has **late-M3 engine/data maturity**, an **M1 product surface**, and
 **pre-production operational readiness**. Durable Jobs and the Memory/Knowledge/Quality
 track are complete. The current product remains a hard-coded single-scope/single-agent
 system and should not be presented as the target multi-user platform.
@@ -15,7 +15,7 @@ system and should not be presented as the target multi-user platform.
 | Track | Maturity | Evidence | Main gap |
 |---|---|---|---|
 | Agent runtime and data engine | Late M3 | Bounded loop, durable event/session state, tools, approvals, schedules, Durable Jobs, memory/search/consolidation, deterministic evals, Knowledge lifecycle/search/citations/taint. | Event upcasters, retention/erasure, isolated execution, durable interactive topology. |
-| Product surface | Early M1 | Minimal chat, React development UI, sessions, approvals, Gmail status, schedules, admin overview, Knowledge UI, OneBot/Telegram slices. | Identity, Agents CRUD/switcher, Calendar, onboarding, Memory/Admin governance UI, Web/IM parity, responsive/i18n/a11y. |
+| Product surface | M1, M3.1 in progress | Compose-delivered React app, chat, sessions, approvals, Gmail status, schedules, admin overview, Knowledge, Jobs, Memory proposals, demo bootstrap, Playwright smoke, OneBot/Telegram slices. | Local first-run wizard, identity, Agents CRUD/switcher, Calendar, complete Memory/Admin governance, Web/IM parity, responsive/i18n/a11y. |
 | Production readiness | Pre-production | Compose dev stack, migrations, health/readiness, RBAC tiers, core CI, durable jobs recovery tests. | Enforced RLS role, real sandbox, durable auth/OAuth/webhook/idempotency, accurate delivery profiles, scale/SLO/DR/security gates. |
 
 ## Verified completed capabilities
@@ -56,18 +56,28 @@ system and should not be presented as the target multi-user platform.
 ### Current surfaces/integrations
 
 - Server-rendered minimal chat and management pages.
-- React app runnable through Vite; Compose web service is not the React app.
+- Compose `:3000` serves the built React app through nginx, including SPA fallback and
+  `/v1`, `/health`, `/readiness`, and SSE proxying.
+- React Jobs and Memory proposal pages expose current backend contracts.
+- Guarded, idempotent demo bootstrap seeds searchable Knowledge content and a welcome session.
 - Gmail is the only native connector; OAuth/read/status/revoke paths exist, with optional
   approval-gated real send.
 - OneBot and Telegram gateway code exists.
 
 ## Verified baselines
 
-The latest completed feature audits reported:
+The final M3.1 increment validation on 2026-07-16 reported:
 
-- Python: **1036 passed / 1 skipped** (1037 collected).
-- React/Vitest: **49 passed**.
-- Ruff lint/format and strict mypy: passed.
+- Python non-integration: **828 passed / 1 skipped**; isolated Postgres/Redis integration:
+  **239 passed**.
+- React/Vitest: **53 passed**; Playwright Compose smoke: **9 passed** against the isolated
+  stack before and after demo seeding.
+- Ruff lint/format, strict mypy, web lint/build, Compose config, app/web image builds, and
+  live nginx syntax: passed.
+- Demo bootstrap: dry-run credential redaction, production guard refusal, isolated seed,
+  searchable 3-document corpus, and idempotent replay passed.
+- The populated Playwright smoke left sessions, events, Jobs, Knowledge, Memory proposals,
+  approvals, schedules, and connector-token row counts unchanged.
 - Memory replay: **12/12 cases**, **7/7 gates**, weighted overall **0.982**, no live fallback.
 - Knowledge replay: **8/8 cases**, **7/7 gates**, all named retrieval/citation/taint/deletion
   measures **1.000**, no live embedding fallback.
@@ -76,8 +86,16 @@ The latest completed feature audits reported:
 - Knowledge live smoke: create → ingest → cited/tainted search → safe update/activation →
   immediate-hide delete → durable purge.
 
-These are retained baselines, not a claim that every current-main dependency/environment
-was re-run for this documentation change.
+The Memory/Knowledge eval figures are retained feature-audit baselines; the other figures above
+come from the final isolated M3.1 increment run.
+
+## M3.1 increment status
+
+**In progress.** This increment completes real Compose React delivery, truthful Jobs/Memory
+surfaces, safe demo bootstrap data, stale-stack detection, and a non-destructive browser smoke.
+M3.1 remains open because the planned local first-run wizard for provider/secret/default-Agent
+and optional connector setup is not implemented. Product-state copy still needs a dedicated
+exit-gate audit before declaring the milestone complete.
 
 ## Critical and high blockers
 
@@ -98,8 +116,8 @@ was re-run for this documentation change.
    erasure.
 10. **Scheduler/topology:** scheduler package is a stub; worker cron schedules jobs;
     interactive runtime is not the target server/worker topology.
-11. **Delivery mismatch:** Compose `:3000` is a static stub; `full` does not deliver the
-    documented observability/object-store/sandbox stack.
+11. **Delivery profile gap:** Compose `:3000` now delivers the React app, but `full` still does
+    not deliver the documented observability/object-store/sandbox stack.
 12. **SDK/operations:** no generated-client/versioning pipeline; observability, CI security/
     performance coverage, backup/restore, and DR are below target.
 
@@ -109,7 +127,7 @@ was re-run for this documentation change.
 - Agents CRUD, persisted personal/team Agents, explicit resource grants, real switcher.
 - Calendar and a reusable connector/trigger framework.
 - Web/IM runtime and approval parity.
-- Memory UI, complete Admin/RBAC UI, onboarding.
+- Complete Memory block/history editing, Admin/RBAC UI, and local first-run onboarding.
 - Correct current copy, responsive behavior, internationalization, and accessibility.
 
 ## Next work

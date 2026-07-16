@@ -17,7 +17,7 @@ Do not infer current-main API availability from health alone.
 | API docs `/docs` | Available | Available | Best source for the exact API exposed by the running image. |
 | `/v1/jobs` | Usually absent | Available | Requires current-main rebuild and Postgres/Redis. |
 | `/v1/knowledge-bases` | Usually absent | Available | Requires rebuild; useful results require seeded KB data and embeddings. |
-| React app | Run Vite separately | Run Vite separately | Compose `keel-web` on `:3000` is a static stub, not the React bundle. |
+| React app `:3000` | Static stub (no Chat/Jobs/Knowledge) | Available | Requires a current-main rebuild; `keel-web` now serves the built React bundle, not the old stub. |
 
 ## Prerequisites
 
@@ -27,6 +27,9 @@ Do not infer current-main API availability from health alone.
 - For Gmail: a Desktop OAuth client, `KEEL_SECRET_KEY`, and an authorized token.
 - For Knowledge search: current-main containers plus seeded/ingested data. A clean stack has
   no demo KB content.
+- For the automated smoke (step 6 below): Node/npm for `web/`, and a Playwright-managed
+  Chromium install via `npm run test:e2e:install` (first run only). No provider credentials
+  or seeded data are required — the smoke only exercises safe, read-only states.
 
 ## Safe 10–15 minute Windows PowerShell script
 
@@ -105,9 +108,35 @@ Invoke-RestMethod "$base/v1/knowledge-bases" | ConvertTo-Json -Depth 6
 Expected: services become healthy; jobs and Knowledge endpoints return JSON. Empty arrays
 are correct on an unseeded stack.
 
-### 5. Optional React UI via Vite (2 minutes)
+### 4a. Optional guarded demo data (1–3 minutes)
 
-Compose `:3000` is a static readiness stub. To demonstrate the actual React application:
+For a local demo stack, seed searchable Knowledge content plus a welcome session without editing
+database rows. Preview first; the command refuses non-loopback or production-labelled targets:
+
+```powershell
+$env:KEEL_APP_ENV = "dev"
+uv run python scripts/seed_demo_data.py --dry-run
+uv run python scripts/seed_demo_data.py --yes
+```
+
+The default `auto` embedding mode falls back to a deterministic offline embedder if the configured
+provider is unavailable. Use `--mode fake` to force the offline path. Re-running is idempotent:
+the same Knowledge Base, documents, jobs, and session are reused, and unrelated data is not
+modified or deleted.
+
+### 5. React application on `:3000` (2 minutes)
+
+After a current-main rebuild (step 4), `http://localhost:3000` serves the built React app
+directly — the same demo surfaces above (Chat, Sessions, Memory, Knowledge, Jobs, Schedules,
+Approvals, Observability, Settings) with `/v1`, `/health`, and `/readiness` proxied to
+`keel-server` by nginx (`deploy/docker/web.nginx.conf`):
+
+```powershell
+Start-Process "http://localhost:3000/"
+```
+
+For frontend-only iteration against an existing `:8000` API without rebuilding the `keel-web`
+image, run Vite instead:
 
 ```powershell
 Set-Location C:\src\keel\web
@@ -117,6 +146,33 @@ npm run dev
 
 Open the URL Vite prints (normally `http://localhost:5173`). Vite proxies `/v1` and
 `/health` to `:8000`. Stop it with `Ctrl+C` after the demo.
+
+### 6. Automated browser smoke (2–3 minutes)
+
+A Playwright smoke exercises this same safe walkthrough end to end against the React app on
+`:3000`: it loads the app, follows the SPA history fallback, navigates every section above,
+checks the `/health` and `/readiness` proxies, and confirms Jobs/Knowledge/Memory render a
+valid empty or populated state — without sending Gmail, revoking connectors, cancelling jobs,
+resolving approvals, running schedules, or changing settings. Run it against an
+already-running stack (it never starts/stops Compose or deletes volumes):
+
+```powershell
+Set-Location C:\src\keel\web
+npm ci
+npm run test:e2e:install   # first run only: installs the Chromium browser
+npm run test:e2e
+```
+
+Target a different host/port (e.g. the Vite dev server from step 5) with `SMOKE_BASE_URL`:
+
+```powershell
+$env:SMOKE_BASE_URL = "http://127.0.0.1:5173"
+npm run test:e2e
+```
+
+If the target is still the stale pre-rebuild stack, the suite fails immediately with an
+actionable error (e.g. `/v1/jobs` returning 404) instead of silently skipping current-main
+routes — rebuild per step 4 and re-run.
 
 ## Safety and fallbacks
 

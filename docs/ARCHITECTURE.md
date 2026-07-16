@@ -23,7 +23,7 @@ The target architecture below remains useful, but these substitutions and gaps a
 | Gateways/outbound | OneBot/Telegram webhook handlers are unauthenticated; outbound idempotency is process-local. | Authenticated/replay-safe webhooks and durable outbound idempotency (M3.3). |
 | Permissions | Main CLI profile is fail-closed, but APIs permit construction paths where an omitted default can become allow-all. | Explicit non-allow default as an invariant in every policy constructor (M3.3). |
 | Events/data lifecycle | Event rows have versions; no upcaster registry, retention policy, or complete erasure path. | M3.4 event evolution, then M3.5 retention/erasure. |
-| Web delivery | React/Vite app exists and runs separately; Compose `keel-web` serves a static stub. | Demo React delivery in M3.1; production image and accurate profiles in M3.8. |
+| Web delivery | Compose `keel-web` builds and serves the React app through nginx with API/SSE proxying and SPA fallback. | Production profile hardening and accurate full-stack delivery in M3.8. |
 | Observability/SDK/CI | Deterministic evals and basic tracing exist; full OTel/metrics/SLOs, generated SDK/version diff, and documented production CI gates do not. | Event/API compatibility in M3.4 and production delivery gates in M3.8. |
 
 Architecture statements using present tense below should be read as **target contracts** unless
@@ -368,10 +368,10 @@ Typer + Rich/Textual. Thin client of the API: interactive TUI (streaming, approv
 
 ### 12.2 Web app (`web/`)
 The React + Vite + TypeScript app currently provides chat, sessions, connectors, Knowledge,
-schedules, approvals, overview, and settings during Vite development. Compose `keel-web`
-still serves a static stub; it does not package the React build. Memory/Agents/admin
-governance completeness, responsive/i18n/a11y work, production nginx delivery, and Tauri
-remain targets.
+Jobs, Memory proposals, schedules, approvals, overview, and settings. Compose `keel-web`
+packages the production build behind nginx with API/SSE proxying and SPA fallback. Memory
+block/Agent/admin governance completeness, responsive/i18n/a11y work, production profile
+hardening, and Tauri remain targets.
 
 ### 12.3 IM gateway (`adapters/`)
 - **Topology [G11]:** adapters are **hosted in `keel-server`** by default (all profiles, as the container diagram shows); a standalone **`keel-gateway`** container is an **opt-in scale-out split** for high-volume channels.

@@ -79,11 +79,14 @@ describe("chat components", () => {
       <ChatContext
         items={items}
         usage={{ promptTokens: 100, completionTokens: 20, cacheReadTokens: 50, costUsd: 0.012 }}
+        model="api/model-current"
       />,
     );
     expect(screen.getByText("120")).toBeInTheDocument(); // total tokens
     expect(screen.getByText("$0.0120")).toBeInTheDocument();
     expect(screen.getByText("50 (50%)")).toBeInTheDocument(); // cache hit
+    expect(screen.getByText("api/model-current")).toBeInTheDocument();
+    expect(screen.getByText(/consolidation 已启用/)).toBeInTheDocument();
   });
 
   it("RunBar shows an interrupt button while running", () => {

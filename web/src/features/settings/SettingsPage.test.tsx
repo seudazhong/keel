@@ -10,6 +10,8 @@ test("shows the current model and switches it on save", async () => {
   await tick(1200);
   const select = screen.getByLabelText("默认模型") as HTMLSelectElement;
   expect(select.value).toBe("github_copilot/claude-sonnet-4.5");
+  expect(screen.queryByText("● 已登录")).not.toBeInTheDocument();
+  expect(screen.getByText(/不包含认证状态/)).toBeInTheDocument();
 
   fireEvent.change(select, { target: { value: "github_copilot/gpt-5.3-codex" } });
   fireEvent.click(screen.getByRole("button", { name: "保存" }));
