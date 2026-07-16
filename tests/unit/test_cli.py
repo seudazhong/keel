@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from keel_cli import runner as runner_mod
 from keel_cli.main import app
-from keel_cli.runner import ChatSession, build_session, default_permissions
-from keel_core.protocols import ProviderChunk, ToolCall
+from keel_cli.runner import ChatSession, build_session, build_tools, default_permissions
+from keel_core.protocols import ProviderChunk, ToolCall, ToolContext
 from keel_core.testing import ScriptedProviderGateway
 from keel_core.types import FinishReason, PermissionDecision, StopReason
 
@@ -25,6 +26,56 @@ class _Capture:
     @property
     def text(self) -> str:
         return "".join(self.parts)
+
+
+def test_cli_wires_shell_for_sanitized_workspace(tmp_path: Path) -> None:
+    notices: list[str] = []
+    tools = build_tools(tmp_path, write_notice=notices.append)
+    assert [tool.name for tool in tools] == [
+        "read",
+        "write",
+        "edit",
+        "ls",
+        "glob",
+        "grep",
+        "shell",
+    ]
+    assert notices == []
+
+
+@pytest.mark.parametrize("git_kind", ["directory", "file"])
+async def test_cli_git_workspace_disables_shell_but_keeps_file_tools(
+    tmp_path: Path,
+    git_kind: str,
+) -> None:
+    git_path = tmp_path / ".git"
+    if git_kind == "directory":
+        git_path.mkdir()
+    else:
+        git_path.write_text("gitdir: elsewhere", encoding="utf-8")
+    out, meta = _Capture(), _Capture()
+    session = build_session(
+        model="test/model",
+        workspace=tmp_path,
+        provider=ScriptedProviderGateway(
+            [[ProviderChunk(delta="done", finish_reason=FinishReason.end_turn)]]
+        ),
+        write_out=out,
+        write_meta=meta,
+    )
+
+    assert session.registry.get("shell") is None
+    assert "shell" not in session.agent.toolset
+    assert "shell disabled" in meta.text
+    assert "file tools remain available" in meta.text
+
+    write = session.registry.get("write")
+    read = session.registry.get("read")
+    assert write is not None and read is not None
+    ctx = ToolContext(scope_id="cli:local", session_id="test")
+    assert (await write.run({"path": "note.txt", "content": "hello"}, ctx)).ok
+    result = await read.run({"path": "note.txt"}, ctx)
+    assert result.ok and result.output == "hello"
 
 
 def _session(
