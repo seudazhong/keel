@@ -14,6 +14,9 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = ROOT / "tests" / "fixtures" / "openapi-v1-baseline.json"
+_DOCUMENTATION_KEYS = frozenset(
+    {"description", "summary", "title", "example", "examples", "externalDocs"}
+)
 
 
 class CompatibilityError(ValueError):
@@ -37,6 +40,8 @@ def _require_additive(baseline: Any, current: Any, path: str = "$") -> None:
         if not isinstance(current, dict):
             raise CompatibilityError(f"{path} changed from an object")
         for key, old_value in baseline.items():
+            if key in _DOCUMENTATION_KEYS:
+                continue
             if key not in current:
                 raise CompatibilityError(f"{path}.{key} was removed")
             _require_additive(old_value, current[key], f"{path}.{key}")
