@@ -6,7 +6,7 @@ import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from keel_core.tools.environment import (
@@ -28,8 +28,14 @@ from keel_core.tools.rpc import (
     ExecutionRpcResponse,
     request_options,
 )
+from keel_core.tools.rpc_auth import (
+    DEFAULT_REPLAY_WINDOW_SECONDS,
+    RpcRequestVerifier,
+)
 from keel_sandbox.policy import EgressPolicy, PathPolicy
 
+# Defense in depth only. The executor's sanitized-workspace validation and the
+# container mount contract are the security boundary for shell path confinement.
 _DENIED_COMMAND_PATH = re.compile(r"(^|[/\\\s'\"=])(?:\.\.|\.git|\.env)(?=$|[/\\\s'\"=])")
 
 
@@ -116,8 +122,21 @@ def create_app(
     *,
     isolation_verified: bool = False,
     admission: ExecutorAdmissionPolicy | None = None,
+    shared_secret: str | None = None,
+    allow_unauthenticated_local_test: bool = False,
+    replay_window_seconds: int = DEFAULT_REPLAY_WINDOW_SECONDS,
 ) -> FastAPI:
-    """Create the service; unverified runtime isolation fails every request closed."""
+    """Create the authenticated service.
+
+    Production requires both a strong shared secret and externally verified container
+    isolation. Tests may explicitly opt into unauthenticated local mode.
+    """
+
+    verifier = RpcRequestVerifier(
+        shared_secret,
+        allow_unauthenticated_local_test=allow_unauthenticated_local_test,
+        replay_window_seconds=replay_window_seconds,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -128,13 +147,25 @@ def create_app(
     policy = admission or ExecutorAdmissionPolicy()
 
     @app.post("/v1/execute", response_model=ExecutionRpcResponse)
-    async def execute(request: ExecutionRpcRequest) -> ExecutionRpcResponse | JSONResponse:
+    async def execute(raw_request: Request) -> ExecutionRpcResponse | JSONResponse:
+        body_bytes = await raw_request.body()
+        if not verifier.verify(
+            raw_request.headers,
+            body_bytes,
+            method=raw_request.method,
+            path=raw_request.url.path,
+        ):
+            return JSONResponse({"detail": "authentication failed"}, status_code=401)
         if not isolation_verified:
             body = _failure(
                 ExecutionErrorCode.unavailable,
                 "sandbox isolation is not verified",
             )
             return JSONResponse(body.model_dump(mode="json"), status_code=503)
+        try:
+            request = ExecutionRpcRequest.model_validate_json(body_bytes)
+        except ValueError:
+            return JSONResponse({"detail": "invalid request"}, status_code=400)
         denial = policy.admit(request)
         if denial is not None:
             return denial

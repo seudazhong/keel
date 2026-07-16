@@ -15,24 +15,25 @@ def _ctx() -> ToolContext:
 
 
 async def test_shell_echo(tmp_path: Path) -> None:
-    result = await ShellTool(UnsafeLocalDevExecutionEnvironment(tmp_path)).run(
-        {"command": "echo keeltest"}, _ctx()
-    )
+    result = await ShellTool(
+        UnsafeLocalDevExecutionEnvironment(tmp_path, shell_workspace_provisioned=True)
+    ).run({"command": "echo keeltest"}, _ctx())
     assert result.ok
     assert "keeltest" in result.output
 
 
 async def test_shell_timeout(tmp_path: Path) -> None:
     slow = "ping -n 5 127.0.0.1" if sys.platform == "win32" else "sleep 5"
-    result = await ShellTool(UnsafeLocalDevExecutionEnvironment(tmp_path), timeout=0.2).run(
-        {"command": slow}, _ctx()
-    )
+    result = await ShellTool(
+        UnsafeLocalDevExecutionEnvironment(tmp_path, shell_workspace_provisioned=True),
+        timeout=0.2,
+    ).run({"command": slow}, _ctx())
     assert not result.ok
     assert "timed out" in result.output
 
 
 async def test_shell_nonzero_exit(tmp_path: Path) -> None:
-    result = await ShellTool(UnsafeLocalDevExecutionEnvironment(tmp_path)).run(
-        {"command": "exit 3"}, _ctx()
-    )
+    result = await ShellTool(
+        UnsafeLocalDevExecutionEnvironment(tmp_path, shell_workspace_provisioned=True)
+    ).run({"command": "exit 3"}, _ctx())
     assert not result.ok

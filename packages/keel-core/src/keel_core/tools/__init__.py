@@ -25,6 +25,7 @@ from keel_core.tools.environment import (
 from keel_core.tools.executor import ExecRequest, execute
 from keel_core.tools.files import EditTool, GlobTool, GrepTool, LsTool, ReadTool, WriteTool
 from keel_core.tools.rpc import SandboxExecutionEnvironment
+from keel_core.tools.rpc_auth import RpcRequestSigner, RpcRequestVerifier
 from keel_core.tools.shell import ShellTool
 from keel_core.tools.wiring import ExecutionBackend, build_service_execution_environment
 
@@ -45,6 +46,8 @@ __all__ = [
     "ListRequest",
     "OperationOptions",
     "ReadRequest",
+    "RpcRequestSigner",
+    "RpcRequestVerifier",
     "SandboxExecutionEnvironment",
     "UnavailableExecutionEnvironment",
     "UnsafeLocalDevExecutionEnvironment",

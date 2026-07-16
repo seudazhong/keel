@@ -56,7 +56,10 @@ _MUTATING = ("write", "edit", "shell")
 
 def build_tools(workspace: Path) -> list[Any]:
     """Instantiate the built-in toolset confined to ``workspace``."""
-    environment = UnsafeLocalDevExecutionEnvironment(workspace)
+    environment = UnsafeLocalDevExecutionEnvironment(
+        workspace,
+        shell_workspace_provisioned=True,
+    )
     return [
         ReadTool(environment),
         WriteTool(environment),

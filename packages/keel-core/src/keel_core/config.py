@@ -11,7 +11,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -123,7 +123,10 @@ class Settings(BaseSettings):
     # The in-process backend is only for explicitly trusted local previews.
     execution_backend: str = "sandbox"
     sandbox_url: str = "http://keel-sandbox:8090"
+    sandbox_rpc_secret: SecretStr = SecretStr("")
+    sandbox_rpc_local_test_mode: bool = False
     trusted_preview_allow_unsafe_execution: bool = False
+    trusted_preview_shell_workspace_sanitized: bool = False
 
     # Autonomy (M2 slice): scheduler tick cadence + how long an unattended approval
     # stays open before it fails closed (invariant: fail-closed on timeout).

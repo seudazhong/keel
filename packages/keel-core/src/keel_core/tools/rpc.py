@@ -25,6 +25,7 @@ from keel_core.tools.environment import (
     ReadRequest,
     WriteRequest,
 )
+from keel_core.tools.rpc_auth import RpcRequestSigner
 
 
 class ExecutionOperation(StrEnum):
@@ -147,10 +148,16 @@ class SandboxExecutionEnvironment(ExecutionEnvironment):
         self,
         base_url: str,
         *,
+        shared_secret: str | None = None,
+        allow_unauthenticated_local_test: bool = False,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         if not base_url:
             raise ValueError("sandbox base URL is required")
+        self._signer = RpcRequestSigner(
+            shared_secret,
+            allow_unauthenticated_local_test=allow_unauthenticated_local_test,
+        )
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(base_url=base_url.rstrip("/"))
 
@@ -161,10 +168,14 @@ class SandboxExecutionEnvironment(ExecutionEnvironment):
     ) -> ExecutionResult:
         if options.cancellation is not None and options.cancellation.cancelled:
             return _rpc_failure(ExecutionErrorCode.cancelled, "operation cancelled")
+        body = rpc_request.model_dump_json().encode("utf-8")
+        headers = self._signer.headers(body)
+        headers["Content-Type"] = "application/json"
         request_task = asyncio.create_task(
             self._client.post(
                 "/v1/execute",
-                json=rpc_request.model_dump(mode="json"),
+                content=body,
+                headers=headers,
                 timeout=options.limits.timeout_seconds,
             )
         )

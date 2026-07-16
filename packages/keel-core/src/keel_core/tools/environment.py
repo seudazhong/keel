@@ -8,6 +8,7 @@ Server and worker wiring use the sandbox RPC implementation by default.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -197,6 +198,31 @@ class WorkspacePathPolicy:
             return None
         return relative
 
+    def is_sanitized_for_shell(self) -> bool:
+        """Verify denied names are absent from the workspace tree.
+
+        This validates the local workspace contents. Container deployments must also
+        mount only this sanitized tree so shell processes cannot reach host parents.
+        """
+        if not self.root.is_dir() or self.root.name in self.deny_names:
+            return False
+
+        def raise_walk_error(error: OSError) -> None:
+            raise error
+
+        for current, directories, files in os.walk(
+            self.root,
+            followlinks=False,
+            onerror=raise_walk_error,
+        ):
+            if any(name in self.deny_names for name in (*directories, *files)):
+                return False
+            for name in (*directories, *files):
+                candidate = Path(current, name)
+                if candidate.is_symlink() or candidate.is_junction() or candidate.is_mount():
+                    return False
+        return True
+
 
 async def _with_controls[T](
     operation: Awaitable[T],
@@ -284,12 +310,21 @@ class UnsafeLocalDevExecutionEnvironment:
     """Opt-in in-process backend for trusted local development only.
 
     It enforces workspace path policy but cannot provide container-grade process or
-    network isolation. Production service wiring rejects this backend by default.
+    network isolation. Shell execution additionally requires an explicit sanitized
+    workspace assertion and revalidates that denied paths are absent before every
+    command. Production service wiring rejects this backend by default.
     """
 
-    def __init__(self, workspace: Path | str, *, spill_dir: Path | None = None) -> None:
+    def __init__(
+        self,
+        workspace: Path | str,
+        *,
+        spill_dir: Path | None = None,
+        shell_workspace_provisioned: bool = False,
+    ) -> None:
         self._policy = WorkspacePathPolicy(workspace)
         self._spill_dir = spill_dir
+        self._shell_workspace_provisioned = shell_workspace_provisioned
 
     def _bounded(
         self,
@@ -316,6 +351,23 @@ class UnsafeLocalDevExecutionEnvironment:
     async def execute(self, request: CommandRequest) -> ExecutionResult:
         if not request.command:
             return _error(ExecutionErrorCode.invalid, "empty command")
+        if not self._shell_workspace_provisioned:
+            return _error(
+                ExecutionErrorCode.denied,
+                "shell workspace was not explicitly provisioned as sanitized",
+            )
+        try:
+            sanitized = await asyncio.to_thread(self._policy.is_sanitized_for_shell)
+        except OSError:
+            return _error(
+                ExecutionErrorCode.denied,
+                "shell workspace sanitization could not be verified",
+            )
+        if not sanitized:
+            return _error(
+                ExecutionErrorCode.denied,
+                "shell workspace contains denied paths",
+            )
         if request.requested_egress_hosts:
             return _error(
                 ExecutionErrorCode.denied,
