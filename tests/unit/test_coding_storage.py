@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import sys
 import threading
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -17,6 +19,7 @@ from keel_core.coding import (
     ActiveGitStore,
     ArtifactRetention,
     ArtifactStore,
+    CodingRunId,
     GitCommandError,
     GitRunner,
     InvalidStorageInput,
@@ -28,6 +31,7 @@ from keel_core.coding import (
     LocalWorktreeStore,
     ObjectKey,
     ObjectStore,
+    ProjectId,
     SnapshotStore,
     StorageConflict,
     StorageNotFound,
@@ -56,6 +60,26 @@ class RecordingGitRunner(GitRunner):
     ) -> subprocess.CompletedProcess[str]:
         self.calls.append(tuple(args))
         return super().run(args, cwd=cwd, check=check)
+
+    def run_bounded(
+        self,
+        args: Sequence[str],
+        *,
+        monitored_path: Path,
+        max_bytes: int,
+        cwd: Path | None = None,
+        check: bool = True,
+        poll_interval_seconds: float = 0.01,
+    ) -> subprocess.CompletedProcess[str]:
+        self.calls.append(tuple(args))
+        return super().run_bounded(
+            args,
+            monitored_path=monitored_path,
+            max_bytes=max_bytes,
+            cwd=cwd,
+            check=check,
+            poll_interval_seconds=poll_interval_seconds,
+        )
 
 
 def _run(git: GitRunner, cwd: Path, *args: str) -> str:
@@ -385,6 +409,64 @@ def test_worktree_reaper_uses_owned_markers_only(tmp_path: Path) -> None:
     assert storage.reap_worktrees(older_than=_OLD + timedelta(days=1)).removed == 0
 
 
+def test_worktree_reaper_does_not_delete_recreated_same_run_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    remote, _git = _remote(tmp_path)
+    storage = _storage(tmp_path)
+    project = project_id("alpha")
+    run = run_id("same-run")
+    storage.import_project(project, remote)
+    workspace = storage.materialize(project, run)
+    marker = storage.worktrees_root / "alpha" / ".same-run.json"
+    old_marker = json.loads(marker.read_text(encoding="utf-8"))
+    old_marker["created_at"] = _OLD.isoformat()
+    marker.write_text(json.dumps(old_marker), encoding="utf-8")
+    discovered = threading.Event()
+    original_reap = storage._reap_workspace
+
+    def observed_reap(
+        project_value: ProjectId,
+        run_value: CodingRunId,
+        *,
+        observed_identity: tuple[int, int],
+        observed_workspace_id: str | None,
+        observed_marker: bool,
+        cutoff: datetime,
+    ) -> tuple[bool, int]:
+        discovered.set()
+        return original_reap(
+            project_value,
+            run_value,
+            observed_identity=observed_identity,
+            observed_workspace_id=observed_workspace_id,
+            observed_marker=observed_marker,
+            cutoff=cutoff,
+        )
+
+    monkeypatch.setattr(storage, "_reap_workspace", observed_reap)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with storage._lock(project).acquire():
+            future = pool.submit(storage.reap_worktrees, older_than=_OLD + timedelta(days=1))
+            assert discovered.wait(timeout=5)
+            coding_local._remove_tree(workspace.path)
+            marker.unlink()
+            workspace.path.mkdir()
+            (workspace.path / "new-instance.txt").write_text("new", encoding="utf-8")
+            coding_local._atomic_json(
+                marker,
+                {
+                    "project_id": "alpha",
+                    "run_id": "same-run",
+                    "workspace_id": "new-instance",
+                    "commit": workspace.commit,
+                    "created_at": datetime.now(UTC).isoformat(),
+                },
+            )
+        assert future.result(timeout=5).removed == 0
+    assert (workspace.path / "new-instance.txt").read_text(encoding="utf-8") == "new"
+
+
 def test_artifact_hashes_retention_reaping_and_idempotent_delete(tmp_path: Path) -> None:
     storage = _storage(tmp_path)
     storage.create_project(project_id("alpha"))
@@ -465,19 +547,89 @@ def test_repository_and_snapshot_byte_quotas_are_enforced(tmp_path: Path) -> Non
         tmp_path / "repository",
         quotas=StorageQuotas(max_repository_bytes=1),
     )
-    with pytest.raises(StorageQuotaExceeded, match="repository"):
+    with pytest.raises(StorageQuotaExceeded, match="quota"):
         tiny_repository.create_project(project_id("alpha"))
     assert not (tiny_repository.projects_root / "alpha.git").exists()
 
     remote, _git = _remote(tmp_path)
+    tiny_import = _storage(
+        tmp_path / "import",
+        quotas=StorageQuotas(max_repository_bytes=1),
+    )
+    with pytest.raises(StorageQuotaExceeded, match="quota"):
+        tiny_import.import_project(project_id("alpha"), remote)
+    assert not (tiny_import.projects_root / "alpha.git").exists()
+    assert not list(tiny_import.projects_root.glob(".alpha.import.*"))
+
     tiny_snapshot = _storage(
         tmp_path / "snapshot",
         quotas=StorageQuotas(max_snapshot_bytes=1),
     )
     tiny_snapshot.import_project(project_id("alpha"), remote)
-    with pytest.raises(StorageQuotaExceeded, match="file"):
+    with pytest.raises(StorageQuotaExceeded, match="quota"):
         tiny_snapshot.create_snapshot(project_id("alpha"))
     assert list((tiny_snapshot.snapshots_root / "alpha").glob("*.bundle")) == []
+    assert list((tiny_snapshot.snapshots_root / "alpha").glob("*.tmp")) == []
+
+
+def test_bounded_runner_terminates_writer_as_soon_as_quota_is_crossed(
+    tmp_path: Path,
+) -> None:
+    script = tmp_path / "slow_writer.py"
+    destination = tmp_path / "bounded-output.bin"
+    finished = tmp_path / "finished"
+    script.write_text(
+        "import os, pathlib, sys, time\n"
+        "destination = pathlib.Path(sys.argv[1])\n"
+        "with destination.open('wb') as handle:\n"
+        "    for _ in range(100):\n"
+        "        handle.write(os.urandom(1024))\n"
+        "        handle.flush()\n"
+        "        os.fsync(handle.fileno())\n"
+        "        time.sleep(0.02)\n"
+        "pathlib.Path(sys.argv[2]).write_text('finished')\n",
+        encoding="utf-8",
+    )
+    runner = GitRunner(sys.executable, timeout_seconds=10)
+
+    with pytest.raises(StorageQuotaExceeded, match="quota"):
+        runner.run_bounded(
+            [str(script), str(destination), str(finished)],
+            monitored_path=destination,
+            max_bytes=4096,
+            poll_interval_seconds=0.005,
+        )
+    assert destination.stat().st_size < 100 * 1024
+    assert not finished.exists()
+
+
+def test_fetch_quota_failure_keeps_authoritative_repository_untouched(
+    tmp_path: Path,
+) -> None:
+    remote, git = _remote(tmp_path)
+    storage = _storage(tmp_path)
+    project = storage.import_project(project_id("alpha"), remote)
+    before = project.head
+    current_size = coding_local._tree_size(project.repository_path)
+    storage.quotas = StorageQuotas(max_repository_bytes=current_size + 64 * 1024)
+    (remote / "large.bin").write_bytes(os.urandom(512 * 1024))
+    _run(git, remote, "add", "large.bin")
+    _run(
+        git,
+        remote,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.test",
+        "commit",
+        "-m",
+        "large",
+    )
+
+    with pytest.raises(StorageQuotaExceeded, match="quota"):
+        storage.fetch(project_id("alpha"), remote)
+    assert storage.get_project(project_id("alpha")).head == before
+    assert not list(storage.projects_root.glob(".alpha.stage.*"))
 
 
 def test_failed_fetch_leaves_authoritative_refs_unchanged(tmp_path: Path) -> None:

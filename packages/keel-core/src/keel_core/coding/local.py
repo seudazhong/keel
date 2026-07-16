@@ -7,8 +7,10 @@ import importlib
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
+import threading
 import time
 import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -83,13 +85,7 @@ class GitRunner:
         self.executable = executable
         self.timeout_seconds = timeout_seconds
 
-    def run(
-        self,
-        args: Sequence[str],
-        *,
-        cwd: Path | None = None,
-        check: bool = True,
-    ) -> subprocess.CompletedProcess[str]:
+    def _command_and_env(self, args: Sequence[str]) -> tuple[list[str], dict[str, str]]:
         validated: list[str] = []
         for arg in args:
             value = os.fspath(arg)
@@ -108,8 +104,18 @@ class GitRunner:
             "SSH_ASKPASS": "",
             "LC_ALL": "C",
         }
+        return [self.executable, *validated], env
+
+    def run(
+        self,
+        args: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        check: bool = True,
+    ) -> subprocess.CompletedProcess[str]:
+        command, env = self._command_and_env(args)
         result = subprocess.run(
-            [self.executable, *validated],
+            command,
             cwd=cwd,
             env=env,
             stdin=subprocess.DEVNULL,
@@ -122,8 +128,115 @@ class GitRunner:
             check=False,
         )
         if check and result.returncode:
-            raise GitCommandError(validated, result.stderr.strip())
+            raise GitCommandError(command[1:], result.stderr.strip())
         return result
+
+    def run_bounded(
+        self,
+        args: Sequence[str],
+        *,
+        monitored_path: Path,
+        max_bytes: int,
+        cwd: Path | None = None,
+        check: bool = True,
+        poll_interval_seconds: float = 0.01,
+    ) -> subprocess.CompletedProcess[str]:
+        """Run Git while continuously enforcing a destination byte ceiling."""
+
+        if max_bytes <= 0:
+            raise StorageQuotaExceeded("destination byte quota is exhausted")
+        command, env = self._command_and_env(args)
+        popen_kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **popen_kwargs,
+        )
+        stdout = bytearray()
+        stderr = bytearray()
+
+        def drain(pipe: Any, target: bytearray) -> None:
+            try:
+                while chunk := pipe.read(64 * 1024):
+                    target.extend(chunk)
+                    if len(target) > 1024 * 1024:
+                        del target[: len(target) - 1024 * 1024]
+            finally:
+                pipe.close()
+
+        stdout_thread = threading.Thread(target=drain, args=(process.stdout, stdout), daemon=True)
+        stderr_thread = threading.Thread(target=drain, args=(process.stderr, stderr), daemon=True)
+        stdout_thread.start()
+        stderr_thread.start()
+        exceeded = False
+        timed_out = False
+        monitor_error: Exception | None = None
+        deadline = time.monotonic() + self.timeout_seconds
+        while process.poll() is None:
+            try:
+                current_size = _monitored_size(monitored_path, max_bytes=max_bytes)
+            except Exception as exc:
+                monitor_error = exc
+                self._terminate(process)
+                break
+            if current_size > max_bytes:
+                exceeded = True
+                self._terminate(process)
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                self._terminate(process)
+                break
+            time.sleep(poll_interval_seconds)
+        process.wait()
+        stdout_thread.join()
+        stderr_thread.join()
+        if _monitored_size(monitored_path, max_bytes=max_bytes) > max_bytes:
+            exceeded = True
+        stdout_text = bytes(stdout).decode("utf-8", errors="replace")
+        stderr_text = bytes(stderr).decode("utf-8", errors="replace")
+        result = subprocess.CompletedProcess(command, process.returncode, stdout_text, stderr_text)
+        if exceeded:
+            raise StorageQuotaExceeded("Git destination exceeded its byte quota")
+        if timed_out:
+            raise subprocess.TimeoutExpired(command, self.timeout_seconds)
+        if monitor_error is not None:
+            raise monitor_error
+        if check and result.returncode:
+            raise GitCommandError(command[1:], stderr_text.strip())
+        return result
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen[bytes]) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            if os.name == "nt":
+                control_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+                if control_break is not None:
+                    process.send_signal(control_break)
+                else:
+                    process.kill()
+            else:
+                posix_os = importlib.import_module("os")
+                posix_os.killpg(process.pid, signal.SIGTERM)
+            process.wait(timeout=2)
+        except (OSError, subprocess.TimeoutExpired):
+            if process.poll() is None:
+                if os.name == "nt":
+                    process.kill()
+                else:
+                    posix_os = importlib.import_module("os")
+                    posix_os.killpg(process.pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+                process.wait()
 
 
 def _utc_now() -> datetime:
@@ -159,6 +272,39 @@ def _hash_file(path: Path, *, max_bytes: int | None = None) -> tuple[str, int]:
                 raise StorageQuotaExceeded("file exceeds the configured size limit")
             digest.update(chunk)
     return digest.hexdigest(), size
+
+
+def _monitored_size(path: Path, *, max_bytes: int) -> int:
+    try:
+        if path.is_file():
+            return path.stat().st_size
+        if not path.exists():
+            return 0
+    except OSError:
+        return 0
+    size = 0
+    pending = [path]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = list(os.scandir(directory))
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    raise InvalidStorageInput(
+                        "symlinks are not allowed in monitored Git destinations"
+                    )
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+                elif entry.is_file(follow_symlinks=False):
+                    size += entry.stat(follow_symlinks=False).st_size
+                    if size > max_bytes:
+                        return size
+            except FileNotFoundError:
+                continue
+    return size
 
 
 def _tree_size(path: Path, *, max_bytes: int | None = None) -> int:
@@ -453,21 +599,35 @@ class LocalCodingStorage:
         branch = validate_git_ref(default_branch)
         if branch == "HEAD" or branch.startswith("refs/"):
             raise InvalidStorageInput("default_branch must be an unqualified branch name")
-        self.git.run(["init", "--bare", f"--initial-branch={branch}", str(path)])
+        self.git.run_bounded(
+            ["init", "--bare", f"--initial-branch={branch}", str(path)],
+            monitored_path=path,
+            max_bytes=self.quotas.max_repository_bytes,
+        )
 
     def _atomic_fetch(self, repo: Path, remote: str) -> None:
-        self._git_dir(
-            repo,
-            "-c",
-            "protocol.file.allow=always",
-            "-c",
-            "http.followRedirects=false",
-            "fetch",
-            "--atomic",
-            "--prune",
-            "--force",
-            remote,
-            "+refs/*:refs/*",
+        if (
+            _monitored_size(repo, max_bytes=self.quotas.max_repository_bytes)
+            > self.quotas.max_repository_bytes
+        ):
+            raise StorageQuotaExceeded("repository exceeds the configured size limit")
+        self.git.run_bounded(
+            [
+                "--git-dir",
+                str(repo),
+                "-c",
+                "protocol.file.allow=always",
+                "-c",
+                "http.followRedirects=false",
+                "fetch",
+                "--atomic",
+                "--prune",
+                "--force",
+                remote,
+                "+refs/*:refs/*",
+            ],
+            monitored_path=repo,
+            max_bytes=self.quotas.max_repository_bytes,
         )
 
     def _set_default_head(self, repo: Path, *candidates: str) -> None:
@@ -643,12 +803,30 @@ class LocalCodingStorage:
             project_root = _safe_child(self.snapshots_root, str(project))
             project_root.mkdir(parents=True, exist_ok=True)
             existing = list(project_root.glob("*.json"))
+            snapshot_usage = sum(
+                path.stat().st_size
+                for path in project_root.glob("*.bundle")
+                if path.is_file() and not path.is_symlink()
+            )
+            remaining_project_bytes = self.quotas.max_project_snapshot_bytes - snapshot_usage
+            bundle_limit = min(self.quotas.max_snapshot_bytes, remaining_project_bytes)
+            if bundle_limit <= 0:
+                raise StorageQuotaExceeded("project snapshot byte quota exceeded")
             temporary = project_root / f".{uuid.uuid4().hex}.bundle.tmp"
             try:
-                self._git_dir(repo, "bundle", "create", str(temporary), "--all")
-                snapshot_id, bundle_size = _hash_file(
-                    temporary, max_bytes=self.quotas.max_snapshot_bytes
+                self.git.run_bounded(
+                    [
+                        "--git-dir",
+                        str(repo),
+                        "bundle",
+                        "create",
+                        str(temporary),
+                        "--all",
+                    ],
+                    monitored_path=temporary,
+                    max_bytes=bundle_limit,
                 )
+                snapshot_id, bundle_size = _hash_file(temporary, max_bytes=bundle_limit)
                 bundle = _safe_child(project_root, f"{snapshot_id}.bundle")
                 metadata = _safe_child(project_root, f"{snapshot_id}.json")
                 if metadata.exists():
@@ -662,11 +840,6 @@ class LocalCodingStorage:
                     return existing_record
                 if len(existing) >= self.quotas.max_snapshots_per_project:
                     raise StorageQuotaExceeded("project snapshot quota exceeded")
-                snapshot_usage = sum(
-                    path.stat().st_size
-                    for path in project_root.glob("*.bundle")
-                    if path.is_file() and not path.is_symlink()
-                )
                 if snapshot_usage + bundle_size > self.quotas.max_project_snapshot_bytes:
                     raise StorageQuotaExceeded("project snapshot byte quota exceeded")
                 created = _utc_now()
@@ -800,6 +973,7 @@ class LocalCodingStorage:
                     {
                         "project_id": str(project),
                         "run_id": str(run),
+                        "workspace_id": uuid.uuid4().hex,
                         "commit": commit,
                         "created_at": created.isoformat(),
                     },
@@ -823,6 +997,48 @@ class LocalCodingStorage:
             marker.unlink(missing_ok=True)
             return existed
 
+    def _reap_workspace(
+        self,
+        project: ProjectId,
+        run: CodingRunId,
+        *,
+        observed_identity: tuple[int, int],
+        observed_workspace_id: str | None,
+        observed_marker: bool,
+        cutoff: datetime,
+    ) -> tuple[bool, int]:
+        path = _safe_child(self.worktrees_root, str(project), str(run))
+        marker = self._workspace_marker(project, run)
+        with self._lock(project).acquire():
+            if not path.is_dir() or path.is_symlink():
+                return False, 0
+            current_stat = path.stat()
+            if (current_stat.st_dev, current_stat.st_ino) != observed_identity:
+                return False, 0
+            marker_exists = marker.is_file() and not marker.is_symlink()
+            if marker_exists != observed_marker:
+                return False, 0
+            created = datetime.fromtimestamp(current_stat.st_mtime, UTC)
+            if marker_exists:
+                value = _read_json(marker)
+                if (
+                    value.get("project_id") != str(project)
+                    or value.get("run_id") != str(run)
+                    or value.get("workspace_id") != observed_workspace_id
+                ):
+                    return False, 0
+                created = _parse_datetime(str(value["created_at"]))
+            if created >= cutoff:
+                return False, 0
+            reclaimed = sum(
+                item.stat().st_size
+                for item in path.rglob("*")
+                if item.is_file() and not item.is_symlink()
+            )
+            _remove_tree(path)
+            marker.unlink(missing_ok=True)
+            return True, reclaimed
+
     def reap_worktrees(self, *, older_than: datetime) -> ReapResult:
         if older_than.tzinfo is None or older_than.utcoffset() is None:
             raise InvalidStorageInput("reaper cutoff must be timezone-aware")
@@ -844,29 +1060,30 @@ class LocalCodingStorage:
                     if path != _safe_child(self.worktrees_root, str(project), str(run)):
                         continue
                     marker = self._workspace_marker(project, run)
-                    created = datetime.fromtimestamp(path.stat().st_mtime, UTC)
-                    if marker.is_file() and not marker.is_symlink():
+                    path_stat = path.stat()
+                    observed_marker = marker.is_file() and not marker.is_symlink()
+                    observed_workspace_id: str | None = None
+                    if observed_marker:
                         value = _read_json(marker)
                         if value.get("project_id") != str(project) or value.get("run_id") != str(
                             run
                         ):
                             continue
-                        created = _parse_datetime(str(value["created_at"]))
-                    if created >= cutoff:
-                        continue
-                    reclaimed += sum(
-                        item.stat().st_size
-                        for item in path.rglob("*")
-                        if item.is_file() and not item.is_symlink()
+                        workspace_id = value.get("workspace_id")
+                        if not isinstance(workspace_id, str) or not workspace_id:
+                            continue
+                        observed_workspace_id = workspace_id
+                    was_removed, bytes_removed = self._reap_workspace(
+                        project,
+                        run,
+                        observed_identity=(path_stat.st_dev, path_stat.st_ino),
+                        observed_workspace_id=observed_workspace_id,
+                        observed_marker=observed_marker,
+                        cutoff=cutoff,
                     )
-                    if self._repo(project).exists():
-                        was_removed = self.remove(project, run)
-                    else:
-                        with self._lock(project).acquire():
-                            _remove_tree(path)
-                        was_removed = True
                     if was_removed:
                         removed += 1
+                        reclaimed += bytes_removed
                 except (KeyError, OSError, ValueError, json.JSONDecodeError, CodingStorageError):
                     continue
         return ReapResult(removed, reclaimed)
