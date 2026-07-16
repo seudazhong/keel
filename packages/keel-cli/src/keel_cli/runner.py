@@ -40,6 +40,7 @@ from keel_core.tools import (
     LsTool,
     ReadTool,
     ShellTool,
+    UnsafeLocalDevExecutionEnvironment,
     WriteTool,
 )
 from keel_core.tools.executor import ApproveFn
@@ -55,14 +56,15 @@ _MUTATING = ("write", "edit", "shell")
 
 def build_tools(workspace: Path) -> list[Any]:
     """Instantiate the built-in toolset confined to ``workspace``."""
+    environment = UnsafeLocalDevExecutionEnvironment(workspace)
     return [
-        ReadTool(workspace),
-        WriteTool(workspace),
-        EditTool(workspace),
-        LsTool(workspace),
-        GlobTool(workspace),
-        GrepTool(workspace),
-        ShellTool(workspace),
+        ReadTool(environment),
+        WriteTool(environment),
+        EditTool(environment),
+        LsTool(environment),
+        GlobTool(environment),
+        GrepTool(environment),
+        ShellTool(environment),
     ]
 
 

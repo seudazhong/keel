@@ -36,6 +36,7 @@ from keel_core.knowledge.search import KnowledgeSearcher
 from keel_core.knowledge.service import DispatchJob, KnowledgeService
 from keel_core.knowledge.store import KnowledgeStore, PostgresKnowledgeStore
 from keel_core.providers import LiteLLMGateway
+from keel_core.tools import build_service_execution_environment
 from keel_server.api import gateway as gateway_api
 from keel_server.api import knowledge as knowledge_api
 from keel_server.api import oauth as oauth_api
@@ -110,12 +111,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.engine = engine
     app.state.durable_scope = _DURABLE_SCOPE
     app.state.jobs = _build_job_store(engine, _DURABLE_SCOPE, settings)
+    execution_environment = build_service_execution_environment(
+        settings,
+        Path.cwd(),
+        service="server",
+    )
     app.state.runtime = AgentRuntime(
         redis_client=redis_client,
         engine=engine,
         scope_id=_DURABLE_SCOPE,
         model=settings.default_model,
         workspace=Path.cwd(),
+        execution_environment=execution_environment,
         embedding_model=settings.embedding_model,
         embedding_dim=settings.embedding_dim,
         embedding_send_dimensions=settings.embedding_send_dimensions,
@@ -178,6 +185,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 settings.onebot_api_base, settings.onebot_access_token
             ),
             workspace=Path.cwd(),
+            execution_environment=execution_environment,
             self_id=settings.onebot_self_id or None,
             model=settings.default_model,
             rate_limiter=RateLimiter(limit=settings.im_rate_limit),
@@ -188,6 +196,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             provider=LiteLLMGateway(),
             send=gateway_api.make_telegram_sender(settings.telegram_bot_token),
             workspace=Path.cwd(),
+            execution_environment=execution_environment,
             bot_username=settings.telegram_bot_username or None,
             model=settings.default_model,
             rate_limiter=RateLimiter(limit=settings.im_rate_limit),

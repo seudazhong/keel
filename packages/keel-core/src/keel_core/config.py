@@ -119,6 +119,12 @@ class Settings(BaseSettings):
     server_host: str = "0.0.0.0"
     server_port: int = 8000
 
+    # Built-in command/file tools execute through the isolated sandbox RPC service.
+    # The in-process backend is only for explicitly trusted local previews.
+    execution_backend: str = "sandbox"
+    sandbox_url: str = "http://keel-sandbox:8090"
+    trusted_preview_allow_unsafe_execution: bool = False
+
     # Autonomy (M2 slice): scheduler tick cadence + how long an unattended approval
     # stays open before it fails closed (invariant: fail-closed on timeout).
     scheduler_tick_seconds: int = 30
