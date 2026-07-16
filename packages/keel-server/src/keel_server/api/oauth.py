@@ -1,11 +1,14 @@
 """In-browser OAuth (authorization-code) connect flow for Gmail (WS-G / A2e).
 
 ``GET /v1/connectors/gmail/connect`` builds a Google consent URL (server callback as the
-redirect) and 302s the browser to Google; ``GET /v1/connectors/gmail/callback`` exchanges
-the code and stores ``Credentials.to_json()`` via the scope-bound, encrypted token store.
-CSRF ``state`` is validated against a **durable, expiring, one-time** store (Postgres when
-an engine is configured, else in-memory) so a legitimate callback survives a restart or a
-second replica while a replayed/unknown state is rejected. Requires the OAuth client JSON
+redirect) and 302s the browser to Google; it requires **operator** auth when API keys are
+configured, since it mints the durable CSRF ``state``. ``GET /v1/connectors/gmail/callback``
+exchanges the code and stores ``Credentials.to_json()`` via the scope-bound, encrypted
+token store. The callback is intentionally unauthenticated (the browser carries no API
+key); its trust is anchored in a **durable, expiring, one-time** ``state`` that only the
+authenticated ``/connect`` could have created — validated against the store (Postgres when
+an engine is configured, else in-memory) and consumed (deleted) on use, so a replayed or
+unknown state is rejected. Requires the OAuth client JSON
 (``KEEL_GMAIL_CLIENT_SECRETS_PATH``) + ``KEEL_SECRET_KEY`` on the server.
 """
 
@@ -13,7 +16,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from keel_core.config import get_settings
@@ -25,6 +28,7 @@ from keel_core.oauth_state import (
 )
 from keel_core.secrets import keyring_from_settings
 from keel_core.tokens import PostgresTokenStore
+from keel_server.auth import Role, require_role
 
 router = APIRouter(prefix="/v1/connectors/gmail", tags=["oauth"])
 
@@ -68,9 +72,19 @@ def _callback_uri(request: Request) -> str:
     return str(request.url_for("gmail_oauth_callback"))
 
 
-@router.get("/connect", summary="Start the Gmail in-browser OAuth connect flow")
+@router.get(
+    "/connect",
+    summary="Start the Gmail in-browser OAuth connect flow",
+    dependencies=[Depends(require_role(Role.operator))],
+)
 async def gmail_oauth_connect(request: Request) -> RedirectResponse:
-    """Redirect the browser to Google's consent screen (server callback registered)."""
+    """Redirect the browser to Google's consent screen (server callback registered).
+
+    Requires at least **operator** auth when API keys are configured: initiating a
+    connect flow mints the durable one-time CSRF ``state`` that the (necessarily
+    unauthenticated) callback consumes, so this endpoint is the trust anchor of the
+    flow and must not be reachable by an unauthenticated/insufficient-role caller.
+    """
     flow = _flow(_callback_uri(request))
     auth_url, state = flow.authorization_url(
         access_type="offline", prompt="consent", include_granted_scopes="true"
@@ -84,7 +98,16 @@ async def gmail_oauth_connect(request: Request) -> RedirectResponse:
 async def gmail_oauth_callback(
     request: Request, state: str = Query(...), code: str | None = Query(None)
 ) -> HTMLResponse:
-    """Exchange the authorization code and store the connector token for the scope."""
+    """Exchange the authorization code and store the connector token for the scope.
+
+    Intentionally unauthenticated: the browser returning from Google carries no API key.
+    Trust is instead anchored in the ``state`` — an unguessable, single-use, expiring
+    token that only the **operator-authenticated** ``/connect`` above could have created
+    and persisted (durable :class:`~keel_core.oauth_state.PostgresOAuthStateStore`).
+    :meth:`consume` deletes the row as it validates it, so a stolen/replayed ``state`` is
+    rejected. Without a matching live ``state`` the request is refused before any token
+    exchange, so the callback cannot be driven by an anonymous caller.
+    """
     consumed: OAuthState | None = await _oauth_state_store(request).consume(state)
     if consumed is None:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid or expired oauth state")
