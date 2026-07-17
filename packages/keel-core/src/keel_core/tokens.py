@@ -25,6 +25,21 @@ from keel_core.types import ScopeId
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 
 
+async def purge_scope(engine: AsyncEngine, scope_id: ScopeId) -> int:
+    """Revoke every connector token for a scope without needing the envelope key.
+
+    Mirrors :meth:`PostgresTokenStore.purge` but as a key-free module function the erasure
+    coordinator can call (deletion never decrypts). Idempotent; returns rows removed.
+    """
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        result = await conn.execute(
+            text("DELETE FROM connector_tokens WHERE scope_id = :scope"),
+            {"scope": scope_id},
+        )
+    return int(result.rowcount or 0)
+
+
 def _as_keyring(cipher: EnvelopeCipher | KeyRing) -> KeyRing:
     """Accept either a legacy single cipher or a versioned ring."""
     return cipher if isinstance(cipher, KeyRing) else KeyRing.from_cipher(cipher)

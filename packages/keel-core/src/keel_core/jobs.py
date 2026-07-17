@@ -530,6 +530,31 @@ def _validate_limit(limit: int) -> None:
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 
 
+async def purge_scope(
+    engine: AsyncEngine, scope_id: str, *, exclude_job_id: str | None = None
+) -> int:
+    """Erase durable jobs for a scope (idempotent). Returns rows removed.
+
+    ``exclude_job_id`` keeps the currently-executing erasure job's own row alive so the
+    worker can still finalize it (the coordinator passes its own job id when it runs as a
+    durable job). Purely a DELETE — no lease/lifecycle bookkeeping is needed since the
+    scope is being erased wholesale.
+    """
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        if exclude_job_id is None:
+            result = await conn.execute(
+                text("DELETE FROM jobs WHERE scope_id = :scope"),
+                {"scope": scope_id},
+            )
+        else:
+            result = await conn.execute(
+                text("DELETE FROM jobs WHERE scope_id = :scope AND id <> :keep"),
+                {"scope": scope_id, "keep": exclude_job_id},
+            )
+    return int(result.rowcount or 0)
+
+
 def _validate_enqueue_fields(kind: str, idempotency_key: str, max_attempts: int) -> tuple[str, str]:
     kind = _validated_identity(kind, field="kind", code="invalid_kind")
     idempotency_key = _validated_identity(

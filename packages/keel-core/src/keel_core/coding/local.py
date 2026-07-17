@@ -565,6 +565,28 @@ class LocalCodingStorage:
             raise StorageNotFound(f"project not found: {value}")
         return repo
 
+    def purge_project(self, project_id: ProjectId) -> bool:
+        """Erase every on-disk trace of one project (repo, snapshots, worktrees, artifacts).
+
+        Path-confined via ``_safe_child`` (never escapes the storage root) and serialized
+        under the project lock. Idempotent: returns True if anything was removed, False if
+        the project already had no on-disk state. Used by scoped/project data erasure.
+        """
+        project = self._project(project_id)
+        removed = False
+        with self._lock(project).acquire():
+            targets = (
+                _safe_child(self.projects_root, f"{project}.git"),
+                _safe_child(self.snapshots_root, str(project)),
+                _safe_child(self.worktrees_root, str(project)),
+                _safe_child(self.artifacts_root, str(project)),
+            )
+            for path in targets:
+                if path.exists():
+                    _remove_tree(path, ignore_errors=True)
+                    removed = True
+        return removed
+
     def _git_dir(
         self, repo: Path, *args: str, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
