@@ -24,7 +24,7 @@ export function ConnectorsPage() {
       <Topbar
         title="Connectors"
         sub="· OAuth 集成，按 (scope, connector) 加密存储 token"
-        right={<Badge tone="violet">scope: personal · web:local</Badge>}
+        right={<Badge tone="violet">scope: personal</Badge>}
       />
       <div className="w-full max-w-[900px] p-[22px]">
         {isLoading && <Skeleton className="h-28" />}
