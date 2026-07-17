@@ -54,6 +54,7 @@ class ConnectorTool:
         description: str,
         action: ActionFn,
         outbound: bool = False,
+        idempotency_required: bool = False,
         input_schema: dict[str, Any] | None = None,
         idempotency_store: OutboundIdempotencyStore | None = None,
     ) -> None:
@@ -61,6 +62,7 @@ class ConnectorTool:
         self.description = description
         self.outbound = outbound
         self.writes = outbound  # executor schedules outbound actions like writes
+        self._idempotency_required = idempotency_required
         self._action = action
         self._schema = input_schema or {"type": "object"}
         self._idempotency = idempotency_store or InMemoryOutboundStore()
@@ -78,6 +80,8 @@ class ConnectorTool:
     async def _run_outbound(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         key = str(args.get("idempotency_key", ""))
         if not key:
+            if self._idempotency_required:
+                raise ValueError(f"{self.name} requires an idempotency_key")
             output = await self._action(args, ctx)
             return ToolResult(ok=True, output=output, taint=ContentTaint.clean)
         claim = await self._idempotency.claim(ctx.scope_id, self.name, key)

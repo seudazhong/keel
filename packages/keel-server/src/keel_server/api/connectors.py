@@ -4,23 +4,30 @@ from __future__ import annotations
 
 import html
 from typing import Any, cast
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from keel_core.config import get_settings
 from keel_core.connector_contracts import (
     ConnectorAuthenticationError,
+    ConnectorError,
+    ConnectorSetupArtifact,
+    ConnectorSetupArtifactKind,
     ConnectorUnsupportedError,
 )
 from keel_core.connector_credentials import ConnectorCredentialStore
-from keel_core.connector_registry import get_connector_registry
+from keel_core.connector_registry import (
+    ConnectorProviderUnavailableError,
+    get_connector_registry,
+)
 from keel_core.connector_repository import (
     InMemoryConnectorRepository,
     PostgresConnectorRepository,
 )
-from keel_core.connector_service import ConnectorService
+from keel_core.connector_service import ConnectorService, artifact_to_dict
 from keel_core.oauth_state import InMemoryOAuthStateStore, OAuthState, PostgresOAuthStateStore
 from keel_core.outbox import purge_connector as purge_outbound_connector
 from keel_core.secrets import SecretsError, keyring_from_settings
@@ -36,6 +43,10 @@ class SetupRequest(BaseModel):
 
 class ResourceSelectionRequest(BaseModel):
     external_ids: list[str] = Field(default_factory=list)
+
+
+class TargetConfigurationRequest(BaseModel):
+    targets: dict[str, str | None] = Field(default_factory=dict)
 
 
 class SyncRequest(BaseModel):
@@ -108,6 +119,7 @@ def _service(request: Request) -> ConnectorService:
         jobs=getattr(request.app.state, "jobs", None),
         dispatch_job=dispatch,
         change_sink=getattr(request.app.state, "connector_change_sink", None),
+        target_validator=getattr(request.app.state, "connector_target_validator", None),
         delete_credential=delete_credential,
         purge_outbound=purge_outbound,
     )
@@ -122,9 +134,11 @@ def _provider(connector_id: str, request: Request) -> Any:
         return _registry(request).create(connector_id)
     except KeyError as exc:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown connector") from exc
+    except ConnectorProviderUnavailableError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
 
-def _oauth_state_store(request: Request) -> Any:
+def _connector_auth_state_store(request: Request) -> Any:
     store = getattr(request.app.state, "oauth_state_store", None)
     if store is not None:
         return store
@@ -166,6 +180,11 @@ async def list_connectors(request: Request) -> list[dict[str, Any]]:
 )
 async def connector_connect(connector_id: str, request: Request) -> RedirectResponse:
     provider = _provider(connector_id, request)
+    if provider.manifest.auth_action is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{provider.manifest.id} does not declare browser authorization",
+        )
     try:
         start = await provider.begin_auth(_callback_url(request, connector_id))
     except ConnectorUnsupportedError as exc:
@@ -174,7 +193,13 @@ async def connector_connect(connector_id: str, request: Request) -> RedirectResp
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
-    await _oauth_state_store(request).put(start.state, _scope(request), connector_id)
+    parsed = urlsplit(start.url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not start.state.strip():
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "connector authorization start returned invalid instructions",
+        )
+    await _connector_auth_state_store(request).put(start.state, _scope(request), connector_id)
     return RedirectResponse(start.url)
 
 
@@ -187,18 +212,45 @@ async def connector_callback(
     connector_id: str,
     request: Request,
     state: str = Query(...),
-    code: str | None = Query(None),
 ) -> HTMLResponse:
-    consumed: OAuthState | None = await _oauth_state_store(request).consume(state)
-    if consumed is None or consumed.connector_id != connector_id:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid or expired oauth state")
-    if not code or getattr(request.app.state, "engine", None) is None:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing code or datastore")
     provider = _provider(connector_id, request)
+    action = provider.manifest.auth_action
+    if action is None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{provider.manifest.id} does not declare browser authorization",
+        )
+    state_values = request.query_params.getlist("state")
+    if len(state_values) != 1 or len(state.encode("utf-8")) > 4096:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid callback state")
+    parameters: dict[str, str] = {"state": state}
+    for field in action.callback_parameters:
+        values = request.query_params.getlist(field.id)
+        if len(values) > 1:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"duplicate callback parameter: {field.id}",
+            )
+        value = values[0].strip() if values else ""
+        if len(value.encode("utf-8")) > 4096:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"callback parameter is too large: {field.id}",
+            )
+        if field.required and not value:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                f"missing callback parameter: {field.id}",
+            )
+        if value:
+            parameters[field.id] = value
+    consumed: OAuthState | None = await _connector_auth_state_store(request).consume(state)
+    if consumed is None or consumed.connector_id != connector_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid or expired authorization state")
     try:
         result = await provider.complete_auth(
             _callback_url(request, connector_id),
-            {"state": state, "code": code},
+            parameters,
         )
         await _service(request).save_setup(connector_id, result)
     except RuntimeError as exc:
@@ -210,32 +262,76 @@ async def connector_callback(
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     label = html.escape(provider.manifest.name)
+    artifacts = "".join(_artifact_html(item) for item in result.artifacts)
+    close_script = (
+        ""
+        if any(item.kind is ConnectorSetupArtifactKind.secret for item in result.artifacts)
+        else "<script>setTimeout(()=>window.close(),1500)</script>"
+    )
     return HTMLResponse(
         "<!doctype html><meta charset=utf-8>"
         "<body style='font:16px system-ui;padding:40px'>"
         f"✅ {label} 已连接。可关闭此标签页并返回 Keel 的 Connectors 页面刷新。"
-        "<script>setTimeout(()=>window.close(),1500)</script></body>"
+        f"{artifacts}"
+        f"{close_script}</body>",
+        headers={
+            "Cache-Control": "no-store",
+            "Pragma": "no-cache",
+            "Referrer-Policy": "no-referrer",
+        },
     )
 
 
 @router.post(
     "/{connector_id}/setup",
-    summary="Configure a connector without a browser OAuth flow",
+    summary="Run manifest-declared connector setup",
     dependencies=[Depends(require_role(Role.operator))],
 )
 async def connector_setup(
-    connector_id: str, body: SetupRequest, request: Request
+    connector_id: str,
+    body: SetupRequest,
+    request: Request,
+    response: Response,
 ) -> dict[str, Any]:
     _provider(connector_id, request)
     try:
-        binding = await _service(request).setup(connector_id, body.values)
+        outcome = await _service(request).setup(connector_id, body.values)
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     except ConnectorUnsupportedError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    return {"ok": True, "binding_id": binding.id}
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Pragma"] = "no-cache"
+    return {
+        "ok": True,
+        "binding_id": outcome.binding.id,
+        "artifacts": [artifact_to_dict(item) for item in outcome.artifacts],
+    }
+
+
+@router.put(
+    "/{connector_id}/targets",
+    summary="Configure typed connector destination and trigger targets",
+    dependencies=[Depends(require_role(Role.operator))],
+)
+async def configure_connector_targets(
+    connector_id: str,
+    body: TargetConfigurationRequest,
+    request: Request,
+) -> dict[str, Any]:
+    _provider(connector_id, request)
+    try:
+        targets = await _service(request).configure_targets(connector_id, body.targets)
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
+    return {
+        "ok": True,
+        "targets": {item.kind.value: item.target_id for item in targets},
+    }
 
 
 @router.get(
@@ -287,9 +383,7 @@ async def select_connector_resources(
     summary="Queue a durable connector sync",
     dependencies=[Depends(require_role(Role.operator))],
 )
-async def sync_connector(
-    connector_id: str, body: SyncRequest, request: Request
-) -> dict[str, Any]:
+async def sync_connector(connector_id: str, body: SyncRequest, request: Request) -> dict[str, Any]:
     _provider(connector_id, request)
     try:
         job = await _service(request).enqueue_sync(
@@ -330,7 +424,7 @@ async def revoke_connector(connector_id: str, request: Request) -> dict[str, boo
     _provider(connector_id, request)
     try:
         return {"ok": await _service(request).revoke(connector_id)}
-    except Exception as exc:
+    except (ConnectorError, LookupError, RuntimeError, ValueError) as exc:
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY, "connector revoke failed; credentials were retained"
         ) from exc
@@ -345,7 +439,7 @@ async def revoke_and_purge_connector(connector_id: str, request: Request) -> dic
     _provider(connector_id, request)
     try:
         return {"ok": await _service(request).revoke(connector_id, purge=True)}
-    except Exception as exc:
+    except (ConnectorError, LookupError, RuntimeError, ValueError) as exc:
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
             "connector revoke-and-purge failed; credentials were retained",
@@ -373,6 +467,18 @@ async def connector_webhook(connector_id: str, request: Request) -> dict[str, An
     except (LookupError, RuntimeError) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     return {"accepted": accepted, "replayed": not accepted, "changes": changes}
+
+
+def _artifact_html(artifact: ConnectorSetupArtifact) -> str:
+    label = html.escape(artifact.label)
+    value = html.escape(artifact.value)
+    if artifact.kind is ConnectorSetupArtifactKind.url:
+        parsed = urlsplit(artifact.value)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            return (
+                f"<p><strong>{label}:</strong> <a rel='noreferrer' href='{value}'>{value}</a></p>"
+            )
+    return f"<p><strong>{label}:</strong> <code>{value}</code></p>"
 
 
 __all__ = ["router"]

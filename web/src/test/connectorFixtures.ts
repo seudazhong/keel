@@ -60,7 +60,17 @@ export function makeConnectorFixture(
     capabilities: overrides.capabilities ?? ["read"],
     scopes: overrides.scopes ?? [],
     setup_fields: overrides.setup_fields ?? defaultFields[overrides.auth_kind] ?? [],
+    auth_action:
+      overrides.auth_action ??
+      (overrides.auth_kind === "oauth" || overrides.auth_kind === "github_app"
+        ? { label: "Connect", callback_parameters: [] }
+        : null),
+    setup_action_label: overrides.setup_action_label ?? "Save",
     resource_label: overrides.resource_label ?? null,
+    target_fields: overrides.target_fields ?? [],
+    actions: overrides.actions ?? [],
+    available: overrides.available ?? true,
+    availability_error: overrides.availability_error ?? null,
     enabled,
     operational: connected && enabled,
     connected,
@@ -78,6 +88,7 @@ export function makeConnectorFixture(
             last_success_at: "2026-07-08T04:19:55Z",
             error_code: null,
             error_summary: null,
+            targets: {},
           }
         : null),
     health: overrides.health ?? (connected ? "healthy" : "unconfigured"),

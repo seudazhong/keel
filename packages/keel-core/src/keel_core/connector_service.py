@@ -6,20 +6,25 @@ import hashlib
 import json
 import uuid
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
 from keel_core.connector_contracts import (
     ConnectorBinding,
     ConnectorBindingStatus,
+    ConnectorBindingTarget,
     ConnectorCapability,
     ConnectorChange,
     ConnectorChangeKind,
     ConnectorHealth,
     ConnectorHealthStatus,
+    ConnectorItem,
+    ConnectorItemDraft,
     ConnectorManifest,
-    ConnectorResourceDraft,
+    ConnectorSetupArtifact,
     ConnectorSetupResult,
+    ConnectorTargetKind,
 )
 from keel_core.connector_credentials import ConnectorCredentialStore, CredentialEnvelope
 from keel_core.connector_registry import ConnectorRegistry
@@ -40,6 +45,23 @@ CONNECTOR_SYNC_MAX_ATTEMPTS = 3
 @runtime_checkable
 class ConnectorChangeSink(Protocol):
     async def apply(self, change: ConnectorChange) -> None: ...
+
+
+@runtime_checkable
+class ConnectorPurgeSink(Protocol):
+    async def handoff_purge(
+        self, binding: ConnectorBinding, items: tuple[ConnectorItem, ...]
+    ) -> int: ...
+
+
+TargetValidator = Callable[[ConnectorTargetKind, str], Awaitable[bool]]
+TriggerTargetResolver = Callable[[ConnectorTargetKind, str], Awaitable[str]]
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorSetupOutcome:
+    binding: ConnectorBinding
+    artifacts: tuple[ConnectorSetupArtifact, ...] = ()
 
 
 class CallbackConnectorChangeSink:
@@ -90,7 +112,7 @@ class ConnectorKnowledgeService(Protocol):
 
 
 class DurableConnectorChangeSink:
-    """Apply knowledge changes and durably admit trigger events using binding metadata."""
+    """Apply changes through typed binding targets and durable item mappings."""
 
     def __init__(
         self,
@@ -98,10 +120,12 @@ class DurableConnectorChangeSink:
         *,
         knowledge: ConnectorKnowledgeService | None = None,
         admit_event: Callable[[str, str, str], Awaitable[None]] | None = None,
+        resolve_trigger: TriggerTargetResolver | None = None,
     ) -> None:
         self._repository = repository
         self._knowledge = knowledge
         self._admit_event = admit_event
+        self._resolve_trigger = resolve_trigger
 
     async def apply(self, change: ConnectorChange) -> None:
         binding = await self._repository.get_binding(change.provenance.connector_id)
@@ -112,26 +136,27 @@ class DurableConnectorChangeSink:
             return
         if self._knowledge is None:
             raise RuntimeError("connector Knowledge change sink is unavailable")
-        kb_id = binding.metadata.get("knowledge_base_id")
-        if not isinstance(kb_id, str) or not kb_id:
-            raise RuntimeError("connector binding does not select a knowledge_base_id")
-        resources = await self._repository.list_resources(change.provenance.connector_id)
-        resource = next(
-            (
-                item
-                for item in resources
-                if item.external_id == change.provenance.external_resource_id
-            ),
+        kb_id = await self._target(binding, ConnectorTargetKind.knowledge)
+        items = await self._repository.list_items(change.provenance.connector_id)
+        item = next(
+            (item for item in items if item.external_id == change.provenance.external_resource_id),
             None,
         )
-        document_id = None if resource is None else resource.config.get("knowledge_document_id")
-        if not isinstance(document_id, str):
-            document_id = None
+        document_id = (
+            item.destination_id
+            if item is not None and item.destination_kind is ConnectorTargetKind.knowledge
+            else None
+        )
+        mapped_kb_id = (
+            item.destination_target_id
+            if item is not None and item.destination_kind is ConnectorTargetKind.knowledge
+            else None
+        )
         key = _change_idempotency_key(change)
         if change.kind is ConnectorChangeKind.delete:
-            if document_id is not None:
+            if document_id is not None and mapped_kb_id is not None:
                 await self._knowledge.delete_document(
-                    kb_id,
+                    mapped_kb_id,
                     document_id,
                     DeleteKnowledgeCommand(),
                     key,
@@ -168,20 +193,19 @@ class DurableConnectorChangeSink:
                 ),
                 key,
             )
-        await self._repository.upsert_resources(
+        await self._repository.upsert_items(
             change.provenance.connector_id,
             binding.id,
             (
-                ConnectorResourceDraft(
+                ConnectorItemDraft(
                     external_id=change.provenance.external_resource_id,
                     kind="knowledge_document",
                     display_name=change.title,
                     url=change.provenance.source_url,
-                    selected=True,
-                    config={
-                        "knowledge_document_id": document_id,
-                        "revision": change.provenance.revision,
-                    },
+                    destination_kind=ConnectorTargetKind.knowledge,
+                    destination_target_id=kb_id,
+                    destination_id=document_id,
+                    config={"revision": change.provenance.revision},
                 ),
             ),
         )
@@ -189,9 +213,7 @@ class DurableConnectorChangeSink:
     async def _apply_event(self, binding: ConnectorBinding, change: ConnectorChange) -> None:
         if self._admit_event is None:
             raise RuntimeError("connector trigger admission sink is unavailable")
-        session_id = binding.metadata.get("trigger_session_id")
-        if not isinstance(session_id, str) or not session_id:
-            raise RuntimeError("connector binding does not select a trigger_session_id")
+        session_id = await self._trigger_session(binding)
         if change.event is None:
             raise ValueError("connector event changes require a normalized event")
         content = json.dumps(
@@ -215,6 +237,53 @@ class DurableConnectorChangeSink:
             raise ValueError("normalized connector event exceeds 65536 UTF-8 bytes")
         await self._admit_event(session_id, content, _change_idempotency_key(change))
 
+    async def handoff_purge(
+        self, binding: ConnectorBinding, items: tuple[ConnectorItem, ...]
+    ) -> int:
+        if self._knowledge is None:
+            raise RuntimeError("connector Knowledge purge service is unavailable")
+        documents = tuple(
+            item
+            for item in items
+            if item.destination_kind is ConnectorTargetKind.knowledge
+            and item.destination_target_id is not None
+            and item.destination_id is not None
+        )
+        if not documents:
+            return 0
+        for item in documents:
+            assert item.destination_id is not None
+            assert item.destination_target_id is not None
+            await self._knowledge.delete_document(
+                item.destination_target_id,
+                item.destination_id,
+                DeleteKnowledgeCommand(),
+                _purge_idempotency_key(binding, item),
+            )
+        return len(documents)
+
+    async def _target(self, binding: ConnectorBinding, kind: ConnectorTargetKind) -> str:
+        targets = await self._repository.list_targets(binding.connector_id)
+        target = next((item.target_id for item in targets if item.kind is kind), None)
+        if target is None:
+            raise RuntimeError(f"connector binding does not select a {kind.value} target")
+        return target
+
+    async def _trigger_session(self, binding: ConnectorBinding) -> str:
+        targets = await self._repository.list_targets(binding.connector_id)
+        by_kind = {item.kind: item.target_id for item in targets}
+        session_id = by_kind.get(ConnectorTargetKind.trigger_session)
+        if session_id is not None:
+            return session_id
+        routine_id = by_kind.get(ConnectorTargetKind.trigger_routine)
+        if routine_id is None:
+            raise RuntimeError(
+                "connector binding does not select a trigger session or routine target"
+            )
+        if self._resolve_trigger is None:
+            raise RuntimeError("connector trigger routine resolver is unavailable")
+        return await self._resolve_trigger(ConnectorTargetKind.trigger_routine, routine_id)
+
 
 class ConnectorService:
     def __init__(
@@ -226,6 +295,8 @@ class ConnectorService:
         jobs: JobStore | None = None,
         dispatch_job: Callable[[str, str], Awaitable[None]] | None = None,
         change_sink: ConnectorChangeSink | None = None,
+        purge_sink: ConnectorPurgeSink | None = None,
+        target_validator: TargetValidator | None = None,
         delete_credential: Callable[[str], Awaitable[bool]] | None = None,
         purge_outbound: Callable[[str], Awaitable[int]] | None = None,
     ) -> None:
@@ -237,6 +308,12 @@ class ConnectorService:
         self.jobs = jobs
         self._dispatch_job = dispatch_job
         self._change_sink = change_sink or CallbackConnectorChangeSink()
+        self._purge_sink = (
+            purge_sink
+            if purge_sink is not None
+            else (self._change_sink if isinstance(self._change_sink, ConnectorPurgeSink) else None)
+        )
+        self._target_validator = target_validator
         self._delete_credential = delete_credential
         self._purge_outbound = purge_outbound
 
@@ -247,27 +324,30 @@ class ConnectorService:
         legacy = legacy_connected or {}
         rows: list[dict[str, Any]] = []
         for manifest in self.registry.manifests():
-            provider_enabled = self.registry.create(manifest.id).enabled()
+            provider_status = self.registry.status(manifest.id)
+            provider_enabled = provider_status.enabled
             binding = bindings.get(manifest.id)
+            targets = await self.repository.list_targets(manifest.id) if binding is not None else []
             connected = (
                 binding is not None
                 and binding.status
                 in {ConnectorBindingStatus.connected, ConnectorBindingStatus.configured}
             ) or manifest.id in legacy
-            updated_at = (
-                binding.updated_at if binding is not None else legacy.get(manifest.id)
-            )
+            updated_at = binding.updated_at if binding is not None else legacy.get(manifest.id)
             rows.append(
                 {
                     **manifest_to_dict(manifest),
+                    "available": provider_status.available,
+                    "availability_error": provider_status.error,
                     "enabled": provider_enabled,
-                    "operational": connected and provider_enabled,
+                    "operational": connected and provider_enabled and provider_status.available,
                     "connected": connected,
                     "updated_at": updated_at.isoformat() if updated_at else None,
-                    "binding": binding_to_dict(binding) if binding is not None else None,
+                    "binding": (binding_to_dict(binding, targets) if binding is not None else None),
                     "health": (
                         ConnectorHealthStatus.error.value
-                        if binding is not None and binding.status is ConnectorBindingStatus.error
+                        if not provider_status.available
+                        or (binding is not None and binding.status is ConnectorBindingStatus.error)
                         else (
                             ConnectorHealthStatus.healthy.value
                             if connected
@@ -276,11 +356,51 @@ class ConnectorService:
                     ),
                 }
             )
+        for failure in self.registry.discovery_failures():
+            binding = bindings.get(failure.connector_id)
+            targets = (
+                await self.repository.list_targets(failure.connector_id)
+                if binding is not None
+                else []
+            )
+            connected = binding is not None and binding.status in {
+                ConnectorBindingStatus.connected,
+                ConnectorBindingStatus.configured,
+            }
+            rows.append(
+                {
+                    "id": failure.connector_id,
+                    "name": failure.connector_id.replace("_", " ").title(),
+                    "description": "This connector provider could not be loaded.",
+                    "icon": "🔌",
+                    "kind": "secret",
+                    "auth_kind": "secret",
+                    "capabilities": [],
+                    "scopes": [],
+                    "setup_fields": [],
+                    "auth_action": None,
+                    "setup_action_label": "Unavailable",
+                    "resource_label": None,
+                    "target_fields": [],
+                    "actions": [],
+                    "available": False,
+                    "availability_error": failure.error,
+                    "enabled": False,
+                    "operational": False,
+                    "connected": connected,
+                    "updated_at": (
+                        binding.updated_at.isoformat()
+                        if binding is not None and binding.updated_at is not None
+                        else None
+                    ),
+                    "binding": (binding_to_dict(binding, targets) if binding is not None else None),
+                    "health": ConnectorHealthStatus.error.value,
+                }
+            )
+        rows.sort(key=lambda item: str(item["id"]))
         return rows
 
-    async def save_setup(
-        self, connector_id: str, result: ConnectorSetupResult
-    ) -> ConnectorBinding:
+    async def save_setup(self, connector_id: str, result: ConnectorSetupResult) -> ConnectorBinding:
         stored = False
         if result.credential is not None:
             if self.credentials is None:
@@ -298,7 +418,7 @@ class ConnectorService:
                 await self.credentials.delete(connector_id)
             raise
 
-    async def setup(self, connector_id: str, values: dict[str, str]) -> ConnectorBinding:
+    async def setup(self, connector_id: str, values: dict[str, str]) -> ConnectorSetupOutcome:
         provider = self.registry.create(connector_id)
         expected = {item.id: item for item in provider.manifest.setup_fields}
         unknown = set(values) - set(expected)
@@ -311,7 +431,52 @@ class ConnectorService:
         ]
         if missing:
             raise ValueError(f"missing connector setup fields: {', '.join(sorted(missing))}")
-        return await self.save_setup(connector_id, await provider.setup(dict(values)))
+        result = await provider.setup(dict(values))
+        return ConnectorSetupOutcome(
+            await self.save_setup(connector_id, result),
+            result.artifacts,
+        )
+
+    async def configure_targets(
+        self, connector_id: str, values: dict[str, str | None]
+    ) -> list[ConnectorBindingTarget]:
+        manifest = self._manifest(connector_id)
+        binding = await self._required_binding(connector_id)
+        declared = {item.kind: item for item in manifest.target_fields}
+        try:
+            requested = {
+                ConnectorTargetKind(key): value.strip()
+                for key, value in values.items()
+                if value is not None and value.strip()
+            }
+        except ValueError as exc:
+            raise ValueError("unknown connector target kind") from exc
+        unknown = set(requested) - set(declared)
+        if unknown:
+            labels = ", ".join(sorted(item.value for item in unknown))
+            raise ValueError(f"connector does not declare targets: {labels}")
+        current = {
+            item.kind: item.target_id for item in await self.repository.list_targets(connector_id)
+        }
+        if current.get(ConnectorTargetKind.knowledge) != requested.get(
+            ConnectorTargetKind.knowledge
+        ):
+            items = await self.repository.list_items(connector_id)
+            if any(item.destination_kind is ConnectorTargetKind.knowledge for item in items):
+                raise ValueError(
+                    "disconnect and purge imported Knowledge before changing its target"
+                )
+        if self._target_validator is not None:
+            for kind, target_id in requested.items():
+                if not await self._target_validator(kind, target_id):
+                    raise ValueError(
+                        f"{kind.value} target {target_id!r} does not exist in this scope"
+                    )
+        return await self.repository.replace_targets(
+            connector_id,
+            binding.id,
+            requested,
+        )
 
     async def refresh_resources(self, connector_id: str) -> list[dict[str, Any]]:
         provider = self.registry.create(connector_id)
@@ -323,15 +488,12 @@ class ConnectorService:
             drafts = await provider.list_resources(binding, credential)
             await self.repository.upsert_resources(connector_id, binding.id, drafts)
         return [
-            resource_to_dict(item)
-            for item in await self.repository.list_resources(connector_id)
+            resource_to_dict(item) for item in await self.repository.list_resources(connector_id)
         ]
 
     async def select_resources(self, connector_id: str, external_ids: set[str]) -> int:
         await self._required_binding(connector_id)
-        known = {
-            item.external_id for item in await self.repository.list_resources(connector_id)
-        }
+        known = {item.external_id for item in await self.repository.list_resources(connector_id)}
         unknown = external_ids - known
         if unknown:
             raise ValueError(f"unknown connector resources: {', '.join(sorted(unknown))}")
@@ -340,12 +502,14 @@ class ConnectorService:
     async def enqueue_sync(
         self, connector_id: str, *, idempotency_key: str | None = None
     ) -> JobRecord:
+        manifest = self._manifest(connector_id)
+        if ConnectorCapability.sync not in manifest.capabilities:
+            raise ValueError(f"connector {connector_id!r} does not support sync")
+        binding = await self._required_binding(connector_id)
+        await self._validate_required_targets(manifest, connector_id)
         provider = self.registry.create(connector_id)
         if not provider.enabled():
             raise RuntimeError(f"connector {connector_id!r} is disabled")
-        if ConnectorCapability.sync not in provider.manifest.capabilities:
-            raise ValueError(f"connector {connector_id!r} does not support sync")
-        binding = await self._required_binding(connector_id)
         if self.jobs is None:
             raise RuntimeError("durable connector jobs are unavailable")
         key = idempotency_key.strip() if idempotency_key else uuid.uuid4().hex
@@ -362,30 +526,40 @@ class ConnectorService:
         return job
 
     async def sync(self, connector_id: str, binding_id: str | None = None) -> int:
-        provider = self.registry.create(connector_id)
-        if not provider.enabled():
-            raise RuntimeError(f"connector {connector_id!r} is disabled")
+        manifest = self._manifest(connector_id)
         binding = await self._required_binding(connector_id)
         if binding_id is not None and binding.id != binding_id:
             raise ValueError("connector binding changed before sync execution")
-        resources = tuple(
-            await self.repository.list_resources(connector_id, selected_only=True)
-        )
-        cursor = await self.repository.get_cursor(
-            connector_id, binding.id, "default", resource_id=None
-        )
+        await self._validate_required_targets(manifest, connector_id)
+        provider = self.registry.create(connector_id)
+        if not provider.enabled():
+            raise RuntimeError(f"connector {connector_id!r} is disabled")
+        resources = tuple(await self.repository.list_resources(connector_id, selected_only=True))
+        cursors = tuple(await self.repository.list_cursors(connector_id, binding.id))
         credential = await self._credential(connector_id)
         try:
-            result = await provider.sync(binding, resources, cursor, credential)
+            result = await provider.sync(binding, resources, cursors, credential)
             for change in result.changes:
                 self._validate_change(connector_id, binding.id, change)
                 await self._change_sink.apply(change)
-            if result.cursor is not None:
+            resource_ids = {item.id for item in resources}
+            seen_cursors: set[tuple[str | None, str]] = set()
+            for update in result.cursor_updates:
+                key = (update.resource_id, update.stream)
+                if key in seen_cursors:
+                    raise ValueError("connector sync returned duplicate cursor updates")
+                seen_cursors.add(key)
+                if update.resource_id is not None and update.resource_id not in resource_ids:
+                    raise ValueError("connector sync returned a cursor for an unselected resource")
                 await self.repository.put_cursor(
                     connector_id,
                     binding.id,
-                    result.cursor_stream,
-                    result.cursor,
+                    update.stream,
+                    update.value,
+                    resource_id=update.resource_id,
+                    etag=update.etag,
+                    last_modified=update.last_modified,
+                    revision=update.revision,
                 )
             await self.repository.record_health(
                 connector_id,
@@ -444,6 +618,18 @@ class ConnectorService:
         provider = self.registry.create(connector_id)
         credential = await self._credential(connector_id)
         binding = await self.repository.get_binding(connector_id)
+        purged = 0
+        outbound = 0
+        if purge:
+            if self._purge_sink is None:
+                raise RuntimeError("connector Knowledge purge service is unavailable")
+            if binding is not None:
+                purged = await self._purge_sink.handoff_purge(
+                    binding,
+                    tuple(await self.repository.list_items(connector_id)),
+                )
+            if self._purge_outbound is not None:
+                outbound = await self._purge_outbound(connector_id)
         await provider.revoke(credential)
         deleted = False
         if self.credentials is not None:
@@ -452,10 +638,7 @@ class ConnectorService:
         elif self._delete_credential is not None:
             deleted = await self._delete_credential(connector_id)
         removed = await self.repository.delete_connector(connector_id)
-        outbound = 0
-        if purge and self._purge_outbound is not None:
-            outbound = await self._purge_outbound(connector_id)
-        return deleted or removed > 0 or outbound > 0 or binding is not None
+        return deleted or removed > 0 or outbound > 0 or purged > 0 or binding is not None
 
     async def _required_binding(self, connector_id: str) -> ConnectorBinding:
         binding = await self.repository.get_binding(connector_id)
@@ -463,15 +646,41 @@ class ConnectorService:
             raise LookupError(f"connector {connector_id!r} is not configured")
         return binding
 
+    def _manifest(self, connector_id: str) -> ConnectorManifest:
+        registration = self.registry.get(connector_id)
+        if registration is not None:
+            return registration.manifest
+        self.registry.create(connector_id)
+        raise AssertionError("connector registry create unexpectedly returned")
+
     async def _credential(self, connector_id: str) -> CredentialEnvelope | None:
         if self.credentials is None:
             return None
         return await self.credentials.get(connector_id)
 
-    @staticmethod
-    def _validate_change(
-        connector_id: str, binding_id: str, change: ConnectorChange
+    async def _validate_required_targets(
+        self, manifest: ConnectorManifest, connector_id: str
     ) -> None:
+        required = {item.kind for item in manifest.target_fields if item.required}
+        if not required:
+            return
+        configured = {
+            item.kind: item.target_id for item in await self.repository.list_targets(connector_id)
+        }
+        missing = required - set(configured)
+        if missing:
+            labels = ", ".join(sorted(item.value for item in missing))
+            raise RuntimeError(f"connector sync requires configured targets: {labels}")
+        if self._target_validator is not None:
+            for kind in sorted(required, key=lambda item: item.value):
+                target_id = configured[kind]
+                if not await self._target_validator(kind, target_id):
+                    raise RuntimeError(
+                        f"connector sync target is unavailable: {kind.value}={target_id}"
+                    )
+
+    @staticmethod
+    def _validate_change(connector_id: str, binding_id: str, change: ConnectorChange) -> None:
         if change.taint is not ContentTaint.tainted:
             raise ValueError("external connector changes must be tainted")
         if change.provenance.connector_id != connector_id:
@@ -498,6 +707,11 @@ def _change_idempotency_key(change: ConnectorChange) -> str:
     return f"connector:{hashlib.sha256(raw.encode()).hexdigest()}"
 
 
+def _purge_idempotency_key(binding: ConnectorBinding, item: ConnectorItem) -> str:
+    raw = f"{binding.scope_id}|{binding.connector_id}|{binding.id}|{item.id}|{item.destination_id}"
+    return f"connector-purge:{hashlib.sha256(raw.encode()).hexdigest()}"
+
+
 def manifest_to_dict(manifest: ConnectorManifest) -> dict[str, Any]:
     return {
         "id": manifest.id,
@@ -519,11 +733,46 @@ def manifest_to_dict(manifest: ConnectorManifest) -> dict[str, Any]:
             }
             for item in manifest.setup_fields
         ],
+        "auth_action": (
+            None
+            if manifest.auth_action is None
+            else {
+                "label": manifest.auth_action.label,
+                "callback_parameters": [
+                    {"id": item.id, "required": item.required}
+                    for item in manifest.auth_action.callback_parameters
+                ],
+            }
+        ),
+        "setup_action_label": manifest.setup_action_label,
         "resource_label": manifest.resource_label,
+        "target_fields": [
+            {
+                "kind": item.kind.value,
+                "label": item.label,
+                "required": item.required,
+                "help_text": item.help_text,
+            }
+            for item in manifest.target_fields
+        ],
+        "actions": [
+            {
+                "name": item.name,
+                "description": item.description,
+                "input_schema": dict(item.input_schema),
+                "semantics": item.semantics.value,
+                "idempotency": item.idempotency.value,
+                "approval": item.approval.value,
+            }
+            for item in manifest.actions
+        ],
     }
 
 
-def binding_to_dict(binding: ConnectorBinding) -> dict[str, Any]:
+def binding_to_dict(
+    binding: ConnectorBinding,
+    targets: list[ConnectorBindingTarget] | tuple[ConnectorBindingTarget, ...] = (),
+) -> dict[str, Any]:
     return {
         "id": binding.id,
         "status": binding.status.value,
@@ -536,6 +785,16 @@ def binding_to_dict(binding: ConnectorBinding) -> dict[str, Any]:
         ),
         "error_code": binding.error_code,
         "error_summary": binding.error_summary,
+        "targets": {item.kind.value: item.target_id for item in targets},
+    }
+
+
+def artifact_to_dict(artifact: ConnectorSetupArtifact) -> dict[str, Any]:
+    return {
+        "kind": artifact.kind.value,
+        "label": artifact.label,
+        "value": artifact.value,
+        "secret": artifact.kind.value == "secret",
     }
 
 
@@ -557,8 +816,11 @@ __all__ = [
     "CallbackConnectorChangeSink",
     "ConnectorChangeSink",
     "ConnectorKnowledgeService",
+    "ConnectorPurgeSink",
     "ConnectorService",
+    "ConnectorSetupOutcome",
     "DurableConnectorChangeSink",
+    "artifact_to_dict",
     "binding_to_dict",
     "manifest_to_dict",
     "resource_to_dict",

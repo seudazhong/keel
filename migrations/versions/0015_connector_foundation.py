@@ -18,7 +18,9 @@ depends_on: str | Sequence[str] | None = None
 
 _SCOPED_TABLES = (
     "connector_bindings",
+    "connector_binding_targets",
     "connector_resources",
+    "connector_items",
     "connector_cursors",
     "connector_deliveries",
 )
@@ -69,6 +71,29 @@ def upgrade() -> None:
     )
 
     op.execute(
+        """
+        CREATE TABLE connector_binding_targets (
+            id text PRIMARY KEY,
+            scope_id text NOT NULL,
+            connector_id text NOT NULL,
+            binding_id text NOT NULL,
+            kind text NOT NULL
+                CHECK (kind IN ('knowledge', 'trigger_session', 'trigger_routine')),
+            target_id text NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now(),
+            UNIQUE (scope_id, binding_id, kind),
+            FOREIGN KEY (scope_id, binding_id)
+                REFERENCES connector_bindings (scope_id, id) ON DELETE CASCADE
+        )
+        """
+    )
+    op.execute(
+        "CREATE INDEX ix_connector_binding_targets_lookup "
+        "ON connector_binding_targets (scope_id, connector_id, binding_id)"
+    )
+
+    op.execute(
         f"""
         CREATE TABLE connector_resources (
             id text PRIMARY KEY,
@@ -94,6 +119,49 @@ def upgrade() -> None:
     op.execute(
         "CREATE INDEX ix_connector_resources_selected "
         "ON connector_resources (scope_id, connector_id, binding_id, selected)"
+    )
+
+    op.execute(
+        f"""
+        CREATE TABLE connector_items (
+            id text PRIMARY KEY,
+            scope_id text NOT NULL,
+            connector_id text NOT NULL,
+            binding_id text NOT NULL,
+            resource_id text,
+            external_id text NOT NULL,
+            kind text NOT NULL,
+            display_name text NOT NULL,
+            url text,
+            destination_kind text
+                CHECK (destination_kind IN ('knowledge', 'trigger_session', 'trigger_routine')),
+            destination_target_id text,
+            destination_id text,
+            config jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now(),
+            UNIQUE (scope_id, id),
+            UNIQUE (scope_id, binding_id, external_id),
+            FOREIGN KEY (scope_id, binding_id)
+                REFERENCES connector_bindings (scope_id, id) ON DELETE CASCADE,
+            FOREIGN KEY (scope_id, resource_id)
+                REFERENCES connector_resources (scope_id, id) ON DELETE CASCADE,
+            CHECK (
+                (destination_kind IS NULL
+                    AND destination_target_id IS NULL
+                    AND destination_id IS NULL)
+                OR
+                (destination_kind IS NOT NULL
+                    AND destination_target_id IS NOT NULL
+                    AND destination_id IS NOT NULL)
+            ),
+            {_metadata_check("config")}
+        )
+        """
+    )
+    op.execute(
+        "CREATE INDEX ix_connector_items_destination "
+        "ON connector_items (scope_id, connector_id, binding_id, destination_kind)"
     )
 
     op.execute(
@@ -199,8 +267,9 @@ def upgrade() -> None:
             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'keel_runtime') THEN
                 BEGIN
                     GRANT SELECT, INSERT, UPDATE, DELETE
-                        ON connector_bindings, connector_resources,
-                           connector_cursors, connector_deliveries
+                        ON connector_bindings, connector_binding_targets,
+                           connector_resources, connector_items, connector_cursors,
+                           connector_deliveries
                         TO keel_runtime;
                 EXCEPTION WHEN insufficient_privilege THEN
                     RAISE NOTICE 'keel_runtime connector grants skipped (insufficient privilege)';
@@ -214,5 +283,7 @@ def upgrade() -> None:
 def downgrade() -> None:
     op.execute("DROP TABLE IF EXISTS connector_deliveries CASCADE")
     op.execute("DROP TABLE IF EXISTS connector_cursors CASCADE")
+    op.execute("DROP TABLE IF EXISTS connector_items CASCADE")
     op.execute("DROP TABLE IF EXISTS connector_resources CASCADE")
+    op.execute("DROP TABLE IF EXISTS connector_binding_targets CASCADE")
     op.execute("DROP TABLE IF EXISTS connector_bindings CASCADE")

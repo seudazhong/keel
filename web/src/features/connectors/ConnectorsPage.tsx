@@ -7,6 +7,7 @@ import { Chip } from "../../components/ui/chip";
 import { Skeleton } from "../../components/ui/skeleton";
 import { ConnectorResources } from "./ConnectorResources";
 import { ConnectorSetupList } from "./ConnectorSetup";
+import { ConnectorTargets } from "./ConnectorTargets";
 import type { Connector } from "./types";
 import { useConnectors, useRevokeConnector, useSyncConnector } from "./useConnectors";
 
@@ -21,10 +22,6 @@ function healthTone(connector: Connector): "green" | "red" | "amber" {
   if (connector.health === "healthy") return "green";
   if (connector.health === "error") return "red";
   return "amber";
-}
-
-function browserAuth(connector: Connector): boolean {
-  return connector.auth_kind === "oauth" || connector.auth_kind === "github_app";
 }
 
 function ConnectedConnector({ connector }: { connector: Connector }) {
@@ -54,6 +51,7 @@ function ConnectedConnector({ connector }: { connector: Connector }) {
         ))}
       </div>
       <p className="mt-3 text-xs text-text-muted">Updated {fmtDate(connector.updated_at)}</p>
+      <ConnectorTargets connector={connector} />
       <ConnectorResources connector={connector} />
       <div className="mt-3 flex flex-wrap gap-2">
         {connector.capabilities.includes("sync") && (
@@ -61,7 +59,7 @@ function ConnectedConnector({ connector }: { connector: Connector }) {
             Sync now
           </Button>
         )}
-        {browserAuth(connector) && (
+        {connector.auth_action && (
           <Button onClick={() => window.open(`/v1/connectors/${connector.id}/connect`, "_blank")}>
             Reconnect
           </Button>

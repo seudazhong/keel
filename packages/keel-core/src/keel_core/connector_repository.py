@@ -17,11 +17,15 @@ from keel_core.connector_contracts import (
     ConnectorBinding,
     ConnectorBindingDraft,
     ConnectorBindingStatus,
+    ConnectorBindingTarget,
     ConnectorCursor,
     ConnectorHealth,
     ConnectorHealthStatus,
+    ConnectorItem,
+    ConnectorItemDraft,
     ConnectorResource,
     ConnectorResourceDraft,
+    ConnectorTargetKind,
 )
 
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
@@ -90,6 +94,41 @@ def _resource_from_row(row: Any) -> ConnectorResource:
     )
 
 
+def _item_from_row(row: Any) -> ConnectorItem:
+    return ConnectorItem(
+        id=str(row.id),
+        scope_id=str(row.scope_id),
+        connector_id=str(row.connector_id),
+        binding_id=str(row.binding_id),
+        resource_id=row.resource_id,
+        external_id=str(row.external_id),
+        kind=str(row.kind),
+        display_name=str(row.display_name),
+        url=row.url,
+        destination_kind=(
+            None if row.destination_kind is None else ConnectorTargetKind(str(row.destination_kind))
+        ),
+        destination_target_id=row.destination_target_id,
+        destination_id=row.destination_id,
+        config=dict(row.config or {}),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+def _target_from_row(row: Any) -> ConnectorBindingTarget:
+    return ConnectorBindingTarget(
+        id=str(row.id),
+        scope_id=str(row.scope_id),
+        connector_id=str(row.connector_id),
+        binding_id=str(row.binding_id),
+        kind=ConnectorTargetKind(str(row.kind)),
+        target_id=str(row.target_id),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
 def _cursor_from_row(row: Any) -> ConnectorCursor:
     return ConnectorCursor(
         id=str(row.id),
@@ -128,6 +167,15 @@ class ConnectorRepository(Protocol):
 
     async def delete_connector(self, connector_id: str) -> int: ...
 
+    async def list_targets(self, connector_id: str) -> list[ConnectorBindingTarget]: ...
+
+    async def replace_targets(
+        self,
+        connector_id: str,
+        binding_id: str,
+        targets: dict[ConnectorTargetKind, str],
+    ) -> list[ConnectorBindingTarget]: ...
+
     async def list_resources(
         self, connector_id: str, *, selected_only: bool = False
     ) -> list[ConnectorResource]: ...
@@ -138,9 +186,17 @@ class ConnectorRepository(Protocol):
 
     async def select_resources(self, connector_id: str, external_ids: set[str]) -> int: ...
 
+    async def list_items(self, connector_id: str) -> list[ConnectorItem]: ...
+
+    async def upsert_items(
+        self, connector_id: str, binding_id: str, items: Iterable[ConnectorItemDraft]
+    ) -> list[ConnectorItem]: ...
+
     async def get_cursor(
         self, connector_id: str, binding_id: str, stream: str, resource_id: str | None = None
     ) -> ConnectorCursor | None: ...
+
+    async def list_cursors(self, connector_id: str, binding_id: str) -> list[ConnectorCursor]: ...
 
     async def put_cursor(
         self,
@@ -178,7 +234,9 @@ class InMemoryConnectorRepository:
     def __init__(self, scope_id: str) -> None:
         self._scope_id = scope_id
         self._bindings: dict[str, ConnectorBinding] = {}
+        self._targets: dict[tuple[str, ConnectorTargetKind], ConnectorBindingTarget] = {}
         self._resources: dict[tuple[str, str], ConnectorResource] = {}
+        self._items: dict[tuple[str, str], ConnectorItem] = {}
         self._cursors: dict[tuple[str, str, str, str], ConnectorCursor] = {}
         self._deliveries: dict[tuple[str, str], tuple[str, str, datetime]] = {}
 
@@ -226,9 +284,7 @@ class InMemoryConnectorRepository:
         healthy = health.status is ConnectorHealthStatus.healthy
         row = replace(
             prior,
-            status=(
-                ConnectorBindingStatus.connected if healthy else ConnectorBindingStatus.error
-            ),
+            status=(ConnectorBindingStatus.connected if healthy else ConnectorBindingStatus.error),
             last_success_at=health.checked_at if healthy else prior.last_success_at,
             error_code=None if healthy else health.status.value,
             error_summary=None if healthy else health.message,
@@ -242,6 +298,12 @@ class InMemoryConnectorRepository:
         for resource_key in [key for key in self._resources if key[0] == connector_id]:
             del self._resources[resource_key]
             removed += 1
+        for target_key in [key for key in self._targets if key[0] == connector_id]:
+            del self._targets[target_key]
+            removed += 1
+        for item_key in [key for key in self._items if key[0] == connector_id]:
+            del self._items[item_key]
+            removed += 1
         for cursor_key in [key for key in self._cursors if key[0] == connector_id]:
             del self._cursors[cursor_key]
             removed += 1
@@ -249,6 +311,35 @@ class InMemoryConnectorRepository:
             del self._deliveries[delivery_key]
             removed += 1
         return removed
+
+    async def list_targets(self, connector_id: str) -> list[ConnectorBindingTarget]:
+        rows = [row for (cid, _), row in self._targets.items() if cid == connector_id]
+        return [copy.deepcopy(row) for row in sorted(rows, key=lambda item: item.kind.value)]
+
+    async def replace_targets(
+        self,
+        connector_id: str,
+        binding_id: str,
+        targets: dict[ConnectorTargetKind, str],
+    ) -> list[ConnectorBindingTarget]:
+        now = datetime.now(UTC)
+        for key in [key for key in self._targets if key[0] == connector_id]:
+            if key[1] not in targets:
+                del self._targets[key]
+        for kind, target_id in targets.items():
+            key = (connector_id, kind)
+            prior = self._targets.get(key)
+            self._targets[key] = ConnectorBindingTarget(
+                id=prior.id if prior else uuid.uuid4().hex,
+                scope_id=self._scope_id,
+                connector_id=connector_id,
+                binding_id=binding_id,
+                kind=kind,
+                target_id=target_id,
+                created_at=prior.created_at if prior else now,
+                updated_at=now,
+            )
+        return await self.list_targets(connector_id)
 
     async def list_resources(
         self, connector_id: str, *, selected_only: bool = False
@@ -298,11 +389,52 @@ class InMemoryConnectorRepository:
                 changed += 1
         return changed
 
+    async def list_items(self, connector_id: str) -> list[ConnectorItem]:
+        rows = [row for (cid, _), row in self._items.items() if cid == connector_id]
+        return [copy.deepcopy(row) for row in sorted(rows, key=lambda item: item.external_id)]
+
+    async def upsert_items(
+        self, connector_id: str, binding_id: str, items: Iterable[ConnectorItemDraft]
+    ) -> list[ConnectorItem]:
+        now = datetime.now(UTC)
+        for draft in items:
+            key = (connector_id, draft.external_id)
+            prior = self._items.get(key)
+            self._items[key] = ConnectorItem(
+                id=prior.id if prior else uuid.uuid4().hex,
+                scope_id=self._scope_id,
+                connector_id=connector_id,
+                binding_id=binding_id,
+                external_id=draft.external_id,
+                kind=draft.kind,
+                display_name=draft.display_name,
+                url=draft.url,
+                resource_id=draft.resource_id,
+                destination_kind=draft.destination_kind,
+                destination_target_id=draft.destination_target_id,
+                destination_id=draft.destination_id,
+                config=_safe_metadata(draft.config, field="item config"),
+                created_at=prior.created_at if prior else now,
+                updated_at=now,
+            )
+        return await self.list_items(connector_id)
+
     async def get_cursor(
         self, connector_id: str, binding_id: str, stream: str, resource_id: str | None = None
     ) -> ConnectorCursor | None:
         row = self._cursors.get((connector_id, binding_id, resource_id or "", stream))
         return None if row is None else copy.deepcopy(row)
+
+    async def list_cursors(self, connector_id: str, binding_id: str) -> list[ConnectorCursor]:
+        rows = [
+            row
+            for (cid, bid, _, _), row in self._cursors.items()
+            if cid == connector_id and bid == binding_id
+        ]
+        return [
+            copy.deepcopy(row)
+            for row in sorted(rows, key=lambda item: (item.resource_id or "", item.stream))
+        ]
 
     async def put_cursor(
         self,
@@ -487,12 +619,60 @@ class PostgresConnectorRepository:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             result = await conn.execute(
                 text(
-                    "DELETE FROM connector_bindings "
-                    "WHERE scope_id = :scope AND connector_id = :cid"
+                    "DELETE FROM connector_bindings WHERE scope_id = :scope AND connector_id = :cid"
                 ),
                 {"scope": self._scope_id, "cid": connector_id},
             )
         return int(result.rowcount or 0)
+
+    async def list_targets(self, connector_id: str) -> list[ConnectorBindingTarget]:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT * FROM connector_binding_targets "
+                        "WHERE scope_id = :scope AND connector_id = :cid ORDER BY kind"
+                    ),
+                    {"scope": self._scope_id, "cid": connector_id},
+                )
+            ).all()
+        return [_target_from_row(row) for row in rows]
+
+    async def replace_targets(
+        self,
+        connector_id: str,
+        binding_id: str,
+        targets: dict[ConnectorTargetKind, str],
+    ) -> list[ConnectorBindingTarget]:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            await conn.execute(
+                text(
+                    "DELETE FROM connector_binding_targets "
+                    "WHERE scope_id = :scope AND connector_id = :cid"
+                ),
+                {"scope": self._scope_id, "cid": connector_id},
+            )
+            for kind, target_id in targets.items():
+                await conn.execute(
+                    text(
+                        "INSERT INTO connector_binding_targets "
+                        "(id, scope_id, connector_id, binding_id, kind, target_id) "
+                        "VALUES (:id, :scope, :cid, :binding, :kind, :target) "
+                        "ON CONFLICT (scope_id, binding_id, kind) DO UPDATE SET "
+                        "target_id = EXCLUDED.target_id, updated_at = now()"
+                    ),
+                    {
+                        "id": uuid.uuid4().hex,
+                        "scope": self._scope_id,
+                        "cid": connector_id,
+                        "binding": binding_id,
+                        "kind": kind.value,
+                        "target": target_id,
+                    },
+                )
+        return await self.list_targets(connector_id)
 
     async def list_resources(
         self, connector_id: str, *, selected_only: bool = False
@@ -558,6 +738,64 @@ class PostgresConnectorRepository:
             )
         return int(result.rowcount or 0)
 
+    async def list_items(self, connector_id: str) -> list[ConnectorItem]:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT * FROM connector_items "
+                        "WHERE scope_id = :scope AND connector_id = :cid ORDER BY external_id"
+                    ),
+                    {"scope": self._scope_id, "cid": connector_id},
+                )
+            ).all()
+        return [_item_from_row(row) for row in rows]
+
+    async def upsert_items(
+        self, connector_id: str, binding_id: str, items: Iterable[ConnectorItemDraft]
+    ) -> list[ConnectorItem]:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            for draft in items:
+                config = _safe_metadata(draft.config, field="item config")
+                await conn.execute(
+                    text(
+                        "INSERT INTO connector_items "
+                        "(id, scope_id, connector_id, binding_id, resource_id, external_id, "
+                        "kind, display_name, url, destination_kind, destination_target_id, "
+                        "destination_id, config) "
+                        "VALUES (:id, :scope, :cid, :binding, :resource, :external, :kind, "
+                        ":name, :url, :destination_kind, :destination_target_id, "
+                        ":destination_id, CAST(:config AS jsonb)) "
+                        "ON CONFLICT (scope_id, binding_id, external_id) DO UPDATE SET "
+                        "resource_id = EXCLUDED.resource_id, kind = EXCLUDED.kind, "
+                        "display_name = EXCLUDED.display_name, url = EXCLUDED.url, "
+                        "destination_kind = EXCLUDED.destination_kind, "
+                        "destination_target_id = EXCLUDED.destination_target_id, "
+                        "destination_id = EXCLUDED.destination_id, config = EXCLUDED.config, "
+                        "updated_at = now()"
+                    ),
+                    {
+                        "id": uuid.uuid4().hex,
+                        "scope": self._scope_id,
+                        "cid": connector_id,
+                        "binding": binding_id,
+                        "resource": draft.resource_id,
+                        "external": draft.external_id,
+                        "kind": draft.kind,
+                        "name": draft.display_name,
+                        "url": draft.url,
+                        "destination_kind": (
+                            None if draft.destination_kind is None else draft.destination_kind.value
+                        ),
+                        "destination_target_id": draft.destination_target_id,
+                        "destination_id": draft.destination_id,
+                        "config": json.dumps(config, ensure_ascii=False),
+                    },
+                )
+        return await self.list_items(connector_id)
+
     async def get_cursor(
         self, connector_id: str, binding_id: str, stream: str, resource_id: str | None = None
     ) -> ConnectorCursor | None:
@@ -580,6 +818,25 @@ class PostgresConnectorRepository:
                 )
             ).one_or_none()
         return None if row is None else _cursor_from_row(row)
+
+    async def list_cursors(self, connector_id: str, binding_id: str) -> list[ConnectorCursor]:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT * FROM connector_cursors WHERE scope_id = :scope "
+                        "AND connector_id = :cid AND binding_id = :binding "
+                        "ORDER BY resource_key, stream"
+                    ),
+                    {
+                        "scope": self._scope_id,
+                        "cid": connector_id,
+                        "binding": binding_id,
+                    },
+                )
+            ).all()
+        return [_cursor_from_row(row) for row in rows]
 
     async def put_cursor(
         self,
@@ -730,7 +987,9 @@ async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
         for table in (
             "connector_deliveries",
             "connector_cursors",
+            "connector_items",
             "connector_resources",
+            "connector_binding_targets",
             "connector_bindings",
         ):
             result = await conn.execute(

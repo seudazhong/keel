@@ -6,6 +6,8 @@ The confused-deputy acceptance test is the headline of ADR-0009: tainted content
 
 from __future__ import annotations
 
+import pytest
+
 from keel_core.agents import AgentSpec, Scope
 from keel_core.connectors import ConfusedDeputyEngine, ConnectorTool
 from keel_core.events import EventType
@@ -94,6 +96,21 @@ async def test_outbound_connector_is_idempotent() -> None:
     b = await tool.run({"idempotency_key": "k1", "to": "x"}, _ctx(ContentTaint.clean))
     assert a.output == b.output == "sent"
     assert len(calls) == 1  # at-most-once: the second call replays, doesn't re-send
+
+
+async def test_outbound_connector_can_require_idempotency() -> None:
+    async def send(args: dict[str, object], ctx: ToolContext) -> str:
+        return "sent"
+
+    tool = ConnectorTool(
+        name="calendar_create",
+        description="",
+        action=send,
+        outbound=True,
+        idempotency_required=True,
+    )
+    with pytest.raises(ValueError, match="idempotency_key"):
+        await tool.run({}, _ctx(ContentTaint.clean))
 
 
 async def test_outbound_idempotency_survives_a_fresh_tool_via_shared_store() -> None:

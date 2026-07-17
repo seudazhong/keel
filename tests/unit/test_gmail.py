@@ -9,7 +9,14 @@ from __future__ import annotations
 import pytest
 
 from keel_core import gmail
+from keel_core.config import Settings
+from keel_core.connector_contracts import (
+    ConnectorActionApproval,
+    ConnectorActionContext,
+    ConnectorActionSemantics,
+)
 from keel_core.connector_credentials import CredentialEnvelope
+from keel_core.connector_providers import gmail as gmail_provider
 from keel_core.gmail import (
     GmailError,
     format_inbox,
@@ -138,3 +145,20 @@ async def test_send_action_raises_when_unauthorized() -> None:
     action = make_gmail_send_action(FakeTokenStore(None))
     with pytest.raises(GmailError, match="not authorized"):
         await action({"to": "me@example.com"}, _ctx())
+
+
+def test_gmail_provider_declares_and_builds_actions_locally(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        gmail_provider,
+        "get_settings",
+        lambda: Settings(gmail_enabled=True, gmail_send_enabled=True),
+    )
+    actions = gmail_provider.GmailProvider().build_actions(
+        ConnectorActionContext("web:local", credential_store=FakeTokenStore(None))
+    )
+    assert [action.manifest.name for action in actions] == ["inbox_list", "email_send"]
+    assert actions[0].manifest.semantics is ConnectorActionSemantics.read
+    assert actions[1].manifest.semantics is ConnectorActionSemantics.outbound
+    assert actions[1].manifest.approval is ConnectorActionApproval.tainted

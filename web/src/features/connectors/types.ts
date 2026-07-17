@@ -17,6 +17,27 @@ export interface ConnectorSetupField {
   help_text: string | null;
 }
 
+export interface ConnectorAuthAction {
+  label: string;
+  callback_parameters: { id: string; required: boolean }[];
+}
+
+export type ConnectorTargetKind = "knowledge" | "trigger_session" | "trigger_routine";
+
+export interface ConnectorTargetField {
+  kind: ConnectorTargetKind;
+  label: string;
+  required: boolean;
+  help_text: string | null;
+}
+
+export interface ConnectorSetupArtifact {
+  kind: "instruction" | "url" | "secret";
+  label: string;
+  value: string;
+  secret: boolean;
+}
+
 export interface ConnectorBinding {
   id: string;
   status: "configured" | "connected" | "error" | "revoked";
@@ -27,6 +48,7 @@ export interface ConnectorBinding {
   last_success_at: string | null;
   error_code: string | null;
   error_summary: string | null;
+  targets: Partial<Record<ConnectorTargetKind, string>>;
 }
 
 export interface Connector {
@@ -39,7 +61,20 @@ export interface Connector {
   capabilities: ConnectorCapability[];
   scopes: string[];
   setup_fields: ConnectorSetupField[];
+  auth_action: ConnectorAuthAction | null;
+  setup_action_label: string;
   resource_label: string | null;
+  target_fields: ConnectorTargetField[];
+  actions: {
+    name: string;
+    description: string;
+    input_schema: Record<string, unknown>;
+    semantics: "read" | "outbound";
+    idempotency: "none" | "optional" | "required";
+    approval: "none" | "tainted";
+  }[];
+  available: boolean;
+  availability_error: string | null;
   enabled: boolean;
   operational: boolean;
   connected: boolean;

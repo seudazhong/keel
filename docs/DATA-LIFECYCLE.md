@@ -28,7 +28,7 @@ not be — so a new store cannot be added without a conscious retention + erasur
 | `consolidation_cursors` | table | permanent | `scope_id` | scope-bound |
 | `knowledge_bases` / `kb_documents` / `kb_document_versions` / `kb_chunks` / `knowledge_idempotency` | table | permanent | `scope_id` | scope-bound (FK-safe physical purge) |
 | `connector_tokens` | table | permanent | `scope_id` | scope-bound (revoke + purge) |
-| `connector_bindings` / `connector_resources` / `connector_cursors` | table | permanent | `scope_id` | scope-bound connector state |
+| `connector_bindings` / `connector_binding_targets` / `connector_resources` / `connector_items` / `connector_cursors` | table | permanent | `scope_id` | typed targets, selected roots, imported-item mappings, and per-resource sync state |
 | `connector_deliveries` | table | short (1d) | `scope_id` | scope-bound replay/processing ledger |
 | `connector_outbox` | table | short (1d) | `scope_id` | scope-bound |
 | `oauth_states` | table | transient (1h) | `scope_id` | scope-bound |

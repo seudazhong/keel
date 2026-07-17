@@ -23,6 +23,7 @@ from arq.worker import func
 
 from keel_core import __version__
 from keel_core.config import Settings, get_settings, load_env_file
+from keel_core.connector_contracts import ConnectorAction, ConnectorActionContext
 from keel_core.consolidation.agent import (
     MEMORY_CONSOLIDATOR_AGENT_ID,
     build_consolidation_agent,
@@ -64,43 +65,69 @@ async def _enqueue_arq(redis: Any, name: str, *args: object, **options: object) 
     await redis.enqueue_job(name, *args, **options)
 
 
-def _digest_registry(ctx: dict[str, Any], settings: Settings, scope_id: str) -> ToolRegistry:
-    """Digest toolset for a run: the real Gmail inbox/send when enabled, else the fake.
+def _connector_actions(
+    ctx: dict[str, Any], settings: Settings, scope_id: str
+) -> tuple[ConnectorAction, ...]:
+    from keel_core.connector_registry import get_connector_registry
+    from keel_core.secrets import keyring_from_settings
+    from keel_core.tokens import PostgresTokenStore
 
-    Enabling Gmail swaps the inbound ``inbox_list`` (and, when ``gmail_send_enabled``,
-    the outbound ``email_send``) for actions backed by the scope-bound, encrypted
-    connector token store (``ctx["engine"]`` is wired in ``startup``). ``email_send``
-    stays ``outbound=True`` / approval-gated whether real or mocked.
-    """
-    inbox_action = None
-    send_action = None
+    registry = ctx.get("connector_registry") or get_connector_registry()
+    credential_store = ctx.get("connector_action_credentials")
+    engine = ctx.get("engine")
+    if (
+        credential_store is None
+        and engine is not None
+        and (settings.secret_key or settings.secret_keys)
+    ):
+        credential_store = PostgresTokenStore(
+            engine,
+            scope_id,
+            keyring_from_settings(settings),
+        )
+    idempotency_store = None
+    if engine is not None:
+        from keel_core.outbox import PostgresOutboundStore
+
+        idempotency_store = PostgresOutboundStore(engine)
+    return registry.build_actions(
+        ConnectorActionContext(
+            scope_id,
+            credential_store=credential_store,
+            idempotency_store=idempotency_store,
+        )
+    )
+
+
+def _digest_registry(
+    ctx: dict[str, Any],
+    settings: Settings,
+    scope_id: str,
+    actions: tuple[ConnectorAction, ...] | None = None,
+) -> ToolRegistry:
+    connector_actions = (
+        actions if actions is not None else _connector_actions(ctx, settings, scope_id)
+    )
     idempotency_store = None
     engine = ctx.get("engine")
     if engine is not None:
         from keel_core.outbox import PostgresOutboundStore
 
         idempotency_store = PostgresOutboundStore(engine)
-    if settings.gmail_enabled:
-        from keel_core.gmail import make_gmail_inbox_action, make_gmail_send_action
-        from keel_core.secrets import keyring_from_settings
-        from keel_core.tokens import PostgresTokenStore
-
-        store = PostgresTokenStore(ctx["engine"], scope_id, keyring_from_settings(settings))
-        inbox_action = make_gmail_inbox_action(store, settings.gmail_max_messages)
-        if settings.gmail_send_enabled:
-            send_action = make_gmail_send_action(store)
     return digest_registry(
         ctx.get("sent"),
-        inbox_action=inbox_action,
-        send_action=send_action,
         idempotency_store=idempotency_store,
+        connector_actions=connector_actions,
     )
 
 
 async def _run_digest(ctx: dict[str, Any], row: ScheduleRow, settings: Settings) -> str:
     """Start an unattended digest run for a due schedule; suspend on a gated send."""
     store, approvals, provider = ctx["store"], ctx["approvals"], ctx["provider"]
-    agent = build_digest_agent(row.scope_id).model_copy(update={"model": settings.default_model})
+    actions = _connector_actions(ctx, settings, row.scope_id)
+    agent = build_digest_agent(row.scope_id, actions).model_copy(
+        update={"model": settings.default_model}
+    )
     # The scheduled trigger is a *user* turn (the agent's standing behavior is its
     # persona/system prompt); a system-only message list is rejected by chat providers.
     await admit(store, row.session_id, row.scope_id, DIGEST_INSTRUCTION)
@@ -109,8 +136,8 @@ async def _run_digest(ctx: dict[str, Any], row: ScheduleRow, settings: Settings)
         session_id=row.session_id,
         store=store,
         provider=provider,
-        registry=_digest_registry(ctx, settings, row.scope_id),
-        permissions=digest_permissions(),
+        registry=_digest_registry(ctx, settings, row.scope_id, actions),
+        permissions=digest_permissions(actions),
         approvals=approvals,
         expires_at=datetime.now(UTC) + timedelta(hours=settings.approval_timeout_hours),
     )
@@ -212,15 +239,18 @@ async def resume_run(ctx: dict[str, Any], session_id: str, run_id: str, scope_id
     """Continue a suspended run after its approval resolved (grant/deny/expire)."""
     settings = get_settings()
     store, approvals, provider = ctx["store"], ctx["approvals"], ctx["provider"]
-    agent = build_digest_agent(scope_id).model_copy(update={"model": settings.default_model})
+    actions = _connector_actions(ctx, settings, scope_id)
+    agent = build_digest_agent(scope_id, actions).model_copy(
+        update={"model": settings.default_model}
+    )
     result = await resume(
         agent=agent,
         session_id=session_id,
         run_id=run_id,
         store=store,
         provider=provider,
-        registry=_digest_registry(ctx, settings, scope_id),
-        permissions=digest_permissions(),
+        registry=_digest_registry(ctx, settings, scope_id, actions),
+        permissions=digest_permissions(actions),
         approvals=approvals,
     )
     return result.reason.value
@@ -301,21 +331,28 @@ async def startup(ctx: dict[str, Any]) -> None:
         embedder,
         settings,
     )
+    from sqlalchemy import text
+
+    from keel_core.connector_contracts import ConnectorTargetKind
     from keel_core.connector_credentials import ConnectorCredentialStore
     from keel_core.connector_registry import get_connector_registry
     from keel_core.connector_repository import PostgresConnectorRepository
     from keel_core.connector_service import ConnectorService, DurableConnectorChangeSink
     from keel_core.errors import DuplicateEventError
+    from keel_core.knowledge.models import KnowledgeBaseStatus
     from keel_core.knowledge.service import KnowledgeService
     from keel_core.loop import admit_external
     from keel_core.secrets import keyring_from_settings
+    from keel_core.state import session_exists
     from keel_core.tokens import PostgresTokenStore
 
     connector_credentials = None
+    connector_action_credentials = None
     if settings.secret_key or settings.secret_keys:
-        connector_credentials = ConnectorCredentialStore(
-            PostgresTokenStore(engine, _DURABLE_SCOPE, keyring_from_settings(settings))
+        connector_action_credentials = PostgresTokenStore(
+            engine, _DURABLE_SCOPE, keyring_from_settings(settings)
         )
+        connector_credentials = ConnectorCredentialStore(connector_action_credentials)
     connector_repository = PostgresConnectorRepository(engine, _DURABLE_SCOPE)
     connector_knowledge = KnowledgeService(
         cast(KnowledgeStore, knowledge),
@@ -324,6 +361,46 @@ async def startup(ctx: dict[str, Any]) -> None:
         embedding_model=embedder.model,
         embedding_dim=embedder.dim,
     )
+    connector_registry = get_connector_registry()
+    ctx["connector_registry"] = connector_registry
+    ctx["connector_action_credentials"] = connector_action_credentials
+
+    async def validate_connector_target(kind: ConnectorTargetKind, target_id: str) -> bool:
+        if kind is ConnectorTargetKind.knowledge:
+            base = await connector_knowledge.get_base(target_id)
+            return base is not None and base.status is KnowledgeBaseStatus.active
+        if kind is ConnectorTargetKind.trigger_session:
+            return await session_exists(engine, _DURABLE_SCOPE, target_id)
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("SELECT set_config('app.scope_id', :scope, true)"),
+                {"scope": _DURABLE_SCOPE},
+            )
+            return bool(
+                await conn.scalar(
+                    text(
+                        "SELECT EXISTS(SELECT 1 FROM schedules "
+                        "WHERE scope_id = :scope AND id = :routine)"
+                    ),
+                    {"scope": _DURABLE_SCOPE, "routine": target_id},
+                )
+            )
+
+    async def resolve_connector_trigger(kind: ConnectorTargetKind, target_id: str) -> str:
+        if kind is ConnectorTargetKind.trigger_session:
+            return target_id
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("SELECT set_config('app.scope_id', :scope, true)"),
+                {"scope": _DURABLE_SCOPE},
+            )
+            session_id = await conn.scalar(
+                text("SELECT session_id FROM schedules WHERE scope_id = :scope AND id = :routine"),
+                {"scope": _DURABLE_SCOPE, "routine": target_id},
+            )
+        if session_id is None:
+            raise RuntimeError("connector trigger routine target is unavailable")
+        return str(session_id)
 
     async def admit_connector_event(session_id: str, content: str, run_id: str) -> None:
         try:
@@ -338,7 +415,7 @@ async def startup(ctx: dict[str, Any]) -> None:
             pass
 
     connector_service = ConnectorService(
-        get_connector_registry(),
+        connector_registry,
         connector_repository,
         credentials=connector_credentials,
         jobs=ctx["jobs"],
@@ -346,7 +423,9 @@ async def startup(ctx: dict[str, Any]) -> None:
             connector_repository,
             knowledge=connector_knowledge,
             admit_event=admit_connector_event,
+            resolve_trigger=resolve_connector_trigger,
         ),
+        target_validator=validate_connector_target,
     )
     ctx["connector_sync_service"] = connector_service
     register_connector_jobs(job_registry, connector_service, settings)

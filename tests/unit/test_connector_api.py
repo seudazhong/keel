@@ -12,22 +12,29 @@ from httpx import ASGITransport
 
 from keel_core.connector_contracts import (
     BaseConnectorProvider,
+    ConnectorAuthAction,
     ConnectorAuthenticationError,
     ConnectorAuthKind,
     ConnectorAuthStart,
     ConnectorBinding,
     ConnectorBindingDraft,
+    ConnectorCallbackParameter,
     ConnectorCapability,
     ConnectorCursor,
+    ConnectorCursorUpdate,
     ConnectorHealth,
     ConnectorHealthStatus,
     ConnectorIngressResult,
     ConnectorManifest,
     ConnectorResource,
     ConnectorResourceDraft,
+    ConnectorSetupArtifact,
+    ConnectorSetupArtifactKind,
     ConnectorSetupField,
     ConnectorSetupResult,
     ConnectorSyncResult,
+    ConnectorTargetField,
+    ConnectorTargetKind,
 )
 from keel_core.connector_credentials import ConnectorCredentialStore, CredentialEnvelope
 from keel_core.connector_registry import ConnectorRegistration, ConnectorRegistry
@@ -52,16 +59,28 @@ class ManualProvider(BaseConnectorProvider):
             ConnectorCapability.sync,
             ConnectorCapability.webhook,
         ),
-        setup_fields=(
-            ConnectorSetupField("api_key", "API key", secret=True),
-        ),
+        setup_fields=(ConnectorSetupField("api_key", "API key", secret=True),),
         resource_label="Projects",
+        target_fields=(
+            ConnectorTargetField(
+                ConnectorTargetKind.knowledge,
+                "Knowledge Base",
+            ),
+        ),
+        setup_action_label="Store credential",
     )
 
     async def setup(self, values: dict[str, str]) -> ConnectorSetupResult:
         return ConnectorSetupResult(
             ConnectorBindingDraft(display_name="Manual"),
             CredentialEnvelope("secret", {"api_key": values["api_key"]}),
+            (
+                ConnectorSetupArtifact(
+                    ConnectorSetupArtifactKind.secret,
+                    "Generated webhook secret",
+                    "shown-once",
+                ),
+            ),
         )
 
     async def list_resources(
@@ -73,10 +92,15 @@ class ManualProvider(BaseConnectorProvider):
         self,
         binding: ConnectorBinding,
         resources: tuple[ConnectorResource, ...],
-        cursor: ConnectorCursor | None,
+        cursors: tuple[ConnectorCursor, ...],
         credential: CredentialEnvelope | None,
     ) -> ConnectorSyncResult:
-        return ConnectorSyncResult(cursor="next")
+        return ConnectorSyncResult(
+            cursor_updates=(
+                ConnectorCursorUpdate("items", "next", resource_id=resources[0].id),
+                ConnectorCursorUpdate("global", "global-next"),
+            )
+        )
 
     async def health(
         self, binding: ConnectorBinding, credential: CredentialEnvelope | None
@@ -101,6 +125,9 @@ class OAuthProvider(BaseConnectorProvider):
         description="OAuth fixture",
         auth_kind=ConnectorAuthKind.oauth,
         capabilities=(ConnectorCapability.read,),
+        auth_action=ConnectorAuthAction(
+            callback_parameters=(ConnectorCallbackParameter("ticket"),)
+        ),
     )
 
     async def begin_auth(self, callback_url: str) -> ConnectorAuthStart:
@@ -109,6 +136,7 @@ class OAuthProvider(BaseConnectorProvider):
     async def complete_auth(
         self, callback_url: str, parameters: dict[str, str]
     ) -> ConnectorSetupResult:
+        assert parameters == {"state": "state-1", "ticket": "ticket-1"}
         return ConnectorSetupResult(
             ConnectorBindingDraft(display_name="OAuth fixture"),
             CredentialEnvelope("oauth", {"refresh_token": "encrypted-at-rest"}),
@@ -133,6 +161,11 @@ async def connector_client() -> AsyncIterator[tuple[httpx.AsyncClient, FastAPI]]
     )
     app.state.jobs = InMemoryJobStore("scope:test")
     app.state.oauth_state_store = InMemoryOAuthStateStore()
+
+    async def validate_target(kind: ConnectorTargetKind, target_id: str) -> bool:
+        return kind is ConnectorTargetKind.knowledge and target_id == "kb-1"
+
+    app.state.connector_target_validator = validate_target
     transport = ASGITransport(app=app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         yield client, app
@@ -151,7 +184,10 @@ async def test_generic_catalog_setup_resources_sync_health_and_revoke(
         json={"values": {"api_key": "must-not-echo"}},
     )
     assert setup.status_code == 200
+    assert setup.headers["cache-control"] == "no-store"
     assert "must-not-echo" not in setup.text
+    assert setup.json()["artifacts"][0]["value"] == "shown-once"
+    assert "shown-once" not in (await client.get("/v1/connectors")).text
 
     resources = (await client.get("/v1/connectors/manual/resources")).json()
     assert resources[0]["external_id"] == "project-1"
@@ -161,6 +197,13 @@ async def test_generic_catalog_setup_resources_sync_health_and_revoke(
             json={"external_ids": ["project-1"]},
         )
     ).status_code == 200
+    missing_target = await client.post("/v1/connectors/manual/sync", json={})
+    assert missing_target.status_code == 503
+    configured = await client.put(
+        "/v1/connectors/manual/targets",
+        json={"targets": {"knowledge": "kb-1"}},
+    )
+    assert configured.json()["targets"] == {"knowledge": "kb-1"}
     sync = await client.post("/v1/connectors/manual/sync", json={})
     assert sync.status_code == 200 and sync.json()["status"] == "queued"
     health = await client.get("/v1/connectors/manual/health")
@@ -197,11 +240,11 @@ async def test_generic_oauth_callback_dispatch(
     client, app = connector_client
     start = await client.get("/v1/connectors/oauth_fixture/connect", follow_redirects=False)
     assert start.status_code in {302, 307}
-    app.state.engine = object()
     callback = await client.get(
         "/v1/connectors/oauth_fixture/callback",
-        params={"state": "state-1", "code": "code-1"},
+        params={"state": "state-1", "ticket": "ticket-1"},
     )
     assert callback.status_code == 200
+    assert callback.headers["cache-control"] == "no-store"
     binding = await app.state.connector_repository.get_binding("oauth_fixture")
     assert binding is not None and binding.status.value == "connected"

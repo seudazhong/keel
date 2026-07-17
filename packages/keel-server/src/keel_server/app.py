@@ -268,14 +268,16 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         embedder=app.state.runtime.embedder,
         dispatch_job=_dispatch_knowledge_job,
     )
+    from keel_core.connector_contracts import ConnectorTargetKind
     from keel_core.connector_repository import (
         InMemoryConnectorRepository,
         PostgresConnectorRepository,
     )
     from keel_core.connector_service import DurableConnectorChangeSink
     from keel_core.errors import DuplicateEventError
+    from keel_core.knowledge.models import KnowledgeBaseStatus
     from keel_core.loop import admit_external
-    from keel_core.state import InMemoryEventStore, PostgresEventStore
+    from keel_core.state import InMemoryEventStore, PostgresEventStore, session_exists
 
     connector_repository = (
         PostgresConnectorRepository(engine, _DURABLE_SCOPE)
@@ -283,9 +285,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         else InMemoryConnectorRepository(_DURABLE_SCOPE)
     )
     connector_event_store = (
-        PostgresEventStore(engine, _DURABLE_SCOPE)
-        if engine is not None
-        else InMemoryEventStore()
+        PostgresEventStore(engine, _DURABLE_SCOPE) if engine is not None else InMemoryEventStore()
     )
 
     async def _admit_connector_event(session_id: str, content: str, run_id: str) -> None:
@@ -301,10 +301,60 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             pass
 
     app.state.connector_repository = connector_repository
+
+    async def _validate_connector_target(kind: ConnectorTargetKind, target_id: str) -> bool:
+        if kind is ConnectorTargetKind.knowledge:
+            if app.state.knowledge is None:
+                return False
+            base = await app.state.knowledge.get_base(target_id)
+            return base is not None and base.status is KnowledgeBaseStatus.active
+        if kind is ConnectorTargetKind.trigger_session and engine is not None:
+            return await session_exists(engine, _DURABLE_SCOPE, target_id)
+        if kind is ConnectorTargetKind.trigger_session:
+            return cast(InMemoryEventStore, connector_event_store).has_session(
+                target_id, _DURABLE_SCOPE
+            )
+        if engine is None:
+            return False
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("SELECT set_config('app.scope_id', :scope, true)"),
+                {"scope": _DURABLE_SCOPE},
+            )
+            return bool(
+                await conn.scalar(
+                    text(
+                        "SELECT EXISTS(SELECT 1 FROM schedules "
+                        "WHERE scope_id = :scope AND id = :routine)"
+                    ),
+                    {"scope": _DURABLE_SCOPE, "routine": target_id},
+                )
+            )
+
+    async def _resolve_connector_trigger(kind: ConnectorTargetKind, target_id: str) -> str:
+        if kind is ConnectorTargetKind.trigger_session:
+            return target_id
+        if engine is None:
+            raise RuntimeError("connector trigger routine resolver is unavailable")
+        async with engine.begin() as conn:
+            await conn.execute(
+                text("SELECT set_config('app.scope_id', :scope, true)"),
+                {"scope": _DURABLE_SCOPE},
+            )
+            session_id = await conn.scalar(
+                text("SELECT session_id FROM schedules WHERE scope_id = :scope AND id = :routine"),
+                {"scope": _DURABLE_SCOPE, "routine": target_id},
+            )
+        if session_id is None:
+            raise RuntimeError("connector trigger routine target is unavailable")
+        return str(session_id)
+
+    app.state.connector_target_validator = _validate_connector_target
     app.state.connector_change_sink = DurableConnectorChangeSink(
         connector_repository,
         knowledge=app.state.knowledge,
         admit_event=_admit_connector_event,
+        resolve_trigger=_resolve_connector_trigger,
     )
     app.state.erasure = _build_erasure_service(
         engine,

@@ -7,10 +7,18 @@ from datetime import UTC, datetime
 from keel_core.config import get_settings
 from keel_core.connector_contracts import (
     BaseConnectorProvider,
+    ConnectorAction,
+    ConnectorActionApproval,
+    ConnectorActionContext,
+    ConnectorActionIdempotency,
+    ConnectorActionManifest,
+    ConnectorActionSemantics,
+    ConnectorAuthAction,
     ConnectorAuthKind,
     ConnectorAuthStart,
     ConnectorBinding,
     ConnectorBindingDraft,
+    ConnectorCallbackParameter,
     ConnectorCapability,
     ConnectorHealth,
     ConnectorHealthStatus,
@@ -18,7 +26,35 @@ from keel_core.connector_contracts import (
     ConnectorSetupResult,
 )
 from keel_core.connector_credentials import CredentialEnvelope
-from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
+from keel_core.gmail import (
+    GMAIL_CONNECTOR_ID,
+    GMAIL_SCOPES,
+    make_gmail_inbox_action,
+    make_gmail_send_action,
+)
+
+INBOX_ACTION = ConnectorActionManifest(
+    name="inbox_list",
+    description="List recent inbox messages.",
+    input_schema={"type": "object", "properties": {}},
+    semantics=ConnectorActionSemantics.read,
+)
+SEND_ACTION = ConnectorActionManifest(
+    name="email_send",
+    description="Send an email.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "to": {"type": "string"},
+            "subject": {"type": "string"},
+            "body": {"type": "string"},
+            "idempotency_key": {"type": "string"},
+        },
+    },
+    semantics=ConnectorActionSemantics.outbound,
+    idempotency=ConnectorActionIdempotency.optional,
+    approval=ConnectorActionApproval.tainted,
+)
 
 manifest = ConnectorManifest(
     id=GMAIL_CONNECTOR_ID,
@@ -28,7 +64,18 @@ manifest = ConnectorManifest(
     auth_kind=ConnectorAuthKind.oauth,
     capabilities=(ConnectorCapability.read, ConnectorCapability.write),
     scopes=GMAIL_SCOPES,
+    auth_action=ConnectorAuthAction(callback_parameters=(ConnectorCallbackParameter("code"),)),
+    actions=(INBOX_ACTION, SEND_ACTION),
 )
+
+
+def enabled() -> bool:
+    return get_settings().gmail_enabled
+
+
+def availability() -> None:
+    import google_auth_oauthlib.flow  # noqa: F401
+    import googleapiclient.discovery  # noqa: F401
 
 
 def _flow(redirect_uri: str) -> object:
@@ -46,7 +93,7 @@ class GmailProvider(BaseConnectorProvider):
     manifest = manifest
 
     def enabled(self) -> bool:
-        return get_settings().gmail_enabled
+        return enabled()
 
     async def begin_auth(self, callback_url: str) -> ConnectorAuthStart:
         flow = _flow(callback_url)
@@ -98,9 +145,31 @@ class GmailProvider(BaseConnectorProvider):
         """Preserve Gmail's existing local encrypted-token revoke behavior."""
         return None
 
+    def build_actions(self, context: ConnectorActionContext) -> tuple[ConnectorAction, ...]:
+        if context.credential_store is None:
+            raise RuntimeError("encrypted connector credential storage is unavailable")
+        settings = get_settings()
+        actions = [
+            ConnectorAction(
+                INBOX_ACTION,
+                make_gmail_inbox_action(
+                    context.credential_store,
+                    settings.gmail_max_messages,
+                ),
+            )
+        ]
+        if settings.gmail_send_enabled:
+            actions.append(
+                ConnectorAction(
+                    SEND_ACTION,
+                    make_gmail_send_action(context.credential_store),
+                )
+            )
+        return tuple(actions)
+
 
 def factory() -> GmailProvider:
     return GmailProvider()
 
 
-__all__ = ["GmailProvider", "factory", "manifest"]
+__all__ = ["GmailProvider", "availability", "enabled", "factory", "manifest"]

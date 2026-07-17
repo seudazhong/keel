@@ -507,7 +507,11 @@ export const handlers = [
         ? { ...c, connected: true, health: "healthy", updated_at: new Date().toISOString() }
         : c,
     );
-    return HttpResponse.json({ ok: true, binding_id: `${String(params.id)}-binding` });
+    return HttpResponse.json({
+      ok: true,
+      binding_id: `${String(params.id)}-binding`,
+      artifacts: [],
+    });
   }),
   http.post("/v1/connectors/:id/sync", ({ params }) =>
     HttpResponse.json({ ok: true, job_id: `${String(params.id)}-job`, status: "queued" }),

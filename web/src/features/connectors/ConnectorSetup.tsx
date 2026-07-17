@@ -1,32 +1,86 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Button } from "../../components/ui/button";
 import { Card } from "../../components/ui/card";
-import type { Connector } from "./types";
+import type { Connector, ConnectorSetupArtifact } from "./types";
 import { useSetupConnector } from "./useConnectors";
 
-function usesBrowserAuth(connector: Connector): boolean {
-  return connector.auth_kind === "oauth" || connector.auth_kind === "github_app";
+function safeUrl(value: string): string | null {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function Artifacts({ artifacts }: { artifacts: ConnectorSetupArtifact[] }) {
+  if (!artifacts.length) return null;
+  return (
+    <div className="space-y-1 rounded-sm border border-border p-2 text-xs">
+      {artifacts.map((artifact) => {
+        const href = artifact.kind === "url" ? safeUrl(artifact.value) : null;
+        return (
+          <div key={`${artifact.kind}:${artifact.label}`}>
+            <strong>{artifact.label}:</strong>{" "}
+            {href ? (
+              <a className="underline" href={href} rel="noreferrer" target="_blank">
+                {artifact.value}
+              </a>
+            ) : (
+              <span>{artifact.value}</span>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 export function ConnectorSetup({ connector, compact = false }: { connector: Connector; compact?: boolean }) {
   const setup = useSetupConnector();
-  const [values, setValues] = useState<Record<string, string>>({});
   const [saved, setSaved] = useState(false);
+  const [artifacts, setArtifacts] = useState<ConnectorSetupArtifact[]>([]);
+  const form = useRef<HTMLFormElement>(null);
+  const secretHost = useRef<HTMLDivElement>(null);
 
   function connect() {
     window.open(`/v1/connectors/${connector.id}/connect`, "_blank");
   }
 
-  function submit() {
-    setup.mutate(
-      { id: connector.id, values },
-      {
-        onSuccess: () => {
-          setValues({});
-          setSaved(true);
-        },
-      },
+  async function submit() {
+    const current = form.current;
+    if (!current) return;
+    const data = new FormData(current);
+    const values = Object.fromEntries(
+      connector.setup_fields.map((field) => [field.id, String(data.get(field.id) ?? "")]),
     );
+    try {
+      const result = await setup.submit(connector.id, values);
+      current.reset();
+      setSaved(true);
+      setArtifacts(result.artifacts.filter((artifact) => !artifact.secret));
+      const host = secretHost.current;
+      host?.replaceChildren();
+      for (const artifact of result.artifacts.filter((item) => item.secret)) {
+        const row = document.createElement("div");
+        const label = document.createElement("strong");
+        const value = document.createElement("code");
+        label.textContent = `${artifact.label}: `;
+        value.textContent = artifact.value;
+        row.append(label, value);
+        host?.append(row);
+      }
+      if (host?.childElementCount) {
+        const hide = document.createElement("button");
+        hide.type = "button";
+        hide.className = "underline";
+        hide.textContent = "Hide secret values";
+        hide.addEventListener("click", () => host.replaceChildren(), { once: true });
+        host.append(hide);
+      }
+    } catch {
+      return;
+    }
   }
 
   return (
@@ -39,12 +93,23 @@ export function ConnectorSetup({ connector, compact = false }: { connector: Conn
         </div>
       </div>
 
-      {usesBrowserAuth(connector) ? (
-        <Button className="w-full" onClick={connect}>
-          Connect
+      {!connector.available && (
+        <p className="text-xs text-red">{connector.availability_error ?? "Provider unavailable"}</p>
+      )}
+      {connector.auth_action && (
+        <Button className="w-full" onClick={connect} disabled={!connector.available}>
+          {connector.auth_action.label}
         </Button>
-      ) : (
-        <div className="space-y-2">
+      )}
+      {(!connector.auth_action || connector.setup_fields.length > 0) && (
+        <form
+          className="space-y-2"
+          ref={form}
+          onSubmit={(event) => {
+            event.preventDefault();
+            void submit();
+          }}
+        >
           {connector.setup_fields.map((field) => (
             <label className="block" key={field.id}>
               <span className="mb-1 block text-xs font-semibold text-text-soft">{field.label}</span>
@@ -52,23 +117,34 @@ export function ConnectorSetup({ connector, compact = false }: { connector: Conn
                 aria-label={field.label}
                 className="w-full rounded-sm border border-border bg-surface-2 px-3 py-2 text-sm"
                 type={field.secret ? "password" : field.input_type}
+                name={field.id}
                 required={field.required}
-                value={values[field.id] ?? ""}
-                onChange={(event) => {
+                onChange={() => {
                   setSaved(false);
-                  setValues((current) => ({ ...current, [field.id]: event.target.value }));
+                  setArtifacts([]);
+                  secretHost.current?.replaceChildren();
                 }}
                 autoComplete={field.secret ? "new-password" : undefined}
               />
               {field.help_text && <span className="mt-1 block text-xs text-text-muted">{field.help_text}</span>}
             </label>
           ))}
-          <Button className="w-full" onClick={submit} disabled={setup.isPending}>
-            {setup.isPending ? "Saving…" : connector.auth_kind === "webhook" ? "Create webhook" : "Save"}
+          <Button
+            className="w-full"
+            disabled={setup.isPending || !connector.available}
+            type="submit"
+          >
+            {setup.isPending ? "Saving…" : connector.setup_action_label}
           </Button>
-          {saved && <p className="text-xs text-green">Saved. Secret values are not displayed.</p>}
-          {setup.isError && <p className="text-xs text-red">{setup.error.message}</p>}
-        </div>
+          {saved && (
+            <p className="text-xs text-green">
+              Saved. Stored credentials are not displayed again.
+            </p>
+          )}
+          <Artifacts artifacts={artifacts} />
+          <div className="space-y-1 text-xs" ref={secretHost} />
+          {setup.error && <p className="text-xs text-red">{setup.error.message}</p>}
+        </form>
       )}
     </Card>
   );
