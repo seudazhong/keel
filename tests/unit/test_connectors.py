@@ -6,6 +6,8 @@ The confused-deputy acceptance test is the headline of ADR-0009: tainted content
 
 from __future__ import annotations
 
+import pytest
+
 from keel_core.agents import AgentSpec, Scope
 from keel_core.connectors import ConfusedDeputyEngine, ConnectorTool
 from keel_core.events import EventType
@@ -49,6 +51,39 @@ async def test_inbound_connector_taints_output() -> None:
     assert result.taint is ContentTaint.tainted  # external content is untrusted
 
 
+def test_admitted_external_message_taints_following_actions() -> None:
+    from datetime import UTC, datetime
+
+    from keel_core.events import Event
+
+    event = Event(
+        type=EventType.message_token,
+        seq=1,
+        session_id="s1",
+        scope_id="u:1",
+        ts=datetime.now(UTC),
+        payload={"role": "user", "text": "external", "taint": str(ContentTaint.tainted)},
+    )
+    from keel_core.connectors import taint_from_events
+
+    assert taint_from_events([event]) is ContentTaint.tainted
+
+
+async def test_admit_external_persists_external_taint() -> None:
+    from keel_core.connectors import taint_from_events
+    from keel_core.loop import admit_external
+
+    store = InMemoryEventStore()
+    await admit_external(
+        store,
+        "s1",
+        "u:1",
+        "external event",
+        "connector:event-1",
+    )
+    assert taint_from_events(store.snapshot("s1")) is ContentTaint.tainted
+
+
 async def test_outbound_connector_is_idempotent() -> None:
     calls: list[dict[str, object]] = []
 
@@ -61,6 +96,21 @@ async def test_outbound_connector_is_idempotent() -> None:
     b = await tool.run({"idempotency_key": "k1", "to": "x"}, _ctx(ContentTaint.clean))
     assert a.output == b.output == "sent"
     assert len(calls) == 1  # at-most-once: the second call replays, doesn't re-send
+
+
+async def test_outbound_connector_can_require_idempotency() -> None:
+    async def send(args: dict[str, object], ctx: ToolContext) -> str:
+        return "sent"
+
+    tool = ConnectorTool(
+        name="calendar_create",
+        description="",
+        action=send,
+        outbound=True,
+        idempotency_required=True,
+    )
+    with pytest.raises(ValueError, match="idempotency_key"):
+        await tool.run({}, _ctx(ContentTaint.clean))
 
 
 async def test_outbound_idempotency_survives_a_fresh_tool_via_shared_store() -> None:

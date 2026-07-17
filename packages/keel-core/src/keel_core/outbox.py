@@ -32,6 +32,19 @@ async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
     return int(result.rowcount or 0)
 
 
+async def purge_connector(engine: AsyncEngine, scope_id: str, connector_id: str) -> int:
+    """Erase one connector's outbound claims without touching other connectors."""
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        result = await conn.execute(
+            text(
+                "DELETE FROM connector_outbox WHERE scope_id = :scope AND connector_id = :connector"
+            ),
+            {"scope": scope_id, "connector": connector_id},
+        )
+    return int(result.rowcount or 0)
+
+
 @dataclass(frozen=True)
 class Claim:
     """The outcome of attempting to claim an idempotency key.

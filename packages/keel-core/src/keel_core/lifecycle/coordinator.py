@@ -284,6 +284,7 @@ class ErasureCoordinator:
             ("memory_proposals", lambda: self._wrap(purge.memory_proposals(scope))),
             ("consolidation_cursor", lambda: self._wrap(purge.consolidation_cursor(scope))),
             ("knowledge", lambda: self._wrap(purge.knowledge(scope))),
+            ("connector_state", lambda: self._wrap(purge.connector_state(scope))),
             ("connector_tokens", lambda: self._wrap(purge.connector_tokens(scope))),
             ("connector_outbox", lambda: self._wrap(purge.connector_outbox(scope))),
             ("oauth_states", lambda: self._wrap(purge.oauth_states(scope))),

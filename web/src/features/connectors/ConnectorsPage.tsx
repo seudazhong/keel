@@ -5,7 +5,11 @@ import { Button } from "../../components/ui/button";
 import { Card } from "../../components/ui/card";
 import { Chip } from "../../components/ui/chip";
 import { Skeleton } from "../../components/ui/skeleton";
-import { useConnectors, useRevokeConnector } from "./useConnectors";
+import { ConnectorResources } from "./ConnectorResources";
+import { ConnectorSetupList } from "./ConnectorSetup";
+import { ConnectorTargets } from "./ConnectorTargets";
+import type { Connector } from "./types";
+import { useConnectors, useRevokeConnector, useSyncConnector } from "./useConnectors";
 
 function fmtDate(iso: string | null): string {
   if (!iso) return "—";
@@ -13,124 +17,162 @@ function fmtDate(iso: string | null): string {
   return Number.isNaN(d.getTime()) ? "—" : d.toLocaleString();
 }
 
+function healthTone(connector: Connector): "green" | "red" | "amber" {
+  if (!connector.enabled) return "amber";
+  if (connector.health === "healthy") return "green";
+  if (connector.health === "error") return "red";
+  return "amber";
+}
+
+function ConnectedConnector({ connector }: { connector: Connector }) {
+  const revoke = useRevokeConnector();
+  const purge = useRevokeConnector(true);
+  const forget = useRevokeConnector(false, true);
+  const forcePurge = useRevokeConnector(true, true);
+  const sync = useSyncConnector();
+
+  return (
+    <Card className="p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <div className="font-semibold">
+            {connector.icon} {connector.name}
+          </div>
+          <p className="mt-1 text-xs text-text-muted">{connector.description}</p>
+        </div>
+        <Badge tone={healthTone(connector)}>
+          {connector.enabled ? connector.health : "disabled"}
+        </Badge>
+      </div>
+      <div className="mt-3 flex flex-wrap gap-1.5">
+        {connector.scopes.map((scope) => (
+          <Chip key={scope}>{scope}</Chip>
+        ))}
+        {connector.capabilities.map((capability) => (
+          <Chip key={capability}>{capability}</Chip>
+        ))}
+      </div>
+      <p className="mt-3 text-xs text-text-muted">Updated {fmtDate(connector.updated_at)}</p>
+      {!connector.available && (
+        <Banner tone="warn" className="mt-3">
+          <span>⚠️</span>
+          <div>
+            {connector.availability_error ?? "The provider cannot be loaded."} Remote revoke is
+            unavailable; local removal remains explicit.
+          </div>
+        </Banner>
+      )}
+      <ConnectorTargets connector={connector} />
+      <ConnectorResources connector={connector} />
+      <div className="mt-3 flex flex-wrap gap-2">
+        {connector.capabilities.includes("sync") && (
+          <Button onClick={() => sync.mutate(connector.id)} disabled={sync.isPending}>
+            Sync now
+          </Button>
+        )}
+        {connector.auth_action && (
+          <Button onClick={() => window.open(`/v1/connectors/${connector.id}/connect`, "_blank")}>
+            Reconnect
+          </Button>
+        )}
+        <Button variant="danger" onClick={() => revoke.mutate(connector.id)} disabled={revoke.isPending}>
+          Disconnect
+        </Button>
+        <Button variant="danger" onClick={() => purge.mutate(connector.id)} disabled={purge.isPending}>
+          Disconnect and purge
+        </Button>
+        <Button
+          variant="danger"
+          onClick={() => {
+            if (
+              window.confirm(
+                "Forget local credentials and state without remote revoke? Imported data will remain and its connector mappings will be lost.",
+              )
+            ) {
+              forget.mutate(connector.id);
+            }
+          }}
+          disabled={forget.isPending}
+        >
+          Forget local state
+        </Button>
+        <Button
+          variant="danger"
+          onClick={() => {
+            if (
+              window.confirm(
+                "Force local purge without remote revoke? Imported connector data will be removed.",
+              )
+            ) {
+              forcePurge.mutate(connector.id);
+            }
+          }}
+          disabled={forcePurge.isPending}
+        >
+          Force local purge
+        </Button>
+      </div>
+      {(revoke.isError || purge.isError || forget.isError || forcePurge.isError || sync.isError) && (
+        <p className="mt-2 text-xs text-red">
+          {(revoke.error ?? purge.error ?? forget.error ?? forcePurge.error ?? sync.error)?.message}
+        </p>
+      )}
+    </Card>
+  );
+}
+
 export function ConnectorsPage() {
   const { data, isLoading, isError, refetch } = useConnectors();
-  const revoke = useRevokeConnector();
-  const connected = data?.filter((c) => c.connected) ?? [];
-  const addable = data?.filter((c) => !c.connected) ?? [];
+  const connected = data?.filter((connector) => connector.connected) ?? [];
+  const addable = data?.filter((connector) => !connector.connected) ?? [];
 
   return (
     <>
       <Topbar
         title="Connectors"
-        sub="· OAuth 集成，按 (scope, connector) 加密存储 token"
+        sub="· Manifest-driven setup with encrypted credentials"
         right={<Badge tone="violet">scope: personal</Badge>}
       />
       <div className="w-full max-w-[900px] p-[22px]">
         {isLoading && <Skeleton className="h-28" />}
-
         {isError && (
           <Banner tone="danger">
             <span>⚠️</span>
             <div>
-              加载连接器失败。
+              Failed to load connectors.
               <button className="ml-2 underline" onClick={() => void refetch()}>
-                重试
+                Retry
               </button>
             </div>
           </Banner>
         )}
-
         {data && (
           <>
             <div className="mb-2.5 text-sm font-semibold text-text-soft">
-              已连接 · {connected.length}
+              Connected · {connected.length}
             </div>
-            <Card className="mb-[22px] overflow-hidden">
-              {connected.length === 0 ? (
-                <p className="p-4 text-sm text-text-muted">
-                  还没有已连接的连接器。可用的 OAuth 连接器支持从本页发起浏览器授权。
-                </p>
+            <div className="mb-[22px] space-y-3">
+              {connected.length ? (
+                connected.map((connector) => (
+                  <ConnectedConnector connector={connector} key={connector.id} />
+                ))
               ) : (
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b border-border text-left text-xs text-text-muted">
-                      <th className="px-4 py-2.5 font-medium">集成</th>
-                      <th className="px-4 py-2.5 font-medium">授予范围（最小）</th>
-                      <th className="px-4 py-2.5 font-medium">状态</th>
-                      <th className="px-4 py-2.5 font-medium">最近更新</th>
-                      <th className="px-4 py-2.5 font-medium" />
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {connected.map((c) => (
-                      <tr key={c.id} className="border-b border-border last:border-0">
-                        <td className="px-4 py-3 font-semibold">
-                          {c.icon} {c.name}
-                        </td>
-                        <td className="px-4 py-3">
-                          <div className="flex flex-wrap gap-1.5">
-                            {c.scopes.map((s) => (
-                              <Chip key={s}>{s}</Chip>
-                            ))}
-                          </div>
-                        </td>
-                        <td className="px-4 py-3">
-                          <Badge tone="green">● 正常</Badge>
-                        </td>
-                        <td className="px-4 py-3 text-text-muted">{fmtDate(c.updated_at)}</td>
-                        <td className="px-4 py-3 text-right">
-                          <Button
-                            variant="danger"
-                            className="px-2.5 py-1 text-xs"
-                            disabled={revoke.isPending}
-                            onClick={() => revoke.mutate(c.id)}
-                          >
-                            撤销
-                          </Button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+                <Card className="p-4 text-sm text-text-muted">No connectors are configured.</Card>
               )}
-            </Card>
-
+            </div>
             <Banner tone="warn" className="mb-[22px]">
               <span>🛡️</span>
               <div>
-                <b>污点（taint）规则：</b>来自连接器的外部内容（邮件正文、网页、文档）会被标记为{" "}
-                <b>untrusted</b>；当某个外发动作的计划受污点内容影响时，会自动升级为「需审批」——防止
-                confused-deputy 泄露。
+                External connector content is tainted. Outbound actions influenced by it require
+                approval and use durable idempotency.
               </div>
             </Banner>
-
             {addable.length > 0 && (
               <>
-                <div className="mb-2.5 text-sm font-semibold text-text-soft">可添加</div>
-                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                  {addable.map((c) => (
-                    <Card key={c.id} className="flex flex-col items-center gap-2 p-4 text-center">
-                      <div className="text-2xl">{c.icon}</div>
-                      <b className="text-sm">{c.name}</b>
-                      <Button
-                        className="w-full"
-                        disabled={c.kind !== "oauth"}
-                        title={
-                          c.kind === "oauth"
-                            ? "在浏览器中授权（新标签页）"
-                            : "暂未支持浏览器内连接"
-                        }
-                        onClick={() => window.open(`/v1/connectors/${c.id}/connect`, "_blank")}
-                      >
-                        连接
-                      </Button>
-                    </Card>
-                  ))}
+                <div className="mb-2.5 text-sm font-semibold text-text-soft">
+                  Setup and authorization
                 </div>
-                <p className="mt-3 text-xs text-text-muted">
-                  点击「连接」在新标签页完成 Google 授权；授权后回到本页刷新即可看到已连接。
-                </p>
+                <ConnectorSetupList connectors={addable} />
               </>
             )}
           </>

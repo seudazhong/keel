@@ -73,6 +73,8 @@ MEMORY_PROPOSAL = "memory_proposal"
 CONSOLIDATION_CURSOR = "consolidation_cursor"
 KNOWLEDGE = "knowledge"
 CONNECTOR_TOKEN = "connector_token"
+CONNECTOR_STATE = "connector_state"
+CONNECTOR_DELIVERY = "connector_delivery"
 CONNECTOR_OUTBOX = "connector_outbox"
 OAUTH_STATE = "oauth_state"
 WEBHOOK_DELIVERY = "webhook_delivery"
@@ -98,6 +100,8 @@ DEFAULT_RETENTION: Mapping[str, RetentionPolicy] = {
     CONSOLIDATION_CURSOR: _policy(CONSOLIDATION_CURSOR, RetentionClass.permanent),
     KNOWLEDGE: _policy(KNOWLEDGE, RetentionClass.permanent),
     CONNECTOR_TOKEN: _policy(CONNECTOR_TOKEN, RetentionClass.permanent),
+    CONNECTOR_STATE: _policy(CONNECTOR_STATE, RetentionClass.permanent),
+    CONNECTOR_DELIVERY: _policy(CONNECTOR_DELIVERY, RetentionClass.short),
     CONNECTOR_OUTBOX: _policy(CONNECTOR_OUTBOX, RetentionClass.short),
     OAUTH_STATE: _policy(OAUTH_STATE, RetentionClass.transient),
     WEBHOOK_DELIVERY: _policy(WEBHOOK_DELIVERY, RetentionClass.short),

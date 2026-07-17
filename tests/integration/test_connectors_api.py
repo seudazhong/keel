@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.secrets import EnvelopeCipher
 from keel_core.tokens import PostgresTokenStore, list_connected
-from keel_server.api.v1 import router
+from keel_server.api.connectors import router
 
 pytestmark = pytest.mark.integration
 

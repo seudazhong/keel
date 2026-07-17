@@ -1,0 +1,52 @@
+{
+  "calendar": {
+    "accessRole": "owner",
+    "id": "team-calendar@example.test",
+    "primary": false,
+    "summary": "Team Calendar",
+    "timeZone": "Asia/Shanghai"
+  },
+  "events": {
+    "items": [
+      {
+        "end": {
+          "date": "2026-07-21"
+        },
+        "etag": "\"sanitized-revision-1\"",
+        "htmlLink": "https://calendar.google.com/calendar/event?eid=sanitized",
+        "id": "event-all-day",
+        "recurrence": [
+          "RRULE:FREQ=WEEKLY;COUNT=4"
+        ],
+        "start": {
+          "date": "2026-07-20"
+        },
+        "status": "confirmed",
+        "summary": "Sanitized planning day",
+        "updated": "2026-07-18T00:00:00Z"
+      },
+      {
+        "end": {
+          "dateTime": "2026-07-20T10:30:00+08:00",
+          "timeZone": "Asia/Shanghai"
+        },
+        "etag": "\"sanitized-revision-2\"",
+        "id": "event-recurring-instance",
+        "originalStartTime": {
+          "dateTime": "2026-07-20T10:00:00+08:00",
+          "timeZone": "Asia/Shanghai"
+        },
+        "recurringEventId": "event-series",
+        "start": {
+          "dateTime": "2026-07-20T10:00:00+08:00",
+          "timeZone": "Asia/Shanghai"
+        },
+        "status": "confirmed",
+        "summary": "Sanitized recurring standup",
+        "updated": "2026-07-18T00:01:00Z"
+      }
+    ],
+    "nextPageToken": "sanitized-next-page",
+    "timeZone": "Asia/Shanghai"
+  }
+}
