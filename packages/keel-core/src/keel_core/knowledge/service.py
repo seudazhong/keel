@@ -5,9 +5,11 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from typing import Any
 
 from keel_core.config import Settings
-from keel_core.jobs import JobRecord, JobStore, JobValidationError
+from keel_core.job_dispatch import JobDispatchOutbox
+from keel_core.jobs import CancelMode, JobRecord, JobStore, JobValidationError
 
 from .jobs import (
     KNOWLEDGE_DELETE_CANCEL_MODE,
@@ -90,6 +92,7 @@ class KnowledgeService:
         *,
         searcher: KnowledgeSearcher | None = None,
         dispatch_job: DispatchJob | None = None,
+        dispatch_outbox: JobDispatchOutbox | None = None,
         embedding_model: str | None = None,
         embedding_dim: int | None = None,
     ) -> None:
@@ -101,6 +104,7 @@ class KnowledgeService:
         self._jobs = jobs
         self._searcher = searcher
         self._dispatch_job = dispatch_job
+        self._dispatch_outbox = dispatch_outbox
         self._embedding_model = (
             embedding_model.strip()
             if isinstance(embedding_model, str) and embedding_model.strip()
@@ -335,6 +339,43 @@ class KnowledgeService:
             overlap_chars=self._chunk_overlap,
         )
 
+    async def _enqueue_job_once(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        target_session_id: str | None,
+        idempotency_key: str,
+        max_attempts: int,
+        cancel_mode: CancelMode,
+    ) -> tuple[JobRecord, bool]:
+        """Enqueue a durable Knowledge job, atomically recording a cross-scope dispatch intent.
+
+        When an outbox is wired (durable Postgres substrate) the job insert and the global
+        ``job_dispatch_outbox`` intent commit in ONE transaction, so a committed Knowledge job
+        always has a discoverable dispatch pointer the worker reconciler can recover after a lost
+        enqueue — the per-Agent-scope indexing job is never orphaned (finding 3). Without an
+        outbox (in-memory/lite profile) it falls back to the plain enqueue.
+        """
+        if self._dispatch_outbox is not None:
+            return await self._jobs.enqueue_once_with_dispatch_intent(
+                kind=kind,
+                payload=payload,
+                target_session_id=target_session_id,
+                idempotency_key=idempotency_key,
+                max_attempts=max_attempts,
+                cancel_mode=cancel_mode,
+                outbox=self._dispatch_outbox,
+            )
+        return await self._jobs.enqueue_once(
+            kind=kind,
+            payload=payload,
+            target_session_id=target_session_id,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+            cancel_mode=cancel_mode,
+        )
+
     async def _ensure_ingest_job(
         self,
         result: KnowledgeDocumentVersionIdempotencyResult,
@@ -351,7 +392,7 @@ class KnowledgeService:
             document_version_id=version.id,
         )
         try:
-            job, _ = await self._jobs.enqueue_once(
+            job, _ = await self._enqueue_job_once(
                 kind=KNOWLEDGE_INGEST_KIND,
                 payload=payload.model_dump(mode="json"),
                 target_session_id=target_session_id,
@@ -398,7 +439,7 @@ class KnowledgeService:
     ) -> JobRecord:
         payload = KnowledgeDeletePayload(kb_id=kb_id, document_id=document_id)
         resource_key = document_id if document_id is not None else "all"
-        job, _ = await self._jobs.enqueue_once(
+        job, _ = await self._enqueue_job_once(
             kind=KNOWLEDGE_DELETE_KIND,
             payload=payload.model_dump(mode="json"),
             target_session_id=None,

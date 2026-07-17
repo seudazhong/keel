@@ -41,12 +41,17 @@ from keel_core.knowledge.service import (
     KnowledgeDocumentJobResult,
     KnowledgeService,
 )
-from keel_server.auth import Role, require_role
+from keel_server.endpoint_auth import (
+    EndpointAuth,
+    EndpointPrivilege,
+    require_authenticated,
+    require_privilege,
+)
 
 router = APIRouter(
     prefix="/v1/knowledge-bases",
     tags=["knowledge"],
-    dependencies=[Depends(require_role(Role.viewer))],
+    dependencies=[Depends(require_authenticated)],
 )
 
 
@@ -173,14 +178,31 @@ class KnowledgeSearchResponse(_ResponseModel):
     status: KnowledgeSearchStatus
 
 
-def _service(request: Request) -> KnowledgeService:
-    service: KnowledgeService | None = getattr(request.app.state, "knowledge", None)
-    scope: object = getattr(request.app.state, "durable_scope", None)
-    if service is None or not isinstance(scope, str) or not scope:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "knowledge unavailable")
-    if service.scope_id != scope:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "knowledge scope misconfigured")
-    return service
+def _service(request: Request, auth: EndpointAuth) -> KnowledgeService:
+    """Resolve a Knowledge service bound to the caller's derived data-plane scope.
+
+    A per-request scoped service is built from the canonical ``auth.scope_id`` (an OIDC user's
+    ``agent:<org>/<agent>``, a bound/global machine credential's selected Agent, or the non-cloud
+    ``web:local`` local-preview scope) via the app's bounded ``knowledge_factory`` — so an
+    authenticated call never touches a foreign scope's Knowledge and a cross-org/Agent KB/document
+    id is invisible (404). A directly-wired singleton (lite profile / unit doubles) is used only
+    when it already matches the resolved scope; a mismatch fails closed rather than leak another
+    tenant's Knowledge.
+    """
+    scope = auth.scope_id
+    factory = getattr(request.app.state, "knowledge_factory", None)
+    if factory is not None:
+        service: KnowledgeService | None = factory(scope)
+        if service is not None:
+            if service.scope_id != scope:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, "knowledge scope misconfigured"
+                )
+            return service
+    singleton: KnowledgeService | None = getattr(request.app.state, "knowledge", None)
+    if singleton is not None and singleton.scope_id == scope:
+        return singleton
+    raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "knowledge unavailable")
 
 
 def _kb_id(value: str) -> str:
@@ -205,27 +227,35 @@ def _idempotency_key(value: str) -> str:
     "",
     response_model=KnowledgeBaseResponse,
     status_code=status.HTTP_201_CREATED,
-    dependencies=[Depends(require_role(Role.operator))],
 )
 async def create_base(
     body: CreateKnowledgeBaseCommand,
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
 ) -> KnowledgeBaseResponse:
-    result = await _service(request).create_base(body, _idempotency_key(idempotency_key))
+    result = await _service(request, auth).create_base(body, _idempotency_key(idempotency_key))
     return KnowledgeBaseResponse.from_record(result.resource)
 
 
 @router.get("", response_model=list[KnowledgeBaseResponse])
-async def list_bases(request: Request) -> list[KnowledgeBaseResponse]:
+async def list_bases(
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> list[KnowledgeBaseResponse]:
     return [
-        KnowledgeBaseResponse.from_record(record) for record in await _service(request).list_bases()
+        KnowledgeBaseResponse.from_record(record)
+        for record in await _service(request, auth).list_bases()
     ]
 
 
 @router.get("/{kb_id}", response_model=KnowledgeBaseResponse)
-async def get_base(kb_id: str, request: Request) -> KnowledgeBaseResponse:
-    record = await _service(request).get_base(_kb_id(kb_id))
+async def get_base(
+    kb_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> KnowledgeBaseResponse:
+    record = await _service(request, auth).get_base(_kb_id(kb_id))
     if record is None or record.status is KnowledgeBaseStatus.deleted:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "knowledge base not found")
     return KnowledgeBaseResponse.from_record(record)
@@ -235,14 +265,14 @@ async def get_base(kb_id: str, request: Request) -> KnowledgeBaseResponse:
     "/{kb_id}",
     response_model=KnowledgeBaseDeleteResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_role(Role.operator))],
 )
 async def delete_base(
     kb_id: str,
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
 ) -> KnowledgeBaseDeleteResponse:
-    result = await _service(request).delete_base(
+    result = await _service(request, auth).delete_base(
         _kb_id(kb_id),
         DeleteKnowledgeCommand(),
         _idempotency_key(idempotency_key),
@@ -251,10 +281,14 @@ async def delete_base(
 
 
 @router.get("/{kb_id}/documents", response_model=list[KnowledgeDocumentResponse])
-async def list_documents(kb_id: str, request: Request) -> list[KnowledgeDocumentResponse]:
+async def list_documents(
+    kb_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> list[KnowledgeDocumentResponse]:
     return [
         KnowledgeDocumentResponse.from_record(record)
-        for record in await _service(request).list_documents(_kb_id(kb_id))
+        for record in await _service(request, auth).list_documents(_kb_id(kb_id))
     ]
 
 
@@ -262,15 +296,15 @@ async def list_documents(kb_id: str, request: Request) -> list[KnowledgeDocument
     "/{kb_id}/documents",
     response_model=KnowledgeDocumentJobResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_role(Role.operator))],
 )
 async def create_document(
     kb_id: str,
     body: CreateKnowledgeDocumentCommand,
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
 ) -> KnowledgeDocumentJobResponse:
-    result = await _service(request).create_document(
+    result = await _service(request, auth).create_document(
         _kb_id(kb_id),
         body,
         _idempotency_key(idempotency_key),
@@ -286,10 +320,11 @@ async def get_document(
     kb_id: str,
     document_id: str,
     request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
 ) -> KnowledgeDocumentDetailResponse:
     base_id = _kb_id(kb_id)
     doc_id = _document_id(document_id)
-    service = _service(request)
+    service = _service(request, auth)
     document = await service.get_document(base_id, doc_id)
     if document is None or document.status is KnowledgeDocumentStatus.deleted:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "knowledge document not found")
@@ -304,7 +339,6 @@ async def get_document(
     "/{kb_id}/documents/{document_id}",
     response_model=KnowledgeDocumentJobResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_role(Role.operator))],
 )
 async def update_document(
     kb_id: str,
@@ -312,8 +346,9 @@ async def update_document(
     body: UpdateKnowledgeDocumentCommand,
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
 ) -> KnowledgeDocumentJobResponse:
-    result = await _service(request).update_document(
+    result = await _service(request, auth).update_document(
         _kb_id(kb_id),
         _document_id(document_id),
         body,
@@ -326,7 +361,6 @@ async def update_document(
     "/{kb_id}/documents/{document_id}/reindex",
     response_model=KnowledgeDocumentJobResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_role(Role.operator))],
 )
 async def reindex_document(
     kb_id: str,
@@ -334,8 +368,9 @@ async def reindex_document(
     body: ReindexKnowledgeDocumentCommand,
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
 ) -> KnowledgeDocumentJobResponse:
-    result = await _service(request).reindex_document(
+    result = await _service(request, auth).reindex_document(
         _kb_id(kb_id),
         _document_id(document_id),
         body,
@@ -348,15 +383,15 @@ async def reindex_document(
     "/{kb_id}/documents/{document_id}",
     response_model=KnowledgeDocumentDeleteResponse,
     status_code=status.HTTP_202_ACCEPTED,
-    dependencies=[Depends(require_role(Role.operator))],
 )
 async def delete_document(
     kb_id: str,
     document_id: str,
     request: Request,
     idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
 ) -> KnowledgeDocumentDeleteResponse:
-    result = await _service(request).delete_document(
+    result = await _service(request, auth).delete_document(
         _kb_id(kb_id),
         _document_id(document_id),
         DeleteKnowledgeCommand(),
@@ -370,9 +405,10 @@ async def search(
     kb_id: str,
     request: Request,
     q: Annotated[str, Query(min_length=1, max_length=2_000)],
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
     k: Annotated[int, Query(ge=1, le=10)] = 5,
 ) -> KnowledgeSearchResponse:
-    hits, search_status = await _service(request).search(_kb_id(kb_id), q, k=k)
+    hits, search_status = await _service(request, auth).search(_kb_id(kb_id), q, k=k)
     return KnowledgeSearchResponse(hits=hits, status=search_status)
 
 

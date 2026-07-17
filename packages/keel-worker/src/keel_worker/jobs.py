@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 import traceback
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -13,12 +15,14 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, TypeVar, cast
 
+from keel_core.job_dispatch import JobDispatchOutbox
 from keel_core.jobs import (
     CancelMode,
     JobCancellationRequested,
     JobError,
     JobLease,
     JobLeaseLostError,
+    JobLimits,
     JobRecord,
     JobResult,
     JobStatus,
@@ -26,13 +30,28 @@ from keel_core.jobs import (
     JobTerminalIntent,
     JobValidationError,
     PermanentJobError,
+    PostgresJobStore,
     RetryableJobError,
     retry_delay_seconds,
 )
+from keel_core.knowledge.jobs import KNOWLEDGE_DELETE_KIND, KNOWLEDGE_INGEST_KIND
 from keel_core.observability import get_tracer
+from keel_core.scoping import ScopeValidationError, validate_scope_id
 
 logger = logging.getLogger("keel.worker.jobs")
 _PG_INTEGER_MAX = 2**31 - 1
+
+# A stable, per-process reconciler identity for the job-dispatch outbox lease fence.
+_WORKER_ID = f"{socket.gethostname()}:{uuid.uuid4().hex[:8]}"
+
+# The durable job kinds that may be dispatched across per-Agent scopes via the global
+# job-dispatch outbox. Only Knowledge indexing/deletion is created under a per-Agent scope; every
+# other durable job (erasure, project sync) stays pinned to the process ``durable_scope``. The
+# reconciler and cross-scope ``run_job`` both revalidate an intent's kind against this set so a
+# spoofed/foreign job kind can never be dispatched into another tenant's scope (finding 3).
+_CROSS_SCOPE_JOB_KINDS = frozenset({KNOWLEDGE_INGEST_KIND, KNOWLEDGE_DELETE_KIND})
+
+_TERMINAL_JOB_STATUSES = frozenset({JobStatus.succeeded, JobStatus.failed, JobStatus.cancelled})
 
 JobHandler = Callable[["JobContext", dict[str, Any]], Awaitable[JobResult]]
 JobCancelledHook = Callable[[JobRecord], Awaitable[None]]
@@ -362,25 +381,79 @@ async def _retry_or_fail(
     return status_value, status
 
 
+def _scoped_job_execution(
+    ctx: dict[str, Any], scope_id: str
+) -> tuple[JobStore, JobRegistry] | None:
+    """Resolve the job store + handler registry bound to ``scope_id`` (finding 3).
+
+    The worker dispatches Knowledge indexing/deletion jobs across many per-Agent scopes, so a
+    cross-scope ``run_job`` must construct its :class:`JobStore` and Knowledge store/service/
+    embedder for the job's *own* ``scope_id`` — never the process-wide ``durable_scope``. The
+    pinned ``durable_scope`` reuses the fully-featured registry wired at startup (Knowledge +
+    erasure + project sync), preserving existing non-Knowledge job behavior; every other scope
+    gets a Knowledge-only registry (the only kinds admitted under a per-Agent scope), so a
+    non-Knowledge kind in a per-Agent scope has no handler and fails closed as an unknown kind.
+
+    Returns ``None`` when the scope is malformed or no shared engine is wired (a cross-scope job
+    cannot run without Postgres).
+    """
+    durable_scope = str(ctx["durable_scope"])
+    if scope_id == durable_scope:
+        # The pinned store/registry wired at startup. A store bound to a *different* scope is a
+        # misconfiguration caught by ``run_job``'s ``store.scope_id != scope_id`` guard.
+        return ctx["jobs"], ctx["job_registry"]
+
+    engine = ctx.get("engine")
+    if engine is None:
+        # In-memory test-double path (mirrors the run worker's ``_scoped_stores`` fallback): the
+        # single ctx-provided store/registry stands in for whatever scope the test drives.
+        double: JobStore | None = ctx.get("jobs")
+        registry_double: JobRegistry | None = ctx.get("job_registry")
+        if double is None or registry_double is None:
+            return None
+        return double, registry_double
+    settings = ctx["job_settings"]
+    embedder = ctx.get("embedder")
+    if embedder is None:
+        return None
+    # Lazy import avoids a worker.knowledge <-> worker.jobs import cycle (worker.knowledge imports
+    # JobRegistry from this module).
+    from keel_core.knowledge.store import KnowledgeStore, PostgresKnowledgeStore
+    from keel_worker.knowledge import knowledge_job_registry
+
+    knowledge_store = PostgresKnowledgeStore(
+        engine,
+        scope_id,
+        document_max_bytes=settings.knowledge_document_max_bytes,
+    )
+    registry = knowledge_job_registry(cast(KnowledgeStore, knowledge_store), embedder, settings)
+    job_store = PostgresJobStore(engine, scope_id, limits=JobLimits.from_settings(settings))
+    return job_store, registry
+
+
 async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
     durable_scope = str(ctx["durable_scope"])
     if scope_id != durable_scope:
-        logger.warning(
-            "job scope mismatch configured=%s requested=%s job=%s",
-            durable_scope,
-            scope_id,
-            job_id,
-        )
-        return "scope_mismatch"
-    store: JobStore = ctx["jobs"]
-    if store.scope_id != durable_scope:
+        # Cross-scope dispatch: an outbox-driven Knowledge job in a *different* scope must be a
+        # canonical per-Agent scope (revalidated). The pinned ``durable_scope`` is trusted config
+        # and is used as-is (it need not be a canonical ``agent:<org>/<agent>`` value).
+        try:
+            scope_id = validate_scope_id(scope_id)
+        except ScopeValidationError:
+            logger.warning("run_job rejected malformed scope=%r job=%s", scope_id, job_id)
+            return "invalid_scope"
+    scoped = _scoped_job_execution(ctx, scope_id)
+    if scoped is None:
+        logger.warning("run_job cannot bind scope=%s job=%s (no substrate)", scope_id, job_id)
+        return "scope_unavailable"
+    store, registry = scoped
+    if store.scope_id != scope_id:
         logger.error(
-            "job store scope mismatch configured=%s store=%s",
-            durable_scope,
+            "job store scope mismatch requested=%s store=%s",
+            scope_id,
             store.scope_id,
         )
         return "scope_mismatch"
-    registry: JobRegistry = ctx["job_registry"]
     clock = _clock(ctx)
     before = await store.get(job_id)
     if before is None:
@@ -621,3 +694,84 @@ async def dispatch_jobs(ctx: dict[str, Any]) -> int:
                 _safe_exception_frames(exc),
             )
     return processed
+
+
+def _scoped_job_store(ctx: dict[str, Any], scope_id: str) -> JobStore | None:
+    """A :class:`JobStore` bound to ``scope_id`` for the reconciler (reuses the pinned store)."""
+    durable_scope = str(ctx["durable_scope"])
+    if scope_id == durable_scope:
+        pinned: JobStore = ctx["jobs"]
+        return pinned if pinned.scope_id == durable_scope else None
+    engine = ctx.get("engine")
+    if engine is None:
+        # In-memory test-double path: the ctx store stands in when its scope matches the intent.
+        double: JobStore | None = ctx.get("jobs")
+        return double if double is not None and double.scope_id == scope_id else None
+    return PostgresJobStore(engine, scope_id, limits=JobLimits.from_settings(ctx["job_settings"]))
+
+
+async def reconcile_job_dispatch_tick(ctx: dict[str, Any]) -> int:
+    """Cross-scope Knowledge job dispatch driven by the global job-dispatch outbox (finding 3).
+
+    The scope-partitioned ``jobs`` table is RLS-forced, so a worker bound to one scope cannot see
+    another's jobs, and the pinned ``dispatch_jobs`` reconciler only scans ``durable_scope``. The
+    global :class:`~keel_core.job_dispatch.JobDispatchOutbox` is the one cross-scope index:
+    Knowledge admission records ``(job_id, scope_id, kind)`` there (atomically with the job
+    insert), and this tick leases a batch of due intents (fenced so duplicate workers never both
+    process one), re-dispatches ``run_job(scope, job_id)`` for each still-open job, removes the
+    intents of jobs that have reached a terminal state, and defers the rest. This makes a document
+    created under any per-Agent scope actually indexed after a lost enqueue, rather than orphaned.
+    Every step is idempotent (a duplicate ``run_job`` enqueue is deduped by the job claim).
+    """
+    outbox: JobDispatchOutbox | None = ctx.get("job_dispatch_outbox")
+    if outbox is None:
+        return 0
+    enqueue: EnqueueJob = ctx["enqueue"]
+    now = datetime.now(UTC)
+    claimed = await outbox.claim_due(worker_id=_WORKER_ID, now=now)
+    if not claimed:
+        return 0
+
+    dispatched = 0
+    for intent in claimed:
+        try:
+            scope_id = validate_scope_id(intent.scope_id)
+        except ScopeValidationError:
+            # A malformed scope can never be dispatched — drop its intent (fail closed).
+            await outbox.remove(intent.job_id)
+            logger.warning("dropped job outbox intent with malformed scope=%r", intent.scope_id)
+            continue
+        if intent.kind not in _CROSS_SCOPE_JOB_KINDS:
+            # A kind that is not cross-scope-dispatchable must never be routed into a per-Agent
+            # scope; drop the intent rather than dispatch a foreign/unknown kind (fail closed).
+            await outbox.remove(intent.job_id)
+            logger.warning(
+                "dropped job outbox intent with non-dispatchable kind=%s job=%s",
+                intent.kind,
+                intent.job_id,
+            )
+            continue
+        store = _scoped_job_store(ctx, scope_id)
+        if store is None:
+            # No substrate to reconcile against right now; defer for a later tick.
+            await outbox.reschedule(intent.job_id, now=now)
+            continue
+        record = await store.get(intent.job_id)
+        if record is None or record.status in _TERMINAL_JOB_STATUSES:
+            # Nothing left to dispatch: the job is gone or terminal. Ack (remove) the intent.
+            await outbox.remove(intent.job_id)
+            continue
+        try:
+            await enqueue("run_job", scope_id, intent.job_id)
+            dispatched += 1
+        except Exception as exc:
+            logger.warning(
+                "job dispatch reconcile enqueue failed scope=%s job=%s error_type=%s",
+                scope_id,
+                intent.job_id,
+                type(exc).__name__,
+            )
+        # Defer a re-check so a still-queued/running job is retried without spinning; the intent
+        # is removed once the job reaches a terminal state (or is purged, via FK cascade).
+        await outbox.reschedule(intent.job_id, now=now)
+    return dispatched

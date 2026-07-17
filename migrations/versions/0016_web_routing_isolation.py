@@ -4,8 +4,13 @@ Revision ID: 0016_web_routing_isolation
 Revises: 0015_projects_github
 Create Date: 2026-07-18
 
-M3.6 durable Web routing review findings 2 (composite session tenant identity) and 4
-(cross-scope dispatch/reconciliation).
+M3.6 durable Web routing review findings 2 (composite session tenant identity), 3 (per-scope
+Knowledge + cross-scope Knowledge job dispatch) and 4 (cross-scope run dispatch/reconciliation).
+
+Two global, non-RLS dispatch indices are created here: ``run_dispatch_outbox`` (runs) and
+``job_dispatch_outbox`` (durable jobs, e.g. Knowledge ingest/delete). Both carry only a resource
+id + canonical scope routing key (no content/payload), so a single worker reconciler can drive
+work across *every* per-Agent scope without a per-scope cron.
 
 The ``runs`` table (0014) is scope-partitioned under ``FORCE ROW LEVEL SECURITY`` keyed by
 ``app.scope_id``, so a worker that binds one scope can only *see* that scope's runs. Before
@@ -95,6 +100,77 @@ def upgrade() -> None:
         """
     )
 
+    # --- Global Knowledge job-dispatch outbox (review finding 3) --------------------------
+    # The scope-partitioned ``jobs`` table (0009) is under ``ENABLE ROW LEVEL SECURITY`` keyed
+    # by ``app.scope_id``, so a worker bound to one scope cannot *see* another scope's jobs.
+    # Before this migration the server built a single ``web:local``-bound Knowledge service and
+    # the worker's ``dispatch_jobs`` reconciler was pinned to that one scope, so a Knowledge
+    # document created under a per-Agent scope (``agent:<org>/<agent>``) enqueued an ingest job
+    # that no worker ever dispatched — the document stayed orphaned/unindexed.
+    #
+    # ``job_dispatch_outbox`` is the Knowledge/durable-job analogue of ``run_dispatch_outbox``:
+    # a **minimal, non-sensitive, global** index of durable jobs with an open dispatch intent —
+    # a ``job_id`` + its canonical ``scope_id`` + the job ``kind`` + a coarse ``state`` + a fenced
+    # lease and a ``next_attempt_at`` retry hint. It carries **no** document content, payload,
+    # prompt, or embedding — only the routing key a worker needs to discover *which* scopes have
+    # dispatchable jobs, so a single reconciler can enumerate every active scope, bind each in
+    # turn, and dispatch ``run_job(scope, job_id)`` without a per-scope cron. Admission writes the
+    # intent atomically with the job insert; the reconciler removes it once the job is terminal.
+    op.execute(
+        """
+        CREATE TABLE job_dispatch_outbox (
+            -- The dispatch pointer is owned by its job: deleting a job (lifecycle purge, scope
+            -- erasure) cascades the intent away, so purge leaves no orphaned metadata and no
+            -- intent can outlive (or dangle past) the job it points at (finding 3).
+            job_id text PRIMARY KEY
+                REFERENCES jobs (id) ON DELETE CASCADE,
+            scope_id text NOT NULL,
+            -- The job kind (e.g. 'knowledge.ingest'); lets the reconciler revalidate that the
+            -- intent points at a cross-scope-dispatchable kind before enqueuing.
+            kind text NOT NULL,
+            -- Coarse dispatch state, NOT the job's authoritative status (which lives, RLS-
+            -- protected, on ``jobs``). 'pending' means "a worker should dispatch this job in
+            -- this scope"; the reconciler removes the row once the job is terminal.
+            state text NOT NULL DEFAULT 'pending'
+                CHECK (state IN ('pending', 'leased')),
+            attempts integer NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+            -- Retry hint: a leased/failed intent is retried no earlier than this.
+            next_attempt_at timestamptz NOT NULL DEFAULT now(),
+            -- Fenced reconciler lease so duplicate workers never both process one intent.
+            lease_owner text,
+            lease_expires_at timestamptz,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now(),
+            CHECK ((lease_owner IS NULL) = (lease_expires_at IS NULL))
+        )
+        """
+    )
+    # The reconciler's due-scan: pending or lease-expired intents, oldest first.
+    op.execute(
+        "CREATE INDEX ix_job_dispatch_outbox_due ON job_dispatch_outbox (next_attempt_at, scope_id)"
+    )
+    # Enumerate distinct active scopes cheaply.
+    op.execute("CREATE INDEX ix_job_dispatch_outbox_scope ON job_dispatch_outbox (scope_id)")
+
+    # The outbox is deliberately global (no RLS): it is the cross-scope dispatch index. Grant
+    # the non-owner runtime role read/lease/delete (guarded so a managed Postgres that forbids
+    # GRANT does not fail the migration).
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'keel_runtime') THEN
+                BEGIN
+                    GRANT SELECT, INSERT, UPDATE, DELETE ON job_dispatch_outbox
+                        TO keel_runtime;
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'keel_runtime job outbox grants skipped (insufficient privilege)';
+                END;
+            END IF;
+        END $$;
+        """
+    )
+
     # --- Composite session tenant identity (review finding 2) -----------------------------
     # Before this migration ``sessions.id`` was a *global* primary key and ``events`` was
     # unique on ``(session_id, seq)``, so a session id could exist in only one scope — two orgs
@@ -127,4 +203,5 @@ def downgrade() -> None:
     op.execute("ALTER TABLE sessions DROP CONSTRAINT sessions_pkey")
     op.execute("ALTER TABLE sessions ADD PRIMARY KEY (id)")
 
+    op.execute("DROP TABLE IF EXISTS job_dispatch_outbox CASCADE")
     op.execute("DROP TABLE IF EXISTS run_dispatch_outbox CASCADE")

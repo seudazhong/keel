@@ -265,12 +265,23 @@ Still to do (not yet done):
   survives a server/worker restart, a reconciler sweep for the crash-after-terminalize
   delivery window, and a cloud channel→org/Agent mapping (fail closed when absent). Designed
   but not implemented in this increment.
-- **Per-scope Knowledge stores/services.** Connectors/tokens/Gmail OAuth are now per canonical
-  scope, but the Knowledge API router still builds a single `web:local`-bound `KnowledgeService`.
-  Moving it to per-request canonical scope additionally requires the worker's Knowledge indexing
-  jobs (`dispatch_jobs`/`run_job`) to be driven across scopes (the same cross-scope pattern as
-  the run-dispatch outbox), so a document created in a per-Agent scope is actually indexed rather
-  than orphaned; deferred to avoid a broken half-migration.
+- **Per-scope Knowledge + cross-scope worker jobs (finding 3).** The Knowledge API router is now
+  per-request scoped: each call resolves its canonical `auth.scope_id` through the unified
+  `EndpointAuth`/`require_privilege` (OIDC user, bound/global machine credential, or the non-cloud
+  `web:local` local-preview) and a bounded `knowledge_factory` builds a `KnowledgeService` bound to
+  exactly that scope — no authenticated call touches the singleton `web:local` Knowledge, and a
+  cross-org/Agent KB/document id is invisible (404). To keep a document created under a per-Agent
+  scope actually indexed (not orphaned), migration `0016` adds a minimal, non-sensitive **global**
+  `job_dispatch_outbox` (`job_id → jobs(id) ON DELETE CASCADE` + `scope_id` + `kind` + fenced
+  lease, no content). Knowledge admission writes the durable job **and** its dispatch intent in one
+  transaction (`JobStore.enqueue_once_with_dispatch_intent`); a failed intent write rolls the job
+  back, and a lost enqueue returns the accepted job (pending) with the intent surviving. The worker
+  `reconcile_job_dispatch_tick` leases due intents across every scope (`FOR UPDATE SKIP LOCKED` +
+  fenced lease), re-dispatches `run_job(scope, job_id)`, and retires terminal intents; `run_job`
+  builds its `PostgresJobStore` + Knowledge store/service/embedder from the **payload/outbox
+  scope** (revalidated, kind-checked) rather than the process-wide `durable_scope`, preserving all
+  non-Knowledge job behavior. Readiness surfaces `knowledge_dispatch`. Evidence:
+  `tests/unit/test_job_dispatch_outbox.py`, `tests/integration/test_knowledge_routing_postgres.py`.
 - **Connector tool parity** in the durable worker path (beyond file/shell + memory +
   Knowledge) is a follow-up.
 - **SSE token-streaming liveness** from the worker: durable events (including completed
@@ -307,10 +318,15 @@ Hardened the durable Web-routing review findings with tests:
   SSE client replaces the header-less `EventSource` (reconnect with `Last-Event-ID`, de-dupe,
   abort-on-unmount); and a truthful sign-in/context screen appears when the server rejects a
   request for auth (it does not fake an OIDC authorization-code flow).
-- **Per-scope Knowledge + worker jobs (finding 3) remains deferred** — see the Knowledge
-  limitation above; it requires driving the worker's Knowledge indexing jobs across scopes (a
-  cross-scope job-dispatch outbox mirroring the run-dispatch one) so the server-side per-scope
-  service does not orphan documents, and was not attempted here to avoid a broken half-migration.
+- **Per-scope Knowledge + cross-scope worker jobs (finding 3).** The Knowledge API router is now
+  per-request scoped (unified `EndpointAuth`/`require_privilege` → canonical `auth.scope_id` →
+  bounded `knowledge_factory`), and its indexing/deletion jobs are driven across every per-Agent
+  scope by a new **global** `job_dispatch_outbox` (migration `0016`, `job_id → jobs(id) ON DELETE
+  CASCADE`) mirroring the run-dispatch outbox: admission writes job + intent atomically, the worker
+  `reconcile_job_dispatch_tick` re-dispatches leased intents across scopes, and `run_job` binds the
+  job's own payload/outbox scope — so a document created in a per-Agent scope is actually indexed
+  rather than orphaned. Evidence: `tests/unit/test_job_dispatch_outbox.py`,
+  `tests/integration/test_knowledge_routing_postgres.py`.
 
 ## Next work
 

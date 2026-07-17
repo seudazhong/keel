@@ -255,7 +255,8 @@ async def test_run_job_rejects_argument_scope_before_store_access() -> None:
         "job_scope",
     )
 
-    assert result == "scope_mismatch"
+    # A malformed/foreign scope is rejected up front (validated) before the store is ever read.
+    assert result == "invalid_scope"
 
 
 async def test_run_job_rejects_store_bound_to_another_scope() -> None:

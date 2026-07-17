@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from keel_core.config import Settings
 from keel_core.events import Event, EventType
 from keel_core.evolution import current_event_version
+from keel_core.job_dispatch import JobDispatchOutbox, record_job_intent_in_connection
 from keel_core.state import InMemoryEventStore, append_event_in_transaction
 
 _MAX_JSON_DEPTH = 100
@@ -357,6 +358,19 @@ class JobStore(Protocol):
         target_session_id: str | None,
         idempotency_key: str,
         max_attempts: int,
+        cancel_mode: CancelMode = CancelMode.immediate,
+        now: datetime | None = None,
+    ) -> tuple[JobRecord, bool]: ...
+
+    async def enqueue_once_with_dispatch_intent(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        target_session_id: str | None,
+        idempotency_key: str,
+        max_attempts: int,
+        outbox: JobDispatchOutbox,
         cancel_mode: CancelMode = CancelMode.immediate,
         now: datetime | None = None,
     ) -> tuple[JobRecord, bool]: ...
@@ -930,6 +944,44 @@ class InMemoryJobStore:
             self._dedupe[key] = job_id
             return _copy_record(record), True
 
+    async def enqueue_once_with_dispatch_intent(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        target_session_id: str | None,
+        idempotency_key: str,
+        max_attempts: int,
+        outbox: JobDispatchOutbox,
+        cancel_mode: CancelMode = CancelMode.immediate,
+        now: datetime | None = None,
+    ) -> tuple[JobRecord, bool]:
+        """Enqueue the job and record its cross-scope dispatch intent atomically (double).
+
+        The Postgres store commits both in one transaction; this in-memory double emulates that
+        atomicity: if recording the intent fails, a **newly-created** job is rolled back so a
+        committed job never exists without a discoverable dispatch pointer (a replayed/existing
+        job is left intact). The error is not swallowed — the caller can retry idempotently.
+        """
+        record, created = await self.enqueue_once(
+            kind=kind,
+            payload=payload,
+            target_session_id=target_session_id,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+            cancel_mode=cancel_mode,
+            now=now,
+        )
+        try:
+            await outbox.record(record.id, record.scope_id, record.kind, now=now)
+        except Exception:
+            if created:
+                async with self._lock:
+                    self._rows.pop(record.id, None)
+                    self._dedupe.pop((self._scope_id, record.kind, record.idempotency_key), None)
+            raise
+        return record, created
+
     async def get(self, job_id: str) -> JobRecord | None:
         safe_job_id = _optional_read_identity(job_id, field="job_id", code="invalid_job_id")
         if safe_job_id is None:
@@ -1310,81 +1362,149 @@ class PostgresJobStore:
         cancel_mode: CancelMode = CancelMode.immediate,
         now: datetime | None = None,
     ) -> tuple[JobRecord, bool]:
+        async with self._engine.begin() as conn:
+            return await self._enqueue_once_in_conn(
+                conn,
+                kind=kind,
+                payload=payload,
+                target_session_id=target_session_id,
+                idempotency_key=idempotency_key,
+                max_attempts=max_attempts,
+                cancel_mode=cancel_mode,
+                now=now,
+            )
+
+    async def enqueue_once_with_dispatch_intent(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        target_session_id: str | None,
+        idempotency_key: str,
+        max_attempts: int,
+        outbox: JobDispatchOutbox,
+        cancel_mode: CancelMode = CancelMode.immediate,
+        now: datetime | None = None,
+    ) -> tuple[JobRecord, bool]:
+        """Commit the job insert + its cross-scope dispatch intent in ONE transaction.
+
+        Both the ``INSERT INTO jobs`` and the ``job_dispatch_outbox`` intent run on this store's
+        engine inside a single ``begin()`` block: if the intent write fails the job insert is
+        rolled back with it, so a durable Knowledge job never exists without a discoverable
+        dispatch pointer, and the cross-scope reconciler can always find it after a lost enqueue
+        (finding 3). The ``outbox`` must be backed by the same engine — asserted below.
+        """
+        from keel_core.job_dispatch import PostgresJobDispatchOutbox
+
+        if isinstance(outbox, PostgresJobDispatchOutbox) and outbox._engine is not self._engine:
+            raise JobValidationError(
+                "dispatch_outbox_engine_mismatch",
+                "dispatch outbox must share the job store engine for atomicity",
+            )
+        timestamp = _normalized_utc_timestamp(now, field="now") if now is not None else _utcnow()
+        async with self._engine.begin() as conn:
+            record, created = await self._enqueue_once_in_conn(
+                conn,
+                kind=kind,
+                payload=payload,
+                target_session_id=target_session_id,
+                idempotency_key=idempotency_key,
+                max_attempts=max_attempts,
+                cancel_mode=cancel_mode,
+                now=timestamp,
+            )
+            # Same transaction as the insert — commits or rolls back as one unit. Idempotent on
+            # job_id, so a replayed admission (existing job) simply re-asserts the intent.
+            await record_job_intent_in_connection(
+                conn, record.id, record.scope_id, record.kind, now=timestamp
+            )
+        return record, created
+
+    async def _enqueue_once_in_conn(
+        self,
+        conn: AsyncConnection,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        target_session_id: str | None,
+        idempotency_key: str,
+        max_attempts: int,
+        cancel_mode: CancelMode = CancelMode.immediate,
+        now: datetime | None = None,
+    ) -> tuple[JobRecord, bool]:
         kind, idempotency_key = _validate_enqueue_fields(kind, idempotency_key, max_attempts)
         cancel_mode = _validated_cancel_mode(cancel_mode)
         timestamp = _normalized_utc_timestamp(now, field="now") if now is not None else _utcnow()
-        async with self._engine.begin() as conn:
-            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            await conn.execute(
-                text("SELECT pg_advisory_xact_lock(:lock_id)"),
-                {"lock_id": _job_dedupe_lock_id(self._scope_id, kind, idempotency_key)},
-            )
-            existing_sql = text(
-                "SELECT * FROM jobs WHERE scope_id = :scope "
-                "AND kind = :kind AND idempotency_key = :key"
-            )
-            dedupe_params = {
-                "scope": self._scope_id,
-                "kind": kind,
-                "key": idempotency_key,
-            }
-            existing = (await conn.execute(existing_sql, dedupe_params)).mappings().one_or_none()
-            if existing is not None:
-                return _to_job_record(existing), False
-
-            safe_payload = self._limits.validate_payload(payload)
-            safe_target_session_id = None
-            if target_session_id is not None:
-                safe_target_session_id = _validated_identity(
-                    target_session_id,
-                    field="target_session_id",
-                    code="invalid_target_session_id",
-                )
-                exists = (
-                    await conn.execute(
-                        text("SELECT 1 FROM sessions WHERE id = :session AND scope_id = :scope"),
-                        {"session": safe_target_session_id, "scope": self._scope_id},
-                    )
-                ).one_or_none()
-                if exists is None:
-                    raise JobValidationError(
-                        "target_session_not_found",
-                        "target session does not exist in the current scope",
-                    )
-            job_id = f"job_{uuid.uuid4().hex}"
-            inserted = (
-                (
-                    await conn.execute(
-                        text(
-                            "INSERT INTO jobs "
-                            "(id, scope_id, kind, payload, target_session_id, "
-                            "idempotency_key, max_attempts, cancel_mode, next_attempt_at, "
-                            "created_at, updated_at) VALUES "
-                            "(:id, :scope, :kind, CAST(:payload AS jsonb), :target, "
-                            ":key, :max_attempts, :cancel_mode, :now, :now, :now) "
-                            "ON CONFLICT (scope_id, kind, idempotency_key) DO NOTHING "
-                            "RETURNING *"
-                        ),
-                        {
-                            "id": job_id,
-                            "scope": self._scope_id,
-                            "kind": kind,
-                            "payload": json.dumps(safe_payload, ensure_ascii=False),
-                            "target": safe_target_session_id,
-                            "key": idempotency_key,
-                            "max_attempts": max_attempts,
-                            "cancel_mode": cancel_mode.value,
-                            "now": timestamp,
-                        },
-                    )
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if inserted is not None:
-                return _to_job_record(inserted), True
-            existing = (await conn.execute(existing_sql, dedupe_params)).mappings().one()
+        await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+        await conn.execute(
+            text("SELECT pg_advisory_xact_lock(:lock_id)"),
+            {"lock_id": _job_dedupe_lock_id(self._scope_id, kind, idempotency_key)},
+        )
+        existing_sql = text(
+            "SELECT * FROM jobs WHERE scope_id = :scope AND kind = :kind AND idempotency_key = :key"
+        )
+        dedupe_params = {
+            "scope": self._scope_id,
+            "kind": kind,
+            "key": idempotency_key,
+        }
+        existing = (await conn.execute(existing_sql, dedupe_params)).mappings().one_or_none()
+        if existing is not None:
             return _to_job_record(existing), False
+
+        safe_payload = self._limits.validate_payload(payload)
+        safe_target_session_id = None
+        if target_session_id is not None:
+            safe_target_session_id = _validated_identity(
+                target_session_id,
+                field="target_session_id",
+                code="invalid_target_session_id",
+            )
+            exists = (
+                await conn.execute(
+                    text("SELECT 1 FROM sessions WHERE id = :session AND scope_id = :scope"),
+                    {"session": safe_target_session_id, "scope": self._scope_id},
+                )
+            ).one_or_none()
+            if exists is None:
+                raise JobValidationError(
+                    "target_session_not_found",
+                    "target session does not exist in the current scope",
+                )
+        job_id = f"job_{uuid.uuid4().hex}"
+        inserted = (
+            (
+                await conn.execute(
+                    text(
+                        "INSERT INTO jobs "
+                        "(id, scope_id, kind, payload, target_session_id, "
+                        "idempotency_key, max_attempts, cancel_mode, next_attempt_at, "
+                        "created_at, updated_at) VALUES "
+                        "(:id, :scope, :kind, CAST(:payload AS jsonb), :target, "
+                        ":key, :max_attempts, :cancel_mode, :now, :now, :now) "
+                        "ON CONFLICT (scope_id, kind, idempotency_key) DO NOTHING "
+                        "RETURNING *"
+                    ),
+                    {
+                        "id": job_id,
+                        "scope": self._scope_id,
+                        "kind": kind,
+                        "payload": json.dumps(safe_payload, ensure_ascii=False),
+                        "target": safe_target_session_id,
+                        "key": idempotency_key,
+                        "max_attempts": max_attempts,
+                        "cancel_mode": cancel_mode.value,
+                        "now": timestamp,
+                    },
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if inserted is not None:
+            return _to_job_record(inserted), True
+        existing = (await conn.execute(existing_sql, dedupe_params)).mappings().one()
+        return _to_job_record(existing), False
 
     async def get(self, job_id: str) -> JobRecord | None:
         safe_job_id = _optional_read_identity(job_id, field="job_id", code="invalid_job_id")

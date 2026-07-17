@@ -36,6 +36,10 @@ from keel_core.identity import (
     OIDCVerifier,
     PostgresIdentityStore,
 )
+from keel_core.job_dispatch import (
+    JobDispatchOutbox,
+    PostgresJobDispatchOutbox,
+)
 from keel_core.jobs import (
     InMemoryJobStore,
     JobLimits,
@@ -89,6 +93,11 @@ logger = logging.getLogger("keel.server")
 
 _DURABLE_SCOPE = "web:local"
 
+# Bound the per-scope Knowledge service cache so a long-lived server that serves many distinct
+# per-Agent scopes cannot grow the map without limit. Scoped services hold no dedicated resources
+# (all share the process engine), so a coarse clear-on-full eviction is sufficient.
+_KNOWLEDGE_SERVICE_CACHE_MAX = 256
+
 
 def _build_job_store(
     engine: AsyncEngine | None,
@@ -138,6 +147,7 @@ def _build_knowledge_service(
     *,
     embedder: Embedder | None,
     dispatch_job: DispatchJob | None = None,
+    dispatch_outbox: JobDispatchOutbox | None = None,
 ) -> KnowledgeService | None:
     if engine is None:
         return None
@@ -159,6 +169,7 @@ def _build_knowledge_service(
         settings,
         searcher=searcher,
         dispatch_job=dispatch_job,
+        dispatch_outbox=dispatch_outbox,
         embedding_model=(None if embedder is None else embedder.model),
         embedding_dim=(None if embedder is None else embedder.dim),
     )
@@ -269,6 +280,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # worker reconciler can recover it from any scope (M3.6, finding 4). Only meaningful with a
     # shared Postgres substrate; None with in-memory/process-local stores.
     app.state.dispatch_outbox = PostgresRunDispatchOutbox(engine) if engine is not None else None
+    # Global cross-scope Knowledge/durable-job dispatch outbox (M3.6, finding 3): Knowledge job
+    # admission records a job's dispatch intent here (atomically with the job insert) so the
+    # worker's job reconciler can dispatch it from any per-Agent scope, and a document created in
+    # a per-Agent scope is actually indexed rather than orphaned. None with in-memory stores.
+    app.state.job_dispatch_outbox = (
+        PostgresJobDispatchOutbox(engine) if engine is not None else None
+    )
     app.state.jobs = _build_job_store(engine, _DURABLE_SCOPE, settings)
     execution_environment = build_service_execution_environment(
         settings,
@@ -354,7 +372,49 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.jobs,
         embedder=app.state.runtime.embedder,
         dispatch_job=_dispatch_knowledge_job,
+        dispatch_outbox=app.state.job_dispatch_outbox,
     )
+    # Per-request scoped Knowledge factory (M3.6, finding 3). An authenticated call derives its
+    # canonical ``agent:<org>/<agent>`` scope (or the non-cloud ``web:local`` local-preview scope)
+    # and this factory builds a KnowledgeService bound to exactly that scope — so no authenticated
+    # call ever touches a foreign scope's Knowledge (a singleton ``web:local`` service). All stores
+    # share the process engine (disposed at shutdown), so a bounded cache holds no extra resources;
+    # it only caps distinct-scope service objects. Knowledge mutation is enabled only when the
+    # queue + shared substrate exist so a document's ingest job is actually dispatched.
+    knowledge_cache: dict[str, KnowledgeService] = {}
+    knowledge_embedder = app.state.runtime.embedder
+    job_outbox = app.state.job_dispatch_outbox
+
+    def _knowledge_factory(scope_id: str) -> KnowledgeService | None:
+        if engine is None:
+            return None
+        cached = knowledge_cache.get(scope_id)
+        if cached is not None:
+            return cached
+        service = _build_knowledge_service(
+            engine,
+            scope_id,
+            settings,
+            _build_job_store(engine, scope_id, settings),
+            embedder=knowledge_embedder,
+            dispatch_job=_dispatch_knowledge_job,
+            dispatch_outbox=job_outbox,
+        )
+        if service is None:
+            return None
+        if len(knowledge_cache) >= _KNOWLEDGE_SERVICE_CACHE_MAX:
+            # Simple bounded eviction: drop the whole map rather than track LRU order; scoped
+            # services are cheap to rebuild (they hold no dedicated connections).
+            knowledge_cache.clear()
+        knowledge_cache[scope_id] = service
+        return service
+
+    app.state.knowledge_factory = _knowledge_factory
+    app.state.knowledge_cache = knowledge_cache
+    # Knowledge mutation (create/update/reindex/delete) needs a live queue + shared substrate so an
+    # ingest/delete job is actually dispatched to a worker (else the reconciler heals it). Readiness
+    # surfaces this so a load balancer can drain an instance that would silently orphan documents.
+    app.state.knowledge_mutation_enabled = engine is not None
     app.state.erasure = _build_erasure_service(
         engine,
         _DURABLE_SCOPE,
@@ -415,6 +475,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         yield
     finally:
+        cache = getattr(app.state, "knowledge_cache", None)
+        if isinstance(cache, dict):
+            cache.clear()  # scoped services share the engine disposed below; drop references
         await app.state.runtime.aclose()
         await redis_client.aclose()
         arq = getattr(app.state, "arq", None)
@@ -490,6 +553,19 @@ def create_app() -> FastAPI:
         checks["run_admission"] = "ready" if admission_ready else "degraded"
         if not admission_ready:
             ready = False
+
+        # Knowledge mutation (create/update/reindex/delete) enqueues a durable ingest/delete job
+        # that a worker must dispatch across scopes via the job-dispatch outbox. When Knowledge
+        # mutation is enabled the dispatch path requires both the global job outbox and a live
+        # queue; report degraded (503) so a load balancer drains an instance that would accept a
+        # document but never index it (finding 3).
+        if getattr(app.state, "knowledge_mutation_enabled", False):
+            dispatcher_ready = (
+                getattr(app.state, "job_dispatch_outbox", None) is not None and queue_ready
+            )
+            checks["knowledge_dispatch"] = "ready" if dispatcher_ready else "degraded"
+            if not dispatcher_ready:
+                ready = False
 
         body = ReadinessResponse(ready=ready, checks=checks)
         return JSONResponse(body.model_dump(), status_code=200 if ready else 503)
