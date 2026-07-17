@@ -64,7 +64,10 @@ implemented in Compose.
   `0011` adds a non-bypass `keel_runtime` role plus `FORCE ROW LEVEL SECURITY` on the
   connector token/outbox tables; connect as a `keel_runtime` member (not the owner) to make
   RLS a hard boundary. Extending `FORCE`/grants to the remaining scoped tables is pending.
-- There is no real sandbox service: shell execution occurs in the server/CLI process.
+- The authenticated `keel-sandbox` service boundary exists and server/worker wiring fails
+  closed when it is unavailable or unauthenticated, but Compose does not deploy it yet.
+  CLI shell is available only for a workspace validated as free of `.git`, `.env`, links,
+  and nested mounts.
 - Interactive runs and some approval state are process-local; server restarts can interrupt
   them.
 - OAuth CSRF state, IM webhook authentication/replay protection, and outbound-connector

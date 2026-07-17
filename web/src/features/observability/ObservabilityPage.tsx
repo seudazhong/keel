@@ -25,7 +25,7 @@ export function ObservabilityPage() {
       <Topbar
         title="Observability"
         sub="· 作用域内的用量与运行概览"
-        right={<Badge tone="violet">scope: personal · web:local</Badge>}
+        right={<Badge tone="violet">scope: personal</Badge>}
       />
       <div className="w-full max-w-[900px] p-[22px]">
         {isLoading && <Skeleton className="h-28" />}

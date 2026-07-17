@@ -30,7 +30,7 @@ export function SchedulesPage() {
       <Topbar
         title="Schedules"
         sub="· 定时与后台任务（interval / cron 触发）"
-        right={<Badge tone="violet">scope: personal · web:local</Badge>}
+        right={<Badge tone="violet">scope: personal</Badge>}
       />
       <div className="w-full max-w-[900px] p-[22px]">
         {isLoading && <Skeleton className="h-28" />}

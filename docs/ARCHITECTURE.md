@@ -16,7 +16,7 @@ The target architecture below remains useful, but these substitutions and gaps a
 |---|---|---|
 | Scope/identity | One hard-coded `web:local` scope; no users, organizations, or persisted Agents CRUD. | Local Agent profiles in M3.2, then user identity, single-organization-v1 membership, private personal Agents, and explicit team grants in [M3.6](./ROADMAP.md#m36--multi-user-identity-access-and-durable-run-topology). |
 | RLS | Scoped rows and RLS policies exist, but the runtime role owns the DB/schema and can bypass RLS. | Non-owner runtime role plus audited fail-closed isolation ([M3.3](./ROADMAP.md#m33--cloud-safety-foundation)). |
-| Execution | `ShellTool` executes in the server/CLI process; there is no deployed sandbox service. | Isolated execution backend with egress/path/capability controls (ADR-0005, M3.3). |
+| Execution | Server/worker tool wiring uses authenticated `keel-sandbox` RPC and fails closed without it; the CLI exposes shell only for a verified sanitized workspace. The sandbox container is not yet deployed by Compose. | Deploy and exercise the isolated executor with enforced mounts/egress (ADR-0005, M3.3). |
 | Runs/approvals | Interactive execution and some approvals are server-local/in-memory; durable unattended approvals and jobs exist. | Worker-owned durable interactive topology and restart-safe cross-surface approvals (M3.3/M3.6). |
 | Server/worker/scheduler | Server runs interactive turns; worker runs arq jobs and cron scheduling. `keel-scheduler` is a stub, not a separately elected service. | Durable worker ownership in M3.6; elected scheduler and scale-out validation in M3.8. |
 | Auth/secrets | Optional plaintext configured API keys; empty config means implicit admin. OAuth state is process-local. | Hashed/scoped machine credentials and durable connector OAuth state in M3.3; human identity/OIDC in M3.6. |
@@ -142,8 +142,8 @@ Each decision lists the choice, why, and the main alternative rejected. Deeper r
 - **Target topology:** `keel-server` is stateless and horizontally scalable; it admits runs
   and streams events while `keel-worker` owns execution, `keel-scheduler` is
   singleton-by-election, and `keel-sandbox` isolates dangerous tools. **Current fidelity:**
-  interactive runs and shell execution remain in the server process, worker cron performs
-  scheduling, and no sandbox service is deployed.
+  server/worker execution is wired through authenticated sandbox RPC and fails closed, but
+  the sandbox container is not deployed by Compose; worker cron still performs scheduling.
 
 ### 3.3 Components inside `keel-core` (level 3)
 ```
@@ -389,8 +389,9 @@ hardening, and Tauri remain targets.
 - **Approval target [G5]:** one durable pending store and TTL applies identically across
   CLI/Web/IM. Durable unattended approvals exist; interactive approval/run state is still
   process-local.
-- **Sandbox target [P5]:** isolated executor container plus command policy. Current
-  `ShellTool` executes in process, so the target sandbox claims are not yet satisfied.
+- **Sandbox target [P5]:** the typed environment, authenticated/replay-protected RPC boundary,
+  sanitized-workspace admission, and fail-closed service wiring exist. Production still must
+  deploy the executor container with the documented mount and egress invariants.
 - **Egress/paths:** SSRF-safe fetch; workspace-only file access; deny `.git`/`.env`/secrets; artifact path-traversal guard.
 - **Secrets [G9]:** app-level **envelope encryption** — a per-record data key encrypts each secret and is wrapped by a **master key** sourced from env/Docker secret (v1), pluggable to Vault/KMS; keys never ship in images and a rotation procedure is documented. `connections`/`config` hold secret *refs*; values are redacted in logs & telemetry; `.env` is secrets-only.
 - **Trust-gating:** untrusted IM/web content confined to a safe toolset; project skills/MCP gated on trust; **import ≠ trust** (MCP allow-list) [P6].

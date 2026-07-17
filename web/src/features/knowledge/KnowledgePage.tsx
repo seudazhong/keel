@@ -320,7 +320,7 @@ export function KnowledgePage() {
       <Topbar
         title="Knowledge"
         sub="· Manage scoped knowledge bases, documents, and retrieval"
-        right={<Badge tone="violet">scope: personal · web:local</Badge>}
+        right={<Badge tone="violet">scope: personal</Badge>}
       />
       <div className="space-y-4 p-[22px]">
         {boundedError(bases.isError || documents.isError || detail.isError || job.isError || mutationFailed)}

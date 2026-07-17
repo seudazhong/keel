@@ -40,6 +40,8 @@ from keel_core.tools import (
     LsTool,
     ReadTool,
     ShellTool,
+    UnsafeLocalDevExecutionEnvironment,
+    WorkspacePathPolicy,
     WriteTool,
 )
 from keel_core.tools.executor import ApproveFn
@@ -51,19 +53,35 @@ Writer = Callable[[str], None]
 # asks via an approver). ``--allow-all`` swaps in a permissive engine.
 _READ_ONLY = ("read", "ls", "glob", "grep")
 _MUTATING = ("write", "edit", "shell")
+SHELL_DISABLED_MESSAGE = (
+    "shell disabled: workspace does not satisfy the sanitized execution contract "
+    "(.git/.env, links, nested mounts, or validation failure); file tools remain available"
+)
 
 
-def build_tools(workspace: Path) -> list[Any]:
-    """Instantiate the built-in toolset confined to ``workspace``."""
-    return [
-        ReadTool(workspace),
-        WriteTool(workspace),
-        EditTool(workspace),
-        LsTool(workspace),
-        GlobTool(workspace),
-        GrepTool(workspace),
-        ShellTool(workspace),
+def build_tools(workspace: Path, *, write_notice: Writer | None = None) -> list[Any]:
+    """Instantiate tools, advertising shell only for a verified sanitized workspace."""
+    try:
+        shell_enabled = WorkspacePathPolicy(workspace).is_sanitized_for_shell()
+    except OSError:
+        shell_enabled = False
+    environment = UnsafeLocalDevExecutionEnvironment(
+        workspace,
+        shell_workspace_provisioned=shell_enabled,
+    )
+    tools: list[Any] = [
+        ReadTool(environment),
+        WriteTool(environment),
+        EditTool(environment),
+        LsTool(environment),
+        GlobTool(environment),
+        GrepTool(environment),
     ]
+    if shell_enabled:
+        tools.append(ShellTool(environment))
+    elif write_notice is not None:
+        write_notice(f"  ! {SHELL_DISABLED_MESSAGE}\n")
+    return tools
 
 
 def default_permissions() -> RuleBasedPermissionEngine:
@@ -195,14 +213,14 @@ def build_session(
 ) -> ChatSession:
     """Assemble a :class:`ChatSession` from CLI options."""
     scope = Scope(id=scope_id, kind=ScopeKind.personal, trust=TrustLevel.trusted)
+    tools = build_tools(workspace, write_notice=write_meta)
     agent = AgentSpec(
         id="cli",
         name="Keel CLI",
         model=model,
         scope=scope,
-        toolset=list(_READ_ONLY + _MUTATING),
+        toolset=[tool.name for tool in tools],
     )
-    tools = build_tools(workspace)
     permissions = allow_all_permissions() if allow_all else default_permissions()
     return ChatSession(
         agent=agent,

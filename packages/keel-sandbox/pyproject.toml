@@ -1,11 +1,16 @@
 [project]
 name = "keel-sandbox"
 version = "0.0.0"
-description = "Keel sandbox executor image and agent (stub; lands in M1)."
+description = "Keel isolated executor service boundary."
 requires-python = ">=3.12"
 dependencies = [
     "keel-core",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
 ]
+
+[project.scripts]
+keel-sandbox = "keel_sandbox.__main__:main"
 
 [build-system]
 requires = ["hatchling"]
