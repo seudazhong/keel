@@ -285,11 +285,31 @@ async def startup(ctx: dict[str, Any]) -> None:
     )
     ctx["embedder"] = embedder
     ctx["knowledge"] = knowledge
-    ctx["job_registry"] = knowledge_job_registry(
+    job_registry = knowledge_job_registry(
         cast(KnowledgeStore, knowledge),
         embedder,
         settings,
     )
+
+    # Durable data-erasure coordinator + job (M3.5). Bounded Redis stream cleanup uses the
+    # worker's Redis connection; external provider/telemetry deletion has no API and is
+    # recorded as an incomplete step so a request finishes 'partial', never 'completed'.
+    from keel_core.lifecycle.coordinator import ErasureCoordinator, UnsupportedExternalStep
+    from keel_core.lifecycle.redis import RedisLifecycleCleaner
+    from keel_core.lifecycle.store import PostgresErasureStore
+    from keel_worker.lifecycle import register_erasure_jobs
+
+    erasure_coordinator = ErasureCoordinator(
+        engine,
+        PostgresErasureStore(engine, _DURABLE_SCOPE),
+        redis_cleaner=RedisLifecycleCleaner(redis),
+        external_steps=[UnsupportedExternalStep("provider_telemetry")],
+    )
+    ctx["erasure_coordinator"] = erasure_coordinator
+    register_erasure_jobs(
+        job_registry, erasure_coordinator, lease_seconds=settings.job_lease_seconds
+    )
+    ctx["job_registry"] = job_registry
 
     async def enqueue(name: str, *args: object, **options: object) -> None:
         await _enqueue_arq(redis, name, *args, **options)

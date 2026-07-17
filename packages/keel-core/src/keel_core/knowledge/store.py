@@ -4624,4 +4624,46 @@ class PostgresKnowledgeStore:
             return record
 
 
-__all__ = ["InMemoryKnowledgeStore", "KnowledgeStore", "PostgresKnowledgeStore"]
+async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
+    """Erase all Knowledge data for a scope (bases, documents, versions, chunks, dedup).
+
+    Physical deletion in FK-safe order: chunks -> null out the document<->version
+    self-references -> versions -> documents -> bases -> idempotency ledger. Idempotent;
+    returns the total rows removed. The erasure coordinator calls this instead of the
+    soft-delete (status) flows so no residual embeddings/content survive.
+    """
+    async with engine.begin() as conn:
+        await conn.execute(_PG_SET_SCOPE, {"scope": scope_id})
+        total = 0
+        chunks = await conn.execute(
+            text("DELETE FROM kb_chunks WHERE scope_id = :scope"), {"scope": scope_id}
+        )
+        total += int(chunks.rowcount or 0)
+        # Break the kb_documents <-> kb_document_versions circular FK before deleting.
+        await conn.execute(
+            text(
+                "UPDATE kb_documents SET desired_version_id = NULL, active_version_id = NULL "
+                "WHERE scope_id = :scope"
+            ),
+            {"scope": scope_id},
+        )
+        versions = await conn.execute(
+            text("DELETE FROM kb_document_versions WHERE scope_id = :scope"), {"scope": scope_id}
+        )
+        total += int(versions.rowcount or 0)
+        documents = await conn.execute(
+            text("DELETE FROM kb_documents WHERE scope_id = :scope"), {"scope": scope_id}
+        )
+        total += int(documents.rowcount or 0)
+        bases = await conn.execute(
+            text("DELETE FROM knowledge_bases WHERE scope_id = :scope"), {"scope": scope_id}
+        )
+        total += int(bases.rowcount or 0)
+        dedup = await conn.execute(
+            text("DELETE FROM knowledge_idempotency WHERE scope_id = :scope"), {"scope": scope_id}
+        )
+        total += int(dedup.rowcount or 0)
+    return total
+
+
+__all__ = ["InMemoryKnowledgeStore", "KnowledgeStore", "PostgresKnowledgeStore", "purge_scope"]

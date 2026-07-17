@@ -654,6 +654,38 @@ def test_failed_fetch_leaves_authoritative_refs_unchanged(tmp_path: Path) -> Non
     assert all("--atomic" in call for call in fetch_calls)
 
 
+def test_purge_project_erases_every_on_disk_trace_and_preserves_others(tmp_path: Path) -> None:
+    storage = _storage(tmp_path)
+    storage.create_project(project_id("alpha"))
+    storage.create_project(project_id("beta"))
+    artifacts = LocalArtifactStore(storage)
+    artifacts.put(project_id("alpha"), run_id("run-1"), b"a", name="a.patch")
+    artifacts.put(project_id("beta"), run_id("run-1"), b"b", name="b.patch")
+    # Residual snapshot + worktree state for alpha (confined under the storage roots).
+    for root in (storage.snapshots_root, storage.worktrees_root):
+        (root / "alpha").mkdir(parents=True, exist_ok=True)
+        (root / "alpha" / "residual").write_text("x", encoding="utf-8")
+
+    alpha_paths = (
+        storage.projects_root / "alpha.git",
+        storage.snapshots_root / "alpha",
+        storage.worktrees_root / "alpha",
+        storage.artifacts_root / "alpha",
+    )
+    assert all(path.exists() for path in alpha_paths)
+
+    assert storage.purge_project(project_id("alpha")) is True
+    assert not any(path.exists() for path in alpha_paths)
+    # A repeat purge is idempotent: nothing left to remove.
+    assert storage.purge_project(project_id("alpha")) is False
+    # A purge of an absent project is a no-op, never an error.
+    assert storage.purge_project(project_id("never")) is False
+
+    # Cross-project data is untouched.
+    assert (storage.projects_root / "beta.git").exists()
+    assert (storage.artifacts_root / "beta").exists()
+
+
 def test_local_object_store_has_s3_shaped_keys_but_confines_paths(tmp_path: Path) -> None:
     objects = LocalObjectStore(tmp_path / "objects", max_object_bytes=5)
     assert isinstance(objects, ObjectStore)

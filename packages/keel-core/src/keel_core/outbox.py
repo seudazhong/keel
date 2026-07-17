@@ -21,6 +21,17 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 
 
+async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
+    """Erase every outbound-idempotency claim for a scope (idempotent)."""
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        result = await conn.execute(
+            text("DELETE FROM connector_outbox WHERE scope_id = :scope"),
+            {"scope": scope_id},
+        )
+    return int(result.rowcount or 0)
+
+
 @dataclass(frozen=True)
 class Claim:
     """The outcome of attempting to claim an idempotency key.

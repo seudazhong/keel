@@ -151,6 +151,250 @@
         "title": "CreateMessageResponse",
         "type": "object"
       },
+      "ErasureRequestBody": {
+        "description": "Submit an erasure request for a scope, a session, or a coding project.",
+        "properties": {
+          "idempotency_key": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "maxLength": 1000,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "target_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Id"
+          },
+          "target_kind": {
+            "$ref": "#/components/schemas/ErasureTargetKind",
+            "default": "scope"
+          }
+        },
+        "required": [
+          "idempotency_key"
+        ],
+        "title": "ErasureRequestBody",
+        "type": "object"
+      },
+      "ErasureRequestResponse": {
+        "properties": {
+          "attempts": {
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "completed_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completed At"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "external_incomplete": {
+            "title": "External Incomplete",
+            "type": "boolean"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "requested_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested By"
+          },
+          "scope_id": {
+            "title": "Scope Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "target_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Target Id"
+          },
+          "target_kind": {
+            "title": "Target Kind",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "id",
+          "scope_id",
+          "target_kind",
+          "target_id",
+          "status",
+          "external_incomplete",
+          "attempts",
+          "requested_by",
+          "reason",
+          "created_at",
+          "updated_at",
+          "completed_at"
+        ],
+        "title": "ErasureRequestResponse",
+        "type": "object"
+      },
+      "ErasureStatus": {
+        "description": "Lifecycle of an erasure request.",
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "partial",
+          "failed"
+        ],
+        "title": "ErasureStatus",
+        "type": "string"
+      },
+      "ErasureStatusResponse": {
+        "properties": {
+          "job_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Job Id"
+          },
+          "request": {
+            "$ref": "#/components/schemas/ErasureRequestResponse"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/ErasureStepResponse"
+            },
+            "title": "Steps",
+            "type": "array"
+          }
+        },
+        "required": [
+          "request",
+          "steps"
+        ],
+        "title": "ErasureStatusResponse",
+        "type": "object"
+      },
+      "ErasureStepResponse": {
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "rows_affected": {
+            "title": "Rows Affected",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "step": {
+            "title": "Step",
+            "type": "string"
+          }
+        },
+        "required": [
+          "step",
+          "status",
+          "rows_affected",
+          "detail"
+        ],
+        "title": "ErasureStepResponse",
+        "type": "object"
+      },
+      "ErasureTargetKind": {
+        "description": "The granularity of an erasure request.",
+        "enum": [
+          "scope",
+          "session",
+          "project"
+        ],
+        "title": "ErasureTargetKind",
+        "type": "string"
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -1605,6 +1849,194 @@
         "summary": "Revoke a connector's stored token",
         "tags": [
           "v1"
+        ]
+      }
+    },
+    "/v1/erasure/requests": {
+      "get": {
+        "operationId": "list_erasure_requests_v1_erasure_requests_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/ErasureStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ErasureRequestResponse"
+                  },
+                  "title": "Response List Erasure Requests V1 Erasure Requests Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List erasure requests for the scope",
+        "tags": [
+          "erasure"
+        ]
+      },
+      "post": {
+        "operationId": "submit_erasure_v1_erasure_requests_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ErasureRequestBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErasureStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Submit a data-erasure request (scope/session/project)",
+        "tags": [
+          "erasure"
+        ]
+      }
+    },
+    "/v1/erasure/requests/{request_id}": {
+      "get": {
+        "operationId": "get_erasure_request_v1_erasure_requests__request_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErasureStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get an erasure request's status + step ledger",
+        "tags": [
+          "erasure"
+        ]
+      }
+    },
+    "/v1/erasure/requests/{request_id}/retry": {
+      "post": {
+        "operationId": "retry_erasure_request_v1_erasure_requests__request_id__retry_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "request_id",
+            "required": true,
+            "schema": {
+              "title": "Request Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErasureStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Retry a failed/partial erasure request",
+        "tags": [
+          "erasure"
         ]
       }
     },

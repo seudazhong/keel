@@ -16,6 +16,32 @@ logger = logging.getLogger("keel.core.recall")
 
 RecallMode = Literal["hybrid", "lexical", "lexical-degraded"]
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
+
+
+async def purge_scope(engine: AsyncEngine, scope_id: ScopeId) -> int:
+    """Erase every message-embedding projection row for a scope (idempotent)."""
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        result = await conn.execute(
+            text("DELETE FROM message_embeddings WHERE scope_id = :scope"),
+            {"scope": scope_id},
+        )
+    return int(result.rowcount or 0)
+
+
+async def purge_session(engine: AsyncEngine, scope_id: ScopeId, session_id: SessionId) -> int:
+    """Erase message-embedding rows for one session in a scope (idempotent)."""
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        result = await conn.execute(
+            text(
+                "DELETE FROM message_embeddings WHERE scope_id = :scope AND session_id = :session"
+            ),
+            {"scope": scope_id, "session": session_id},
+        )
+    return int(result.rowcount or 0)
+
+
 _INSERT_EMBEDDING = text(
     "INSERT INTO message_embeddings "
     "(event_id, scope_id, session_id, seq, role, content, model, dim, embedding) "

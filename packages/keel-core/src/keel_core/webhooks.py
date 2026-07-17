@@ -28,6 +28,19 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+async def purge_all(engine: AsyncEngine) -> int:
+    """Erase every webhook replay record (GLOBAL, not scope-bound).
+
+    ``webhook_deliveries`` is a global dedup ledger keyed by ``(provider, delivery_id)``
+    with no ``scope_id`` and no personal content. Scope erasure deliberately preserves it
+    (shared configuration); this global purge exists for operator housekeeping / a full
+    teardown only. Returns rows removed.
+    """
+    async with engine.begin() as conn:
+        result = await conn.execute(text("DELETE FROM webhook_deliveries"))
+    return int(result.rowcount or 0)
+
+
 def verify_onebot_signature(secret: str, body: bytes, signature: str | None) -> bool:
     """Verify a OneBot ``X-Signature: sha1=<hex>`` HMAC over the raw request body.
 

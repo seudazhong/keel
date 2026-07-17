@@ -52,6 +52,40 @@ class InMemoryEventStore:
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 
 
+async def purge_scope(engine: AsyncEngine, scope_id: ScopeId) -> int:
+    """Erase every event + session for a scope (idempotent). Returns rows removed.
+
+    ``message_embeddings`` cascades from ``events`` (ON DELETE CASCADE); the erasure
+    coordinator also purges it explicitly first so a session-scoped erase is exact.
+    """
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        events = await conn.execute(
+            text("DELETE FROM events WHERE scope_id = :scope"),
+            {"scope": scope_id},
+        )
+        sessions = await conn.execute(
+            text("DELETE FROM sessions WHERE scope_id = :scope"),
+            {"scope": scope_id},
+        )
+    return int(events.rowcount or 0) + int(sessions.rowcount or 0)
+
+
+async def purge_session(engine: AsyncEngine, scope_id: ScopeId, session_id: SessionId) -> int:
+    """Erase one session's events + session row within a scope (idempotent)."""
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        events = await conn.execute(
+            text("DELETE FROM events WHERE scope_id = :scope AND session_id = :session"),
+            {"scope": scope_id, "session": session_id},
+        )
+        sessions = await conn.execute(
+            text("DELETE FROM sessions WHERE scope_id = :scope AND id = :session"),
+            {"scope": scope_id, "session": session_id},
+        )
+    return int(events.rowcount or 0) + int(sessions.rowcount or 0)
+
+
 async def append_event_in_transaction(
     conn: AsyncConnection,
     event: Event,

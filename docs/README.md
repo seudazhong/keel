@@ -21,6 +21,7 @@ which are retained as historical design evidence.
 | [Demo](./DEMO.md) | Safe 10–15 minute Windows demo, including stale-stack and rebuild paths. |
 | [Usage](./USAGE.md) | Current CLI, server API, minimal web UI, React UI, and connector usage. |
 | [Operations](./OPERATIONS.md) | Compose lifecycle, health checks, configuration, safety, backup caveats, and troubleshooting. |
+| [Data lifecycle](./DATA-LIFECYCLE.md) | Retention defaults, the data map, and the operator erasure runbook + recovery/verification procedure. |
 | [Development](./DEVELOPMENT.md) | Workspace setup, tests, lint/type checks, React development, and documentation validation. |
 
 Repository-specific notes also live in

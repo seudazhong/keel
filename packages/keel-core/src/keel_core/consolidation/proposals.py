@@ -23,6 +23,17 @@ from keel_core.consolidation.hashing import consolidation_idempotency_key
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 
 
+async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
+    """Erase every core-memory proposal for a scope (idempotent)."""
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        result = await conn.execute(
+            text("DELETE FROM memory_proposals WHERE scope_id = :scope"),
+            {"scope": scope_id},
+        )
+    return int(result.rowcount or 0)
+
+
 class ProposalOutcome(StrEnum):
     """The result of resolving a proposal."""
 

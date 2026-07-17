@@ -32,6 +32,20 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
+async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
+    """Erase every pending OAuth CSRF state minted for a scope (idempotent).
+
+    ``oauth_states`` is keyed by the random state (not scope-partitioned), but each row
+    records the ``scope_id`` it was minted for, so scope erasure can drop them by scope.
+    """
+    async with engine.begin() as conn:
+        result = await conn.execute(
+            text("DELETE FROM oauth_states WHERE scope_id = :scope"),
+            {"scope": scope_id},
+        )
+    return int(result.rowcount or 0)
+
+
 class InMemoryOAuthStateStore:
     """Non-durable one-time state store (tests / lite profile)."""
 

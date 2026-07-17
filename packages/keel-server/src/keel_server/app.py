@@ -40,6 +40,7 @@ from keel_core.providers import LiteLLMGateway
 from keel_core.webhooks import InMemoryWebhookReplayStore, PostgresWebhookReplayStore
 from keel_server.api import gateway as gateway_api
 from keel_server.api import knowledge as knowledge_api
+from keel_server.api import lifecycle as lifecycle_api
 from keel_server.api import oauth as oauth_api
 from keel_server.api import v1
 from keel_server.auth import parse_api_keys
@@ -65,6 +66,31 @@ def _build_job_store(
 
 async def _enqueue_arq(pool: Any, name: str, *args: object, **options: object) -> None:
     await pool.enqueue_job(name, *args, **options)
+
+
+def _build_erasure_service(
+    engine: AsyncEngine | None,
+    scope_id: str,
+    jobs: JobStore,
+    *,
+    redis_client: Any,
+    dispatch_job: Any,
+) -> Any:
+    """Build the scope-bound erasure admission service (None in the lite/memory profile)."""
+    if engine is None:
+        return None
+    from keel_core.lifecycle.coordinator import ErasureCoordinator, UnsupportedExternalStep
+    from keel_core.lifecycle.redis import RedisLifecycleCleaner
+    from keel_core.lifecycle.service import ErasureService
+    from keel_core.lifecycle.store import PostgresErasureStore
+
+    coordinator = ErasureCoordinator(
+        engine,
+        PostgresErasureStore(engine, scope_id),
+        redis_cleaner=RedisLifecycleCleaner(redis_client),
+        external_steps=[UnsupportedExternalStep("provider_telemetry")],
+    )
+    return ErasureService(coordinator, jobs, dispatch_job=dispatch_job)
 
 
 def _build_knowledge_service(
@@ -186,6 +212,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         embedder=app.state.runtime.embedder,
         dispatch_job=_dispatch_knowledge_job,
     )
+    app.state.erasure = _build_erasure_service(
+        engine,
+        _DURABLE_SCOPE,
+        app.state.jobs,
+        redis_client=redis_client,
+        dispatch_job=_dispatch_knowledge_job,
+    )
     # OneBot IM gateway (optional): only wired when an API base is configured.
     if settings.onebot_api_base:
         app.state.onebot_gateway = OneBotGateway(
@@ -271,6 +304,7 @@ def create_app() -> FastAPI:
 
     app.include_router(v1.router)
     app.include_router(knowledge_api.router)
+    app.include_router(lifecycle_api.router)
     app.include_router(oauth_api.router)
     app.include_router(gateway_api.router)
     app.include_router(pages_router)
