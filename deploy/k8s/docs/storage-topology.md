@@ -14,7 +14,7 @@ storage rows are dormant templates for the not-yet-implemented managed-code-proj
 | **Active Git repository** | mutable bare repo: objects, refs, packfiles | `base/datastores/git-pvc.example.yaml` | **dormant — not mounted by any Deployment; no app config references it** | authoritative active state; back up regularly, once real | lives with the project; serialized maintenance/GC |
 | **Git snapshots/backups** | immutable bundles/snapshots | object storage (`base/datastores/objectstorage-secret.example.yaml`) | **dormant — no app config references an object-storage endpoint today** | durable recovery copy, not directly mutated | versioned/retained by policy |
 | **Working volume (worktree)** | one writable checkout + build outputs, per run | sandbox Job's `emptyDir` (`base/sandbox/job-template.yaml`) | dormant along with the Job template itself (see `docs/security-model.md` "Sandbox Job creation is not wired up") | **disposable** | created per run; reclaimed on run end; hard TTL (`activeDeadlineSeconds`) |
-| **Server/worker tool workspace** | `ShellTool`/file-tool scratch for today's in-process execution | `base/server/deployment.yaml` `emptyDir` at `/workspace` | **active** — this is real, and distinct from the Git/object storage rows above | disposable | Pod lifetime |
+| **Server/worker tool workspace** | `AgentRuntime`/execution-environment scratch (`Path.cwd()`-based; see `docs/security-model.md` "Isolation levels" for the `keel-sandbox` RPC default vs. the in-process opt-out) | `base/server/deployment.yaml` `emptyDir` at `/workspace` | **active** — this is real, and distinct from the Git/object storage rows above | disposable | Pod lifetime |
 | **Spilled tool output / artifacts** | large tool output, diffs, build reports | object storage | dormant (see above) | scoped, purgeable (retention_class) | per-run/per-artifact |
 
 ## Why no in-cluster Postgres/Redis StatefulSet ships here
@@ -84,10 +84,12 @@ access keys where your cloud provider supports it — see the comment in
 
 Distinct from the dormant Git/object storage above: `base/server/deployment.yaml` mounts a
 real, active `emptyDir` at `/workspace` and sets `workingDir: /workspace` so keel-server's
-`ShellTool`/file-tool scratch space (today's in-process execution;
-`packages/keel-server/src/keel_server/app.py` defaults it to `Path.cwd()`) has somewhere
-writable to use that is not the read-only `/app` source tree. This is disposable, Pod-lifetime
-scratch — it is not durable storage and is unrelated to the Git PVC.
+`AgentRuntime` workspace and execution-environment fallback (both default to `Path.cwd()`,
+`packages/keel-server/src/keel_server/app.py`) have somewhere writable to use that is not the
+read-only `/app` source tree — whether tool calls are routed through the default
+`keel-sandbox` RPC client or the explicit `unsafe-local-dev` opt-out (see
+`docs/security-model.md` "Isolation levels"). This is disposable, Pod-lifetime scratch — it is
+not durable storage and is unrelated to the Git PVC.
 
 ## Encryption
 

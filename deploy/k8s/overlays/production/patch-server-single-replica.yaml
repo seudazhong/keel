@@ -7,6 +7,12 @@
 # losing it. Raise this only once durable interactive run/approval coordination
 # (M3.3 "Cloud Safety Foundation" exit gate: "Server restart does not lose an admitted run or
 # pending approval") is implemented and this base's Deployment default reflects it.
+#
+# This patch only re-asserts `replicas: 1`; it does not need to (and must not) touch
+# `spec.strategy` — the production overlay inherits base/server/deployment.yaml's
+# `strategy: Recreate` unpatched, so old and new keel-server Pods are never scheduled at
+# once in production either. `scripts/validate_manifests.py` and
+# tests/unit/test_deploy_k8s_manifests.py verify both properties on the rendered overlay.
 - op: replace
   path: /spec/replicas
   value: 1

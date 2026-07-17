@@ -31,12 +31,14 @@ it does not by itself satisfy the hostile multi-tenant gates in
 2. **Fill in placeholders:**
    - `base/secret-app.example.yaml` → copy to `secret-app.yaml` (your overlay, not this repo).
      **Set a real, non-empty `KEEL_API_KEYS`** with at least one valid `key:role` entry (role
-     one of `viewer`/`operator`/`admin`) — empty/missing/malformed means every request is
-     treated as an implicit, unauthenticated admin (`packages/keel-core/src/keel_core/config.py`
-     `api_keys`; format matches `packages/keel-server/src/keel_server/auth.py`
-     `parse_api_keys`). Fill the rest of the real values or point an external-secret operator
-     at this name/shape. Leave `KEEL_CLOUD_MODE: "true"` in `base/configmap-app.yaml`
-     unchanged — do not set it to `"false"`.
+     one of `viewer`/`operator`/`admin`) — empty/missing/malformed leaves `parse_api_keys`
+     with no valid entries, and with `KEEL_CLOUD_MODE: "true"` forced below, that makes every
+     request fail **closed** with 503 (`Settings.cloud_mode` / `app.state.auth_required`,
+     `packages/keel-core/src/keel_core/config.py`; format matches
+     `packages/keel-server/src/keel_server/auth.py` `parse_api_keys`) rather than falling back
+     to the local implicit-admin open mode. Fill the rest of the real values or point an
+     external-secret operator at this name/shape. Leave `KEEL_CLOUD_MODE: "true"` in
+     `base/configmap-app.yaml` unchanged — do not set it to `"false"`.
    - `base/datastores/postgres-external-service.example.yaml` /
      `redis-external-service.example.yaml` → copy, set the real `externalName` (or replace
      with your operator's Service if self-hosting in-cluster).

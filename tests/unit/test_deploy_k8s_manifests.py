@@ -16,6 +16,8 @@ from pathlib import Path
 
 import pytest
 
+from keel_server.auth import parse_api_keys
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VALIDATOR_PATH = REPO_ROOT / "deploy" / "k8s" / "scripts" / "validate_manifests.py"
 
@@ -148,6 +150,8 @@ def test_server_pinned_to_single_replica_in_base_and_production() -> None:
         encoding="utf-8"
     )
     assert "replicas: 1" in server
+    assert "strategy:" in server
+    assert "type: Recreate" in server
 
     production_patch = (
         REPO_ROOT
@@ -163,6 +167,30 @@ def test_server_pinned_to_single_replica_in_base_and_production() -> None:
         REPO_ROOT / "deploy" / "k8s" / "overlays" / "production" / "kustomization.yaml"
     ).read_text(encoding="utf-8")
     assert "patch-server-single-replica.yaml" in production_kustomization
+
+
+def test_server_rollout_strategy_never_overlaps_old_and_new_pods(
+    validator: types.ModuleType,
+) -> None:
+    """`replicas: 1` alone does not prevent overlap: Kubernetes' default `RollingUpdate`
+    strategy still surges a new Pod up before removing the old one even at a single replica.
+    This must be caught in the base manifest text and in the rendered base/production
+    Kustomize output alike.
+    """
+    findings: list[str] = []
+    validator.check_server_single_instance_rollout(findings)
+    hard_failures = [f for f in findings if not f.startswith("SKIPPED")]
+    assert not hard_failures, "\n".join(hard_failures)
+
+    assert validator._non_overlapping_strategy({"type": "Recreate"})
+    assert validator._non_overlapping_strategy(
+        {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": 0, "maxUnavailable": 1}}
+    )
+    assert not validator._non_overlapping_strategy(None)
+    assert not validator._non_overlapping_strategy({"type": "RollingUpdate"})
+    assert not validator._non_overlapping_strategy(
+        {"type": "RollingUpdate", "rollingUpdate": {"maxSurge": "25%"}}
+    )
 
 
 def test_cloud_mode_forced_true_and_api_keys_have_valid_role(
@@ -195,3 +223,39 @@ def test_api_key_format_check_never_leaks_key_material(validator: types.ModuleTy
     validator.check_auth_secret_required(findings)
     for finding in findings:
         assert "supersecretvalue123" not in finding
+
+
+def test_validator_key_shape_check_matches_real_parse_api_keys(
+    validator: types.ModuleType,
+) -> None:
+    """The validator's syntactic `key:role` shape check
+    (``validate_manifests._has_valid_key_role_entry``) is a lightweight mirror of the real
+    parser, ``keel_server.auth.parse_api_keys`` — it must accept/reject the same raw
+    `KEEL_API_KEYS` shapes so the two cannot silently drift apart (the validator passing a
+    template shape the real server would treat as entirely empty, or vice versa). This uses
+    only synthetic placeholder values and asserts solely on the boolean outcome, so no key
+    material is ever included in a test failure message.
+    """
+    accepted_and_rejected_shapes = [
+        "adm:admin",
+        "op:operator,vw:viewer",
+        "adm:admin, op:operator ,vw:VIEWER,bad:notarole,, norole",
+        "",
+        "   ",
+        "noColonAtAll",
+        "onlyrole:",
+        ":admin",
+        "key:notarole",
+        ",,,",
+        "a:b:role",
+        "key1:admin,key2:bogus,key3:operator",
+        " KEY:ADMIN ",
+    ]
+    for raw in accepted_and_rejected_shapes:
+        validator_accepts = validator._has_valid_key_role_entry(raw)
+        parser_accepts = bool(parse_api_keys(raw))
+        assert validator_accepts == parser_accepts, (
+            "validator._has_valid_key_role_entry and keel_server.auth.parse_api_keys "
+            "disagree on whether a KEEL_API_KEYS shape is accepted "
+            f"(validator={validator_accepts}, parser={parser_accepts})"
+        )

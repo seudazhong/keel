@@ -37,10 +37,15 @@ What this checks (see docs/security-model.md for the rationale behind each rule)
          (`key:role`, role one of viewer/operator/admin) `KEEL_API_KEYS` entry (without ever
          logging the key material itself), `base/configmap-app.yaml` never sets that key
          (auth must come from an externally supplied Secret, never a default-empty/open-admin
-         config), and the active config forces `KEEL_CLOUD_MODE: "true"` so fail-closed auth
-         is the shipped default even before that setting is consumed by application code;
+         config), and the active config forces `KEEL_CLOUD_MODE: "true"`, which is consumed by
+         application code (``Settings.cloud_mode`` / ``app.state.auth_required``) so
+         fail-closed auth is the shipped, active default;
        - keel-server's tool workspace (`workingDir`) is never the read-only `/app` source
          tree, and is backed by a real writable volume mount;
+       - keel-server stays at `replicas: 1` with a non-overlapping rollout `strategy`
+         (`Recreate`, or `RollingUpdate` with `maxSurge: 0`) in both the base manifest text and
+         the rendered base/production Kustomize output, so an old and new keel-server Pod are
+         never scheduled at once during an upgrade;
        - the sandbox ServiceAccount and Job template disable ServiceAccount token automount
          and are never given a Role/RoleBinding;
        - the sandbox Job template never mounts the durable Git PVC and never sets
@@ -268,6 +273,110 @@ def check_workload_hardening(findings: list[Finding]) -> None:
             )
 
 
+def _non_overlapping_strategy(strategy: dict[str, Any] | None) -> bool:
+    """True if a Deployment rollout strategy can never run an old and new Pod together.
+
+    Kubernetes' default (unset) `RollingUpdate` strategy uses 25% `maxSurge`/`maxUnavailable`,
+    which rounds `maxSurge` up to 1 even at a single replica — the new Pod is started *before*
+    the old one is removed, so both run concurrently mid-rollout. `Recreate` (terminate then
+    create) never does this. An explicit `RollingUpdate` with `maxSurge: 0` also never does
+    this: no new Pod may start until the old one has been removed to free the "surge" budget.
+    """
+    if not strategy:
+        return False
+    if strategy.get("type") == "Recreate":
+        return True
+    if strategy.get("type") == "RollingUpdate":
+        max_surge = str((strategy.get("rollingUpdate") or {}).get("maxSurge", "25%"))
+        return max_surge in ("0", "0%")
+    return False
+
+
+def check_server_single_instance_rollout(findings: list[Finding]) -> None:
+    """`keel-server` must stay logically single-instance until durable run/approval
+    coordination lands (docs/security-model.md "Why `keel-server` is pinned to one replica").
+    `replicas: 1` alone is not enough — Kubernetes' default `RollingUpdate` strategy still
+    surges a new Pod up before removing the old one even at a single replica, so an old and
+    new `keel-server` would run concurrently mid-rollout. The rollout `strategy` must be
+    `Recreate` (or an explicit `RollingUpdate` with `maxSurge: 0`) so that never happens, in
+    both the base manifest and the rendered production overlay.
+    """
+    server_path = K8S_ROOT / "base/server/deployment.yaml"
+    text = read(server_path)
+    label = str(server_path.relative_to(REPO_ROOT))
+
+    if not re.search(r"^\s*replicas:\s*1\s*$", text, re.MULTILINE):
+        findings.append(Finding(f"{label}: must set `replicas: 1`"))
+
+    if yaml is not None:
+        try:
+            base_doc = yaml.safe_load(text)
+        except yaml.YAMLError:
+            base_doc = None
+        if base_doc is not None and not _non_overlapping_strategy(
+            (base_doc.get("spec") or {}).get("strategy")
+        ):
+            findings.append(
+                Finding(
+                    f"{label}: `spec.strategy` must be `Recreate` (or `RollingUpdate` with "
+                    "`maxSurge: 0`) so an old and new keel-server Pod are never scheduled at "
+                    "once — the Kubernetes default RollingUpdate (25%/25%) surges a new Pod "
+                    "up before removing the old one even at replicas: 1"
+                )
+            )
+
+    kubectl = shutil.which("kubectl")
+    if kubectl is None:
+        findings.append(
+            Finding(
+                "SKIPPED: kubectl not found on PATH; rendered keel-server replicas/strategy "
+                "were not verified for base/production."
+            )
+        )
+        return
+    for target in (K8S_ROOT / "base", K8S_ROOT / "overlays" / "production"):
+        objects = _rendered_objects(target, kubectl)
+        if objects is None:
+            findings.append(
+                Finding(
+                    f"SKIPPED: could not render/parse {target.relative_to(REPO_ROOT)} to "
+                    "verify keel-server replicas/strategy."
+                )
+            )
+            continue
+        server_objects = [
+            obj
+            for obj in objects
+            if obj.get("kind") == "Deployment"
+            and obj.get("metadata", {}).get("name") == "keel-server"
+        ]
+        if not server_objects:
+            findings.append(
+                Finding(
+                    f"{target.relative_to(REPO_ROOT)}: rendered output has no keel-server "
+                    "Deployment"
+                )
+            )
+            continue
+        for obj in server_objects:
+            spec = obj.get("spec", {})
+            if spec.get("replicas") != 1:
+                findings.append(
+                    Finding(
+                        f"{target.relative_to(REPO_ROOT)}: rendered keel-server Deployment "
+                        f"has replicas={spec.get('replicas')!r}, must be 1"
+                    )
+                )
+            if not _non_overlapping_strategy(spec.get("strategy")):
+                findings.append(
+                    Finding(
+                        f"{target.relative_to(REPO_ROOT)}: rendered keel-server Deployment "
+                        "must use a non-overlapping rollout strategy (`Recreate` or "
+                        "`RollingUpdate` with `maxSurge: 0`)"
+                    )
+                )
+
+
 def check_no_active_rbac(findings: list[Finding]) -> None:
     """No Role/ClusterRole/RoleBinding/ClusterRoleBinding may ship as a deployable resource.
 
@@ -328,9 +437,11 @@ def check_auth_secret_required(findings: list[Finding]) -> None:
     scaffold cannot force an operator to fill in a real value, but it can and must (a) require
     the key to exist with a non-empty, correctly-shaped (`key:role`) placeholder in the
     shipped template, (b) never let it leak into the plaintext ConfigMap, and (c) ship
-    `KEEL_CLOUD_MODE: "true"` in the active config so a future fail-closed enforcement of that
-    setting has the right value from day one (see base/configmap-app.yaml's own comment for
-    why this is not yet consumed by application code).
+    `KEEL_CLOUD_MODE: "true"` in the active config, which is consumed by application code
+    (`Settings.cloud_mode` / `app.state.auth_required` / `authenticate()` in
+    `packages/keel-server/src/keel_server/auth.py`): malformed/empty `KEEL_API_KEYS` under
+    cloud mode fails every request closed (503) rather than falling back to local
+    implicit-admin.
 
     Deliberately never includes the actual key value in a finding message — only whether a
     validly-shaped entry was found — so this check cannot leak key material into CI logs.
@@ -758,6 +869,7 @@ def run_all_checks() -> list[Finding]:
     check_kustomize_builds(findings)
     check_schema_validation(findings)
     check_workload_hardening(findings)
+    check_server_single_instance_rollout(findings)
     check_no_active_rbac(findings)
     check_workspace_is_not_readonly_app(findings)
     check_auth_secret_required(findings)

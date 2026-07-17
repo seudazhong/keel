@@ -9,12 +9,16 @@ topology described in [`docs/ARCHITECTURE.md` §15](../../docs/ARCHITECTURE.md) 
 
 **It is not a claim of hostile multi-tenant readiness.** Read
 [`docs/security-model.md`](docs/security-model.md) "Pending gates" before running untrusted,
-multi-organization workloads on this scaffold. Today's real sandbox execution is a single
-process (`ShellTool` in-process; see [`docs/OPERATIONS.md`](../../docs/OPERATIONS.md)), so the
-sandbox Job template describes the *target* isolation shape a future, narrowly-scoped
-sandbox-controller will submit to once the real sandbox service and stronger-isolation runtime
-integration land — it is not wired up to a live agent runtime yet, and `keel-server` holds no
-Kubernetes RBAC to create it directly (see "What is (and is not) enforced here" below).
+multi-organization workloads on this scaffold. `keel-server`/`keel-worker` route shell/file
+tool calls through an authenticated `keel-sandbox` RPC boundary by default
+(`execution_backend=sandbox`; see [`docs/OPERATIONS.md`](../../docs/OPERATIONS.md)), but
+neither Compose nor this scaffold deploys that service, so tool execution fails closed until
+one exists (or an operator explicitly opts into unconditional in-process execution — see
+[`docs/security-model.md`](docs/security-model.md) "Isolation levels"). The separate per-run
+sandbox `Job` template describes the *target* isolation shape a future, narrowly-scoped
+sandbox-controller will submit to once real Job creation lands — it is not wired up to a live
+agent runtime yet, and `keel-server` holds no Kubernetes RBAC to create it directly (see "What
+is (and is not) enforced here" below).
 
 `keel-scheduler` is **not deployed** by this scaffold: its entrypoint
 (`packages/keel-scheduler/src/keel_scheduler/main.py`) is currently a stub that logs once and
@@ -78,10 +82,11 @@ Kubernetes cluster, kind/minikube, or any credentials.
 - Restricted `securityContext` (non-root, dropped `ALL` capabilities, no privilege escalation,
   `seccompProfile: RuntimeDefault`, read-only root filesystem) on every workload.
 - `automountServiceAccountToken: false` on **every** workload, including `keel-server` — a
-  process that executes shell/code tools (today, in-process; see
-  [`docs/security-model.md`](docs/security-model.md) "Isolation levels") must never hold a
-  Kubernetes ServiceAccount token. This scaffold ships **no RBAC at all** (no Role,
-  ClusterRole, RoleBinding, or ClusterRoleBinding) for the app's own ServiceAccounts —
+  process whose tool-execution wiring can end up running shell/code (today, via the
+  authenticated `keel-sandbox` RPC boundary by default, or in-process only via an explicit
+  opt-out; see [`docs/security-model.md`](docs/security-model.md) "Isolation levels") must
+  never hold a Kubernetes ServiceAccount token. This scaffold ships **no RBAC at all** (no
+  Role, ClusterRole, RoleBinding, or ClusterRoleBinding) for the app's own ServiceAccounts —
   `scripts/validate_manifests.py` fails the build if one is ever added back as an active
   resource. Per-run sandbox Job creation therefore is **not wired up**: it needs a
   narrowly-scoped, separately-namespaced sandbox-controller with an admission policy, which
@@ -89,18 +94,20 @@ Kubernetes cluster, kind/minikube, or any credentials.
 - `KEEL_API_KEYS` is **required**, non-empty, contains at least one syntactically valid
   `key:role` entry (role one of `viewer`/`operator`/`admin`), and lives only in a Secret
   (never the ConfigMap) — empty/missing/malformed means every request is an implicit,
-  unauthenticated admin. `KEEL_CLOUD_MODE: "true"` is forced in the active config so
-  fail-closed auth is the shipped default the day that setting is consumed by application
-  code (not yet — see [`docs/security-model.md`](docs/security-model.md) "Pending gates").
+  unauthenticated admin. `KEEL_CLOUD_MODE: "true"` is forced in the active config and is
+  consumed by application code (`Settings.cloud_mode` / `app.state.auth_required`, M3.3): with
+  cloud mode on, an empty *or malformed* `KEEL_API_KEYS` fails every request closed instead of
+  falling back to open admin mode (see
+  [`docs/security-model.md`](docs/security-model.md) "What is enforced by these manifests").
 - `keel-server`'s tool workspace is redirected to a dedicated writable `emptyDir` at
   `/workspace` via `workingDir`, so its read-only root filesystem never has to make the app's
   own `/app` source tree the place model-chosen tool calls write to.
-- `keel-server` is pinned to **1 replica** in both `base/` and the production overlay, even
-  though it is architecturally stateless and horizontally scalable — interactive runs and
-  pending tool-approval state are currently process-local (see
-  [`docs/security-model.md`](docs/security-model.md) "Pending gates"), so a second replica
-  today would silently drop an in-flight run or approval. Only `keel-worker` scales up in the
-  production overlay.
+- `keel-server` is pinned to **1 replica** with a **non-overlapping (`Recreate`) rollout
+  strategy** in both `base/` and the production overlay, even though it is architecturally
+  stateless and horizontally scalable — interactive runs and pending tool-approval state are
+  currently process-local (see [`docs/security-model.md`](docs/security-model.md) "Pending
+  gates"), so a second replica *or* an overlapping rollout today would silently drop an
+  in-flight run or approval. Only `keel-worker` scales up in the production overlay.
 - No ServiceAccount token in sandbox Jobs; the sandbox `ServiceAccount` has no Role/RoleBinding
   anywhere in this scaffold.
 - Explicit `resources.requests`/`limits` on every container; sandbox Jobs additionally carry

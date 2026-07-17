@@ -1,20 +1,32 @@
 # keel-server: stateless FastAPI control-plane API. Architecturally horizontally scalable
-# (ARCHITECTURE §15), but held at a single replica here — see the `replicas:` comment below.
+# (ARCHITECTURE §15), but held at a single replica with a non-overlapping rollout `strategy`
+# here — see the `replicas:`/`strategy:` comments below.
 #
-# SECURITY-CRITICAL: keel-server currently executes `ShellTool`/model-chosen tool calls
-# **in-process** (there is no deployed sandbox service yet — see
-# ../../docs/security-model.md "Isolation levels"). A process that can run arbitrary shell
-# commands must never also hold a Kubernetes ServiceAccount token: that token would let an
-# attacker who reaches shell execution pivot straight into the cluster API. This Pod
-# therefore carries NO ServiceAccount token at all (`automountServiceAccountToken: false`,
-# no `serviceAccountName`) and no RBAC grant exists anywhere in this scaffold for it — see
-# ../../docs/security-model.md "Pending gates" for why per-run sandbox Job creation is not
-# wired to this Deployment.
+# SECURITY-CRITICAL: keel-server routes shell/file tool calls through
+# `keel_core.tools.wiring.build_service_execution_environment`, which defaults to the
+# authenticated `keel-sandbox` RPC client (`execution_backend=sandbox`,
+# `packages/keel-core/src/keel_core/config.py`) rather than running them unconditionally
+# in-process. This scaffold does not ship a `keel-sandbox` Deployment/Service (see
+# ../../docs/security-model.md "Isolation levels"), so tool-execution calls fail closed
+# ("unavailable") until one is stood up; the only opt-out,
+# `KEEL_EXECUTION_BACKEND=unsafe-local-dev` with
+# `KEEL_TRUSTED_PREVIEW_ALLOW_UNSAFE_EXECUTION=true`, is not set here and restores
+# unconditional in-process execution if an operator explicitly opts in. Either way, a process
+# that can end up running shell/code tools must never also hold a Kubernetes ServiceAccount
+# token: that token would let an attacker who reaches tool execution pivot straight into the
+# cluster API. This Pod therefore carries NO ServiceAccount token at all
+# (`automountServiceAccountToken: false`, no `serviceAccountName`) and no RBAC grant exists
+# anywhere in this scaffold for it — see ../../docs/security-model.md "Pending gates" for why
+# per-run sandbox Job creation is not wired to this Deployment (and is a separate, still-
+# dormant concept from the `keel-sandbox` RPC service above).
 #
-# `KEEL_API_KEYS` (in `../secret-app.example.yaml`) MUST be set to a non-empty value before
-# this is deployed: empty/unset makes every request an implicit, unauthenticated admin
-# (`packages/keel-core/src/keel_core/config.py` `api_keys`, see ../../docs/OPERATIONS.md).
-# `scripts/validate_manifests.py` fails the build if it is missing or empty.
+# `KEEL_API_KEYS` (in `../secret-app.example.yaml`) MUST be set to a non-empty, syntactically
+# valid value before this is deployed. With `KEEL_CLOUD_MODE: "true"` forced in
+# `../configmap-app.yaml`, empty/missing/malformed `KEEL_API_KEYS` fails every request
+# **closed** (503) rather than granting local implicit-admin access
+# (`packages/keel-core/src/keel_core/config.py` `api_keys`/`cloud_mode`,
+# `packages/keel-server/src/keel_server/auth.py`, see ../../docs/OPERATIONS.md).
+# `scripts/validate_manifests.py` fails the build if it is missing, empty, or malformed.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,6 +45,18 @@ spec:
   # this only once that work ships, and update
   # ../../overlays/production/patch-server-single-replica.yaml to match.
   replicas: 1
+  # `replicas: 1` alone does not prevent overlap: Kubernetes' default `RollingUpdate` (25%
+  # maxSurge/maxUnavailable) rounds maxSurge up to 1 even at a single replica, so it starts
+  # the new Pod *before* removing the old one — an old and new keel-server would run
+  # concurrently mid-rollout, exactly the process-local-state hazard `replicas: 1` exists to
+  # avoid (see the comment above). `Recreate` terminates the old Pod before creating the new
+  # one, so old and new server Pods are never scheduled at once. This trades a brief
+  # (readiness-probe-bounded) request gap during upgrades for that guarantee — see
+  # ../../docs/upgrade-rollback.md. `scripts/validate_manifests.py` and
+  # tests/unit/test_deploy_k8s_manifests.py enforce both `replicas: 1` and this
+  # non-overlapping strategy in the base and the rendered production overlay.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: keel-server
@@ -56,12 +80,14 @@ spec:
           image: ghcr.io/OWNER/keel-app:REPLACE_WITH_PINNED_DIGEST
           command: ["keel-server"]
           # The image's WORKDIR is /app (its own read-only source tree, see
-          # deploy/docker/app.Dockerfile). keel-server's tool workspace defaults to
-          # `Path.cwd()` (packages/keel-server/src/keel_server/app.py) — without this
-          # override that resolves to /app, i.e. the read-only root filesystem below would
-          # make every write/edit/shell tool call fail against the app's OWN source
-          # directory. Redirecting cwd to a dedicated writable scratch volume keeps /app
-          # read-only while giving today's in-process tool execution a real place to write.
+          # deploy/docker/app.Dockerfile). keel-server's `AgentRuntime` workspace and its
+          # execution-environment fallback both default to `Path.cwd()`
+          # (packages/keel-server/src/keel_server/app.py) — without this override that
+          # resolves to /app, i.e. the read-only root filesystem below would make every
+          # write/edit/shell tool call fail against the app's OWN source directory, whether
+          # routed through the default `keel-sandbox` RPC client or the explicit
+          # `unsafe-local-dev` opt-out. Redirecting cwd to a dedicated writable scratch volume
+          # keeps /app read-only while giving both paths a real place to write.
           workingDir: /workspace
           ports:
             - name: http

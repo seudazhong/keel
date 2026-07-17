@@ -13,11 +13,11 @@ and §8 "Threat model & tenancy invariants" of the
 | Control | Where | Effect |
 |---|---|---|
 | Restricted Pod `securityContext` | every Deployment + the sandbox Job template | non-root, dropped `ALL` Linux capabilities (web adds back only `NET_BIND_SERVICE` to bind port 80), no privilege escalation, `seccompProfile: RuntimeDefault`, read-only root filesystem with `emptyDir` scratch for the few writable paths each process needs |
-| No ServiceAccount token anywhere | every workload, `base/sandbox/serviceaccount.yaml`, `base/sandbox/job-template.yaml` | `automountServiceAccountToken: false` everywhere, including `keel-server` (which executes shell/code tools in-process today — see "Isolation levels" below); `scripts/validate_manifests.py` fails the build if any workload omits this |
+| No ServiceAccount token anywhere | every workload, `base/sandbox/serviceaccount.yaml`, `base/sandbox/job-template.yaml` | `automountServiceAccountToken: false` everywhere, including `keel-server`/`keel-worker` (which route shell/file tool calls through the `keel-sandbox` RPC boundary by default, or in-process only via an explicit opt-out — see "Isolation levels" below); `scripts/validate_manifests.py` fails the build if any workload omits this |
 | No Kubernetes RBAC at all | (nothing — deliberately) | this scaffold grants **zero** Role/ClusterRole/RoleBinding/ClusterRoleBinding to any of its own ServiceAccounts; `scripts/validate_manifests.py` fails the build if one is ever added back as an active resource. See "Sandbox Job creation is not wired up" below for why |
-| Required externally-supplied auth | `base/secret-app.example.yaml` (`KEEL_API_KEYS`), `base/configmap-app.yaml` (`KEEL_CLOUD_MODE`) | `KEEL_API_KEYS` must be non-empty, contain at least one syntactically valid `key:role` entry, and lives only in a Secret, never the plaintext ConfigMap — empty/missing/malformed makes every request an implicit, unauthenticated admin (`packages/keel-core/src/keel_core/config.py` `api_keys`; role parsing mirrors `packages/keel-server/src/keel_server/auth.py` `parse_api_keys`). `KEEL_CLOUD_MODE: "true"` is forced in the active config so a future fail-closed enforcement of that setting is already correctly configured. `scripts/validate_manifests.py` fails the build if any of this regresses, and never logs the key value itself when it does |
-| Single-replica `keel-server` | `base/server/deployment.yaml`, `overlays/production/patch-server-single-replica.yaml` | held at exactly 1 replica in both base and production — see "Why `keel-server` is pinned to one replica" below |
-| Non-source-tree tool workspace | `base/server/deployment.yaml` (`workingDir: /workspace` + matching `emptyDir`) | keeps the read-only root filesystem consistent with the app's actual `Path.cwd()`-based tool workspace (`packages/keel-server/src/keel_server/app.py`) instead of pointing it at the read-only `/app` source tree |
+| Required externally-supplied auth, fail-closed | `base/secret-app.example.yaml` (`KEEL_API_KEYS`), `base/configmap-app.yaml` (`KEEL_CLOUD_MODE`) | `KEEL_API_KEYS` must be non-empty, contain at least one syntactically valid `key:role` entry, and lives only in a Secret, never the plaintext ConfigMap. `KEEL_CLOUD_MODE: "true"` is forced in the active config and **is consumed by application code** (M3.3): `Settings.cloud_mode` drives `app.state.auth_required` (`packages/keel-server/src/keel_server/app.py`), which `authenticate()` (`packages/keel-server/src/keel_server/auth.py`) checks — with cloud mode on, an empty *or malformed* `KEEL_API_KEYS` (every entry skipped by `parse_api_keys`, leaving an empty key map) makes every request fail closed with 503, instead of the local implicit-admin open mode. `scripts/validate_manifests.py` fails the build if any of this regresses, and never logs the key value itself when it does |
+| Single-replica, non-overlapping-rollout `keel-server` | `base/server/deployment.yaml` (`replicas: 1`, `strategy: Recreate`), `overlays/production/patch-server-single-replica.yaml` | held at exactly 1 replica in both base and production, with a `Recreate` rollout strategy so an old and new `keel-server` Pod are never scheduled at once — see "Why `keel-server` is pinned to one replica" below |
+| Non-source-tree tool workspace | `base/server/deployment.yaml` (`workingDir: /workspace` + matching `emptyDir`) | keeps the read-only root filesystem consistent with the app's actual `Path.cwd()`-based workspace (`packages/keel-server/src/keel_server/app.py`) instead of pointing it at the read-only `/app` source tree |
 | Bounded resources | every container | explicit `requests`/`limits`; sandbox Jobs additionally set `activeDeadlineSeconds` and `backoffLimit: 0` so a stuck or misbehaving run cannot retry indefinitely or run unbounded |
 | Default-deny network, both directions | `base/networkpolicy/default-deny-all.yaml` + narrow, paired allows | every Pod denies all ingress/egress unless an explicit policy allows it; because `NetworkPolicy` is directional, every cross-Pod path ships **both** halves — `allow-web-egress-to-server.yaml` (egress) pairs with `allow-ingress-to-web-and-server.yaml` (ingress); `allow-sandbox-egress-proxy-only.yaml` (egress) pairs with `allow-server-ingress-from-sandbox.yaml` (ingress) for the sandbox RPC callback; and the same egress rule's proxy leg pairs with `allow-egress-proxy-ingress-from-sandbox.yaml` (ingress) for the egress-proxy's side |
 | DNS egress scoped to `kube-system` | `base/networkpolicy/allow-dns-egress.yaml` | `namespaceSelector` matches the `kube-system` namespace by its automatic `kubernetes.io/metadata.name` label, not `{}` (any namespace) — a same-labeled Pod outside `kube-system` cannot become an egress target |
@@ -39,6 +39,20 @@ scale at all. Raise this only once durable interactive run/approval coordination
 approval"; M3.6 exit gate "restart/scale-out preserves run and approval ownership") — update
 both the base default and the production patch together so they cannot drift apart.
 
+`replicas: 1` alone is not sufficient to keep this logically single-instance during an
+*upgrade*: Kubernetes' default `RollingUpdate` strategy (25% `maxSurge`/`maxUnavailable`)
+rounds `maxSurge` up to 1 even at a single replica, so it starts the new-revision Pod *before*
+terminating the old one — an old and new `keel-server` would run concurrently for the
+duration of the rollout, which is exactly the process-local-state hazard the replica pin
+exists to avoid. `base/server/deployment.yaml` therefore also sets `strategy: type:
+Recreate`, which terminates the old Pod before creating the new one, so old and new
+`keel-server` Pods are never scheduled at once — at the cost of a brief (readiness-probe-
+bounded) request gap during upgrades instead of the load-balancer-level overlap a rolling
+update would otherwise allow (`docs/upgrade-rollback.md`). `scripts/validate_manifests.py`
+and `tests/unit/test_deploy_k8s_manifests.py` enforce both `replicas: 1` and this
+non-overlapping strategy against the base manifest text and the rendered base/production
+Kustomize output, so neither can silently regress.
+
 `keel-worker` has no such constraint: arq gives each job to exactly one worker and coordinates
 the `scheduler_tick` cron across replicas via a Redis lock, so it scales freely
 (`docker-compose.yml` comments) — the production overlay raises its replica floor
@@ -50,10 +64,11 @@ An earlier version of this scaffold granted `keel-server`'s own ServiceAccount R
 `create`/`get`/`list`/`watch`/`delete` `Jobs` and read `Pods`/`Pod` logs, reasoning that this
 was "narrow" because it was scoped to one namespace. It was removed: a ServiceAccount that can
 create arbitrary `Job`/`Pod` specs can mount arbitrary Secrets/PVCs in that namespace, run as
-arbitrary images, and — combined with `keel-server` also being the same process that executes
-untrusted, model-chosen shell commands in-process today — gives an attacker who reaches shell
-execution a direct path to indirect Secret/PVC/ServiceAccount exfiltration via a crafted Job
-spec. "Scoped to a namespace" is not the same as "safe" when the namespace itself holds the
+arbitrary images, and — combined with `keel-server`/`keel-worker` being the processes whose
+execution-environment wiring can end up running untrusted, model-chosen shell commands
+in-process (see "Isolation levels" below) — gives an attacker who reaches tool execution a
+direct path to indirect Secret/PVC/ServiceAccount exfiltration via a crafted Job spec.
+"Scoped to a namespace" is not the same as "safe" when the namespace itself holds the
 Postgres/Redis credentials and connector tokens.
 
 Standing up real per-run sandbox Job creation safely requires one of:
@@ -67,20 +82,42 @@ Standing up real per-run sandbox Job creation safely requires one of:
   pattern in `base/sandbox/job-template.yaml`, mandatory `runAsNonRoot`/dropped-capabilities,
   etc.), so a compromised `keel-server` cannot submit an arbitrary Job even with the RBAC.
 
-Neither exists yet. `base/sandbox/job-template.yaml` documents the target Job shape for
-whichever mechanism is built; it is excluded from the Kustomize build for that reason, not
-merely because it is per-run.
+Neither exists yet, and neither is the same thing as the `keel-sandbox` RPC service described
+below: `base/sandbox/job-template.yaml` documents the target Job shape for whichever
+Job-creation mechanism is eventually built; it remains excluded from the Kustomize build for
+that reason, not merely because it is per-run, and no manifest here claims sandbox Jobs are
+dynamically created — they are not.
 
 ## Isolation levels: what "sandbox" means today vs. the target
 
 - **Today (current fidelity, see [`docs/OPERATIONS.md`](../../../docs/OPERATIONS.md) and
-  [`docs/STATUS.md`](../../../docs/STATUS.md)):** there is no deployed sandbox service.
-  `ShellTool` and other model-chosen execution run in the server/CLI process. Nothing in this
-  `deploy/k8s` scaffold changes that fact by itself — the sandbox Job template
-  (`base/sandbox/job-template.yaml`) is the *target* shape a future sandbox-controller would
-  submit to, not a wired-up execution path today. This is exactly why `keel-server` (the
-  process hosting that in-process execution) carries no ServiceAccount token and no RBAC: see
-  "Sandbox Job creation is not wired up" above.
+  [`docs/STATUS.md`](../../../docs/STATUS.md)):** `keel-server` and `keel-worker` both build
+  their tool-execution environment through
+  `keel_core.tools.wiring.build_service_execution_environment`, which **defaults to**
+  `execution_backend=sandbox` — an authenticated RPC client
+  (`keel_core.tools.rpc.SandboxExecutionEnvironment`) that must reach a `keel-sandbox` service
+  at `KEEL_SANDBOX_URL` (default `http://keel-sandbox:8090`). That service boundary exists in
+  code (`packages/keel-sandbox/src/keel_sandbox/service.py`) and wiring fails **closed** when
+  it is unreachable or unauthenticated — but neither `docker-compose.yml` nor this
+  `deploy/k8s` scaffold deploys a `keel-sandbox` Deployment/Service yet. Deployed as-is,
+  `keel-server`/`keel-worker` start and serve `/health`/`/readiness` normally, but every
+  tool-execution call (shell, read, write, edit, list, glob, grep) fails closed
+  ("unavailable") until a real, reachable `keel-sandbox` exists — an intentional fail-closed
+  gap, not a hidden regression. The only opt-out is explicitly setting
+  `KEEL_EXECUTION_BACKEND=unsafe-local-dev` together with
+  `KEEL_TRUSTED_PREVIEW_ALLOW_UNSAFE_EXECUTION=true` (neither set by this scaffold's
+  ConfigMap), which restores unconditional in-process execution for a trusted single-org
+  preview only. This — either the unreachable-by-default RPC path or the explicit in-process
+  opt-out — is exactly why `keel-server`/`keel-worker` carry no ServiceAccount token and no
+  RBAC: see "Sandbox Job creation is not wired up" above. The per-run sandbox **Job** template
+  (`base/sandbox/job-template.yaml`) is a separate, still-dormant concept for a possible future
+  execution-backend implementation reached through a sandbox-controller; it is not the
+  `keel-sandbox` RPC service above, and neither is wired up or dynamically created today.
+  Because this scaffold ships no `keel-sandbox` Service, there is also no NetworkPolicy allow
+  rule yet for control-plane egress to it — `base/networkpolicy/allow-control-plane-egress.yaml`
+  deliberately excludes private-CIDR destinations, so it would not permit that traffic even if
+  the Service existed; standing up `keel-sandbox` in this namespace needs a new, explicit
+  allow rule alongside it, not an assumption that today's NetworkPolicies already cover it.
 - **Rootless-OCI floor:** once the real sandbox exists, running it as an unprivileged
   container with the hardening in this scaffold (dropped capabilities, read-only rootfs,
   default-deny egress, resource ceilings) is the accepted floor for a **trusted single-org**
@@ -182,14 +219,21 @@ multi-tenant deployment. They mirror
 [`docs/ROADMAP.md`](../../../docs/ROADMAP.md) M3.3/M3.6/M3.8, and the design doc's own gated
 rollout language (§8.4, §9):
 
-1. **Real sandbox integration.** No sandbox execution backend is deployed; the Job template is
-   unvalidated against a live agent runtime. Per-run Job creation/deletion, worktree
-   materialization, and the control-plane↔sandbox mTLS RPC described in the design doc do not
-   exist in code yet.
+1. **Real sandbox integration, deployed.** `packages/keel-sandbox/src/keel_sandbox/service.py`
+   is a real, authenticated RPC execution boundary that `keel-server`/`keel-worker` call by
+   default (`execution_backend=sandbox`), and wiring fails closed when it is unreachable or
+   unauthenticated (see "Isolation levels" above) — but neither `docker-compose.yml` nor this
+   scaffold deploys a `keel-sandbox` Deployment/Service, and no NetworkPolicy here permits
+   control-plane egress to one yet. The **separate** per-run sandbox `Job` template
+   (`base/sandbox/job-template.yaml`) remains unvalidated against a live agent runtime; Job
+   creation/deletion and worktree materialization described in the design doc do not exist in
+   code.
 2. **A sandbox-controller (or admission policy) for Job creation.** `keel-server` holds no RBAC
    to create Jobs (see "Sandbox Job creation is not wired up" above) — until a narrowly-scoped
    controller or admission policy exists, there is no safe, automated way to submit
-   `base/sandbox/job-template.yaml` at all.
+   `base/sandbox/job-template.yaml` at all. This is unrelated to and does not substitute for
+   gate 1 above: standing up the `keel-sandbox` RPC service does not require Job-create RBAC,
+   only a reachable Service and a new, explicit NetworkPolicy egress rule.
 3. **Stronger-isolation runtime, wired end-to-end.** `runtimeClassName` support is a manifest
    hook only; no gVisor/Kata/microVM runtime has been qualified, load-tested, or made the
    default for any real workload.
@@ -202,13 +246,6 @@ rollout language (§8.4, §9):
    like the architecture target — M3.3/M3.6 exit gates in `docs/ROADMAP.md` ("Server restart
    does not lose an admitted run or pending approval"; "restart/scale-out preserves run and
    approval ownership") are not yet met.
-6. **Cloud-mode enforcement in application code.** `KEEL_CLOUD_MODE` is shipped `"true"` in
-   `base/configmap-app.yaml` so the correct value is already in place, but
-   `packages/keel-core/src/keel_core/config.py` has no such setting yet — nothing currently
-   reads or enforces it. Do not treat setting this key as equivalent to fail-closed auth being
-   implemented; `KEEL_API_KEYS` being non-empty and correctly formatted is what actually gates
-   access today (see "authenticate()"/`parse_api_keys` in
-   `packages/keel-server/src/keel_server/auth.py`).
 7. **Egress allow-list proxy.** `allow-sandbox-egress-proxy-only.yaml` /
    `allow-egress-proxy-ingress-from-sandbox.yaml` assume a `keel-egress-proxy` workload exists;
    this scaffold does not ship that proxy's Deployment or its allow-list/registry-mirror logic
@@ -227,6 +264,12 @@ rollout language (§8.4, §9):
     given cluster's CNI actually enforces the policies it ships — that requires a live cluster
     test this repo's cluster-free validation deliberately does not perform.
 
-Until (1)–(6) are closed, treat any Kubernetes deployment of this scaffold as, at best, the
+Cloud-mode fail-closed auth enforcement (`Settings.cloud_mode` / `app.state.auth_required` /
+`packages/keel-server/src/keel_server/auth.py` `authenticate()`) landed in application code as
+part of M3.3 and is no longer a pending gate — `KEEL_CLOUD_MODE: "true"` in
+`base/configmap-app.yaml` is now an active control, not a value shipped ahead of enforcement;
+see the "What is enforced by these manifests" table above.
+
+Until (1)–(5) are closed, treat any Kubernetes deployment of this scaffold as, at best, the
 same **trusted single-org preview** tier as the Compose `full` profile
 ([`docs/OPERATIONS.md`](../../../docs/OPERATIONS.md)) — not a hostile multi-tenant platform.

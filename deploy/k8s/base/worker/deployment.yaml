@@ -1,8 +1,12 @@
 # keel-worker: arq worker running agent turns and durable jobs (ARCHITECTURE §15). Scale with
 # `replicas`; arq gives each job to exactly one worker and the scheduler_tick cron coordinates
 # across replicas via a Redis lock, so scale-out is CAS-safe (see docker-compose.yml comments).
-# The worker itself never executes model-chosen shell/code — that is dispatched to per-run
-# sandbox Jobs (../sandbox/job-template.yaml) over the internal control-plane<->sandbox RPC.
+# keel-worker builds its own execution environment the same way keel-server does
+# (`keel_core.tools.wiring.build_service_execution_environment`, default
+# `execution_backend=sandbox`): shell/file tool calls are routed to the authenticated
+# `keel-sandbox` RPC service, not dispatched as dynamically-created per-run Kubernetes Jobs —
+# `../sandbox/job-template.yaml` is a separate, still-dormant template, not the execution path
+# in code today. See ../../docs/security-model.md "Isolation levels".
 apiVersion: apps/v1
 kind: Deployment
 metadata:
