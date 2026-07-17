@@ -1354,7 +1354,13 @@ async def test_provider_action_context_enforces_scope_and_selected_resources() -
     registry = ConnectorRegistry(
         (ConnectorRegistration(manifest, Provider, "tests.action_fixture"),)
     )
-    actions = registry.build_actions(ConnectorActionContext.with_repository("scope:a", repository))
+    actions = registry.build_actions(
+        ConnectorActionContext.with_repository(
+            "scope:a",
+            repository,
+            credential_store=object(),
+        )
+    )
     action = actions[0].action
     assert (
         await action(
