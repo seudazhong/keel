@@ -69,12 +69,13 @@ from keel_core.tokens import InMemoryTokenStore
 from keel_core.types import ContentTaint
 
 
-def test_builtin_registry_discovers_gmail_deterministically() -> None:
+def test_builtin_registry_discovers_providers_deterministically() -> None:
     first = discover_connector_registry()
     second = discover_connector_registry()
-    assert [item.id for item in first.manifests()] == ["gmail"]
+    assert [item.id for item in first.manifests()] == ["gmail", "google_calendar"]
     assert first.manifests() == second.manifests()
     assert first.create("gmail").manifest.id == "gmail"
+    assert first.create("google_calendar").manifest.id == "google_calendar"
 
 
 def test_registry_rejects_duplicate_ids() -> None:
@@ -245,14 +246,10 @@ async def test_setup_restores_prior_credential_when_binding_commit_fails(
         ConnectorBindingDraft(display_name="Before"),
         ConnectorBindingStatus.configured,
     )
-    credentials = ConnectorCredentialStore(
-        InMemoryTokenStore("scope:a", EnvelopeCipher("key"))
-    )
+    credentials = ConnectorCredentialStore(InMemoryTokenStore("scope:a", EnvelopeCipher("key")))
     await credentials.put("fixture", CredentialEnvelope("secret", {"value": "before"}))
     service = ConnectorService(
-        ConnectorRegistry(
-            (ConnectorRegistration(_Provider.manifest, _Provider, "tests.fixture"),)
-        ),
+        ConnectorRegistry((ConnectorRegistration(_Provider.manifest, _Provider, "tests.fixture"),)),
         repository,
         credentials=credentials,
     )
@@ -357,9 +354,7 @@ async def test_ingress_challenge_returns_before_delivery_claim() -> None:
     await repository.upsert_binding(
         "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
     )
-    credentials = ConnectorCredentialStore(
-        InMemoryTokenStore("scope:a", EnvelopeCipher("key"))
-    )
+    credentials = ConnectorCredentialStore(InMemoryTokenStore("scope:a", EnvelopeCipher("key")))
     await credentials.put("fixture", CredentialEnvelope("secret", {"value": "hidden"}))
     service = ConnectorService(registry, repository, credentials=credentials)
     outcome = await service.ingress(
