@@ -11,6 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 from keel_core.connector_contracts import (
@@ -257,6 +258,7 @@ class _FakeGoogleCredentials:
     def __init__(self, *, valid: bool) -> None:
         self.valid = valid
         self.refresh_token = "refresh-token"
+        self.token = "refreshed-token"
         self.refresh_requests: list[object] = []
 
     def refresh(self, request: object) -> None:
@@ -338,6 +340,18 @@ def test_google_client_refreshes_credentials_and_builds_drive_v3(
         "cache_discovery": False,
     }
     assert client.credential.values["token"] == "refreshed-token"
+    authorization_checked: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == "Bearer refreshed-token"
+        authorization_checked.append(True)
+        return httpx.Response(200, content=b"refreshed export")
+
+    mock = httpx.MockTransport(handler)
+    client._export_transport._client_factory = lambda: httpx.Client(transport=mock)
+    content, mime_type = client.read_content(DriveFile("doc-1", "Doc", GOOGLE_DOC_MIME_TYPE))
+    assert (content, mime_type) == ("refreshed export", TEXT_MIME_TYPE)
+    assert authorization_checked == [True]
 
 
 class _ExecutableRequest:
@@ -504,14 +518,9 @@ class _MediaFiles:
     def __init__(self, request: _StreamingRequest) -> None:
         self.request = request
         self.get_media_calls = 0
-        self.export_media_calls = 0
 
     def get_media(self, **kwargs: Any) -> _StreamingRequest:
         self.get_media_calls += 1
-        return self.request
-
-    def export_media(self, **kwargs: Any) -> _StreamingRequest:
-        self.export_media_calls += 1
         return self.request
 
 
@@ -547,9 +556,16 @@ def test_google_doc_export_aborts_bounded_stream_without_full_buffering(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     total_size = 4_000_000
-    request = _StreamingRequest(total_size)
-    service = _MediaService(request)
+    stream = _TrackingExportStream(total_size)
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["no_range"] = "range" not in request.headers
+        return httpx.Response(200, stream=stream)
+
+    service = _MediaService(_StreamingRequest(1))
     client, _, _ = _library_client(monkeypatch, service, valid=True)
+    client._export_transport = _export_transport(handler)
     file = DriveFile(
         id="large-doc",
         name="Large Doc",
@@ -558,9 +574,112 @@ def test_google_doc_export_aborts_bounded_stream_without_full_buffering(
 
     with pytest.raises(GoogleDriveContentTooLargeError, match="1 MiB"):
         client.read_content(file)
-    assert service.files_api.export_media_calls == 1
-    assert request.http.bytes_returned <= 1_048_576 + 262_144
-    assert request.http.bytes_returned < total_size
+    assert seen["no_range"] is True
+    assert stream.bytes_yielded <= 1_048_576 + 65_536
+    assert stream.bytes_yielded < total_size
+
+
+class _TrackingExportStream(httpx.SyncByteStream):
+    def __init__(
+        self,
+        total_size: int,
+        *,
+        chunk_size: int = 65_536,
+        chunks: tuple[bytes, ...] | None = None,
+    ) -> None:
+        self.total_size = total_size
+        self.chunk_size = chunk_size
+        self.chunks = chunks
+        self.bytes_yielded = 0
+
+    def __iter__(self) -> Any:
+        if self.chunks is not None:
+            for chunk in self.chunks:
+                self.bytes_yielded += len(chunk)
+                yield chunk
+            return
+        remaining = self.total_size
+        while remaining:
+            size = min(self.chunk_size, remaining)
+            self.bytes_yielded += size
+            remaining -= size
+            yield b"x" * size
+
+
+def _export_transport(
+    handler: Any,
+    *,
+    token: str = "direct-export-token",
+) -> Any:
+    mock = httpx.MockTransport(handler)
+    return google_drive_docs._GoogleDriveExportTransport(
+        token,
+        lambda: httpx.Client(transport=mock),
+    )
+
+
+def test_direct_export_stream_success_uses_fixed_origin_and_bearer_auth() -> None:
+    seen: dict[str, Any] = {}
+    stream = _TrackingExportStream(
+        12,
+        chunks=(b"hello ", b"world\n"),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(
+            host=request.url.host,
+            raw_path=request.url.raw_path,
+            mime_type=request.url.params["mimeType"],
+            authorized=request.headers["Authorization"] == f"Bearer {token}",
+            identity_encoding=request.headers["Accept-Encoding"] == "identity",
+            no_range="range" not in request.headers,
+        )
+        return httpx.Response(200, stream=stream)
+
+    token = "direct-export-secret"
+    transport = _export_transport(handler, token=token)
+    assert transport.export_text("doc/with space") == b"hello world\n"
+
+    assert seen["host"] == "www.googleapis.com"
+    assert seen["raw_path"] == b"/drive/v3/files/doc%2Fwith%20space/export?mimeType=text%2Fplain"
+    assert seen["mime_type"] == TEXT_MIME_TYPE
+    assert seen["authorized"] is True
+    assert seen["identity_encoding"] is True
+    assert seen["no_range"] is True
+    assert token not in repr(transport)
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "expected"),
+    [
+        (401, None, ConnectorAuthenticationError),
+        (404, None, google_drive_docs._GoogleNotFoundError),
+        (429, None, GoogleDriveRateLimitError),
+        (403, "userRateLimitExceeded", GoogleDriveRateLimitError),
+        (500, None, GoogleDriveError),
+    ],
+)
+def test_direct_export_status_auth_and_rate_limit_classification(
+    status: int,
+    reason: str | None,
+    expected: type[Exception],
+) -> None:
+    body = json.dumps(
+        {
+            "error": {
+                "errors": [{"reason": reason}] if reason is not None else [],
+            }
+        }
+    ).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, content=body)
+
+    token = "status-secret-token"
+    transport = _export_transport(handler, token=token)
+    with pytest.raises(expected) as raised:
+        transport.export_text("doc-1")
+    assert token not in str(raised.value)
 
 
 class _GoogleHttpError(Exception):

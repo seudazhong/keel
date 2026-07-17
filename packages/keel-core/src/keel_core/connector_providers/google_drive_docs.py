@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import urllib.error
@@ -12,7 +13,9 @@ from collections.abc import Buffer, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
+
+import httpx
 
 from keel_core.config import get_settings
 from keel_core.connector_contracts import (
@@ -69,6 +72,9 @@ _CURSOR_STREAM = "drive_changes"
 _PAGE_SIZE = 1000
 _MAX_CONTENT_BYTES = 1_048_576
 _DOWNLOAD_CHUNK_BYTES = 262_144
+_EXPORT_CHUNK_BYTES = 65_536
+_ERROR_RESPONSE_BYTES = 65_536
+_DRIVE_API_ORIGIN = "https://www.googleapis.com"
 _FILE_FIELDS = "id,name,mimeType,parents,webViewLink,modifiedTime,version,trashed,size,md5Checksum"
 
 manifest = ConnectorManifest(
@@ -212,6 +218,7 @@ class DriveClient(Protocol):
 
 DriveClientFactory = Callable[[CredentialEnvelope], DriveClient]
 TokenRevoker = Callable[[CredentialEnvelope], None]
+ExportClientFactory = Callable[[], httpx.Client]
 
 
 def enabled() -> bool:
@@ -233,6 +240,68 @@ def _flow(redirect_uri: str) -> object:
         scopes=list(GOOGLE_DRIVE_DOCS_SCOPES),
         redirect_uri=redirect_uri,
     )
+
+
+def _export_http_client() -> httpx.Client:
+    return httpx.Client(
+        follow_redirects=False,
+        timeout=httpx.Timeout(30.0, connect=10.0),
+    )
+
+
+class _GoogleDriveExportTransport:
+    def __init__(
+        self,
+        access_token: str,
+        client_factory: ExportClientFactory = _export_http_client,
+    ) -> None:
+        if not access_token:
+            raise ConnectorAuthenticationError(
+                "Google Drive authorization has no access token; reconnect the connector."
+            )
+        self._access_token = access_token
+        self._client_factory = client_factory
+
+    def export_text(self, file_id: str) -> bytes:
+        file_path = urllib.parse.quote(file_id, safe="")
+        url = f"{_DRIVE_API_ORIGIN}/drive/v3/files/{file_path}/export"
+        try:
+            with self._client_factory() as client:
+                with client.stream(
+                    "GET",
+                    url,
+                    params={"mimeType": TEXT_MIME_TYPE},
+                    headers={
+                        "Accept-Encoding": "identity",
+                        "Authorization": f"Bearer {self._access_token}",
+                    },
+                ) as response:
+                    if response.status_code != 200:
+                        _raise_google_status(
+                            response.status_code,
+                            _bounded_response_body(response, _ERROR_RESPONSE_BYTES),
+                        )
+                    content_encoding = response.headers.get(
+                        "content-encoding",
+                        "identity",
+                    ).lower()
+                    if content_encoding not in {"", "identity"}:
+                        raise GoogleDriveError(
+                            "Google Drive export returned an unsupported content encoding."
+                        )
+                    content_length = _optional_size(response.headers.get("content-length"))
+                    if content_length is not None and content_length > _MAX_CONTENT_BYTES:
+                        raise GoogleDriveContentTooLargeError(
+                            "Google Drive text content exceeds the 1 MiB Knowledge limit."
+                        )
+                    buffer = _BoundedBytesIO(_MAX_CONTENT_BYTES)
+                    for chunk in response.iter_bytes(chunk_size=_EXPORT_CHUNK_BYTES):
+                        buffer.write(chunk)
+                    return buffer.getvalue()
+        except GoogleDriveError:
+            raise
+        except httpx.HTTPError:
+            raise GoogleDriveError("Google Drive export request failed.") from None
 
 
 class _GoogleApiDriveClient:
@@ -260,6 +329,12 @@ class _GoogleApiDriveClient:
                 credentials=self._credentials,
                 cache_discovery=False,
             )
+            access_token = self._credentials.token
+            if not isinstance(access_token, str):
+                raise ConnectorAuthenticationError(
+                    "Google Drive authorization has no access token; reconnect the connector."
+                )
+            self._export_transport = _GoogleDriveExportTransport(access_token)
         except ConnectorAuthenticationError:
             raise
         except Exception as exc:
@@ -362,10 +437,7 @@ class _GoogleApiDriveClient:
 
     def read_content(self, file: DriveFile) -> tuple[str, str]:
         if file.mime_type == GOOGLE_DOC_MIME_TYPE:
-            request = self._service.files().export_media(
-                fileId=file.id,
-                mimeType=TEXT_MIME_TYPE,
-            )
+            raw = self._export_transport.export_text(file.id)
             mime_type = TEXT_MIME_TYPE
         elif file.mime_type in {TEXT_MIME_TYPE, MARKDOWN_MIME_TYPE}:
             if file.size is not None and file.size > _MAX_CONTENT_BYTES:
@@ -377,9 +449,9 @@ class _GoogleApiDriveClient:
                 supportsAllDrives=True,
             )
             mime_type = file.mime_type
+            raw = self._download_media(request)
         else:
             raise GoogleDriveError(f"unsupported Drive MIME type: {file.mime_type}")
-        raw = self._download_media(request)
         return _normalize_text(raw), mime_type
 
     def check_health(self) -> None:
@@ -452,7 +524,18 @@ class _GoogleNotFoundError(GoogleDriveError):
 def _raise_google_error(exc: Exception) -> None:
     status = getattr(getattr(exc, "resp", None), "status", None)
     content = getattr(exc, "content", b"")
+    _raise_google_status(status, content, cause=exc)
+
+
+def _raise_google_status(
+    status: object,
+    content: object,
+    *,
+    cause: Exception | None = None,
+) -> NoReturn:
     reason = ""
+    if isinstance(content, str):
+        content = content.encode()
     if isinstance(content, bytes):
         try:
             payload = json.loads(content.decode("utf-8", errors="replace"))
@@ -465,20 +548,32 @@ def _raise_google_error(exc: Exception) -> None:
                 if isinstance(errors, list) and errors and isinstance(errors[0], dict):
                     reason = str(errors[0].get("reason", ""))
     if status == 404:
-        raise _GoogleNotFoundError("Google Drive file was not found.") from exc
+        raise _GoogleNotFoundError("Google Drive file was not found.") from cause
     if status == 410:
-        raise GoogleDriveCursorInvalidError("Google Drive changes cursor expired.") from exc
+        raise GoogleDriveCursorInvalidError("Google Drive changes cursor expired.") from cause
     if status in {401}:
         raise ConnectorAuthenticationError(
             "Google Drive authorization is invalid; reconnect the connector."
-        ) from exc
+        ) from cause
     if status == 429 or reason in {
         "dailyLimitExceeded",
         "rateLimitExceeded",
         "userRateLimitExceeded",
     }:
-        raise GoogleDriveRateLimitError("Google Drive rate limit exceeded; retry later.") from exc
-    raise GoogleDriveError("Google Drive request failed.") from exc
+        raise GoogleDriveRateLimitError("Google Drive rate limit exceeded; retry later.") from cause
+    raise GoogleDriveError("Google Drive request failed.") from cause
+
+
+def _bounded_response_body(response: httpx.Response, limit: int) -> bytes:
+    body = _BoundedBytesIO(limit)
+    for chunk in response.iter_bytes(chunk_size=min(_EXPORT_CHUNK_BYTES, limit)):
+        remaining = limit - body.tell()
+        if remaining <= 0:
+            break
+        body.write(chunk[:remaining])
+        if len(chunk) > remaining:
+            break
+    return body.getvalue()
 
 
 def _revoke_google_token(credential: CredentialEnvelope) -> None:
@@ -516,6 +611,10 @@ class GoogleDriveDocsProvider(BaseConnectorProvider):
     async def begin_auth(
         self, context: ConnectorOperationContext, callback_url: str
     ) -> ConnectorAuthStart:
+        return await asyncio.to_thread(self._begin_auth, callback_url)
+
+    @staticmethod
+    def _begin_auth(callback_url: str) -> ConnectorAuthStart:
         flow = _flow(callback_url)
         auth_url, state = flow.authorization_url(  # type: ignore[attr-defined]
             access_type="offline",
@@ -527,6 +626,17 @@ class GoogleDriveDocsProvider(BaseConnectorProvider):
     async def complete_auth(
         self,
         context: ConnectorOperationContext,
+        callback_url: str,
+        parameters: dict[str, str],
+    ) -> ConnectorSetupResult:
+        return await asyncio.to_thread(
+            self._complete_auth,
+            callback_url,
+            parameters,
+        )
+
+    @staticmethod
+    def _complete_auth(
         callback_url: str,
         parameters: dict[str, str],
     ) -> ConnectorSetupResult:
@@ -546,6 +656,9 @@ class GoogleDriveDocsProvider(BaseConnectorProvider):
         )
 
     async def list_resources(self, context: ConnectorOperationContext) -> ConnectorResourceResult:
+        return await asyncio.to_thread(self._list_resources, context)
+
+    def _list_resources(self, context: ConnectorOperationContext) -> ConnectorResourceResult:
         client = self._client(context)
         resources: list[ConnectorResourceDraft] = []
         page_token: str | None = None
@@ -575,6 +688,9 @@ class GoogleDriveDocsProvider(BaseConnectorProvider):
         )
 
     async def sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult:
+        return await asyncio.to_thread(self._sync, context)
+
+    def _sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult:
         if context.binding is None:
             raise GoogleDriveError("Google Drive binding is unavailable.")
         client = self._client(context)
@@ -589,6 +705,9 @@ class GoogleDriveDocsProvider(BaseConnectorProvider):
             return self._full_resync(context, client)
 
     async def health(self, context: ConnectorOperationContext) -> ConnectorHealth:
+        return await asyncio.to_thread(self._health, context)
+
+    def _health(self, context: ConnectorOperationContext) -> ConnectorHealth:
         now = datetime.now(UTC)
         if not self.enabled():
             return ConnectorHealth(
@@ -624,7 +743,7 @@ class GoogleDriveDocsProvider(BaseConnectorProvider):
 
     async def revoke(self, context: ConnectorOperationContext) -> None:
         if context.credential is not None:
-            self._token_revoker(context.credential)
+            await asyncio.to_thread(self._token_revoker, context.credential)
 
     def _incremental_sync(
         self,
