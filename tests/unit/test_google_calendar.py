@@ -8,8 +8,16 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import parse_qs
 
+import google_auth_httplib2
+import googleapiclient.discovery
+import httplib2
+import httpx
 import pytest
+from google.auth.exceptions import RefreshError
+from google.auth.transport import requests as google_requests
+from google.oauth2 import credentials as google_credentials
 
 from keel_core.connector_contracts import (
     ConnectorActionApproval,
@@ -33,6 +41,7 @@ from keel_core.connector_providers.google_calendar import (
     GOOGLE_CALENDAR_WRITE_SCOPE,
     GOOGLE_CALENDAR_WRITE_SCOPES,
     GoogleCalendarAuthenticationError,
+    GoogleCalendarError,
     GoogleCalendarProvider,
     GoogleCalendarRateLimitError,
     GoogleCalendarRevokeError,
@@ -41,8 +50,12 @@ from keel_core.connector_providers.google_calendar import (
 )
 from keel_core.connector_providers.google_calendar._client import (
     CalendarClient,
+    GoogleCalendarNotFoundError,
+    _map_http_error,
     build_client,
+    revoke_google_token,
 )
+from keel_core.connector_registry import discover_connector_registry
 from keel_core.connector_repository import InMemoryConnectorRepository
 from keel_core.connectors import ConnectorTool
 from keel_core.digest import digest_permissions
@@ -253,6 +266,246 @@ def test_manifest_declares_least_scope_and_safe_outbound_contracts() -> None:
         assert actions[name].approval is ConnectorActionApproval.tainted
         assert actions[name].idempotency is ConnectorActionIdempotency.required
     assert actions["google_calendar_events_list"].semantics is ConnectorActionSemantics.read
+
+
+def test_registry_discovers_and_creates_google_calendar_provider() -> None:
+    registry = discover_connector_registry()
+    assert GOOGLE_CALENDAR_CONNECTOR_ID in {item.id for item in registry.manifests()}
+    assert registry.create(GOOGLE_CALENDAR_CONNECTOR_ID).manifest == google_calendar.manifest
+
+
+def test_build_client_uses_google_credentials_refresh_and_timeout_wiring(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    observed: dict[str, object] = {}
+    request_marker = object()
+    http_marker = object()
+    authorized_http_marker = object()
+
+    class Credentials:
+        valid = False
+        refresh_token = "present"
+
+        def refresh(self, request: object) -> None:
+            observed["refresh_request_matches"] = request is request_marker
+            self.valid = True
+
+        def to_json(self) -> str:
+            return json.dumps(
+                {
+                    "client_id": "sanitized-client.apps.googleusercontent.com",
+                    "refresh_token": "sanitized-refresh-token",
+                    "scopes": list(GOOGLE_CALENDAR_READ_SCOPES),
+                    "token": "rotated-sanitized-token",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                }
+            )
+
+    credentials = Credentials()
+
+    def from_authorized_user_info(
+        info: dict[str, Any],
+        scopes: list[str],
+    ) -> Credentials:
+        observed["credential_keys"] = tuple(sorted(info))
+        observed["requested_scopes"] = tuple(scopes)
+        observed["token_present"] = isinstance(info.get("token"), str)
+        return credentials
+
+    def make_http(*, timeout: int) -> object:
+        observed["timeout"] = timeout
+        return http_marker
+
+    def make_authorized_http(
+        supplied_credentials: object,
+        *,
+        http: object,
+    ) -> object:
+        observed["authorized_credentials_match"] = supplied_credentials is credentials
+        observed["authorized_http_match"] = http is http_marker
+        return authorized_http_marker
+
+    service = SimpleNamespace(close=lambda: observed.update(service_closed=True))
+
+    def build(
+        api: str,
+        version: str,
+        *,
+        http: object,
+        cache_discovery: bool,
+    ) -> object:
+        observed["build"] = (api, version, http is authorized_http_marker, cache_discovery)
+        return service
+
+    monkeypatch.setattr(
+        google_credentials.Credentials,
+        "from_authorized_user_info",
+        staticmethod(from_authorized_user_info),
+    )
+    monkeypatch.setattr(google_requests, "Request", lambda: request_marker)
+    monkeypatch.setattr(httplib2, "Http", make_http)
+    monkeypatch.setattr(google_auth_httplib2, "AuthorizedHttp", make_authorized_http)
+    monkeypatch.setattr(googleapiclient.discovery, "build", build)
+
+    client = build_client(_credential(), GOOGLE_CALENDAR_READ_SCOPES)
+    client.close()
+
+    assert observed == {
+        "authorized_credentials_match": True,
+        "authorized_http_match": True,
+        "build": ("calendar", "v3", True, False),
+        "credential_keys": (
+            "client_id",
+            "client_secret",
+            "refresh_token",
+            "scopes",
+            "token",
+            "token_uri",
+        ),
+        "refresh_request_matches": True,
+        "requested_scopes": GOOGLE_CALENDAR_READ_SCOPES,
+        "service_closed": True,
+        "timeout": 10,
+        "token_present": True,
+    }
+    for secret in (
+        "sanitized-access-token",
+        "sanitized-client-secret",
+        "sanitized-refresh-token",
+    ):
+        assert secret not in caplog.text
+
+
+def test_build_client_sanitizes_google_refresh_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Credentials:
+        valid = False
+        refresh_token = "present"
+
+        def refresh(self, request: object) -> None:
+            del request
+            raise RefreshError(  # type: ignore[no-untyped-call]
+                "synthetic refresh failure containing sanitized-access-token"
+            )
+
+    monkeypatch.setattr(
+        google_credentials.Credentials,
+        "from_authorized_user_info",
+        staticmethod(lambda info, scopes: Credentials()),
+    )
+    with pytest.raises(GoogleCalendarAuthenticationError) as captured:
+        build_client(_credential(), GOOGLE_CALENDAR_READ_SCOPES)
+    assert "refresh failed" in str(captured.value)
+    assert "sanitized-access-token" not in str(captured.value)
+    assert "sanitized-access-token" not in repr(captured.value)
+
+
+@pytest.mark.parametrize(
+    ("status", "content", "expected_type", "message"),
+    [
+        (401, b'{"error":"sanitized-access-token"}', GoogleCalendarAuthenticationError, "rejected"),
+        (403, b'{"error":"forbidden"}', GoogleCalendarAuthenticationError, "rejected"),
+        (404, b'{"error":"missing"}', GoogleCalendarNotFoundError, "no longer exists"),
+        (409, b'{"error":"conflict"}', GoogleCalendarError, "(409)"),
+        (410, b'{"error":"gone"}', GoogleCalendarSyncTokenExpired, "sync token"),
+        (429, b'{"error":"quota"}', GoogleCalendarRateLimitError, "rate limited"),
+        (418, b'{"error":"default"}', GoogleCalendarError, "HTTP 418"),
+    ],
+)
+def test_map_http_error_is_typed_and_sanitized(
+    status: int,
+    content: bytes,
+    expected_type: type[GoogleCalendarError],
+    message: str,
+) -> None:
+    mapped = _map_http_error(SimpleNamespace(resp=SimpleNamespace(status=status), content=content))
+    assert type(mapped) is expected_type
+    assert message in str(mapped)
+    assert "sanitized-access-token" not in str(mapped)
+    assert "sanitized-access-token" not in repr(mapped)
+
+
+def test_map_http_error_detects_403_rate_limit_reason() -> None:
+    mapped = _map_http_error(
+        SimpleNamespace(
+            resp=SimpleNamespace(status=403),
+            content=b'{"reason":"userRateLimitExceeded","token":"sanitized-access-token"}',
+        )
+    )
+    assert type(mapped) is GoogleCalendarRateLimitError
+    assert "sanitized-access-token" not in str(mapped)
+
+
+@pytest.mark.parametrize("status", [200, 204])
+async def test_revoke_google_token_uses_real_mock_transport_without_query_secret(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    status: int,
+) -> None:
+    token = "sanitized-revoke-token"
+    observed: dict[str, object] = {}
+    real_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        form = parse_qs(request.content.decode("ascii"))
+        observed.update(
+            method=request.method,
+            query_empty=not request.url.query,
+            token_matches=form.get("token") == [token],
+        )
+        return httpx.Response(status, request=request)
+
+    def client(*, timeout: float) -> httpx.AsyncClient:
+        observed["timeout"] = timeout
+        return real_client(timeout=timeout, transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(httpx, "AsyncClient", client)
+    await revoke_google_token(token)
+
+    assert observed == {
+        "method": "POST",
+        "query_empty": True,
+        "timeout": 10.0,
+        "token_matches": True,
+    }
+    assert token not in caplog.text
+
+
+async def test_revoke_google_token_sanitizes_status_and_transport_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    token = "sanitized-revoke-token"
+    real_client = httpx.AsyncClient
+
+    def install(handler: Callable[[httpx.Request], httpx.Response]) -> None:
+        def client(*, timeout: float) -> httpx.AsyncClient:
+            return real_client(timeout=timeout, transport=httpx.MockTransport(handler))
+
+        monkeypatch.setattr(httpx, "AsyncClient", client)
+
+    def rejected(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(400, request=request)
+
+    install(rejected)
+    with pytest.raises(GoogleCalendarRevokeError) as rejected_error:
+        await revoke_google_token(token)
+    assert "remote revoke failed" in str(rejected_error.value)
+    assert token not in str(rejected_error.value)
+    assert token not in repr(rejected_error.value)
+
+    def unavailable(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("transport unavailable", request=request)
+
+    install(unavailable)
+    with pytest.raises(GoogleCalendarRevokeError) as unavailable_error:
+        await revoke_google_token(token)
+    assert "could not be reached" in str(unavailable_error.value)
+    assert token not in str(unavailable_error.value)
+    assert token not in repr(unavailable_error.value)
+    assert token not in caplog.text
 
 
 async def test_oauth_stages_read_then_incremental_write(
