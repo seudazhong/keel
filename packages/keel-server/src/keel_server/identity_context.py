@@ -32,12 +32,13 @@ from keel_core.identity import (
     IdentityValidationError,
     LastOwnerError,
     NotFoundError,
+    OIDCAvailabilityError,
     OIDCVerificationError,
     OIDCVerifier,
     OptimisticConcurrencyError,
     OrgContext,
 )
-from keel_server.auth import Principal, Role, authenticate
+from keel_server.auth import Principal, Role, _match_principal, authenticate
 
 
 class ActorKind(StrEnum):
@@ -69,8 +70,10 @@ def _bearer_token(request: Request) -> str | None:
 
 
 def _looks_like_jwt(token: str) -> bool:
-    # A compact JWS has exactly three '.'-separated non-empty segments; an opaque API key
-    # does not. This lets a bearer header carry either without ambiguity.
+    # A compact JWS has exactly three '.'-separated non-empty segments. This is a *routing*
+    # hint for whether to attempt OIDC verification first — it is NOT authoritative: a valid
+    # opaque API key can coincidentally have three dotted segments, and a value that looks
+    # like a JWT but fails verification is retried as an API key (see :func:`resolve_actor`).
     parts = token.split(".")
     return len(parts) == 3 and all(parts)
 
@@ -85,17 +88,71 @@ def _oidc_verifier(request: Request) -> OIDCVerifier | None:
     return verifier if isinstance(verifier, OIDCVerifier) else None
 
 
+def _machine_or_local_actor(principal: Principal) -> Actor:
+    is_local = principal.name == "local"
+    return Actor(
+        kind=ActorKind.local if is_local else ActorKind.machine,
+        api_role=principal.role,
+        display_name=principal.name,
+    )
+
+
+def _configured_api_key_principal(request: Request, presented: str) -> Principal | None:
+    """Match ``presented`` against the *configured* API keys only (no open-mode fallback).
+
+    Deliberately does NOT invoke :func:`authenticate` (which, in open mode, would return an
+    implicit-admin local principal for *any* credential). That keeps a JWT that failed
+    verification from being laundered into an implicit-admin bypass: the bearer value is
+    only accepted if it exactly matches a real configured API key.
+    """
+    keys = getattr(request.app.state, "api_keys", {}) or {}
+    if not keys:
+        return None
+    return _match_principal(keys, presented)
+
+
 async def resolve_actor(request: Request) -> Actor:
-    """Resolve the request's actor from an OIDC JWT or the API-key/local path."""
+    """Resolve the request's actor from an OIDC JWT or the API-key/local path.
+
+    Credential classification (fail closed, no invalid-JWT bypass):
+
+    * An explicit ``X-API-Key`` header is always treated as an API key (never a JWT).
+    * A bearer token shaped like a JWT is verified as an OIDC token first. If verification
+      fails because the token is *invalid* (bad signature/claims/structure), the same value
+      is retried against the configured API keys — so a valid dotted API key still works —
+      but it is never allowed to fall through to the open-mode implicit admin. A provider
+      *availability* failure fails closed with 503 (never an uncontrolled 500).
+    * Any other bearer/local credential takes the existing API-key/local path.
+    """
     token = _bearer_token(request)
     verifier = _oidc_verifier(request)
     service = _identity_service(request)
-    if verifier is not None and token is not None and _looks_like_jwt(token):
+    explicit_api_key = bool((request.headers.get("x-api-key") or "").strip())
+
+    attempt_oidc = (
+        verifier is not None
+        and token is not None
+        and not explicit_api_key
+        and _looks_like_jwt(token)
+    )
+    if attempt_oidc:
+        assert verifier is not None and token is not None  # narrowed by attempt_oidc
         if service is None:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "identity service unavailable")
         try:
             claims = await verifier.verify(token)
+        except OIDCAvailabilityError:
+            # The provider (JWKS) is unreachable/misbehaving: fail closed with a controlled
+            # 503 — the token may be valid, we just cannot verify it right now.
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "identity provider unavailable"
+            ) from None
         except OIDCVerificationError:
+            # Not a valid OIDC token. It may instead be an opaque/dotted API key presented as
+            # a bearer credential — try that, but never fall through to open-mode admin.
+            principal = _configured_api_key_principal(request, token)
+            if principal is not None:
+                return _machine_or_local_actor(principal)
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token") from None
         try:
             user = await service.resolve_oidc_user(claims)
@@ -111,13 +168,8 @@ async def resolve_actor(request: Request) -> Actor:
             oidc_subject=claims.subject,
         )
 
-    principal: Principal = authenticate(request)
-    is_local = principal.name == "local"
-    return Actor(
-        kind=ActorKind.local if is_local else ActorKind.machine,
-        api_role=principal.role,
-        display_name=principal.name,
-    )
+    principal = authenticate(request)
+    return _machine_or_local_actor(principal)
 
 
 def _cloud_mode(request: Request) -> bool:

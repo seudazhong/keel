@@ -23,9 +23,10 @@ identity primitives that later durable-run integration binds against:
 
 Row-Level Security (ADR-0009 / DESIGN-REVIEW G16): the three tenant-owned tables carry a
 policy keyed by the ``app.org_id`` GUC (mirroring the ``app.scope_id`` pattern of the
-event core). ``memberships`` additionally permits a data-subject self-read keyed by
-``app.user_id`` so a user can enumerate its own memberships across orgs before an org is
-selected; writes are still confined to the operating org. ``FORCE ROW LEVEL SECURITY`` +
+event core). ``memberships`` additionally layers a **SELECT-only** data-subject self-read
+keyed by ``app.user_id`` so a user can enumerate its own memberships across orgs before an
+org is selected; that self-read never applies to UPDATE/DELETE, so mutations always require
+the correct operating ``app.org_id``. ``FORCE ROW LEVEL SECURITY`` +
 the non-owner, non-bypass ``keel_runtime`` role (created in 0011) keep the owner connection
 subject to the policy in production. Grants are (re)applied here guarded so a managed
 Postgres that forbids GRANT does not fail the migration.
@@ -202,15 +203,25 @@ def upgrade() -> None:
             "WITH CHECK (org_id = current_setting('app.org_id', true))"
         )
 
-    # memberships: org isolation, plus a data-subject self-read (list my own orgs). Writes
-    # remain confined to the operating org (WITH CHECK omits the self-read branch).
+    # memberships: strict org isolation for EVERY command (SELECT/INSERT/UPDATE/DELETE) —
+    # a mutation is only ever visible/allowed inside the operating org.
     op.execute(
         "CREATE POLICY org_isolation ON memberships "
+        "USING (org_id = current_setting('app.org_id', true)) "
+        "WITH CHECK (org_id = current_setting('app.org_id', true))"
+    )
+    # A data-subject self-read (list my own orgs) is layered as a **SELECT-only**
+    # permissive policy. Permissive policies are OR-combined per command, so this widens
+    # only reads to the caller's own membership rows; it deliberately does NOT apply to
+    # UPDATE/DELETE, so a caller holding just ``app.user_id`` (no operating ``app.org_id``)
+    # can never mutate a cross-org membership row — mutations still require the correct
+    # ``app.org_id`` above (defense-in-depth behind the service's authorization).
+    op.execute(
+        "CREATE POLICY self_read ON memberships FOR SELECT "
         "USING ("
         "  org_id = current_setting('app.org_id', true) "
         "  OR user_id = current_setting('app.user_id', true)"
-        ") "
-        "WITH CHECK (org_id = current_setting('app.org_id', true))"
+        ")"
     )
 
     for table in _ORG_TABLES:

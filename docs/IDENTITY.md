@@ -31,9 +31,16 @@ Three actor kinds are derived per request (no global mutable state), in
 
 * **user** — a human presenting a verified OIDC **bearer JWT**. The token is validated by
   `keel_core.identity.oidc.OIDCVerifier` (issuer + audience, signature against the issuer's
-  JWKS with rotation-aware caching, and `exp`/`nbf`/`iat` with bounded leeway; asymmetric
-  algorithms only — `HS*` is rejected to prevent alg-confusion). The subject is resolved to
-  a durable user by its `(issuer, subject)` link.
+  JWKS with rotation-aware caching, and `exp`/`nbf`/`iat` with bounded leeway). The
+  algorithm allowlist is a **hard-coded asymmetric set** (`RS*`/`ES*`/`PS*`) enforced at
+  construction — `HS*`/`none`/octet keys are rejected regardless of configuration
+  (alg-confusion defense). A multi-audience token must carry an `azp` equal to the
+  configured client id, an unknown `kid` triggers at most one coalesced, rate-limited JWKS
+  refresh (then a bounded negative cache), and a provider outage fails closed with `503`
+  (never an uncontrolled `500`) while an invalid token is `401`. The subject is resolved to
+  a durable user by its `(issuer, subject)` link. A bearer credential that is not a valid
+  JWT is retried as a configured API key, so a valid dotted API key still works, but an
+  invalid JWT is never laundered into an API-key/open-mode bypass.
 * **machine** — an API-key caller (the existing hashed-key path, unchanged). Has a role
   tier but no durable identity; identity APIs require a user (see below).
 * **local** — the open-mode single operator. Mapped to a durable *local operator* user so
@@ -61,18 +68,25 @@ An Agent acting on a resource never exceeds **both** the acting user's org capab
 the Agent's granted capabilities — the effective set is their **intersection** (a
 confused-deputy / privilege-escalation defense). Membership administration enforces
 **last-owner protection** (an org must retain ≥1 active owner) and restricts owner
-assignment to owners. This is deliberately distinct from the coarse `role >= minimum`
-endpoint tiers in `keel_server.auth`; `keel_core.scope.DefaultScopeGuard` is unchanged and
-still guards the event-core scope checks.
+assignment to owners. Owner-affecting membership changes, member management, and grant
+create/revoke are made **atomic with actor re-validation** in the durable store (a stable
+organization-row lock for last-owner, a `FOR SHARE` membership-row lock for actor role
+revalidation), so two concurrent demotions cannot leave an org ownerless and a demoted
+admin cannot commit a membership change or grant after losing authority. This is
+deliberately distinct from the coarse `role >= minimum` endpoint tiers in
+`keel_server.auth`; `keel_core.scope.DefaultScopeGuard` is unchanged and still guards the
+event-core scope checks.
 
 ## Row-Level Security
 
 The tenant-owned tables (`memberships`, `agents`, `resource_grants`) enforce Postgres RLS
 keyed by the `app.org_id` GUC, with `FORCE ROW LEVEL SECURITY` and grants to the non-owner
 `keel_runtime` role (created in `0011`), consistent with the M3.3/M3.5 safety migrations.
-`memberships` additionally permits a data-subject self-read keyed by `app.user_id` (so a
-user can list its own orgs before selecting one); writes stay confined to the operating
-org. Repositories set these GUCs on every access.
+`memberships` additionally layers a **SELECT-only** data-subject self-read keyed by
+`app.user_id` (so a user can list its own orgs before selecting one); that self-read never
+applies to `UPDATE`/`DELETE`, so a caller holding only `app.user_id` cannot mutate a
+cross-org membership — mutations always require the correct operating `app.org_id`.
+Repositories set these GUCs on every access.
 
 ## REST API (`/v1/identity`)
 
@@ -96,9 +110,11 @@ API key, or an Agent's persona/instruction text.
 | `KEEL_OIDC_ISSUER` | — | Expected `iss`. |
 | `KEEL_OIDC_AUDIENCE` | — | Allowed `aud` (comma-separated). |
 | `KEEL_OIDC_JWKS_URI` | — | Issuer JWKS (`https://`), fetched + cached. |
-| `KEEL_OIDC_ALGORITHMS` | safe asymmetric set | Override allowed algorithms. |
+| `KEEL_OIDC_CLIENT_ID` | single `aud` | Expected `azp` for multi-audience tokens. |
+| `KEEL_OIDC_ALGORITHMS` | safe asymmetric set | Restrict within the hard-coded `RS*`/`ES*`/`PS*` allowlist (`HS*`/`none` always rejected). |
 | `KEEL_OIDC_LEEWAY_SECONDS` | `60` | Clock skew tolerance for `exp`/`nbf`/`iat`. |
 | `KEEL_OIDC_JWKS_CACHE_TTL_SECONDS` | `3600` | JWKS cache TTL (rotation refresh on unknown `kid`). |
+| `KEEL_OIDC_JWKS_MIN_REFRESH_INTERVAL_SECONDS` | `60` | Min interval between unknown-`kid` JWKS refreshes (anti-amplification). |
 | `KEEL_IDENTITY_ALLOW_JIT_PROVISIONING` | `false` | JIT-provision a first-seen verified subject. |
 
 With OIDC disabled, only the API-key and local-operator actor paths are available; outside

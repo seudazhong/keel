@@ -102,8 +102,16 @@ class Settings(BaseSettings):
     oidc_audience: str = ""
     oidc_jwks_uri: str = ""
     oidc_algorithms: str = ""  # comma-separated; empty -> safe asymmetric defaults
+    # Expected authorized party (``azp``). When a token carries multiple audiences its
+    # ``azp`` MUST equal this client id (multi-audience confused-deputy defense). Empty ->
+    # derived from ``oidc_audience`` when exactly one audience is configured.
+    oidc_client_id: str = ""
     oidc_leeway_seconds: int = Field(default=60, ge=0)
     oidc_jwks_cache_ttl_seconds: int = Field(default=3600, gt=0)
+    # Minimum interval between attacker-driven (unknown-kid) JWKS refreshes. Bounds outbound
+    # JWKS requests so a flood of tokens with bogus ``kid``s cannot amplify into a matching
+    # flood of network calls (unknown-kid amplification defense).
+    oidc_jwks_min_refresh_interval_seconds: float = Field(default=60.0, ge=0)
     # Just-in-time user provisioning: a first-seen verified subject is auto-provisioned a
     # durable user. Off by default (fail closed): an unlinked subject must be linked
     # explicitly before it can act.

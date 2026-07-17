@@ -159,10 +159,12 @@ def _build_identity(engine: AsyncEngine | None, settings: Settings) -> tuple[Any
             audience=settings.oidc_audience,
             algorithms=algorithms or None,
             leeway_seconds=settings.oidc_leeway_seconds,
+            client_id=settings.oidc_client_id or None,
         )
         provider = HTTPJWKSProvider(
             settings.oidc_jwks_uri,
             cache_ttl_seconds=settings.oidc_jwks_cache_ttl_seconds,
+            min_refresh_interval_seconds=settings.oidc_jwks_min_refresh_interval_seconds,
         )
         verifier = OIDCVerifier(config, provider)
     return service, verifier

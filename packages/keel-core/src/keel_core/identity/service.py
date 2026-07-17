@@ -196,7 +196,11 @@ class IdentityService:
         if target is None or not target.is_active:
             raise NotFoundError("target user not found")
         membership = await self._store.create_membership(
-            org_id=org_id, user_id=target_user_id, role=role
+            org_id=org_id,
+            user_id=target_user_id,
+            role=role,
+            revalidate_actor_user_id=actor_user_id,
+            require_owner_actor=role is MembershipRole.owner,
         )
         self._audit.record(
             AuditEvent(
@@ -221,10 +225,22 @@ class IdentityService:
         owner_change = MembershipRole.owner in (current.role, new_role)
         if owner_change and actor.role is not MembershipRole.owner:
             raise PermissionDenied("only an owner may change owner assignments")
-        # Last-owner protection: never demote the final active owner.
-        if current.role is MembershipRole.owner and new_role is not MembershipRole.owner:
+        # Last-owner protection: never demote the final active owner. The store re-checks
+        # this atomically under an org lock (guard_last_owner) so a concurrent second
+        # demotion cannot slip through; this precheck only surfaces a clearer early error.
+        demotes_owner = (
+            current.role is MembershipRole.owner and new_role is not MembershipRole.owner
+        )
+        if demotes_owner:
             await self._guard_last_owner(org_id)
-        updated = await self._store.update_membership_role(org_id, target_user_id, new_role)
+        updated = await self._store.update_membership_role(
+            org_id,
+            target_user_id,
+            new_role,
+            guard_last_owner=demotes_owner,
+            revalidate_actor_user_id=actor_user_id,
+            require_owner_actor=owner_change,
+        )
         if updated is None:
             raise NotFoundError("target membership not found")
         self._audit.record(
@@ -247,11 +263,18 @@ class IdentityService:
         current = await self._store.get_membership(org_id, target_user_id)
         if current is None or not current.is_active:
             raise NotFoundError("target membership not found")
-        if current.role is MembershipRole.owner:
+        removes_owner = current.role is MembershipRole.owner
+        if removes_owner:
             if actor.role is not MembershipRole.owner:
                 raise PermissionDenied("only an owner may remove an owner")
             await self._guard_last_owner(org_id)
-        revoked = await self._store.revoke_membership(org_id, target_user_id)
+        revoked = await self._store.revoke_membership(
+            org_id,
+            target_user_id,
+            guard_last_owner=removes_owner,
+            revalidate_actor_user_id=actor_user_id,
+            require_owner_actor=removes_owner,
+        )
         if revoked is None:
             raise NotFoundError("target membership not found")
         self._audit.record(
@@ -464,7 +487,7 @@ class IdentityService:
         decision = self._authz.can_grant_resource(actor, agent, grant.capability)
         if not decision:
             raise PermissionDenied(decision.reason)
-        revoked = await self._store.revoke_grant(org_id, grant_id)
+        revoked = await self._store.revoke_grant(org_id, grant_id, actor_user_id=actor_user_id)
         if revoked is None:
             raise NotFoundError("grant not found")
         self._audit.record(

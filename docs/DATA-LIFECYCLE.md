@@ -59,7 +59,11 @@ Notes:
   not the runtime `scope_id`). They are erased by the dedicated identity purge in
   `keel_core.identity.purge`: `purge_organization(org_id)` (tenant offboarding) and
   `purge_user(user_id)` (a data subject; cascades through the user's OIDC links, owned
-  Agents, memberships, and issued grants). Identity is **not event-sourced**, so no
+  Agents, memberships, and issued grants). User erasure **never orphans an active org**: it
+  is atomically blocked (`UserErasureBlockedError`, deleting nothing) when the user is the
+  sole active owner of an active org that still has other active members (ownership must be
+  transferred first), and it atomically archives an active org the user solely owns and is
+  the only active member of. Identity is **not event-sourced**, so no
   projection rebuild can resurrect an erased identity row. When durable runs land and a
   run's scope is derived from `(org, agent)`, org erasure will be folded into the scope
   coordinator; until then it is a standalone primitive (tracked honestly here).

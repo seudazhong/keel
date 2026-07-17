@@ -24,13 +24,16 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from keel_core.errors import PermissionDenied
 from keel_core.identity.models import (
+    ADMIN_ROLES,
     Agent,
     AgentKind,
     AgentStatus,
     Capability,
     ConflictError,
     GrantStatus,
+    LastOwnerError,
     Membership,
     MembershipRole,
     MembershipStatus,
@@ -86,15 +89,36 @@ class IdentityStore(Protocol):
 
     # memberships
     async def create_membership(
-        self, *, org_id: str, user_id: str, role: MembershipRole
+        self,
+        *,
+        org_id: str,
+        user_id: str,
+        role: MembershipRole,
+        revalidate_actor_user_id: str | None = None,
+        require_owner_actor: bool = False,
     ) -> Membership: ...
     async def get_membership(self, org_id: str, user_id: str) -> Membership | None: ...
     async def list_memberships(self, org_id: str) -> list[Membership]: ...
     async def list_memberships_for_user(self, user_id: str) -> list[Membership]: ...
     async def update_membership_role(
-        self, org_id: str, user_id: str, role: MembershipRole
+        self,
+        org_id: str,
+        user_id: str,
+        role: MembershipRole,
+        *,
+        guard_last_owner: bool = False,
+        revalidate_actor_user_id: str | None = None,
+        require_owner_actor: bool = False,
     ) -> Membership | None: ...
-    async def revoke_membership(self, org_id: str, user_id: str) -> Membership | None: ...
+    async def revoke_membership(
+        self,
+        org_id: str,
+        user_id: str,
+        *,
+        guard_last_owner: bool = False,
+        revalidate_actor_user_id: str | None = None,
+        require_owner_actor: bool = False,
+    ) -> Membership | None: ...
     async def count_active_owners(self, org_id: str) -> int: ...
 
     # agents
@@ -140,7 +164,9 @@ class IdentityStore(Protocol):
     async def list_grants_for_resource(
         self, org_id: str, resource_type: str, resource_id: str
     ) -> list[ResourceGrant]: ...
-    async def revoke_grant(self, org_id: str, grant_id: str) -> ResourceGrant | None: ...
+    async def revoke_grant(
+        self, org_id: str, grant_id: str, *, actor_user_id: str
+    ) -> ResourceGrant | None: ...
 
 
 # --- In-memory implementation --------------------------------------------------------
@@ -291,8 +317,16 @@ class InMemoryIdentityStore:
         return None
 
     async def create_membership(
-        self, *, org_id: str, user_id: str, role: MembershipRole
+        self,
+        *,
+        org_id: str,
+        user_id: str,
+        role: MembershipRole,
+        revalidate_actor_user_id: str | None = None,
+        require_owner_actor: bool = False,
     ) -> Membership:
+        if revalidate_actor_user_id is not None:
+            self._require_manager(org_id, revalidate_actor_user_id, require_owner_actor)
         if self._membership_key(org_id, user_id) is not None:
             raise ConflictError("membership already exists")
         now = _now()
@@ -318,19 +352,44 @@ class InMemoryIdentityStore:
         return [m for m in self._memberships.values() if m.user_id == user_id]
 
     async def update_membership_role(
-        self, org_id: str, user_id: str, role: MembershipRole
+        self,
+        org_id: str,
+        user_id: str,
+        role: MembershipRole,
+        *,
+        guard_last_owner: bool = False,
+        revalidate_actor_user_id: str | None = None,
+        require_owner_actor: bool = False,
     ) -> Membership | None:
         key = self._membership_key(org_id, user_id)
         if key is None:
             return None
+        if revalidate_actor_user_id is not None:
+            self._require_manager(org_id, revalidate_actor_user_id, require_owner_actor)
+        if guard_last_owner and self._other_active_owners(org_id, user_id) == 0:
+            raise LastOwnerError("an organization must retain at least one active owner")
         updated = replace(self._memberships[key], role=role, updated_at=_now())
         self._memberships[key] = updated
         return updated
 
-    async def revoke_membership(self, org_id: str, user_id: str) -> Membership | None:
+    async def revoke_membership(
+        self,
+        org_id: str,
+        user_id: str,
+        *,
+        guard_last_owner: bool = False,
+        revalidate_actor_user_id: str | None = None,
+        require_owner_actor: bool = False,
+    ) -> Membership | None:
         key = self._membership_key(org_id, user_id)
         if key is None:
             return None
+        if self._memberships[key].status is not MembershipStatus.active:
+            return None
+        if revalidate_actor_user_id is not None:
+            self._require_manager(org_id, revalidate_actor_user_id, require_owner_actor)
+        if guard_last_owner and self._other_active_owners(org_id, user_id) == 0:
+            raise LastOwnerError("an organization must retain at least one active owner")
         now = _now()
         updated = replace(
             self._memberships[key],
@@ -340,6 +399,34 @@ class InMemoryIdentityStore:
         )
         self._memberships[key] = updated
         return updated
+
+    def _other_active_owners(self, org_id: str, exclude_user_id: str) -> int:
+        return sum(
+            1
+            for m in self._memberships.values()
+            if m.org_id == org_id
+            and m.user_id != exclude_user_id
+            and m.role is MembershipRole.owner
+            and m.status is MembershipStatus.active
+        )
+
+    def _require_manager(self, org_id: str, actor_user_id: str, require_owner: bool) -> None:
+        membership = self._active_manage_membership(org_id, actor_user_id)
+        if membership is None or (require_owner and membership.role is not MembershipRole.owner):
+            raise PermissionDenied(
+                "this operation requires an active org "
+                + ("owner" if require_owner else "admin/owner")
+                + " membership"
+            )
+
+    def _active_manage_membership(self, org_id: str, user_id: str) -> Membership | None:
+        key = self._membership_key(org_id, user_id)
+        if key is None:
+            return None
+        membership = self._memberships[key]
+        if membership.status is not MembershipStatus.active or membership.role not in ADMIN_ROLES:
+            return None
+        return membership
 
     async def count_active_owners(self, org_id: str) -> int:
         return sum(
@@ -457,6 +544,11 @@ class InMemoryIdentityStore:
         capability: Capability,
         grantor_user_id: str,
     ) -> ResourceGrant:
+        # Re-validate the grantor's authority here (defense-in-depth mirror of the durable
+        # store's transactional recheck): a grantor whose admin/owner membership has been
+        # revoked concurrently must not be able to commit a grant.
+        if self._active_manage_membership(org_id, grantor_user_id) is None:
+            raise PermissionDenied("granting requires an active org admin/owner membership")
         for grant in self._grants.values():
             if (
                 grant.org_id == org_id
@@ -516,10 +608,14 @@ class InMemoryIdentityStore:
             and g.resource_id == resource_id
         ]
 
-    async def revoke_grant(self, org_id: str, grant_id: str) -> ResourceGrant | None:
+    async def revoke_grant(
+        self, org_id: str, grant_id: str, *, actor_user_id: str
+    ) -> ResourceGrant | None:
         grant = await self.get_grant(org_id, grant_id)
         if grant is None:
             return None
+        if self._active_manage_membership(org_id, actor_user_id) is None:
+            raise PermissionDenied("revoking requires an active org admin/owner membership")
         now = _now()
         updated = replace(grant, status=GrantStatus.revoked, revoked_at=now, updated_at=now)
         self._grants[grant_id] = updated
@@ -885,14 +981,58 @@ class PostgresIdentityStore:
         return None if row is None else _to_org(row)
 
     # --- memberships (tenant-owned) --------------------------------------------------
+    async def _require_active_manager(
+        self, conn: Any, org_id: str, user_id: str, *, require_owner: bool = False
+    ) -> None:
+        """Re-check + row-lock the actor's admin/owner membership inside a mutation txn.
+
+        The ``FOR SHARE`` lock blocks a concurrent role demotion/revocation (which needs a
+        ``FOR UPDATE`` write lock on the same row) until this transaction commits; if the
+        demotion has already committed, the filtered row no longer matches and the operation
+        is refused. This makes grant + member management atomic with grantor/actor
+        revalidation so a demoted admin (or an owner demoted to admin, when ``require_owner``
+        is set) cannot commit the privileged mutation afterward.
+        """
+        roles = "('owner')" if require_owner else "('owner', 'admin')"
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT role FROM memberships "
+                        "WHERE org_id = :org AND user_id = :user AND status = 'active' "
+                        f"AND role IN {roles} FOR SHARE"
+                    ),
+                    {"org": org_id, "user": user_id},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise PermissionDenied(
+                "this operation requires an active org "
+                + ("owner" if require_owner else "admin/owner")
+                + " membership"
+            )
+
     async def create_membership(
-        self, *, org_id: str, user_id: str, role: MembershipRole
+        self,
+        *,
+        org_id: str,
+        user_id: str,
+        role: MembershipRole,
+        revalidate_actor_user_id: str | None = None,
+        require_owner_actor: bool = False,
     ) -> Membership:
         membership_id = new_membership_id()
         try:
             async with self._engine.begin() as conn:
                 await conn.execute(_SET_ORG, {"org": org_id})
                 await conn.execute(_SET_USER, {"user": user_id})
+                if revalidate_actor_user_id is not None:
+                    await self._require_active_manager(
+                        conn, org_id, revalidate_actor_user_id, require_owner=require_owner_actor
+                    )
                 row = (
                     (
                         await conn.execute(
@@ -971,11 +1111,50 @@ class PostgresIdentityStore:
             )
         return [_to_membership(row) for row in rows]
 
+    async def _lock_org_and_require_owner_retained(
+        self, conn: Any, org_id: str, exclude_user_id: str
+    ) -> None:
+        """Serialize owner-affecting mutations on an org, then assert an owner survives.
+
+        Takes a stable ``FOR UPDATE`` lock on the (global) organization row so two
+        concurrent owner demotions/removals cannot both observe two owners and both proceed.
+        Under that lock we recount the *other* active owners; if none remain the mutation
+        would leave the org ownerless and is rejected. This is the durable, race-free
+        backstop to the service-level precheck — never a substitute driven only by it.
+        """
+        await conn.execute(
+            text("SELECT id FROM organizations WHERE id = :org FOR UPDATE"),
+            {"org": org_id},
+        )
+        remaining = await conn.scalar(
+            text(
+                "SELECT count(*) FROM memberships "
+                "WHERE org_id = :org AND role = 'owner' AND status = 'active' "
+                "AND user_id <> :user"
+            ),
+            {"org": org_id, "user": exclude_user_id},
+        )
+        if int(remaining or 0) == 0:
+            raise LastOwnerError("an organization must retain at least one active owner")
+
     async def update_membership_role(
-        self, org_id: str, user_id: str, role: MembershipRole
+        self,
+        org_id: str,
+        user_id: str,
+        role: MembershipRole,
+        *,
+        guard_last_owner: bool = False,
+        revalidate_actor_user_id: str | None = None,
+        require_owner_actor: bool = False,
     ) -> Membership | None:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_ORG, {"org": org_id})
+            if revalidate_actor_user_id is not None:
+                await self._require_active_manager(
+                    conn, org_id, revalidate_actor_user_id, require_owner=require_owner_actor
+                )
+            if guard_last_owner:
+                await self._lock_org_and_require_owner_retained(conn, org_id, user_id)
             row = (
                 (
                     await conn.execute(
@@ -992,9 +1171,23 @@ class PostgresIdentityStore:
             )
         return None if row is None else _to_membership(row)
 
-    async def revoke_membership(self, org_id: str, user_id: str) -> Membership | None:
+    async def revoke_membership(
+        self,
+        org_id: str,
+        user_id: str,
+        *,
+        guard_last_owner: bool = False,
+        revalidate_actor_user_id: str | None = None,
+        require_owner_actor: bool = False,
+    ) -> Membership | None:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_ORG, {"org": org_id})
+            if revalidate_actor_user_id is not None:
+                await self._require_active_manager(
+                    conn, org_id, revalidate_actor_user_id, require_owner=require_owner_actor
+                )
+            if guard_last_owner:
+                await self._lock_org_and_require_owner_retained(conn, org_id, user_id)
             row = (
                 (
                     await conn.execute(
@@ -1210,6 +1403,7 @@ class PostgresIdentityStore:
         try:
             async with self._engine.begin() as conn:
                 await conn.execute(_SET_ORG, {"org": org_id})
+                await self._require_active_manager(conn, org_id, grantor_user_id)
                 await conn.execute(
                     text(
                         "INSERT INTO resource_grants "
@@ -1306,9 +1500,12 @@ class PostgresIdentityStore:
             )
         return [_to_grant(row) for row in rows]
 
-    async def revoke_grant(self, org_id: str, grant_id: str) -> ResourceGrant | None:
+    async def revoke_grant(
+        self, org_id: str, grant_id: str, *, actor_user_id: str
+    ) -> ResourceGrant | None:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_ORG, {"org": org_id})
+            await self._require_active_manager(conn, org_id, actor_user_id)
             row = (
                 (
                     await conn.execute(

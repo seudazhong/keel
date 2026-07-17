@@ -49,6 +49,7 @@ from keel_core.identity.models import (
 from keel_core.identity.oidc import (
     HTTPJWKSProvider,
     JWKSProvider,
+    OIDCAvailabilityError,
     OIDCClaims,
     OIDCConfig,
     OIDCVerificationError,
@@ -93,6 +94,7 @@ __all__ = [
     "NotFoundError",
     "OIDCClaims",
     "OIDCConfig",
+    "OIDCAvailabilityError",
     "OIDCIdentity",
     "OIDCVerificationError",
     "OIDCVerifier",
