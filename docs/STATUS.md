@@ -32,6 +32,24 @@ system and should not be presented as the target multi-user platform.
   - duplicate/crash recovery and attempt exhaustion;
   - exactly-once terminal result injection;
   - list/detail/cancel API and RBAC.
+- Durable interactive runs (M3.6, WS-M):
+  - Postgres `runs` state machine (admitted/queued/running/waiting_approval/completed/
+    failed/cancelled/interrupted/expired) with scope RLS + FORCE RLS, fenced `lease_token`,
+    optimistic `version`, attempt counter, budget/cost summary, and single-active-owner
+    constraint; reversible migration `0014_durable_runs`.
+  - Atomic claim/heartbeat/renew/release, lease-expiry reclaim with fencing, idempotent
+    admission (`(scope, idempotency_key)` unique) and idempotent terminalization
+    (`keel_core/runs.py`).
+  - Worker-owned execution reusing the single agent loop via
+    `keel_core.run_service.execute_run` + `keel_worker.runs.run_interactive`; the server
+    admits + streams and no longer owns the run task for the durable path.
+  - Durable interrupt/cancel/steering (`run_control`) consumed exactly once by the worker
+    (restart- and N-worker-safe); durable approvals bound to org/actor/action-hash/attempt
+    so a stale/replayed decision is rejected; queue/lease reconciliation cron.
+  - Evidence: `tests/unit/test_runs_state_machine.py`, `tests/unit/test_run_service.py`,
+    `tests/integration/test_runs_postgres.py` (two-worker claim race, lease
+    expiry/reclaim/fencing, duplicate admission, durable interrupt across restart, RLS
+    cross-scope denial, stale approval-hash/expiry deny). See _Remaining limitations_ below.
 
 ### Memory, search, and quality
 
@@ -129,6 +147,26 @@ exit-gate audit before declaring the milestone complete.
 - Web/IM runtime and approval parity.
 - Complete Memory block/history editing, Admin/RBAC UI, and local first-run onboarding.
 - Correct current copy, responsive behavior, internationalization, and accessibility.
+
+### Durable runs — remaining limitations (M3.6, WS-M)
+
+The durable substrate (schema, run state machine/repository, worker executor, durable
+approval binding, reconciliation, `/v1/runs` status/interrupt/steer APIs, lifecycle
+erasure) is implemented and tested. Not yet flipped on by default / still to do:
+
+- The server's default `POST /v1/sessions/{id}/messages` admission still runs the
+  in-process `AgentRuntime` as the **explicitly-labelled local-preview compatibility path**
+  for the existing unauthenticated single-scope mode. Routing web admission through
+  `DurableRunService`/`run_interactive` by default is staged behind authenticated identity
+  wiring (org/user/Agent scope derivation for `web:local` is not yet removed).
+- The worker interactive toolset (`keel_worker.runs`) uses the shared file/shell toolset +
+  web permission policy (`keel_core.interactive`); memory/knowledge/connector tool parity
+  with the server runtime in the durable worker path is a follow-up.
+- IM gateways (`ImRunner`, OneBot/Telegram) still use their in-process event store/loop;
+  re-pointing them at the same durable admission path is pending.
+- Agent visibility re-check at worker claim is wired as an injectable hook
+  (`execute_run(visibility_check=...)`) but the concrete persisted-Agent grant check is not
+  yet bound in `run_interactive`.
 
 ## Next work
 

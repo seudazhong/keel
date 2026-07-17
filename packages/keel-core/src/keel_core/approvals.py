@@ -45,6 +45,13 @@ class ApprovalRecord:
     expires_at: datetime
     resolved_at: datetime | None = None
     resolved_by: str | None = None
+    # M3.6 cross-surface binding: a decision is bound to the exact org/actor/run attempt
+    # and a stable hash of (tool, args) so a stale/replayed approval cannot be reused for a
+    # different action or an earlier attempt.
+    org_id: str = ""
+    actor: str = ""
+    action_hash: str = ""
+    run_attempt: int = 0
 
 
 @runtime_checkable
@@ -63,6 +70,10 @@ class ApprovalStore(Protocol):
         idempotency_key: str,
         reason: str,
         expires_at: datetime,
+        org_id: str = "",
+        actor: str = "",
+        action_hash: str = "",
+        run_attempt: int = 0,
     ) -> str: ...
 
     async def get(self, approval_id: str) -> ApprovalRecord | None: ...
@@ -71,7 +82,15 @@ class ApprovalStore(Protocol):
 
     async def pending_for_run(self, run_id: str) -> list[ApprovalRecord]: ...
 
-    async def resolve(self, approval_id: str, status: str, resolved_by: str) -> bool: ...
+    async def resolve(
+        self,
+        approval_id: str,
+        status: str,
+        resolved_by: str,
+        *,
+        expected_action_hash: str | None = None,
+        expected_run_attempt: int | None = None,
+    ) -> bool: ...
 
     async def expire_due(self, now: datetime) -> list[str]: ...
 
@@ -94,6 +113,10 @@ class InMemoryApprovalStore:
         idempotency_key: str,
         reason: str,
         expires_at: datetime,
+        org_id: str = "",
+        actor: str = "",
+        action_hash: str = "",
+        run_attempt: int = 0,
     ) -> str:
         approval_id = uuid.uuid4().hex
         self._rows[approval_id] = ApprovalRecord(
@@ -109,6 +132,10 @@ class InMemoryApprovalStore:
             status="pending",
             created_at=datetime.now(UTC),
             expires_at=expires_at,
+            org_id=org_id,
+            actor=actor,
+            action_hash=action_hash,
+            run_attempt=run_attempt,
         )
         return approval_id
 
@@ -121,9 +148,22 @@ class InMemoryApprovalStore:
     async def pending_for_run(self, run_id: str) -> list[ApprovalRecord]:
         return [r for r in self._rows.values() if r.run_id == run_id and r.status == "pending"]
 
-    async def resolve(self, approval_id: str, status: str, resolved_by: str) -> bool:
+    async def resolve(
+        self,
+        approval_id: str,
+        status: str,
+        resolved_by: str,
+        *,
+        expected_action_hash: str | None = None,
+        expected_run_attempt: int | None = None,
+    ) -> bool:
         row = self._rows.get(approval_id)
         if row is None or row.status != "pending":
+            return False
+        # Fail closed on a stale/replayed decision bound to a different action or attempt.
+        if expected_action_hash is not None and row.action_hash != expected_action_hash:
+            return False
+        if expected_run_attempt is not None and row.run_attempt != expected_run_attempt:
             return False
         row.status = status
         row.resolved_at = datetime.now(UTC)
@@ -156,6 +196,10 @@ def _to_record(row: Any) -> ApprovalRecord:
         expires_at=row["expires_at"],
         resolved_at=row["resolved_at"],
         resolved_by=row["resolved_by"],
+        org_id=row["org_id"],
+        actor=row["actor"],
+        action_hash=row["action_hash"],
+        run_attempt=row["run_attempt"],
     )
 
 
@@ -178,6 +222,10 @@ class PostgresApprovalStore:
         idempotency_key: str,
         reason: str,
         expires_at: datetime,
+        org_id: str = "",
+        actor: str = "",
+        action_hash: str = "",
+        run_attempt: int = 0,
     ) -> str:
         approval_id = uuid.uuid4().hex
         async with self._engine.begin() as conn:
@@ -185,9 +233,11 @@ class PostgresApprovalStore:
             await conn.execute(
                 text(
                     "INSERT INTO approvals (id, scope_id, run_id, session_id, tool, args, "
-                    "call_id, idempotency_key, reason, status, created_at, expires_at) VALUES "
+                    "call_id, idempotency_key, reason, status, created_at, expires_at, "
+                    "org_id, actor, action_hash, run_attempt) VALUES "
                     "(:id, :scope, :run_id, :session_id, :tool, CAST(:args AS jsonb), :call_id, "
-                    ":key, :reason, 'pending', now(), :expires_at)"
+                    ":key, :reason, 'pending', now(), :expires_at, :org_id, :actor, "
+                    ":action_hash, :run_attempt)"
                 ),
                 {
                     "id": approval_id,
@@ -200,6 +250,10 @@ class PostgresApprovalStore:
                     "key": idempotency_key,
                     "reason": reason,
                     "expires_at": expires_at,
+                    "org_id": org_id,
+                    "actor": actor,
+                    "action_hash": action_hash,
+                    "run_attempt": run_attempt,
                 },
             )
         return approval_id
@@ -255,15 +309,32 @@ class PostgresApprovalStore:
             )
         return [_to_record(r) for r in rows]
 
-    async def resolve(self, approval_id: str, status: str, resolved_by: str) -> bool:
+    async def resolve(
+        self,
+        approval_id: str,
+        status: str,
+        resolved_by: str,
+        *,
+        expected_action_hash: str | None = None,
+        expected_run_attempt: int | None = None,
+    ) -> bool:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             result = await conn.execute(
                 text(
                     "UPDATE approvals SET status = :status, resolved_at = now(), "
-                    "resolved_by = :by WHERE scope_id = :scope AND id = :id AND status = 'pending'"
+                    "resolved_by = :by WHERE scope_id = :scope AND id = :id AND status = 'pending' "
+                    "AND (CAST(:hash AS text) IS NULL OR action_hash = :hash) "
+                    "AND (CAST(:attempt AS integer) IS NULL OR run_attempt = :attempt)"
                 ),
-                {"status": status, "by": resolved_by, "scope": self._scope_id, "id": approval_id},
+                {
+                    "status": status,
+                    "by": resolved_by,
+                    "scope": self._scope_id,
+                    "id": approval_id,
+                    "hash": expected_action_hash,
+                    "attempt": expected_run_attempt,
+                },
             )
         return result.rowcount == 1
 

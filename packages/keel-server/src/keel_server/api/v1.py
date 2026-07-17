@@ -33,6 +33,7 @@ from keel_core.consolidation import (
 )
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
 from keel_core.jobs import JobStatus, JobStore, JobValidationError
+from keel_core.runs import RunControlKind, RunStore
 from keel_core.search import hybrid_search_sessions
 from keel_core.state import PostgresEventStore, list_sessions
 from keel_core.tokens import delete_token, list_connected
@@ -71,6 +72,13 @@ def _durable_approvals(request: Request) -> tuple[ApprovalStore, str]:
     return store, scope
 
 
+def _runs(request: Request) -> RunStore:
+    store: RunStore | None = getattr(request.app.state, "runs", None)
+    if store is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "durable runs unavailable")
+    return store
+
+
 @router.post(
     "/sessions/{session_id}/messages",
     response_model=CreateMessageResponse,
@@ -93,9 +101,64 @@ async def create_message(
     dependencies=[Depends(require_role(Role.operator))],
 )
 async def interrupt_run(run_id: str, request: Request) -> dict[str, bool]:
-    """Ask an in-flight run to stop at its next iteration (StopReason.interrupted)."""
-    runtime = _runtime(request)
-    return {"ok": runtime.interrupt_run(run_id)}
+    """Ask an in-flight run to stop at its next iteration (StopReason.interrupted).
+
+    Records a **durable** interrupt against the run so a worker honours it across a
+    server/worker restart, and (best-effort) also flips the local-preview in-process runtime
+    flag so a same-process run stops immediately.
+    """
+    durable = False
+    store: RunStore | None = getattr(request.app.state, "runs", None)
+    if store is not None and await store.get(run_id) is not None:
+        durable = await store.request_control(
+            run_id, kind=RunControlKind.interrupt, requested_by="web"
+        )
+    local = _runtime(request).interrupt_run(run_id)
+    return {"ok": durable or local}
+
+
+@router.post(
+    "/runs/{run_id}/steer",
+    summary="Steer a running agent run (durable steering message)",
+    dependencies=[Depends(require_role(Role.operator))],
+)
+async def steer_run(run_id: str, body: dict[str, Any], request: Request) -> dict[str, bool]:
+    """Record a durable steering message consumed by the owning worker mid-run."""
+    text_value = str(body.get("text", "")).strip()
+    if not text_value:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "text is required")
+    store = _runs(request)
+    ok = await store.request_control(
+        run_id, kind=RunControlKind.steer, requested_by="web", payload={"text": text_value}
+    )
+    if not ok:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown or terminal run")
+    return {"ok": True}
+
+
+@router.get("/runs/{run_id}", summary="Get durable run status")
+async def get_run(run_id: str, request: Request) -> dict[str, object]:
+    """Read the durable run's authoritative status/attempt/cost (worker-owned execution)."""
+    record = await _runs(request).get(run_id)
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
+    return {
+        "id": record.id,
+        "status": record.status.value,
+        "stop_reason": record.stop_reason,
+        "surface": record.surface,
+        "agent_id": record.agent_id,
+        "session_id": record.session_id,
+        "attempt": record.attempt,
+        "version": record.version,
+        "prompt_tokens": record.prompt_tokens,
+        "completion_tokens": record.completion_tokens,
+        "cost_usd": record.cost_usd,
+        "created_at": record.created_at.isoformat(),
+        "updated_at": record.updated_at.isoformat(),
+        "finished_at": record.finished_at.isoformat() if record.finished_at else None,
+        "error_kind": record.error_kind,
+    }
 
 
 @router.get("/jobs", response_model=list[JobResponse], summary="List durable jobs")

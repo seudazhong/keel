@@ -108,7 +108,7 @@ async def migrated_db(pg_engine: AsyncEngine) -> AsyncIterator[AsyncEngine]:
                 "kb_documents, knowledge_bases, jobs, consolidation_cursors, "
                 "memory_proposals, message_embeddings, events, sessions, memory_blocks, "
                 "memory_block_versions, connector_tokens, connector_outbox, oauth_states, "
-                "webhook_deliveries, archival, schedules, approvals, "
+                "webhook_deliveries, archival, schedules, approvals, run_control, runs, "
                 "erasure_steps, erasure_requests, event_tombstones, retention_policies, "
                 "resource_grants, agents, memberships, oidc_identities, organizations, users"
             )

@@ -138,6 +138,18 @@ approvals; audit UX.
 `web:local`; restart/scale-out preserves run and approval ownership; Web and IM operate the same
 durable runtime; authentication cannot expand connector/resource authority.
 
+**Progress (WS-M, durable run topology):** the durable run substrate is landed and tested —
+Postgres `runs` state machine + `run_control` (migration `0014_durable_runs`), fenced
+claim/lease/heartbeat/reclaim/terminalize (`keel_core/runs.py`), worker-owned execution reusing
+the single agent loop (`keel_core.run_service`, `keel_worker.runs.run_interactive`), durable
+cross-surface approvals bound to org/actor/action-hash/attempt, queue/lease reconciliation, and
+`/v1/runs` status/interrupt/steer APIs. Proven by two-worker claim race, lease
+expiry/reclaim/fencing, duplicate admission, interrupt-across-restart, RLS cross-scope, and
+stale-approval integration tests. **Still open for the exit gate:** flipping the server/IM default
+admission off the `web:local` in-process `AgentRuntime` compatibility path onto the durable
+service, worker memory/knowledge tool parity, and binding the persisted-Agent visibility check at
+worker claim (tracked in [STATUS](./STATUS.md#durable-runs--remaining-limitations-m36-ws-m)).
+
 Multi-organization SaaS, billing, and hard organizational tenancy remain later work.
 
 ## M3.7 — Connector and Team Experience

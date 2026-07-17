@@ -289,6 +289,7 @@ class ErasureCoordinator:
             ("oauth_states", lambda: self._wrap(purge.oauth_states(scope))),
             ("schedules", lambda: self._wrap(purge.schedules(scope))),
             ("approvals", lambda: self._wrap(purge.approvals(scope))),
+            ("runs", lambda: self._wrap(purge.runs(scope))),
             (
                 "jobs",
                 lambda: self._wrap(purge.jobs(scope, exclude_job_id=current_job_id)),

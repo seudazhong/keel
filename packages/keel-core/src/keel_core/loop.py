@@ -43,6 +43,7 @@ from keel_core.protocols import (
     ToolResult,
     Usage,
 )
+from keel_core.runs import action_hash as _action_hash
 from keel_core.tools.executor import ApproveFn, ExecRequest, execute
 from keel_core.types import (
     ContentTaint,
@@ -140,6 +141,20 @@ class RunBudget:
     max_iterations: int = 20
     token_budget: int | None = None
     max_retries: int = 2
+
+
+@dataclass
+class ApprovalBinding:
+    """Binds durable approvals raised by a run to its org/actor/attempt (M3.6).
+
+    Carried into :func:`_run_tools` so each pending approval records the exact org, actor,
+    run attempt, and an ``action_hash`` of (tool, args). A cross-surface decision is then
+    verifiable against the exact action + attempt, so a stale/replayed approval cannot be
+    reused (see :func:`keel_core.runs.action_hash`)."""
+
+    org_id: str = ""
+    actor: str = ""
+    run_attempt: int = 0
 
 
 @dataclass
@@ -309,6 +324,7 @@ async def _run_tools(
     calls: list[ToolCall],
     approvals: ApprovalStore | None = None,
     expires_at: datetime | None = None,
+    binding: ApprovalBinding | None = None,
 ) -> list[str]:
     """Emit tool.call events, run the calls through the parallel-safe permission-gated
     executor, then emit tool.result events — all in source order. A failing tool yields
@@ -358,6 +374,10 @@ async def _run_tools(
                     idempotency_key=key,
                     reason=reason,
                     expires_at=expires_at or _now(),
+                    org_id=binding.org_id if binding else "",
+                    actor=binding.actor if binding else "",
+                    action_hash=_action_hash(call.name, call.arguments),
+                    run_attempt=binding.run_attempt if binding else 0,
                 )
                 await _emit(
                     store,
@@ -419,6 +439,7 @@ async def _agent_loop(
     expires_at: datetime | None = None,
     start_iteration: int = 0,
     system_context: SystemContextFn | None = None,
+    binding: ApprovalBinding | None = None,
 ) -> _LoopOutcome:
     """The turn loop: build request -> call provider -> (gate) run tools -> repeat.
 
@@ -484,6 +505,7 @@ async def _agent_loop(
                 turn.tool_calls,
                 approvals,
                 expires_at,
+                binding,
             )
             if suspended:
                 pending = suspended
@@ -526,6 +548,7 @@ async def run(
     approvals: ApprovalStore | None = None,
     expires_at: datetime | None = None,
     system_context: SystemContextFn | None = None,
+    binding: ApprovalBinding | None = None,
 ) -> RunResult:
     """Execute the agent loop until a named termination and return the result.
 
@@ -578,6 +601,7 @@ async def run(
         approvals=approvals,
         expires_at=expires_at,
         system_context=system_context,
+        binding=binding,
     )
 
     if outcome.reason is StopReason.suspended:
@@ -643,6 +667,7 @@ async def resume(
     stream_deltas: bool = False,
     expires_at: datetime | None = None,
     system_context: SystemContextFn | None = None,
+    binding: ApprovalBinding | None = None,
 ) -> RunResult:
     """Resume a suspended run: resolve its pending tool batch, then continue the loop.
 
@@ -726,6 +751,7 @@ async def resume(
         approvals=approvals,
         expires_at=expires_at,
         system_context=system_context,
+        binding=binding,
     )
 
     if outcome.reason is StopReason.suspended:

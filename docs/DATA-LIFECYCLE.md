@@ -34,6 +34,8 @@ not be — so a new store cannot be added without a conscious retention + erasur
 | `schedules` | table | permanent | `scope_id` | scope-bound |
 | `approvals` | table | standard (30d) | `scope_id` | scope-bound |
 | `jobs` | table | standard (30d) | `scope_id` | scope-bound (running erasure job kept) |
+| `runs` | table | standard (30d) | `scope_id` | scope-bound (durable interactive runs, M3.6) |
+| `run_control` | table | standard (30d) | `scope_id` | scope-bound (durable interrupt/cancel/steer, M3.6) |
 | coding artifacts | filesystem | standard | *(by project id)* | project-scoped (repo/snapshots/worktrees/artifacts) |
 | tool spill files | filesystem | short | *(by recorded path)* | session-scoped, confined to the spill root |
 | Redis event streams (`events:{session_id}`) | redis | permanent | *(by session id)* | session-scoped (bounded key delete) |
@@ -90,7 +92,7 @@ each with a default horizon:
 | --- | --- | --- |
 | `transient` | 1 hour | one-time OAuth CSRF state |
 | `short` | 1 day | webhook replay dedup, outbound-idempotency claims, tool spill |
-| `standard` | 30 days | resolved approvals, finished jobs, coding artifacts |
+| `standard` | 30 days | resolved approvals, finished jobs, finished runs, coding artifacts |
 | `long` | 365 days | memory proposals, the erasure/tombstone ledger |
 | `permanent` | none | sessions, events, memory, archival, knowledge, connector tokens |
 

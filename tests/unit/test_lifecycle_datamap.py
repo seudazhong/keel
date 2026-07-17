@@ -38,6 +38,8 @@ _ENTRY_TO_STEP = {
     "schedules": "schedules",
     "approvals": "approvals",
     "jobs": "jobs",
+    "runs": "runs",
+    "run_control": "runs",
     "coding_artifacts": "coding_artifacts",
     "tool_spill": "tool_spill",
     "redis_event_streams": "redis_streams",

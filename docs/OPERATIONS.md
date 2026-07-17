@@ -146,6 +146,12 @@ An org the user solely owns and is the only member of is atomically archived.
   `POST /v1/identity/agents/{id}/select` is only a forward-compatible bridge. See
   `docs/IDENTITY.md`.)*
 - The scheduler package is not a separate elected service; worker cron performs scheduling.
+- Durable interactive runs (M3.6, WS-M): the `runs`/`run_control` tables + `run_interactive`
+  worker job give worker-owned, restart-safe interactive execution under a fenced lease; the
+  `reconcile_runs_tick` worker cron recovers admitted-but-undispatched and expired
+  running/waiting runs. The server's default web admission still uses the in-process
+  `AgentRuntime` (local-preview compatibility path) until authenticated durable admission is
+  flipped on; see `docs/STATUS.md`. New migration: `0014_durable_runs` (reversible).
 - Event versions exist but upcasters, retention, and full erasure are not implemented.
 - Observability, generated SDK/version checks, CI coverage, backup/restore, and delivery
   profiles remain below the target architecture.

@@ -46,6 +46,7 @@ from keel_core.knowledge.service import DispatchJob, KnowledgeService
 from keel_core.knowledge.store import KnowledgeStore, PostgresKnowledgeStore
 from keel_core.oauth_state import InMemoryOAuthStateStore, PostgresOAuthStateStore
 from keel_core.providers import LiteLLMGateway
+from keel_core.runs import InMemoryRunStore, PostgresRunStore
 from keel_core.tools import build_service_execution_environment
 from keel_core.webhooks import InMemoryWebhookReplayStore, PostgresWebhookReplayStore
 from keel_server.api import gateway as gateway_api
@@ -226,6 +227,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         PostgresApprovalStore(engine, _DURABLE_SCOPE)
         if engine is not None
         else InMemoryApprovalStore()
+    )
+    # Durable, worker-owned interactive runs (M3.6). The server *reads* run status/events
+    # and routes admission/interrupt through the durable run store; a worker owns execution.
+    app.state.runs = (
+        PostgresRunStore(engine, _DURABLE_SCOPE) if engine is not None else InMemoryRunStore()
     )
     app.state.arq = None
     app.state.enqueue = None

@@ -77,6 +77,9 @@ class FakePurge:
         self.calls.append("jobs")
         return 1
 
+    async def runs(self, scope_id: str) -> int:
+        return await self._op("runs")
+
     async def session_message_embeddings(self, scope_id: str, session_id: str) -> int:
         return await self._op("session_message_embeddings")
 

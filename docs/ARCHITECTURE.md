@@ -355,8 +355,22 @@ memory.updated · turn.ended · run.ended{reason} · error · lifecycle{phase}
 - **Current:** schedules are persisted and worker cron uses compare-and-set advancement before
   enqueue. Durable background jobs provide DB leases/reclaim, retries, progress,
   cancellation, and exactly-once terminal result injection.
-- **Not yet target-complete:** `keel-scheduler` is not a separately elected service, and
-  interactive Web runs are not worker-owned. Durable-run and scale-out gates are in M3.6/M3.8.
+- **Durable interactive runs (M3.6, WS-M):** an interactive run is a durable, RLS-scoped
+  `runs` row (state machine: admitted/queued/running/waiting_approval/completed/failed/
+  cancelled/interrupted/expired) driven under a fenced `lease_token` by
+  `keel_worker.runs.run_interactive`, which reuses the single agent loop through
+  `keel_core.run_service.execute_run`. Admission is idempotent (`(scope, idempotency_key)`
+  unique); claim/heartbeat/reclaim/terminalize are atomic and fenced; durable interrupt/
+  cancel/steering (`run_control`) and cross-surface approvals bound to org/actor/action-hash/
+  attempt survive server and worker restart; a `reconcile_runs` cron recovers
+  admitted-but-undispatched and expired running/waiting runs. The durable `runs` row — never a
+  server-local `asyncio` task/future — is the source of truth.
+- **Not yet target-complete:** `keel-scheduler` is not a separately elected service. The
+  server's default web admission still uses the in-process `AgentRuntime` as an
+  explicitly-labelled **local-preview compatibility path**; routing web/IM admission through
+  the durable service by default, worker memory/knowledge tool parity, and the concrete
+  persisted-Agent visibility check at claim are the remaining M3.6 wiring (see
+  [STATUS](./STATUS.md#durable-runs--remaining-limitations-m36-ws-m)). Scale-out gates are in M3.8.
 
 ---
 

@@ -45,11 +45,13 @@ from keel_core.jobs import JobLimits, PostgresJobStore
 from keel_core.loop import ToolRegistry, admit, resume, run
 from keel_core.memory import PostgresMemoryStore
 from keel_core.observability import configure_logging, configure_tracing
+from keel_core.runs import PostgresRunStore
 from keel_core.state import PostgresEventStore
 from keel_core.tools import build_service_execution_environment
 from keel_scheduler.store import ScheduleRow, due_tick
 from keel_worker.jobs import dispatch_jobs, run_job
 from keel_worker.knowledge import knowledge_job_registry
+from keel_worker.runs import reconcile_runs_tick, run_interactive
 
 logger = logging.getLogger("keel.worker")
 
@@ -276,6 +278,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     )
     ctx["store"] = PostgresEventStore(engine, _DURABLE_SCOPE)
     ctx["approvals"] = PostgresApprovalStore(engine, _DURABLE_SCOPE)
+    ctx["runs"] = PostgresRunStore(engine, _DURABLE_SCOPE)
     ctx["schedules"] = PostgresScheduleStore(engine, _DURABLE_SCOPE)
     ctx["claim"] = PostgresClaimStore(engine, _DURABLE_SCOPE)
     ctx["provider"] = LiteLLMGateway()
@@ -345,7 +348,9 @@ class WorkerSettings:
     functions = [
         run_agent,
         resume_run,
+        run_interactive,
         scheduler_tick,
+        reconcile_runs_tick,
         func(
             run_job,
             timeout=get_settings().job_execution_timeout_seconds,
@@ -356,6 +361,7 @@ class WorkerSettings:
     cron_jobs = [
         cron(scheduler_tick, second={0, 30}),
         cron(dispatch_jobs, second={0, 30}),
+        cron(reconcile_runs_tick, second={0, 30}),
     ]
     on_startup = startup
     on_shutdown = shutdown

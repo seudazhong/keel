@@ -25,6 +25,7 @@ from keel_core.oauth_state import purge_scope as _purge_oauth
 from keel_core.outbox import purge_scope as _purge_outbox
 from keel_core.recall import purge_scope as _purge_embeddings
 from keel_core.recall import purge_session as _purge_embeddings_session
+from keel_core.runs import purge_scope as _purge_runs
 from keel_core.search import purge_scope as _purge_archival
 from keel_core.state import purge_scope as _purge_state
 from keel_core.state import purge_session as _purge_state_session
@@ -104,6 +105,9 @@ class ScopePurgeRepository:
 
     async def jobs(self, scope_id: str, *, exclude_job_id: str | None = None) -> int:
         return await _purge_jobs(self._engine, scope_id, exclude_job_id=exclude_job_id)
+
+    async def runs(self, scope_id: str) -> int:
+        return await _purge_runs(self._engine, scope_id)
 
     async def schedules(self, scope_id: str) -> int:
         # Inlined (schedules is owned by keel-scheduler) to avoid a reverse dependency.

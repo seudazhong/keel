@@ -212,6 +212,22 @@ DATA_MAP: tuple[DataMapEntry, ...] = (
         ErasureTreatment.scope_bound,
         "Durable background jobs/results; the running erasure job's own row is kept.",
     ),
+    DataMapEntry(
+        "runs",
+        "table",
+        policies.RUN,
+        "scope_id",
+        ErasureTreatment.scope_bound,
+        "Durable worker-owned interactive runs (state machine + lease + cost summary).",
+    ),
+    DataMapEntry(
+        "run_control",
+        "table",
+        policies.RUN,
+        "scope_id",
+        ErasureTreatment.scope_bound,
+        "Durable interrupt/cancel/steering requests against a run.",
+    ),
     # --- Filesystem ------------------------------------------------------------------
     DataMapEntry(
         "coding_artifacts",
