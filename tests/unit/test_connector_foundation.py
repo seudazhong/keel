@@ -25,9 +25,11 @@ from keel_core.connector_contracts import (
     ConnectorChangeKind,
     ConnectorCredentialUpdate,
     ConnectorCursorUpdate,
+    ConnectorDeliveryHealth,
     ConnectorEvent,
     ConnectorHealth,
     ConnectorHealthStatus,
+    ConnectorIngressFailure,
     ConnectorIngressRequest,
     ConnectorIngressResponse,
     ConnectorIngressResult,
@@ -52,7 +54,11 @@ from keel_core.connector_registry import (
     ConnectorRegistry,
     discover_connector_registry,
 )
-from keel_core.connector_repository import InMemoryConnectorRepository
+from keel_core.connector_repository import (
+    ConnectorDeliveryClaim,
+    ConnectorDeliveryClaimLostError,
+    InMemoryConnectorRepository,
+)
 from keel_core.connector_service import (
     ConnectorChangeSink,
     ConnectorService,
@@ -199,6 +205,24 @@ class _Sink(ConnectorChangeSink):
         self.changes.append(change)
 
 
+class _TrackingRepository(InMemoryConnectorRepository):
+    def __init__(self, scope_id: str) -> None:
+        super().__init__(scope_id)
+        self.claim_attempts = 0
+
+    async def claim_delivery(
+        self,
+        connector_id: str,
+        binding_id: str,
+        delivery_id: str,
+        payload_hash: str,
+    ) -> ConnectorDeliveryClaim | None:
+        self.claim_attempts += 1
+        return await super().claim_delivery(
+            connector_id, binding_id, delivery_id, payload_hash
+        )
+
+
 def _service() -> tuple[ConnectorService, InMemoryConnectorRepository, _Sink]:
     registry = ConnectorRegistry(
         (
@@ -226,13 +250,14 @@ async def test_repository_rejects_plaintext_secret_metadata() -> None:
 
 async def test_health_does_not_promote_staged_binding_to_connected() -> None:
     repository = InMemoryConnectorRepository("scope:a")
-    await repository.upsert_binding(
+    binding = await repository.upsert_binding(
         "fixture",
         ConnectorBindingDraft(),
         ConnectorBindingStatus.configured,
     )
     updated = await repository.record_health(
         "fixture",
+        binding.id,
         ConnectorHealth(ConnectorHealthStatus.healthy, datetime.now(UTC)),
     )
     assert updated is not None
@@ -333,6 +358,31 @@ async def test_ingress_verifies_before_claim_and_replays_once() -> None:
     assert len(sink.changes) == 1
 
 
+async def test_ingress_authentication_failure_never_claims() -> None:
+    repository = _TrackingRepository("scope:a")
+    await repository.upsert_binding(
+        "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    service = ConnectorService(
+        ConnectorRegistry(
+            (ConnectorRegistration(_Provider.manifest, _Provider, "tests.fixture"),)
+        ),
+        repository,
+    )
+    with pytest.raises(ValueError, match="signature"):
+        await service.ingress(
+            "fixture",
+            ConnectorIngressRequest(
+                "POST",
+                {},
+                {"x-signature": "invalid"},
+                b"body",
+                "https://keel.example/v1/connectors/fixture/webhook",
+            ),
+        )
+    assert repository.claim_attempts == 0
+
+
 async def test_ingress_challenge_returns_before_delivery_claim() -> None:
     class ChallengeProvider(_Provider):
         async def ingress(
@@ -356,7 +406,7 @@ async def test_ingress_challenge_returns_before_delivery_claim() -> None:
     registry = ConnectorRegistry(
         (ConnectorRegistration(_Provider.manifest, ChallengeProvider, "tests.challenge"),)
     )
-    repository = InMemoryConnectorRepository("scope:a")
+    repository = _TrackingRepository("scope:a")
     await repository.upsert_binding(
         "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
     )
@@ -377,6 +427,7 @@ async def test_ingress_challenge_returns_before_delivery_claim() -> None:
     )
     assert outcome.response.body == b"challenge"
     assert outcome.accepted is False
+    assert repository.claim_attempts == 0
 
 
 def test_ingress_response_rejects_unsafe_hop_by_hop_headers() -> None:
@@ -404,14 +455,226 @@ async def test_failed_delivery_can_be_retried() -> None:
     binding = await repository.upsert_binding(
         "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
     )
-    assert await repository.claim_delivery("fixture", binding.id, "delivery", "a" * 64)
+    first = await repository.claim_delivery("fixture", binding.id, "delivery", "a" * 64)
+    assert first is not None
+    assert first.token not in repr(first)
     await repository.finish_delivery(
-        "fixture",
-        "delivery",
-        error_code="temporary",
-        error_summary="retryable",
+        first,
+        failure=ConnectorIngressFailure("temporary", "retryable", retryable=True),
     )
-    assert await repository.claim_delivery("fixture", binding.id, "delivery", "a" * 64)
+    second = await repository.claim_delivery("fixture", binding.id, "delivery", "a" * 64)
+    assert second is not None
+    assert second.token != first.token
+    health = await repository.get_delivery_health("fixture", binding.id)
+    assert health is not None
+    assert health.summary == "retryable"
+    await repository.finish_delivery(second)
+    assert await repository.get_delivery_health("fixture", binding.id) is None
+
+
+def test_ingress_failure_requires_delivery_and_rejects_changes() -> None:
+    failure = ConnectorIngressFailure(
+        "provider_unavailable",
+        "Provider processing is temporarily unavailable.",
+        retryable=True,
+    )
+    with pytest.raises(ValueError, match="cannot contain changes or failures"):
+        ConnectorIngressResult(ConnectorIngressResponse(status_code=503), failure=failure)
+    with pytest.raises(ValueError, match="cannot contain changes"):
+        ConnectorIngressResult(
+            ConnectorIngressResponse(status_code=503),
+            delivery_id="delivery",
+            payload_hash="a" * 64,
+            changes=(
+                ConnectorChange(
+                    ConnectorChangeKind.delete,
+                    ConnectorProvenance("fixture", "binding", "resource"),
+                ),
+            ),
+            failure=failure,
+        )
+
+
+async def test_verified_failure_is_durable_and_returns_provider_retry_response() -> None:
+    class FailureProvider(_Provider):
+        async def ingress(
+            self,
+            context: ConnectorOperationContext,
+            request: ConnectorIngressRequest,
+        ) -> ConnectorIngressResult:
+            assert context.binding is not None
+            return ConnectorIngressResult(
+                ConnectorIngressResponse(
+                    status_code=503,
+                    content_type="application/json",
+                    body=b'{"retry":true}',
+                ),
+                delivery_id="delivery-failed",
+                payload_hash=hashlib.sha256(request.body).hexdigest(),
+                failure=ConnectorIngressFailure(
+                    "provider_processing_failed",
+                    "Provider could not process the verified delivery.",
+                    retryable=True,
+                ),
+            )
+
+    repository = InMemoryConnectorRepository("scope:a")
+    binding = await repository.upsert_binding(
+        "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    service = ConnectorService(
+        ConnectorRegistry(
+            (
+                ConnectorRegistration(
+                    _Provider.manifest, FailureProvider, "tests.failure"
+                ),
+            )
+        ),
+        repository,
+    )
+    outcome = await service.ingress(
+        "fixture",
+        ConnectorIngressRequest(
+            "POST",
+            {},
+            {},
+            b"verified",
+            "https://keel.example/v1/connectors/fixture/webhook",
+        ),
+    )
+    assert (outcome.response.status_code, outcome.accepted) == (503, False)
+    health = await repository.get_delivery_health("fixture", binding.id)
+    assert health is not None
+    assert (
+        health.unresolved_count,
+        health.summary,
+        health.retryable,
+    ) == (1, "Provider could not process the verified delivery.", True)
+
+
+async def test_sink_failure_is_exposed_to_provider_health_and_retry_success_clears_it() -> None:
+    captured: list[ConnectorDeliveryHealth | None] = []
+
+    class HealthProvider(_Provider):
+        async def health(self, context: ConnectorOperationContext) -> ConnectorHealth:
+            captured.append(context.delivery_health)
+            if context.delivery_health is None:
+                return ConnectorHealth(ConnectorHealthStatus.healthy, datetime.now(UTC))
+            return ConnectorHealth(
+                ConnectorHealthStatus.degraded,
+                datetime.now(UTC),
+                context.delivery_health.summary,
+                retryable=context.delivery_health.retryable,
+            )
+
+    class FailingSink(ConnectorChangeSink):
+        async def apply(self, change: ConnectorChange) -> None:
+            raise RuntimeError("internal sink details must not be persisted")
+
+    registry = ConnectorRegistry(
+        (ConnectorRegistration(_Provider.manifest, HealthProvider, "tests.health"),)
+    )
+    repository = InMemoryConnectorRepository("scope:a")
+    binding = await repository.upsert_binding(
+        "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    request = ConnectorIngressRequest(
+        "POST",
+        {},
+        {"x-signature": "valid"},
+        b"body",
+        "https://keel.example/v1/connectors/fixture/webhook",
+    )
+    with pytest.raises(RuntimeError, match="internal sink details"):
+        await ConnectorService(
+            registry, repository, change_sink=FailingSink()
+        ).ingress("fixture", request)
+    health = await ConnectorService(registry, repository).health("fixture")
+    assert health.status is ConnectorHealthStatus.degraded
+    failed_health = captured[-1]
+    assert failed_health is not None
+    assert failed_health.summary == "connector delivery processing failed"
+    assert "internal sink details" not in failed_health.summary
+
+    outcome = await ConnectorService(
+        registry, repository, change_sink=_Sink()
+    ).ingress("fixture", request)
+    assert outcome.accepted is True
+    assert await repository.get_delivery_health("fixture", binding.id) is None
+    healthy = await ConnectorService(registry, repository).health("fixture")
+    assert healthy.status is ConnectorHealthStatus.healthy
+    assert captured[-1] is None
+
+
+async def test_delivery_claim_token_and_binding_fence_finalization() -> None:
+    repository = InMemoryConnectorRepository("scope:a")
+    binding = await repository.upsert_binding(
+        "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    first = await repository.claim_delivery("fixture", binding.id, "delivery", "a" * 64)
+    assert first is not None
+    await repository.finish_delivery(
+        first,
+        failure=ConnectorIngressFailure("temporary", "First failure", retryable=True),
+    )
+    second = await repository.claim_delivery("fixture", binding.id, "delivery", "a" * 64)
+    assert second is not None and second.token != first.token
+    with pytest.raises(ConnectorDeliveryClaimLostError, match="claim was lost"):
+        await repository.finish_delivery(first)
+    health = await repository.get_delivery_health("fixture", binding.id)
+    assert health is not None and health.summary == "First failure"
+
+    await repository.delete_connector("fixture")
+    replacement = await repository.upsert_binding(
+        "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    assert replacement.id != binding.id
+    with pytest.raises(ConnectorDeliveryClaimLostError, match="claim was lost"):
+        await repository.finish_delivery(second)
+    assert await repository.get_delivery_health("fixture", replacement.id) is None
+    assert (
+        await repository.record_health(
+            "fixture",
+            binding.id,
+            ConnectorHealth(
+                ConnectorHealthStatus.error,
+                datetime.now(UTC),
+                "old binding failure",
+            ),
+        )
+        is None
+    )
+    current = await repository.get_binding("fixture")
+    assert current is not None and current.status is ConnectorBindingStatus.connected
+
+
+async def test_current_binding_delivery_health_uses_latest_bounded_summary() -> None:
+    repository = InMemoryConnectorRepository("scope:a")
+    binding = await repository.upsert_binding(
+        "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    first = await repository.claim_delivery("fixture", binding.id, "one", "a" * 64)
+    second = await repository.claim_delivery("fixture", binding.id, "two", "b" * 64)
+    assert first is not None and second is not None
+    await repository.finish_delivery(
+        first,
+        failure=ConnectorIngressFailure("first", "First failure", retryable=False),
+    )
+    await repository.finish_delivery(
+        second,
+        failure=ConnectorIngressFailure(
+            "second",
+            "  Latest \n safe summary  ",
+            retryable=True,
+        ),
+    )
+    health = await repository.get_delivery_health("fixture", binding.id)
+    assert health is not None
+    assert (health.unresolved_count, health.summary, health.retryable) == (
+        2,
+        "Latest safe summary",
+        True,
+    )
 
 
 async def test_sync_rejects_clean_external_change() -> None:
