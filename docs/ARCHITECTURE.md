@@ -159,6 +159,8 @@ keel-core
 ├─ skills/        SKILL.md loader, progressive disclosure (inline/fork)
 ├─ mcp/           MCP client (stdio + HTTP/SSE), tool import, allow-list
 ├─ connectors/    email · calendar · contacts · docs · IM — OAuth, per-scope, surfaced as scoped tools
+├─ identity/      users · orgs · memberships · persisted Agents · resource grants (RLS, authz)
+├─ projects/      managed projects · run-scoped worktrees · repo sync ledger · GitHub App (M3.7)
 ├─ discovery/     tool_search (agentic discovery) over registry+MCP+skills
 ├─ permissions/   PermissionEngine (allow/ask/deny), approval bus protocol
 ├─ observability/ tracer (OTel), scores, cost accounting

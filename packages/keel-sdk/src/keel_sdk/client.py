@@ -8,15 +8,27 @@ import httpx
 
 from keel_sdk.models import (
     AgentSummary,
+    AssociateRunRequest,
     CreateAgentRequest,
     CreateGrantRequest,
     CreateMessageRequest,
     CreateMessageResponse,
     CreateOrganizationRequest,
+    CreateProjectRequest,
+    GrantProjectRequest,
     GrantSummary,
+    ImportProjectRequest,
+    InstallationSummary,
     InterruptRunResponse,
+    LinkInstallationRequest,
+    MaterializeWorktreeRequest,
     MeResponse,
     OrganizationMembership,
+    ProjectSummary,
+    RunAssociation,
+    SyncEntrySummary,
+    UpdateProjectRequest,
+    WorktreeSummary,
 )
 
 
@@ -146,3 +158,175 @@ class KeelClient:
         )
         response.raise_for_status()
         return GrantSummary.model_validate(response.json())
+
+    # --- Managed projects (M3.7) — additive methods ----------------------------------
+    async def list_projects(
+        self, org: str, *, include_inactive: bool = False
+    ) -> list[ProjectSummary]:
+        """List managed projects in ``org``."""
+        response = await self._client.get(
+            "/v1/projects",
+            params={"include_inactive": include_inactive},
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return [ProjectSummary.model_validate(item) for item in response.json()]
+
+    async def create_project(self, org: str, request: CreateProjectRequest) -> ProjectSummary:
+        """Create a blank/local managed project in ``org``."""
+        response = await self._client.post(
+            "/v1/projects", json=request.model_dump(), headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        return ProjectSummary.model_validate(response.json())
+
+    async def import_project(self, org: str, request: ImportProjectRequest) -> ProjectSummary:
+        """Import a project from a GitHub repository in ``org``."""
+        response = await self._client.post(
+            "/v1/projects/import", json=request.model_dump(), headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        return ProjectSummary.model_validate(response.json())
+
+    async def get_project(self, org: str, project_id: str) -> ProjectSummary:
+        """Fetch one managed project."""
+        response = await self._client.get(
+            f"/v1/projects/{project_id}", headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        return ProjectSummary.model_validate(response.json())
+
+    async def update_project(
+        self, org: str, project_id: str, request: UpdateProjectRequest
+    ) -> ProjectSummary:
+        """Optimistically update a managed project."""
+        response = await self._client.patch(
+            f"/v1/projects/{project_id}",
+            json=request.model_dump(exclude_none=True),
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return ProjectSummary.model_validate(response.json())
+
+    async def archive_project(
+        self, org: str, project_id: str, *, expected_version: int
+    ) -> ProjectSummary:
+        """Archive a managed project."""
+        response = await self._client.post(
+            f"/v1/projects/{project_id}/archive",
+            json={"expected_version": expected_version},
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return ProjectSummary.model_validate(response.json())
+
+    async def delete_project(
+        self, org: str, project_id: str, *, expected_version: int
+    ) -> ProjectSummary:
+        """Soft-delete a managed project."""
+        response = await self._client.post(
+            f"/v1/projects/{project_id}/delete",
+            json={"expected_version": expected_version},
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return ProjectSummary.model_validate(response.json())
+
+    async def request_project_sync(self, org: str, project_id: str) -> SyncEntrySummary:
+        """Request a durable fetch of a GitHub-sourced project."""
+        response = await self._client.post(
+            f"/v1/projects/{project_id}/sync", headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        return SyncEntrySummary.model_validate(response.json())
+
+    async def list_project_sync(self, org: str, project_id: str) -> list[SyncEntrySummary]:
+        """List a project's repo sync ledger entries."""
+        response = await self._client.get(
+            f"/v1/projects/{project_id}/sync", headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        return [SyncEntrySummary.model_validate(item) for item in response.json()]
+
+    async def list_worktrees(self, org: str, project_id: str) -> list[WorktreeSummary]:
+        """List a project's active worktrees."""
+        response = await self._client.get(
+            f"/v1/projects/{project_id}/worktrees", headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        return [WorktreeSummary.model_validate(item) for item in response.json()]
+
+    async def materialize_worktree(
+        self, org: str, project_id: str, request: MaterializeWorktreeRequest
+    ) -> WorktreeSummary:
+        """Materialize a run-scoped worktree."""
+        response = await self._client.post(
+            f"/v1/projects/{project_id}/worktrees",
+            json=request.model_dump(exclude_none=True),
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return WorktreeSummary.model_validate(response.json())
+
+    async def reclaim_worktree(self, org: str, project_id: str, run_id: str) -> WorktreeSummary:
+        """Reclaim a run-scoped worktree."""
+        response = await self._client.request(
+            "DELETE",
+            f"/v1/projects/{project_id}/worktrees/{run_id}",
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return WorktreeSummary.model_validate(response.json())
+
+    async def list_project_runs(self, org: str, project_id: str) -> list[str]:
+        """List durable run ids associated with a project."""
+        response = await self._client.get(
+            f"/v1/projects/{project_id}/runs", headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        body = response.json()
+        return list(body.get("run_ids", []))
+
+    async def associate_run(
+        self, org: str, project_id: str, request: AssociateRunRequest
+    ) -> RunAssociation:
+        """Associate a durable run with a project."""
+        response = await self._client.post(
+            f"/v1/projects/{project_id}/runs",
+            json=request.model_dump(exclude_none=True),
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return RunAssociation.model_validate(response.json())
+
+    async def grant_project(
+        self, org: str, project_id: str, request: GrantProjectRequest
+    ) -> GrantSummary:
+        """Grant an Agent a capability on a project."""
+        response = await self._client.post(
+            f"/v1/projects/{project_id}/grants",
+            json=request.model_dump(),
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return GrantSummary.model_validate(response.json())
+
+    async def list_installations(self, org: str) -> list[InstallationSummary]:
+        """List GitHub App installations bound to ``org``."""
+        response = await self._client.get(
+            "/v1/projects/github/installations", headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        return [InstallationSummary.model_validate(item) for item in response.json()]
+
+    async def link_installation(
+        self, org: str, request: LinkInstallationRequest
+    ) -> InstallationSummary:
+        """Bind a GitHub App installation to ``org``."""
+        response = await self._client.post(
+            "/v1/projects/github/installations",
+            json=request.model_dump(),
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return InstallationSummary.model_validate(response.json())
