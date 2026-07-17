@@ -424,9 +424,7 @@ def upgrade() -> None:
     )
     # Never executable by PUBLIC (which would include keel_runtime). EXECUTE is granted only
     # to the dedicated maintenance EXECUTOR role below; the definer owns the functions.
-    op.execute(
-        "REVOKE ALL ON FUNCTION keel_erase_organization(text) FROM PUBLIC"
-    )
+    op.execute("REVOKE ALL ON FUNCTION keel_erase_organization(text) FROM PUBLIC")
     op.execute("REVOKE ALL ON FUNCTION keel_erase_user(text) FROM PUBLIC")
 
     # Two-role split (least privilege). The erasure privilege is deliberately separated into a
