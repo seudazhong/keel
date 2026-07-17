@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import urllib.error
+import urllib.request
 from collections.abc import Mapping
+from email.message import Message
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +14,7 @@ from typing import Any
 import pytest
 
 from keel_core.connector_contracts import (
+    ConnectorAuthenticationError,
     ConnectorBinding,
     ConnectorBindingDraft,
     ConnectorBindingStatus,
@@ -34,11 +38,17 @@ from keel_core.connector_providers.google_drive_docs import (
     DriveChangePage,
     DriveFile,
     DriveFilePage,
+    GoogleDriveContentTooLargeError,
     GoogleDriveCursorInvalidError,
     GoogleDriveDocsProvider,
+    GoogleDriveError,
     GoogleDriveRateLimitError,
 )
-from keel_core.connector_registry import ConnectorRegistration, ConnectorRegistry
+from keel_core.connector_registry import (
+    ConnectorRegistration,
+    ConnectorRegistry,
+    discover_connector_registry,
+)
 from keel_core.connector_repository import InMemoryConnectorRepository
 from keel_core.connector_service import ConnectorService, DurableConnectorChangeSink
 from keel_core.knowledge.models import (
@@ -230,11 +240,426 @@ def test_manifest_is_read_only_independent_and_requires_knowledge() -> None:
     assert google_drive_docs.manifest.actions == ()
 
 
+def test_builtin_registry_discovers_and_creates_google_drive_docs() -> None:
+    registry = discover_connector_registry()
+    assert GOOGLE_DRIVE_DOCS_CONNECTOR_ID in {item.id for item in registry.manifests()}
+    assert registry.create(GOOGLE_DRIVE_DOCS_CONNECTOR_ID).manifest is google_drive_docs.manifest
+
+
 def test_removed_change_accepts_partial_google_file_metadata() -> None:
     file = DriveFile.from_change_api({"id": "deleted-1"}, "deleted-1")
     assert file.id == "deleted-1"
     assert file.name == "deleted-1"
     assert file.mime_type == ""
+
+
+class _FakeGoogleCredentials:
+    def __init__(self, *, valid: bool) -> None:
+        self.valid = valid
+        self.refresh_token = "refresh-token"
+        self.refresh_requests: list[object] = []
+
+    def refresh(self, request: object) -> None:
+        self.refresh_requests.append(request)
+        self.valid = True
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "refresh_token": self.refresh_token,
+                "token": "refreshed-token",
+            }
+        )
+
+
+def _library_client(
+    monkeypatch: pytest.MonkeyPatch,
+    service: object,
+    *,
+    valid: bool,
+) -> tuple[Any, _FakeGoogleCredentials, dict[str, Any]]:
+    import google.auth.transport.requests as google_requests
+    import google.oauth2.credentials as google_credentials
+    import googleapiclient.discovery as google_discovery
+
+    credentials = _FakeGoogleCredentials(valid=valid)
+    request_marker = object()
+    seen: dict[str, Any] = {}
+
+    def from_authorized_user_info(
+        values: dict[str, Any],
+        scopes: list[str],
+    ) -> _FakeGoogleCredentials:
+        seen["credential_values"] = values
+        seen["scopes"] = scopes
+        return credentials
+
+    def build(name: str, version: str, **kwargs: Any) -> object:
+        seen["build"] = (name, version, kwargs)
+        return service
+
+    monkeypatch.setattr(
+        google_credentials.Credentials,
+        "from_authorized_user_info",
+        staticmethod(from_authorized_user_info),
+    )
+    monkeypatch.setattr(google_requests, "Request", lambda: request_marker)
+    monkeypatch.setattr(google_discovery, "build", build)
+    client = google_drive_docs._GoogleApiDriveClient(
+        CredentialEnvelope(
+            "oauth",
+            {"refresh_token": "refresh-token", "token": "expired-token"},
+        )
+    )
+    seen["request_marker"] = request_marker
+    return client, credentials, seen
+
+
+def test_google_client_refreshes_credentials_and_builds_drive_v3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = object()
+    client, credentials, seen = _library_client(
+        monkeypatch,
+        service,
+        valid=False,
+    )
+
+    assert credentials.refresh_requests == [seen["request_marker"]]
+    assert seen["credential_values"] == {
+        "refresh_token": "refresh-token",
+        "token": "expired-token",
+    }
+    assert seen["scopes"] == list(GOOGLE_DRIVE_DOCS_SCOPES)
+    name, version, kwargs = seen["build"]
+    assert (name, version) == ("drive", "v3")
+    assert kwargs == {
+        "credentials": credentials,
+        "cache_discovery": False,
+    }
+    assert client.credential.values["token"] == "refreshed-token"
+
+
+class _ExecutableRequest:
+    def __init__(self, response: dict[str, Any]) -> None:
+        self.response = response
+        self.retries: list[int] = []
+
+    def execute(self, *, num_retries: int) -> dict[str, Any]:
+        self.retries.append(num_retries)
+        return self.response
+
+
+class _DriveService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.executed: list[_ExecutableRequest] = []
+
+    def files(self) -> _DriveService:
+        return self
+
+    def changes(self) -> _DriveService:
+        return self
+
+    def about(self) -> _DriveService:
+        return self
+
+    def _request(self, operation: str, response: dict[str, Any], **kwargs: Any) -> object:
+        self.calls.append((operation, kwargs))
+        request = _ExecutableRequest(response)
+        self.executed.append(request)
+        return request
+
+    def list(self, **kwargs: Any) -> object:
+        if "pageToken" in kwargs and "includeRemoved" in kwargs:
+            return self._request(
+                "changes.list",
+                {
+                    "changes": [
+                        {
+                            "fileId": "doc-1",
+                            "removed": False,
+                            "file": {
+                                "id": "doc-1",
+                                "name": "Doc",
+                                "mimeType": GOOGLE_DOC_MIME_TYPE,
+                            },
+                        }
+                    ],
+                    "newStartPageToken": "cursor-2",
+                },
+                **kwargs,
+            )
+        return self._request(
+            "files.list",
+            {
+                "files": [
+                    {
+                        "id": "txt-1",
+                        "name": "Notes.txt",
+                        "mimeType": TEXT_MIME_TYPE,
+                        "size": "12",
+                    }
+                ]
+            },
+            **kwargs,
+        )
+
+    def get(self, **kwargs: Any) -> object:
+        if "fileId" in kwargs:
+            return self._request(
+                "files.get",
+                {
+                    "id": kwargs["fileId"],
+                    "name": "Notes.txt",
+                    "mimeType": TEXT_MIME_TYPE,
+                    "size": "12",
+                },
+                **kwargs,
+            )
+        return self._request("about.get", {}, **kwargs)
+
+    def getStartPageToken(self, **kwargs: Any) -> object:
+        return self._request(
+            "changes.getStartPageToken",
+            {"startPageToken": "cursor-1"},
+            **kwargs,
+        )
+
+
+def test_google_client_wires_paginated_drive_requests_without_sdk_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = _DriveService()
+    client, credentials, _ = _library_client(monkeypatch, service, valid=True)
+
+    page = client.list_files(page_token="files-page", parent_id="folder'one")
+    file = client.get_file("txt-1")
+    start_token = client.get_start_page_token()
+    changes = client.list_changes("cursor-1")
+    client.check_health()
+
+    assert credentials.refresh_requests == []
+    assert page.files[0].size == 12
+    assert file is not None and file.size == 12
+    assert start_token == "cursor-1"
+    assert changes.new_start_page_token == "cursor-2"
+    assert all(request.retries == [0] for request in service.executed)
+    calls = dict(service.calls)
+    assert calls["files.list"]["pageSize"] == 1000
+    assert calls["files.list"]["pageToken"] == "files-page"
+    assert calls["files.list"]["q"] == "'folder\\'one' in parents and trashed = false"
+    assert calls["files.list"]["supportsAllDrives"] is True
+    assert calls["changes.list"]["includeRemoved"] is True
+    assert calls["changes.list"]["supportsAllDrives"] is True
+    assert calls["files.get"]["supportsAllDrives"] is True
+
+
+class _MediaResponse(dict[str, str]):
+    status = 206
+
+
+class _StreamingHttp:
+    def __init__(self, total_size: int) -> None:
+        self.total_size = total_size
+        self.bytes_returned = 0
+        self.calls = 0
+
+    def request(
+        self,
+        uri: str,
+        method: str,
+        *,
+        headers: dict[str, str],
+    ) -> tuple[_MediaResponse, bytes]:
+        assert uri == "https://drive.test/media"
+        assert method == "GET"
+        self.calls += 1
+        raw_range = headers["range"].removeprefix("bytes=")
+        start_text, end_text = raw_range.split("-", 1)
+        start = int(start_text)
+        requested_end = int(end_text)
+        end = min(requested_end, self.total_size - 1)
+        content = b"x" * (end - start + 1)
+        self.bytes_returned += len(content)
+        return (
+            _MediaResponse(
+                {
+                    "content-range": f"bytes {start}-{end}/{self.total_size}",
+                    "content-length": str(len(content)),
+                }
+            ),
+            content,
+        )
+
+
+class _StreamingRequest:
+    def __init__(self, total_size: int) -> None:
+        self.http = _StreamingHttp(total_size)
+        self.uri = "https://drive.test/media"
+        self.headers: dict[str, str] = {}
+
+
+class _MediaFiles:
+    def __init__(self, request: _StreamingRequest) -> None:
+        self.request = request
+        self.get_media_calls = 0
+        self.export_media_calls = 0
+
+    def get_media(self, **kwargs: Any) -> _StreamingRequest:
+        self.get_media_calls += 1
+        return self.request
+
+    def export_media(self, **kwargs: Any) -> _StreamingRequest:
+        self.export_media_calls += 1
+        return self.request
+
+
+class _MediaService:
+    def __init__(self, request: _StreamingRequest) -> None:
+        self.files_api = _MediaFiles(request)
+
+    def files(self) -> _MediaFiles:
+        return self.files_api
+
+
+def test_raw_file_size_preflight_rejects_before_request_or_buffering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request = _StreamingRequest(2_000_000)
+    service = _MediaService(request)
+    client, _, _ = _library_client(monkeypatch, service, valid=True)
+    file = DriveFile(
+        id="large-text",
+        name="large.txt",
+        mime_type=TEXT_MIME_TYPE,
+        size=1_048_577,
+    )
+
+    with pytest.raises(GoogleDriveContentTooLargeError, match="1 MiB"):
+        client.read_content(file)
+    assert service.files_api.get_media_calls == 0
+    assert request.http.calls == 0
+    assert request.http.bytes_returned == 0
+
+
+def test_google_doc_export_aborts_bounded_stream_without_full_buffering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    total_size = 4_000_000
+    request = _StreamingRequest(total_size)
+    service = _MediaService(request)
+    client, _, _ = _library_client(monkeypatch, service, valid=True)
+    file = DriveFile(
+        id="large-doc",
+        name="Large Doc",
+        mime_type=GOOGLE_DOC_MIME_TYPE,
+    )
+
+    with pytest.raises(GoogleDriveContentTooLargeError, match="1 MiB"):
+        client.read_content(file)
+    assert service.files_api.export_media_calls == 1
+    assert request.http.bytes_returned <= 1_048_576 + 262_144
+    assert request.http.bytes_returned < total_size
+
+
+class _GoogleHttpError(Exception):
+    def __init__(self, status: int, reason: str | None = None) -> None:
+        super().__init__("sensitive-provider-error")
+        self.resp = SimpleNamespace(status=status)
+        self.content = json.dumps(
+            {
+                "error": {
+                    "errors": [{"reason": reason}] if reason is not None else [],
+                }
+            }
+        ).encode()
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "expected"),
+    [
+        (401, None, ConnectorAuthenticationError),
+        (404, None, google_drive_docs._GoogleNotFoundError),
+        (410, None, GoogleDriveCursorInvalidError),
+        (429, None, GoogleDriveRateLimitError),
+        (403, "dailyLimitExceeded", GoogleDriveRateLimitError),
+        (403, "rateLimitExceeded", GoogleDriveRateLimitError),
+        (403, "userRateLimitExceeded", GoogleDriveRateLimitError),
+        (403, "insufficientPermissions", GoogleDriveError),
+    ],
+)
+def test_google_error_classification(
+    status: int,
+    reason: str | None,
+    expected: type[Exception],
+) -> None:
+    with pytest.raises(expected):
+        google_drive_docs._raise_google_error(_GoogleHttpError(status, reason))
+
+
+class _RevokeResponse:
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+    def __enter__(self) -> _RevokeResponse:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        return None
+
+
+def test_google_token_revoke_posts_refresh_token_without_leaking_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, Any] = {}
+
+    def urlopen(request: Any, *, timeout: int) -> _RevokeResponse:
+        seen["request"] = request
+        seen["timeout"] = timeout
+        return _RevokeResponse(200)
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    secret = "secret-refresh-token"
+    google_drive_docs._revoke_google_token(
+        CredentialEnvelope(
+            "oauth",
+            {"refresh_token": secret, "token": "access-token"},
+        )
+    )
+
+    request = seen["request"]
+    assert request.full_url == "https://oauth2.googleapis.com/revoke"
+    assert request.get_method() == "POST"
+    assert seen["timeout"] == 10
+    assert request.data == b"token=secret-refresh-token"
+    assert secret not in repr(request.headers)
+
+
+@pytest.mark.parametrize("failure", ["status", "http"])
+def test_google_token_revoke_failures_are_bounded_and_hide_token(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    secret = "never-leak-this-token"
+
+    def urlopen(request: Any, *, timeout: int) -> _RevokeResponse:
+        if failure == "status":
+            return _RevokeResponse(500)
+        raise urllib.error.HTTPError(
+            request.full_url,
+            503,
+            "unavailable",
+            Message(),
+            None,
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    with pytest.raises(GoogleDriveError) as raised:
+        google_drive_docs._revoke_google_token(
+            CredentialEnvelope("oauth", {"refresh_token": secret})
+        )
+    assert secret not in str(raised.value)
 
 
 async def test_auth_requests_only_drive_scope_without_incremental_grants(

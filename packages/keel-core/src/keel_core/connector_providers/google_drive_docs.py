@@ -8,7 +8,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Buffer, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -68,6 +68,7 @@ SUPPORTED_FILE_MIME_TYPES = frozenset(
 _CURSOR_STREAM = "drive_changes"
 _PAGE_SIZE = 1000
 _MAX_CONTENT_BYTES = 1_048_576
+_DOWNLOAD_CHUNK_BYTES = 262_144
 _FILE_FIELDS = "id,name,mimeType,parents,webViewLink,modifiedTime,version,trashed,size,md5Checksum"
 
 manifest = ConnectorManifest(
@@ -110,6 +111,10 @@ class GoogleDriveCursorInvalidError(GoogleDriveError):
     """Drive changes cursor expired and requires a controlled full resync."""
 
 
+class GoogleDriveContentTooLargeError(GoogleDriveError):
+    """Remote content exceeds the existing Knowledge input limit."""
+
+
 @dataclass(frozen=True, slots=True)
 class DriveFile:
     id: str
@@ -119,6 +124,7 @@ class DriveFile:
     source_url: str | None = None
     modified_time: str | None = None
     version: str | None = None
+    size: int | None = None
     trashed: bool = False
 
     @classmethod
@@ -140,6 +146,7 @@ class DriveFile:
             source_url=_optional_string(value.get("webViewLink")),
             modified_time=_optional_string(value.get("modifiedTime")),
             version=_optional_string(value.get("version")),
+            size=_optional_size(value.get("size")),
             trashed=value.get("trashed") is True,
         )
 
@@ -156,6 +163,7 @@ class DriveFile:
             source_url=_optional_string(value.get("webViewLink")),
             modified_time=_optional_string(value.get("modifiedTime")),
             version=_optional_string(value.get("version")),
+            size=_optional_size(value.get("size")),
             trashed=value.get("trashed") is True,
         )
 
@@ -360,6 +368,10 @@ class _GoogleApiDriveClient:
             )
             mime_type = TEXT_MIME_TYPE
         elif file.mime_type in {TEXT_MIME_TYPE, MARKDOWN_MIME_TYPE}:
+            if file.size is not None and file.size > _MAX_CONTENT_BYTES:
+                raise GoogleDriveContentTooLargeError(
+                    "Google Drive text content exceeds the 1 MiB Knowledge limit."
+                )
             request = self._service.files().get_media(
                 fileId=file.id,
                 supportsAllDrives=True,
@@ -367,7 +379,7 @@ class _GoogleApiDriveClient:
             mime_type = file.mime_type
         else:
             raise GoogleDriveError(f"unsupported Drive MIME type: {file.mime_type}")
-        raw = self._execute_media(request)
+        raw = self._download_media(request)
         return _normalize_text(raw), mime_type
 
     def check_health(self) -> None:
@@ -389,19 +401,48 @@ class _GoogleApiDriveClient:
         return response
 
     @staticmethod
-    def _execute_media(request: Any) -> bytes:
+    def _download_media(request: Any) -> bytes:
+        from googleapiclient.http import MediaIoBaseDownload
+
+        buffer = _BoundedBytesIO(_MAX_CONTENT_BYTES)
+        downloader = MediaIoBaseDownload(
+            buffer,
+            request,
+            chunksize=_DOWNLOAD_CHUNK_BYTES,
+        )
         try:
-            response = request.execute(num_retries=0)
+            done = False
+            while not done:
+                progress, done = downloader.next_chunk(num_retries=0)
+                total_size = getattr(progress, "total_size", None)
+                if isinstance(total_size, int) and total_size > _MAX_CONTENT_BYTES:
+                    raise GoogleDriveContentTooLargeError(
+                        "Google Drive text content exceeds the 1 MiB Knowledge limit."
+                    )
+        except GoogleDriveContentTooLargeError:
+            raise
         except Exception as exc:
             _raise_google_error(exc)
             raise AssertionError("unreachable") from exc
-        if isinstance(response, bytes):
-            return response
-        if isinstance(response, str):
-            return response.encode()
-        if isinstance(response, io.BytesIO):
-            return response.getvalue()
-        raise GoogleDriveError("Google Drive returned invalid file content.")
+        return buffer.getvalue()
+
+
+class _BoundedBytesIO(io.BytesIO):
+    def __init__(self, limit: int) -> None:
+        super().__init__()
+        self._limit = limit
+        self.peak_size = 0
+
+    def write(self, data: Buffer, /) -> int:
+        size = memoryview(data).nbytes
+        end = self.tell() + size
+        if end > self._limit:
+            raise GoogleDriveContentTooLargeError(
+                "Google Drive text content exceeds the 1 MiB Knowledge limit."
+            )
+        written = super().write(data)
+        self.peak_size = max(self.peak_size, end)
+        return written
 
 
 class _GoogleNotFoundError(GoogleDriveError):
@@ -901,16 +942,24 @@ def _file_config(file: DriveFile) -> dict[str, Any]:
         "mime_type": file.mime_type,
         "modified_time": file.modified_time,
         "parents": list(file.parents),
+        "size": file.size,
         "version": file.version,
     }
 
 
 def _normalize_text(raw: bytes) -> str:
     if len(raw) > _MAX_CONTENT_BYTES:
-        raise GoogleDriveError("Google Drive text content exceeds the 1 MiB Knowledge limit.")
+        raise GoogleDriveContentTooLargeError(
+            "Google Drive text content exceeds the 1 MiB Knowledge limit."
+        )
     content = raw.decode("utf-8-sig", errors="replace").replace("\x00", "")
     content = content.replace("\r\n", "\n").replace("\r", "\n")
-    return content if content else "\n"
+    content = content if content else "\n"
+    if len(content.encode("utf-8")) > _MAX_CONTENT_BYTES:
+        raise GoogleDriveContentTooLargeError(
+            "Google Drive normalized text exceeds the 1 MiB Knowledge limit."
+        )
+    return content
 
 
 def _mapping_list(value: object, label: str) -> list[Mapping[str, Any]]:
@@ -929,6 +978,16 @@ def _optional_string(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _optional_size(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.isdecimal():
+        return int(value)
+    return None
+
+
 def factory() -> GoogleDriveDocsProvider:
     return GoogleDriveDocsProvider()
 
@@ -943,6 +1002,7 @@ __all__ = [
     "GOOGLE_DRIVE_DOCS_CONNECTOR_ID",
     "GOOGLE_DRIVE_DOCS_SCOPES",
     "GOOGLE_FOLDER_MIME_TYPE",
+    "GoogleDriveContentTooLargeError",
     "GoogleDriveCursorInvalidError",
     "GoogleDriveDocsProvider",
     "GoogleDriveError",

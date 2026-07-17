@@ -46,8 +46,10 @@ that disappeared. Folder topology changes also use this path so descendant moves
 Knowledge content.
 
 Google Docs are exported as `text/plain`; text and Markdown files retain their supported Knowledge
-source type. Content is normalized to UTF-8/LF and limited to the existing 1 MiB Knowledge input
-limit.
+source type. Raw files use trustworthy Drive `size` metadata for an early rejection. All downloads,
+including Google Docs exports where size is unavailable, use bounded 256 KiB streaming chunks and
+abort as soon as the reported or accumulated content exceeds the existing 1 MiB Knowledge input
+limit. Content is then normalized to UTF-8/LF and checked again after normalization.
 
 Every upsert is tainted and includes:
 

@@ -78,10 +78,12 @@ from keel_core.types import ContentTaint
 def test_builtin_registry_discovers_providers_deterministically() -> None:
     first = discover_connector_registry()
     second = discover_connector_registry()
-    assert [item.id for item in first.manifests()] == ["gmail", "google_drive_docs"]
+    connector_ids = [item.id for item in first.manifests()]
+    assert connector_ids == sorted(connector_ids)
+    assert len(connector_ids) == len(set(connector_ids))
+    assert "gmail" in connector_ids
     assert first.manifests() == second.manifests()
     assert first.create("gmail").manifest.id == "gmail"
-    assert first.create("google_drive_docs").manifest.id == "google_drive_docs"
 
 
 def test_registry_rejects_duplicate_ids() -> None:
