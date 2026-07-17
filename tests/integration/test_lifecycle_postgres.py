@@ -169,14 +169,16 @@ async def _seed_scope(engine: AsyncEngine, scope: str) -> str:
         await conn.execute(
             text(
                 "INSERT INTO connector_deliveries "
-                "(id, scope_id, connector_id, binding_id, delivery_id, payload_hash) "
-                "VALUES (:did, :scope, 'gmail', :bid, 'delivery', :hash)"
+                "(id, scope_id, connector_id, binding_id, delivery_id, payload_hash, "
+                "claim_token) "
+                "VALUES (:did, :scope, 'gmail', :bid, 'delivery', :hash, :claim_token)"
             ),
             {
                 **p,
                 "bid": f"{scope}-binding",
                 "did": f"{scope}-delivery",
                 "hash": "a" * 64,
+                "claim_token": "b" * 32,
             },
         )
         await conn.execute(
