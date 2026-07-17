@@ -43,7 +43,8 @@ Outbound tools are limited to:
 
 Both require an idempotency key and tainted-content approval. A hashed idempotency marker is
 embedded in the created body so a retry can reconcile a provider-side success even if the first
-response was lost.
+response was lost. Comment retries query a bounded seven-day update window and inspect the newest
+pagination tail, so large historical comment threads do not hide a recently accepted marker.
 
 Webhooks require `X-Hub-Signature-256`. `X-GitHub-Delivery` is durably replay-protected by the
 connector foundation; only selected-repository Issue, pull-request, and issue-comment events are

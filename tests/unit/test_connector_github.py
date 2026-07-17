@@ -37,7 +37,11 @@ from keel_core.connector_providers.github import (
     GitHubRateLimitError,
     manifest,
 )
-from keel_core.connector_registry import ConnectorRegistration, ConnectorRegistry
+from keel_core.connector_registry import (
+    ConnectorRegistration,
+    ConnectorRegistry,
+    discover_connector_registry,
+)
 from keel_core.connector_repository import InMemoryConnectorRepository
 from keel_core.connector_service import ConnectorChangeSink, ConnectorService
 from keel_core.connectors import ConnectorTool
@@ -219,6 +223,14 @@ def github_secrets(monkeypatch: pytest.MonkeyPatch) -> str:
     monkeypatch.setenv("TEST_GITHUB_PRIVATE_KEY", private_key)
     monkeypatch.setenv("TEST_GITHUB_WEBHOOK_SECRET", "webhook-sanitized")
     return public_key
+
+
+def test_builtin_registry_discovers_github_provider_locally() -> None:
+    registry = discover_connector_registry()
+    registration = registry.get(GITHUB_CONNECTOR_ID)
+    assert registration is not None
+    assert registration.manifest is manifest
+    assert registry.create(GITHUB_CONNECTOR_ID).manifest is manifest
 
 
 async def test_staged_install_persists_metadata_and_discovers_paginated_repositories(
@@ -682,6 +694,100 @@ async def test_outbound_approval_idempotency_and_provider_reconciliation(
     replayed = await issue_tool.run(issue_args, tainted_context)
     assert created.output == replayed.output
     assert issue_posts == 1
+
+
+async def test_comment_reconciliation_reads_recent_tail_after_more_than_300_comments(
+    github_secrets: str,
+) -> None:
+    comments = [
+        {
+            "id": index,
+            "node_id": f"IC_{index}",
+            "body": f"historical comment {index}",
+            "html_url": f"https://github.test/octo-org/demo/issues/9#issuecomment-{index}",
+            "issue_url": "https://api.github.test/repos/octo-org/demo/issues/9",
+            "created_at": "2026-07-18T02:00:00Z",
+            "updated_at": "2026-07-18T02:00:00Z",
+            "user": {"id": 2, "login": "busy-user", "type": "User"},
+        }
+        for index in range(1, 351)
+    ]
+    comment_posts = 0
+    requested_pages: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal comment_posts
+        path = request.url.path
+        if path.endswith("/access_tokens"):
+            return _response(request, 201, _token())
+        if path == "/repos/octo-org/demo/issues/9/comments" and request.method == "GET":
+            query = parse_qs(request.url.query.decode())
+            assert "since" in query
+            page = int(query.get("page", ["1"])[0])
+            requested_pages.append(page)
+            start = (page - 1) * 100
+            page_comments = comments[start : start + 100]
+            last_page = max(1, (len(comments) + 99) // 100)
+            headers = (
+                {
+                    "link": (
+                        "<https://api.github.test/repos/octo-org/demo/issues/9/comments"
+                        f'?per_page=100&page={last_page}>; rel="last"'
+                    )
+                }
+                if last_page > 1
+                else None
+            )
+            return _response(request, 200, page_comments, headers=headers)
+        if path == "/repos/octo-org/demo/issues/9/comments" and request.method == "POST":
+            comment_posts += 1
+            comments.append(
+                {
+                    "id": 8001,
+                    "node_id": "IC_8001",
+                    "body": json.loads(request.content)["body"],
+                    "html_url": ("https://github.test/octo-org/demo/issues/9#issuecomment-8001"),
+                    "issue_url": "https://api.github.test/repos/octo-org/demo/issues/9",
+                    "created_at": "2026-07-18T03:00:00Z",
+                    "updated_at": "2026-07-18T03:00:00Z",
+                    "user": {"id": 1, "login": "keel-app", "type": "Bot"},
+                }
+            )
+            raise httpx.ReadTimeout("response lost after provider accepted", request=request)
+        raise AssertionError(f"unexpected GitHub request: {request.method} {request.url}")
+
+    provider = GitHubProvider(transport=httpx.MockTransport(handler), now=lambda: NOW)
+    raw, credentials = _stores()
+    repository = InMemoryConnectorRepository("scope:github")
+    await _connected_state(repository, credentials)
+    actions = _registry(provider).build_actions(
+        ConnectorActionContext.with_repository(
+            "scope:github",
+            repository,
+            credential_store=raw,
+        )
+    )
+    tools = digest_registry(
+        connector_actions=actions,
+        idempotency_store=InMemoryOutboundStore(),
+    )
+    comment_tool = tools.get("github_comment_create")
+    assert comment_tool is not None
+    args = {
+        "repository_id": REPOSITORY_ID,
+        "number": 9,
+        "body": "approved comment on a busy issue",
+        "idempotency_key": "busy-issue-comment-key",
+    }
+    tool_context = ToolContext(scope_id="scope:github", session_id="session")
+    with pytest.raises(httpx.ReadTimeout):
+        await comment_tool.run(args, tool_context)
+    reconciled = await comment_tool.run(args, tool_context)
+
+    assert json.loads(reconciled.output)["data"]["reconciled"] is True
+    assert comment_posts == 1
+    assert requested_pages[:4] == [1, 4, 3, 2]
+    assert requested_pages[-2:] == [1, 4]
 
 
 async def test_revoked_installation_and_permission_shrink_fail_closed(

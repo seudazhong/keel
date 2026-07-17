@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, cast
-from urllib.parse import quote, urlencode, urljoin, urlsplit
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlsplit
 
 import httpx
 import jwt
@@ -69,6 +69,8 @@ _DEFAULT_API_BASE = "https://api.github.com"
 _DEFAULT_WEB_BASE = "https://github.com"
 _API_VERSION = "2022-11-28"
 _MAX_PAGES = 10
+_COMMENT_RECONCILIATION_PAGES = 3
+_COMMENT_RECONCILIATION_WINDOW = timedelta(days=7)
 _IDEMPOTENCY_PREFIX = "<!-- keel-idempotency:"
 _REF_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PERMISSION_LEVELS = {"none": 0, "read": 1, "write": 2, "admin": 3}
@@ -456,12 +458,52 @@ class GitHubAPI:
             next_url = self._next_link(response.headers.get("link"))
         return GitHubPage(items, next_url)
 
+    async def find_recent_comment_marker(
+        self,
+        token: GitHubInstallationToken,
+        path: str,
+        marker: str,
+    ) -> dict[str, Any] | None:
+        since = (
+            (self._now().astimezone(UTC) - _COMMENT_RECONCILIATION_WINDOW)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        params: dict[str, str | int] = {"per_page": 100, "page": 1, "since": since}
+        first = await self.installation_request(token, "GET", path, params=params)
+        first_items = _objects(first.json(), field="recent issue comments")
+        last_url = self._link(first.headers.get("link"), "last")
+        if last_url is None:
+            return _find_marker(first_items, marker)
+        last_page = self._page_number(last_url)
+        first_match = _find_marker(first_items, marker)
+        if first_match is not None:
+            return first_match
+        oldest_page = max(2, last_page - _COMMENT_RECONCILIATION_PAGES + 1)
+        for page_number in range(last_page, oldest_page - 1, -1):
+            response = await self.installation_request(
+                token,
+                "GET",
+                path,
+                params={"per_page": 100, "page": page_number, "since": since},
+            )
+            match = _find_marker(
+                _objects(response.json(), field="recent issue comments"),
+                marker,
+            )
+            if match is not None:
+                return match
+        return None
+
     def _next_link(self, header: str | None) -> str | None:
+        return self._link(header, "next")
+
+    def _link(self, header: str | None, relation: str) -> str | None:
         if not header:
             return None
         for part in header.split(","):
             section = part.strip()
-            if 'rel="next"' not in section:
+            if f'rel="{relation}"' not in section:
                 continue
             if not section.startswith("<") or ">" not in section:
                 raise GitHubConnectorError("GitHub returned an invalid pagination link")
@@ -470,6 +512,19 @@ class GitHubAPI:
             self._validate_page_url(resolved)
             return resolved
         return None
+
+    @staticmethod
+    def _page_number(url: str) -> int:
+        values = parse_qs(urlsplit(url).query).get("page")
+        if values is None or len(values) != 1:
+            raise GitHubConnectorError("GitHub pagination link omitted a page number")
+        try:
+            page = int(values[0])
+        except ValueError as exc:
+            raise GitHubConnectorError("GitHub pagination link has an invalid page number") from exc
+        if page < 1:
+            raise GitHubConnectorError("GitHub pagination link has an invalid page number")
+        return page
 
     def _validate_page_url(self, value: str) -> None:
         expected = urlsplit(self.config.api_base_url)
@@ -1516,13 +1571,7 @@ class GitHubProvider(BaseConnectorProvider):
             )
             owner, name = _resource_coordinates(resource)
             path = f"/repos/{quote(owner, safe='')}/{quote(name, safe='')}/issues/{number}/comments"
-            existing_page = await api.paginate(
-                token,
-                path,
-                params={"per_page": 100},
-                max_pages=3,
-            )
-            existing = _find_marker(existing_page.items, marker)
+            existing = await api.find_recent_comment_marker(token, path, marker)
             reconciled = existing is not None
             if existing is None:
                 response = await api.installation_request(
