@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
 import pytest
 
 from keel_core.connector_contracts import (
@@ -22,9 +24,11 @@ from keel_core.connector_contracts import (
 )
 from keel_core.connector_credentials import ConnectorCredentialStore, CredentialEnvelope
 from keel_core.connector_providers.notion import (
+    NOTION_API_VERSION,
     NOTION_CONNECTOR_ID,
     NOTION_CREDENTIAL_KIND,
     NOTION_CURSOR_STREAM,
+    HttpxNotionTransport,
     NotionNotFoundError,
     NotionPermissionError,
     NotionProvider,
@@ -33,7 +37,11 @@ from keel_core.connector_providers.notion import (
     NotionTransport,
     manifest,
 )
-from keel_core.connector_registry import ConnectorRegistration, ConnectorRegistry
+from keel_core.connector_registry import (
+    ConnectorRegistration,
+    ConnectorRegistry,
+    discover_connector_registry,
+)
 from keel_core.connector_repository import InMemoryConnectorRepository
 from keel_core.connector_service import ConnectorService, DurableConnectorChangeSink
 from keel_core.knowledge.models import (
@@ -187,6 +195,42 @@ def _page_result(results: list[dict[str, Any]], *, cursor: str | None = None) ->
         "has_more": cursor is not None,
         "next_cursor": cursor,
     }
+
+
+def test_builtin_registry_discovers_notion_independently() -> None:
+    registry = discover_connector_registry()
+    assert NOTION_CONNECTOR_ID in {item.id for item in registry.manifests()}
+    assert registry.create(NOTION_CONNECTOR_ID).manifest is manifest
+
+
+async def test_httpx_transport_sends_live_auth_and_version_headers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = False
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal observed
+        observed = True
+        authorization = request.headers.get("Authorization")
+        assert authorization is not None
+        scheme, separator, credential = authorization.partition(" ")
+        assert scheme == "Bearer"
+        assert separator == " "
+        assert hmac.compare_digest(credential, _TOKEN)
+        assert request.headers.get("Notion-Version") == NOTION_API_VERSION
+        return httpx.Response(200, json={"object": "user", "id": "bot-user"})
+
+    mock_transport = httpx.MockTransport(handle)
+    async_client = httpx.AsyncClient
+
+    def client_factory(**kwargs: Any) -> httpx.AsyncClient:
+        kwargs["transport"] = mock_transport
+        return async_client(**kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    result = await HttpxNotionTransport().request("GET", "/users/me", _TOKEN)
+    assert observed is True
+    assert result == {"object": "user", "id": "bot-user"}
 
 
 async def test_setup_validates_token_and_never_echoes_it() -> None:

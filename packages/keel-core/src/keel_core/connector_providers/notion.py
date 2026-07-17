@@ -100,8 +100,9 @@ class HttpxNotionTransport:
         token: str,
         payload: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        authorization = "Bearer " + token
         headers = {
-            "Authorization": f"Bearer {token}",
+            "Authorization": authorization,
             "Notion-Version": NOTION_API_VERSION,
             "Content-Type": "application/json",
         }
