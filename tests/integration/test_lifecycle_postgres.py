@@ -42,6 +42,12 @@ _SCOPED_TABLES = (
     "kb_document_versions",
     "kb_chunks",
     "knowledge_idempotency",
+    "connector_bindings",
+    "connector_binding_targets",
+    "connector_resources",
+    "connector_items",
+    "connector_cursors",
+    "connector_deliveries",
     "connector_tokens",
     "connector_outbox",
     "oauth_states",
@@ -107,6 +113,71 @@ async def _seed_scope(engine: AsyncEngine, scope: str) -> str:
                 "VALUES (:scope, 'note', 'm', 3, CAST(:vec AS vector))"
             ),
             {**p, "vec": _VEC},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO connector_bindings "
+                "(id, scope_id, connector_id, status, display_name) "
+                "VALUES (:bid, :scope, 'gmail', 'connected', 'Gmail')"
+            ),
+            {**p, "bid": f"{scope}-binding"},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO connector_binding_targets "
+                "(id, scope_id, connector_id, binding_id, kind, target_id) "
+                "VALUES (:tid, :scope, 'gmail', :bid, 'knowledge', :target)"
+            ),
+            {
+                **p,
+                "bid": f"{scope}-binding",
+                "tid": f"{scope}-target",
+                "target": f"{scope}-kb",
+            },
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO connector_resources "
+                "(id, scope_id, connector_id, binding_id, external_id, kind, display_name, "
+                "selected) VALUES (:rid, :scope, 'gmail', :bid, 'inbox', 'mailbox', "
+                "'Inbox', true)"
+            ),
+            {**p, "bid": f"{scope}-binding", "rid": f"{scope}-resource"},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO connector_items "
+                "(id, scope_id, connector_id, binding_id, resource_id, external_id, kind, "
+                "display_name) VALUES (:iid, :scope, 'gmail', :bid, :rid, 'message', "
+                "'message', 'Message')"
+            ),
+            {
+                **p,
+                "bid": f"{scope}-binding",
+                "rid": f"{scope}-resource",
+                "iid": f"{scope}-item",
+            },
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO connector_cursors "
+                "(id, scope_id, connector_id, binding_id, stream, cursor_value) "
+                "VALUES (:cid, :scope, 'gmail', :bid, 'default', 'cursor')"
+            ),
+            {**p, "bid": f"{scope}-binding", "cid": f"{scope}-cursor"},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO connector_deliveries "
+                "(id, scope_id, connector_id, binding_id, delivery_id, payload_hash) "
+                "VALUES (:did, :scope, 'gmail', :bid, 'delivery', :hash)"
+            ),
+            {
+                **p,
+                "bid": f"{scope}-binding",
+                "did": f"{scope}-delivery",
+                "hash": "a" * 64,
+            },
         )
         await conn.execute(
             text(

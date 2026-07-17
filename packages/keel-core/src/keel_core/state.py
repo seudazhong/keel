@@ -298,3 +298,17 @@ async def list_sessions(
         )
         for r in rows
     ]
+
+
+async def session_exists(engine: AsyncEngine, scope_id: ScopeId, session_id: SessionId) -> bool:
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        return bool(
+            await conn.scalar(
+                text(
+                    "SELECT EXISTS(SELECT 1 FROM sessions "
+                    "WHERE scope_id = :scope AND id = :session)"
+                ),
+                {"scope": scope_id, "session": session_id},
+            )
+        )

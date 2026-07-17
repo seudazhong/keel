@@ -1,6 +1,6 @@
 import { fireEvent, screen } from "@testing-library/react";
 import { createMemoryRouter, RouterProvider } from "react-router-dom";
-import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test } from "vitest";
 import { renderWithClient } from "../../test/utils";
 import { OnboardingPage } from "./OnboardingPage";
 import { isOnboardingComplete } from "./useOnboarding";
@@ -30,13 +30,14 @@ test("is not marked complete before the wizard has run", () => {
   expect(isOnboardingComplete()).toBe(false);
 });
 
-test("clearly labels the connectors step as requiring a backend and not performed here", () => {
+test("renders the shared manifest-driven connector setup step", async () => {
   renderWizard();
   // welcome -> locale -> workspace -> connectors
   fireEvent.click(screen.getByRole("button", { name: "Next" }));
   fireEvent.click(screen.getByRole("button", { name: "Next" }));
   fireEvent.click(screen.getByRole("button", { name: "Next" }));
-  expect(screen.getByText("Requires backend · not performed here")).toBeInTheDocument();
+  expect(await screen.findByText("OAuth fixture")).toBeInTheDocument();
+  expect(screen.getByText("Secret fixture")).toBeInTheDocument();
 });
 
 test("walking through every step stores completion + workspace name locally and redirects to Chat", () => {
@@ -60,18 +61,11 @@ test("walking through every step stores completion + workspace name locally and 
   expect(router.state.location.pathname).toBe("/chat");
 });
 
-test("never calls fetch during the wizard — it is entirely local", () => {
-  const fetchSpy = vi.fn();
-  const original = window.fetch;
-  window.fetch = fetchSpy as unknown as typeof window.fetch;
-  try {
-    renderWizard();
-    for (let i = 0; i < STEP_COUNT - 1; i++) {
-      fireEvent.click(screen.getByRole("button", { name: "Next" }));
-    }
-    fireEvent.click(screen.getByRole("button", { name: "Finish" }));
-    expect(fetchSpy).not.toHaveBeenCalled();
-  } finally {
-    window.fetch = original;
+test("connector loading does not prevent completing the local wizard", () => {
+  renderWizard();
+  for (let i = 0; i < STEP_COUNT - 1; i++) {
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
   }
+  fireEvent.click(screen.getByRole("button", { name: "Finish" }));
+  expect(isOnboardingComplete()).toBe(true);
 });

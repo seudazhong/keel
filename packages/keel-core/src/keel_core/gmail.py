@@ -14,6 +14,7 @@ import asyncio
 import json
 from typing import TYPE_CHECKING, Any, Protocol
 
+from keel_core.connector_credentials import rewrap_provider_json, unwrap_legacy_or_enveloped
 from keel_core.connectors import ActionFn
 from keel_core.errors import KeelError
 from keel_core.protocols import ToolContext
@@ -119,14 +120,21 @@ def make_gmail_inbox_action(store: TokenStore, max_messages: int = 5) -> ActionF
     """
 
     async def gmail_inbox(args: dict[str, Any], ctx: ToolContext) -> str:
-        creds_json = await store.get(GMAIL_CONNECTOR_ID)
-        if creds_json is None:
+        stored = await store.get(GMAIL_CONNECTOR_ID)
+        if stored is None:
             raise GmailError(
                 "gmail connector is not authorized for this scope — run scripts/gmail_authorize.py"
             )
+        try:
+            creds_json, enveloped = unwrap_legacy_or_enveloped(stored, expected_kind="oauth")
+        except ValueError as exc:
+            raise GmailError("gmail credentials have an invalid envelope") from exc
         rendered, latest = await asyncio.to_thread(_fetch_inbox_sync, creds_json, max_messages)
         if latest and latest != creds_json:
-            await store.put(GMAIL_CONNECTOR_ID, latest)
+            await store.put(
+                GMAIL_CONNECTOR_ID,
+                rewrap_provider_json(latest, kind="oauth", enveloped=enveloped),
+            )
         return rendered
 
     return gmail_inbox
@@ -169,11 +177,15 @@ def make_gmail_send_action(store: TokenStore) -> ActionFn:
     """
 
     async def gmail_send(args: dict[str, Any], ctx: ToolContext) -> str:
-        creds_json = await store.get(GMAIL_CONNECTOR_ID)
-        if creds_json is None:
+        stored = await store.get(GMAIL_CONNECTOR_ID)
+        if stored is None:
             raise GmailError(
                 "gmail connector is not authorized for this scope — run scripts/gmail_authorize.py"
             )
+        try:
+            creds_json, enveloped = unwrap_legacy_or_enveloped(stored, expected_kind="oauth")
+        except ValueError as exc:
+            raise GmailError("gmail credentials have an invalid envelope") from exc
         to = str(args.get("to", "")).strip()
         if not to:
             raise GmailError("email_send requires a 'to' address")
@@ -181,7 +193,10 @@ def make_gmail_send_action(store: TokenStore) -> ActionFn:
         body = str(args.get("body", ""))
         message_id, latest = await asyncio.to_thread(_send_sync, creds_json, to, subject, body)
         if latest and latest != creds_json:
-            await store.put(GMAIL_CONNECTOR_ID, latest)
+            await store.put(
+                GMAIL_CONNECTOR_ID,
+                rewrap_provider_json(latest, kind="oauth", enveloped=enveloped),
+            )
         return f"sent (id={message_id})"
 
     return gmail_send

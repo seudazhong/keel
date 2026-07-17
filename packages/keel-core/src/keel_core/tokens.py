@@ -86,22 +86,53 @@ class InMemoryTokenStore:
     def __init__(self, scope_id: ScopeId, cipher: EnvelopeCipher | KeyRing) -> None:
         self._scope_id = scope_id
         self._ring = _as_keyring(cipher)
-        # (scope, connector) -> (key_id, ciphertext)
-        self._rows: dict[tuple[str, str], tuple[str, str]] = {}
+        # (scope, connector) -> (key_id, ciphertext, credential version)
+        self._rows: dict[tuple[str, str], tuple[str, str, int]] = {}
 
     async def put(self, connector_id: str, secret: str) -> None:
         enc = self._ring.encrypt(secret)
-        self._rows[(self._scope_id, connector_id)] = (enc.key_id, enc.ciphertext)
+        key = (self._scope_id, connector_id)
+        prior = self._rows.get(key)
+        version = 1 if prior is None else prior[2] + 1
+        self._rows[key] = (enc.key_id, enc.ciphertext, version)
 
     async def get(self, connector_id: str) -> str | None:
         row = self._rows.get((self._scope_id, connector_id))
         if row is None:
             return None
-        key_id, ciphertext = row
+        key_id, ciphertext, _ = row
         return self._ring.decrypt(key_id, ciphertext)
+
+    async def get_versioned(self, connector_id: str) -> tuple[str, int] | None:
+        row = self._rows.get((self._scope_id, connector_id))
+        if row is None:
+            return None
+        key_id, ciphertext, version = row
+        return self._ring.decrypt(key_id, ciphertext), version
+
+    async def put_if_version(
+        self, connector_id: str, secret: str, expected_version: int
+    ) -> int | None:
+        key = (self._scope_id, connector_id)
+        prior = self._rows.get(key)
+        actual = 0 if prior is None else prior[2]
+        if actual != expected_version:
+            return None
+        enc = self._ring.encrypt(secret)
+        version = expected_version + 1
+        self._rows[key] = (enc.key_id, enc.ciphertext, version)
+        return version
 
     async def delete(self, connector_id: str) -> None:
         self._rows.pop((self._scope_id, connector_id), None)
+
+    async def delete_if_version(self, connector_id: str, expected_version: int) -> bool:
+        key = (self._scope_id, connector_id)
+        row = self._rows.get(key)
+        if row is None or row[2] != expected_version:
+            return False
+        del self._rows[key]
+        return True
 
     async def purge(self) -> None:
         for key in [k for k in self._rows if k[0] == self._scope_id]:
@@ -125,10 +156,11 @@ class PostgresTokenStore:
             await conn.execute(
                 text(
                     "INSERT INTO connector_tokens "
-                    "(scope_id, connector_id, ciphertext, key_id) "
-                    "VALUES (:scope, :cid, :ct, :kid) "
+                    "(scope_id, connector_id, ciphertext, key_id, version) "
+                    "VALUES (:scope, :cid, :ct, :kid, 1) "
                     "ON CONFLICT (scope_id, connector_id) DO UPDATE "
-                    "SET ciphertext = :ct, key_id = :kid, updated_at = now()"
+                    "SET ciphertext = :ct, key_id = :kid, "
+                    "version = connector_tokens.version + 1, updated_at = now()"
                 ),
                 {
                     "scope": self._scope_id,
@@ -154,6 +186,66 @@ class PostgresTokenStore:
             return None
         return self._ring.decrypt(row.key_id, row.ciphertext)
 
+    async def get_versioned(self, connector_id: str) -> tuple[str, int] | None:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            row = (
+                await conn.execute(
+                    text(
+                        "SELECT ciphertext, key_id, version FROM connector_tokens "
+                        "WHERE scope_id = :scope AND connector_id = :cid"
+                    ),
+                    {"scope": self._scope_id, "cid": connector_id},
+                )
+            ).one_or_none()
+        if row is None:
+            return None
+        return self._ring.decrypt(row.key_id, row.ciphertext), int(row.version)
+
+    async def put_if_version(
+        self, connector_id: str, secret: str, expected_version: int
+    ) -> int | None:
+        enc = self._ring.encrypt(secret)
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            if expected_version == 0:
+                row = (
+                    await conn.execute(
+                        text(
+                            "INSERT INTO connector_tokens "
+                            "(scope_id, connector_id, ciphertext, key_id, version) "
+                            "VALUES (:scope, :cid, :ct, :kid, 1) "
+                            "ON CONFLICT (scope_id, connector_id) DO NOTHING "
+                            "RETURNING version"
+                        ),
+                        {
+                            "scope": self._scope_id,
+                            "cid": connector_id,
+                            "ct": enc.ciphertext,
+                            "kid": enc.key_id,
+                        },
+                    )
+                ).one_or_none()
+            else:
+                row = (
+                    await conn.execute(
+                        text(
+                            "UPDATE connector_tokens SET ciphertext = :ct, key_id = :kid, "
+                            "version = version + 1, updated_at = now() "
+                            "WHERE scope_id = :scope AND connector_id = :cid "
+                            "AND version = :expected RETURNING version"
+                        ),
+                        {
+                            "scope": self._scope_id,
+                            "cid": connector_id,
+                            "ct": enc.ciphertext,
+                            "kid": enc.key_id,
+                            "expected": expected_version,
+                        },
+                    )
+                ).one_or_none()
+        return None if row is None else int(row.version)
+
     async def delete(self, connector_id: str) -> None:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
@@ -163,6 +255,22 @@ class PostgresTokenStore:
                 ),
                 {"scope": self._scope_id, "cid": connector_id},
             )
+
+    async def delete_if_version(self, connector_id: str, expected_version: int) -> bool:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    "DELETE FROM connector_tokens WHERE scope_id = :scope "
+                    "AND connector_id = :cid AND version = :expected"
+                ),
+                {
+                    "scope": self._scope_id,
+                    "cid": connector_id,
+                    "expected": expected_version,
+                },
+            )
+        return bool(result.rowcount)
 
     async def purge(self) -> None:
         """Revoke every token for this scope (G18: revoke + purge on scope deletion)."""

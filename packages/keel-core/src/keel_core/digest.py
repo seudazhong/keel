@@ -9,6 +9,12 @@ from __future__ import annotations
 from typing import Any
 
 from keel_core.agents import AgentSpec, Scope
+from keel_core.connector_contracts import (
+    ConnectorAction,
+    ConnectorActionApproval,
+    ConnectorActionIdempotency,
+    ConnectorActionSemantics,
+)
 from keel_core.connectors import ActionFn, ConfusedDeputyEngine, ConnectorTool
 from keel_core.loop import ToolRegistry
 from keel_core.outbox import OutboundIdempotencyStore
@@ -51,6 +57,7 @@ def digest_registry(
     inbox_action: ActionFn | None = None,
     send_action: ActionFn | None = None,
     idempotency_store: OutboundIdempotencyStore | None = None,
+    connector_actions: tuple[ConnectorAction, ...] = (),
 ) -> ToolRegistry:
     """The digest toolset. ``sent`` (if given) records outbound sends for tests.
 
@@ -72,52 +79,71 @@ def digest_registry(
         outbox.append(args)
         return "sent"
 
-    return ToolRegistry(
-        [
-            ConnectorTool(
-                name="inbox_list",
-                description="List recent inbox messages.",
-                action=inbox_action or fake_inbox_list,
-                outbound=False,
-                input_schema={"type": "object", "properties": {}},
-            ),
-            ConnectorTool(
-                name="email_send",
-                description="Send an email.",
-                action=send_action or fake_email_send,
-                outbound=True,
-                idempotency_store=idempotency_store,
-                input_schema={
-                    "type": "object",
-                    "properties": {
-                        "to": {"type": "string"},
-                        "subject": {"type": "string"},
-                        "body": {"type": "string"},
-                        "idempotency_key": {"type": "string"},
-                    },
+    tools = {
+        "inbox_list": ConnectorTool(
+            name="inbox_list",
+            description="List recent inbox messages.",
+            action=inbox_action or fake_inbox_list,
+            outbound=False,
+            input_schema={"type": "object", "properties": {}},
+        ),
+        "email_send": ConnectorTool(
+            name="email_send",
+            description="Send an email.",
+            action=send_action or fake_email_send,
+            outbound=True,
+            idempotency_store=idempotency_store,
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "body": {"type": "string"},
+                    "idempotency_key": {"type": "string"},
                 },
-            ),
-        ]
-    )
+            },
+        ),
+    }
+    for action in connector_actions:
+        manifest = action.manifest
+        tools[manifest.name] = ConnectorTool(
+            name=manifest.name,
+            description=manifest.description,
+            action=action.action,
+            outbound=manifest.semantics is ConnectorActionSemantics.outbound,
+            idempotency_required=(manifest.idempotency is ConnectorActionIdempotency.required),
+            idempotency_store=idempotency_store,
+            input_schema=dict(manifest.input_schema),
+        )
+    return ToolRegistry(tuple(tools.values()))
 
 
-def digest_permissions() -> ConfusedDeputyEngine:
+def digest_permissions(
+    connector_actions: tuple[ConnectorAction, ...] = (),
+) -> ConfusedDeputyEngine:
     """Allow inbox read + email send; escalate the send to ``ask`` once content is tainted."""
+    names = {"inbox_list", "email_send"}
+    names.update(action.manifest.name for action in connector_actions)
+    outbound = {"email_send"}
+    outbound.update(
+        action.manifest.name
+        for action in connector_actions
+        if action.manifest.approval is ConnectorActionApproval.tainted
+    )
     base = RuleBasedPermissionEngine(
-        [
-            Rule("inbox_list", PermissionDecision.allow),
-            Rule("email_send", PermissionDecision.allow),
-        ],
+        [Rule(name, PermissionDecision.allow) for name in sorted(names)],
         default=PermissionDecision.deny,
     )
-    return ConfusedDeputyEngine(base, outbound_tools={"email_send"})
+    return ConfusedDeputyEngine(base, outbound_tools=outbound)
 
 
 def digest_session_id(scope_id: str) -> str:
     return f"digest:{scope_id}"
 
 
-def build_digest_agent(scope_id: str) -> AgentSpec:
+def build_digest_agent(
+    scope_id: str, connector_actions: tuple[ConnectorAction, ...] = ()
+) -> AgentSpec:
     """The digest agent (model filled by the worker from settings)."""
     return AgentSpec(
         id="digest",
@@ -125,5 +151,13 @@ def build_digest_agent(scope_id: str) -> AgentSpec:
         model="",
         scope=Scope(id=scope_id, kind=ScopeKind.personal, trust=TrustLevel.trusted),
         persona="You are a concise personal assistant that triages the inbox each morning.",
-        toolset=["inbox_list", "email_send"],
+        toolset=[
+            "inbox_list",
+            "email_send",
+            *[
+                action.manifest.name
+                for action in connector_actions
+                if action.manifest.name not in {"inbox_list", "email_send"}
+            ],
+        ],
     )
