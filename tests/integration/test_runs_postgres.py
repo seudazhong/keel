@@ -234,3 +234,86 @@ async def test_expired_approval_denies_closed(migrated_db: AsyncEngine) -> None:
     assert approval_id in expired
     # A decision on an expired approval fails closed.
     assert await approvals.resolve(approval_id, "granted", "user-1") is False
+
+
+async def test_requeue_sets_resume_marker_and_claim_captures_it(migrated_db: AsyncEngine) -> None:
+    store = PostgresRunStore(migrated_db, "web:local")
+    await _admit(store)
+    await store.mark_queued("run-1")
+    lease = await store.claim("run-1", worker_id="w1", now=_now(), lease_seconds=30)
+    assert lease is not None and lease.resume is False
+    # Suspend on an approval (release to waiting_approval), then resolve -> requeue.
+    await store.release(lease, to_status=RunStatus.waiting_approval)
+    assert await store.requeue("run-1") is True
+    record = await store.get("run-1")
+    assert record is not None and record.status is RunStatus.queued and record.resume_requested
+    # The claim captures resume atomically and clears the marker.
+    resumed = await store.claim("run-1", worker_id="w2", now=_now(), lease_seconds=30)
+    assert resumed is not None and resumed.resume is True
+    cleared = await store.get("run-1")
+    assert cleared is not None and cleared.resume_requested is False
+
+
+async def test_reclaimed_waiting_run_resumes_even_without_marker(migrated_db: AsyncEngine) -> None:
+    store = PostgresRunStore(migrated_db, "web:local")
+    await _admit(store)
+    await store.mark_queued("run-1")
+    t0 = _now()
+    lease = await store.claim("run-1", worker_id="w1", now=t0, lease_seconds=30)
+    assert lease is not None
+    # The run suspends on an approval; its owner then crashes (lease lapses, not requeued).
+    await store.release(lease, to_status=RunStatus.waiting_approval, now=t0)
+    # Force the lease to look expired so a reclaim is possible from waiting_approval.
+    async with migrated_db.begin() as conn:
+        from sqlalchemy import text as _text
+
+        await conn.execute(_text("SELECT set_config('app.scope_id', 'web:local', true)"))
+        await conn.execute(
+            _text(
+                "UPDATE runs SET lease_expires_at = :past, worker_id = 'w1', "
+                "lease_token = 'stale' WHERE id = 'run-1'"
+            ),
+            {"past": t0 - timedelta(seconds=1)},
+        )
+    reclaimed = await store.claim(
+        "run-1", worker_id="w2", now=t0 + timedelta(seconds=60), lease_seconds=30
+    )
+    assert reclaimed is not None and reclaimed.resume is True  # waiting_approval -> resume
+
+
+async def test_redispatchable_finds_queued_unclaimed_runs(migrated_db: AsyncEngine) -> None:
+    store = PostgresRunStore(migrated_db, "web:local")
+    now = _now()
+    await _admit(store, run_id="run-admitted", key="k1")
+    await _admit(store, run_id="run-queued", key="k2")
+    await store.mark_queued("run-queued", now=now - timedelta(seconds=120))
+    # A claimed (owned) run is never redispatchable.
+    await _admit(store, run_id="run-owned", key="k3")
+    await store.mark_queued("run-owned")
+    await store.claim("run-owned", worker_id="w1", now=now, lease_seconds=300)
+    ids = set(await store.redispatchable(now + timedelta(seconds=60), 50, grace_seconds=30))
+    assert "run-admitted" in ids and "run-queued" in ids and "run-owned" not in ids
+
+
+async def test_peek_does_not_consume_ack_consumes_once(migrated_db: AsyncEngine) -> None:
+    store = PostgresRunStore(migrated_db, "web:local")
+    await _admit(store)
+    await store.request_control("run-1", kind=RunControlKind.cancel, requested_by="user-1")
+    # peek is repeatable (does not consume) — a crashed worker re-honors the control.
+    first = await store.peek_control("run-1")
+    second = await store.peek_control("run-1")
+    assert [c.kind for c in first] == [RunControlKind.cancel]
+    assert [c.kind for c in second] == [RunControlKind.cancel]
+    # ack consumes exactly once.
+    assert await store.ack_controls([first[0].id]) == 1
+    assert await store.peek_control("run-1") == []
+    assert await store.ack_controls([first[0].id]) == 0
+
+
+async def test_mark_prompt_persisted_is_idempotent(migrated_db: AsyncEngine) -> None:
+    store = PostgresRunStore(migrated_db, "web:local")
+    await _admit(store)
+    assert (await store.get("run-1")).prompt_persisted is False  # type: ignore[union-attr]
+    assert await store.mark_prompt_persisted("run-1") is True
+    assert await store.mark_prompt_persisted("run-1") is False  # already set
+    assert (await store.get("run-1")).prompt_persisted is True  # type: ignore[union-attr]

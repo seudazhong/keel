@@ -42,14 +42,28 @@ system and should not be presented as the target multi-user platform.
     (`keel_core/runs.py`).
   - Worker-owned execution reusing the single agent loop via
     `keel_core.run_service.execute_run` + `keel_worker.runs.run_interactive`; the server
-    admits + streams and no longer owns the run task for the durable path.
-  - Durable interrupt/cancel/steering (`run_control`) consumed exactly once by the worker
-    (restart- and N-worker-safe); durable approvals bound to org/actor/action-hash/attempt
-    so a stale/replayed decision is rejected; queue/lease reconciliation cron.
+    admits + streams and no longer owns the run task for the durable path. A per-run lease
+    keeper renews the fenced lease well before expiry and, on a lost renewal, fences the run
+    so no further model/tool/event/terminal write proceeds under a stale lease; the loop
+    budget is the authoritative persisted `max_iterations`/`token_budget`.
+  - Admission is crash-safe and idempotently repairable: the user turn is always persisted
+    before the queued/dispatch transition, a retried request completes exactly the missing
+    steps, and reconciliation never dispatches a prompt-less run.
+  - Durable interrupt/cancel/steering (`run_control`) use claim/ack semantics — steering is
+    acked only after its durable turn is appended; interrupt/cancel are re-honored by a
+    reclaiming worker after a crash. Durable approvals resolve through `DurableRunService`
+    bound to org/actor/action-hash/attempt/run-state/expiry (never optional), persist an
+    explicit resume marker (`resume_requested`) captured atomically at claim time, and are
+    routed separately from legacy scheduled `resume_run`; approval expiry resumes the run to
+    record the denial. Run status/steer/interrupt/approval APIs enforce the run's `org_id`
+    (cross-org user access answers 404) while preserving local-preview/API-key compatibility;
+    queue/lease reconciliation cron.
   - Evidence: `tests/unit/test_runs_state_machine.py`, `tests/unit/test_run_service.py`,
+    `tests/unit/test_runs_api.py` (production `/v1` wrappers: org authz + approval routing),
     `tests/integration/test_runs_postgres.py` (two-worker claim race, lease
-    expiry/reclaim/fencing, duplicate admission, durable interrupt across restart, RLS
-    cross-scope denial, stale approval-hash/expiry deny). See _Remaining limitations_ below.
+    expiry/reclaim/fencing, resume-marker capture, redispatch of queued, peek/ack controls,
+    duplicate admission, durable interrupt across restart, RLS cross-scope denial, stale
+    approval-hash/expiry deny). See _Remaining limitations_ below.
 
 ### Memory, search, and quality
 

@@ -75,6 +75,13 @@ def upgrade() -> None:
             result_ref text,
             error_kind text,
             error_message text,
+            -- Explicit durable resume marker: set when an approval resolves and the run is
+            -- requeued so the claiming worker calls loop.resume() (never inferred from a
+            -- pre-claim status that requeue overwrote).
+            resume_requested boolean NOT NULL DEFAULT false,
+            -- Durable admission progress: true once the user turn is persisted. Reconciliation
+            -- must never dispatch a run whose prompt was not durably admitted.
+            prompt_persisted boolean NOT NULL DEFAULT false,
             created_at timestamptz NOT NULL DEFAULT now(),
             updated_at timestamptz NOT NULL DEFAULT now(),
             started_at timestamptz,

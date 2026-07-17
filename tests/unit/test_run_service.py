@@ -7,7 +7,9 @@ isolation guarantees are proven against Postgres in tests/integration/test_runs_
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from keel_core.agents import AgentSpec, Scope
 from keel_core.approvals import InMemoryApprovalStore
@@ -16,14 +18,18 @@ from keel_core.events import EventType
 from keel_core.loop import ToolRegistry, admit
 from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.projections import project_messages
-from keel_core.protocols import ProviderChunk, ToolCall, ToolContext
+from keel_core.protocols import ProviderChunk, ToolCall, ToolContext, Usage
 from keel_core.run_service import (
     DurableRunService,
     execute_run,
+    prompt_persisted_in_log,
     reconcile_runs,
 )
 from keel_core.runs import (
     InMemoryRunStore,
+    RunBudgetSpec,
+    RunControlKind,
+    RunLease,
     RunStatus,
     RunSurface,
 )
@@ -352,9 +358,7 @@ async def test_reconcile_redispatches_reclaims_and_expires() -> None:
     assert past is not None and past.status is RunStatus.expired
 
 
-def run_store_budget():  # type: ignore[no-untyped-def]
-    from keel_core.runs import RunBudgetSpec
-
+def run_store_budget() -> RunBudgetSpec:
     return RunBudgetSpec(max_iterations=5, token_budget=1000)
 
 
@@ -407,3 +411,532 @@ async def test_interrupt_control_is_consumed_by_watcher() -> None:
     assert final.status is RunStatus.interrupted
     assert final.stop_reason == "interrupted"
     _ = EventType  # keep import used for readers cross-referencing the event vocabulary
+
+
+# ----------------------------------------------------------------------------------------
+# Helpers for the hardening tests (M3.6 review fixes).
+# ----------------------------------------------------------------------------------------
+def _tool_turns(n: int, name: str = "noop") -> ScriptedProviderGateway:
+    return ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(
+                    tool_call=ToolCall(id=f"c{i}", name=name, arguments={}),
+                    finish_reason=FinishReason.tool_use,
+                )
+            ]
+            for i in range(n)
+        ]
+    )
+
+
+class _RenewFailingStore:
+    """Wraps a RunStore but forces ``renew`` to fail — models a lost/reclaimed lease."""
+
+    def __init__(self, inner: InMemoryRunStore) -> None:
+        self._inner = inner
+        self.renew_calls = 0
+
+    async def renew(self, lease: RunLease, *, lease_seconds: int, now: Any = None) -> bool:
+        self.renew_calls += 1
+        return False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+class _RenewCountingStore:
+    """Wraps a RunStore counting ``renew`` calls (a live keeper keeps the lease alive)."""
+
+    def __init__(self, inner: InMemoryRunStore) -> None:
+        self._inner = inner
+        self.renew_calls = 0
+
+    async def renew(self, lease: RunLease, *, lease_seconds: int, now: Any = None) -> bool:
+        self.renew_calls += 1
+        return await self._inner.renew(lease, lease_seconds=lease_seconds, now=now)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+async def _admit_and_claim(
+    service: DurableRunService,
+    run_store: InMemoryRunStore,
+    *,
+    content: str = "hi",
+    budget: RunBudgetSpec | None = None,
+    worker_id: str = "w1",
+    lease_seconds: int = 30,
+) -> tuple[str, RunLease]:
+    admitted = await service.admit(
+        org_id="org-1",
+        actor="user-1",
+        agent_id="agent-1",
+        session_id="sess-1",
+        surface=RunSurface.web.value,
+        content=content,
+        idempotency_key="k1",
+        budget=budget,
+    )
+    lease = await run_store.claim(admitted.run_id, worker_id=worker_id, lease_seconds=lease_seconds)
+    assert lease is not None
+    return admitted.run_id, lease
+
+
+# ----- Item 1: lease renewal + effect fencing -------------------------------------------
+async def test_lease_keeper_renews_a_long_running_run() -> None:
+    inner = InMemoryRunStore()
+    events = InMemoryEventStore()
+    approvals = InMemoryApprovalStore()
+    service = _service(inner, events, approvals, [])
+    run_id, lease = await _admit_and_claim(service, inner, lease_seconds=1)
+    counting = _RenewCountingStore(inner)
+
+    async def slow(args: dict[str, object], ctx: ToolContext) -> str:
+        await asyncio.sleep(0.03)
+        return "ok"
+
+    provider = ScriptedProviderGateway(
+        [
+            *(
+                [
+                    ProviderChunk(
+                        tool_call=ToolCall(id=f"c{i}", name="slow", arguments={}),
+                        finish_reason=FinishReason.tool_use,
+                    )
+                ]
+                for i in range(5)
+            ),
+            [ProviderChunk(delta="done", finish_reason=FinishReason.end_turn)],
+        ]
+    )
+    final = await execute_run(
+        lease=lease,
+        run_store=counting,
+        event_store=events,
+        approvals=approvals,
+        agent=_agent(),
+        provider=provider,
+        registry=ToolRegistry([ConnectorTool(name="slow", description="", action=slow)]),
+        permissions=RuleBasedPermissionEngine([], default=PermissionDecision.allow),
+        admit_fn=admit,
+        heartbeat_seconds=0.01,
+    )
+    assert final.status is RunStatus.completed
+    assert counting.renew_calls >= 1  # the keeper renewed the lease well before expiry
+
+
+async def test_lost_lease_fences_out_run_with_no_terminal_write() -> None:
+    inner = InMemoryRunStore()
+    events = InMemoryEventStore()
+    approvals = InMemoryApprovalStore()
+    service = _service(inner, events, approvals, [])
+    run_id, lease = await _admit_and_claim(service, inner)
+    # A durable cancel is pending; it must remain pending after a fenced-out bail (re-honored).
+    assert await service.cancel(run_id, requested_by="user-1")
+    fencing = _RenewFailingStore(inner)
+
+    async def slow(args: dict[str, object], ctx: ToolContext) -> str:
+        await asyncio.sleep(0.03)
+        return "ok"
+
+    final = await execute_run(
+        lease=lease,
+        run_store=fencing,
+        event_store=events,
+        approvals=approvals,
+        agent=_agent(),
+        provider=_tool_turns(50, name="slow"),
+        registry=ToolRegistry([ConnectorTool(name="slow", description="", action=slow)]),
+        permissions=RuleBasedPermissionEngine([], default=PermissionDecision.allow),
+        admit_fn=admit,
+        heartbeat_seconds=0.01,
+        control_poll_seconds=0.5,
+    )
+    # Fenced out: no terminal write happened; the run row is still owned/running for the
+    # reclaiming worker, and the durable cancel control is still pending to be re-honored.
+    assert final.status is RunStatus.running
+    record = await inner.get(run_id)
+    assert record is not None and record.status is RunStatus.running
+    assert [c.kind for c in await inner.peek_control(run_id)] == [RunControlKind.cancel]
+
+
+async def test_two_worker_reclaim_fences_first_owner() -> None:
+    run_store = InMemoryRunStore()
+    events = InMemoryEventStore()
+    approvals = InMemoryApprovalStore()
+    service = _service(run_store, events, approvals, [])
+    admitted = await service.admit(
+        org_id="org-1",
+        actor="user-1",
+        agent_id="agent-1",
+        session_id="sess-1",
+        surface=RunSurface.web.value,
+        content="hi",
+        idempotency_key="k1",
+    )
+    t0 = datetime(2026, 7, 17, 12, 0, tzinfo=UTC)
+    first = await run_store.claim(admitted.run_id, worker_id="w1", now=t0, lease_seconds=30)
+    assert first is not None
+    # The lease lapses; a second worker reclaims (attempt advances) and completes the run.
+    t1 = t0 + timedelta(seconds=40)
+    second = await run_store.claim(admitted.run_id, worker_id="w2", now=t1, lease_seconds=30)
+    assert second is not None and second.attempt == 2
+    final = await execute_run(
+        lease=second,
+        run_store=run_store,
+        event_store=events,
+        approvals=approvals,
+        agent=_agent(),
+        provider=ScriptedProviderGateway(
+            [[ProviderChunk(delta="done", finish_reason=FinishReason.end_turn)]]
+        ),
+        registry=ToolRegistry(),
+        permissions=RuleBasedPermissionEngine([], default=PermissionDecision.allow),
+        admit_fn=admit,
+    )
+    assert final.status is RunStatus.completed
+    # The fenced-out first owner can neither heartbeat nor terminalize.
+    assert await run_store.heartbeat(first) is False
+
+
+# ----- Item 2: atomic / recoverable admission -------------------------------------------
+async def test_admit_repairs_incomplete_admission() -> None:
+    run_store = InMemoryRunStore()
+    events = InMemoryEventStore()
+    approvals = InMemoryApprovalStore()
+    enqueued: list[str] = []
+    service = _service(run_store, events, approvals, enqueued)
+    # Simulate a crash after the row was created but before the prompt/queue/enqueue steps.
+    await run_store.create(
+        run_id="run-1",
+        scope_id=_SCOPE,
+        org_id="org-1",
+        actor="user-1",
+        agent_id="agent-1",
+        session_id="sess-1",
+        surface=RunSurface.web.value,
+        idempotency_key="k1",
+        budget=RunBudgetSpec(),
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    # The idempotent retry must *repair* the row: persist the prompt, queue, and enqueue.
+    result = await service.admit(
+        org_id="org-1",
+        actor="user-1",
+        agent_id="agent-1",
+        session_id="sess-1",
+        surface=RunSurface.web.value,
+        content="the real prompt",
+        idempotency_key="k1",
+    )
+    assert result.run_id == "run-1" and result.created is False
+    record = await run_store.get("run-1")
+    assert record is not None and record.status is RunStatus.queued
+    assert enqueued == ["run-1"]
+    messages = project_messages([e async for e in events.read("sess-1")])
+    assert [m["role"] for m in messages] == ["user"]  # exactly one user turn, never prompt-less
+    # A second repair is an idempotent no-op (no duplicate prompt, no re-enqueue).
+    again = await service.admit(
+        org_id="org-1",
+        actor="user-1",
+        agent_id="agent-1",
+        session_id="sess-1",
+        surface=RunSurface.web.value,
+        content="the real prompt",
+        idempotency_key="k1",
+    )
+    assert again.created is False
+    assert enqueued == ["run-1"]
+    messages = project_messages([e async for e in events.read("sess-1")])
+    assert [m["role"] for m in messages] == ["user"]
+
+
+async def test_reconcile_never_dispatches_a_prompt_less_run() -> None:
+    run_store = InMemoryRunStore()
+    events = InMemoryEventStore()
+    now = datetime(2026, 7, 17, 12, 0, tzinfo=UTC)
+    await run_store.create(
+        run_id="run-1",
+        scope_id=_SCOPE,
+        org_id="o",
+        actor="u",
+        agent_id="a",
+        session_id="s1",
+        surface=RunSurface.web.value,
+        idempotency_key="k1",
+        budget=RunBudgetSpec(),
+        expires_at=now + timedelta(hours=1),
+        now=now,
+    )
+    enqueued: list[str] = []
+
+    async def enqueue(run_id: str) -> None:
+        enqueued.append(run_id)
+
+    async def prompt_persisted(record: Any) -> bool:
+        return await prompt_persisted_in_log(events, record.session_id, record.id)
+
+    later = now + timedelta(seconds=60)
+    result = await reconcile_runs(
+        run_store=run_store, enqueue=enqueue, prompt_persisted=prompt_persisted, now=later
+    )
+    assert result.redispatched == 0 and enqueued == []  # prompt-less -> never dispatched
+    # Once the prompt is durably admitted, reconciliation dispatches it exactly once.
+    await admit(events, "s1", _SCOPE, "prompt")
+    # tag the log so the marker check sees it (admit_run marks the admission turn)
+    from keel_core.loop import admit_run
+
+    await admit_run(events, "s1", _SCOPE, "prompt", "run-1")
+    result = await reconcile_runs(
+        run_store=run_store, enqueue=enqueue, prompt_persisted=prompt_persisted, now=later
+    )
+    assert result.redispatched == 1 and enqueued == ["run-1"]
+
+
+# ----- Item 3: approval routing + resume marker -----------------------------------------
+async def _suspend_on_approval(
+    service: DurableRunService,
+    run_store: InMemoryRunStore,
+    events: InMemoryEventStore,
+    approvals: InMemoryApprovalStore,
+) -> str:
+    admitted = await service.admit(
+        org_id="org-1",
+        actor="user-1",
+        agent_id="agent-1",
+        session_id="sess-1",
+        surface=RunSurface.web.value,
+        content="triage",
+        idempotency_key="k1",
+    )
+
+    async def send(args: dict[str, object], ctx: ToolContext) -> str:
+        return "sent"
+
+    registry = ToolRegistry(
+        [ConnectorTool(name="email.send", description="", action=send, outbound=True)]
+    )
+    permissions = RuleBasedPermissionEngine(
+        [Rule("email.send", PermissionDecision.ask)], default=PermissionDecision.ask
+    )
+    provider = ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(
+                    tool_call=ToolCall(id="c1", name="email.send", arguments={"to": "z@x"}),
+                    finish_reason=FinishReason.tool_use,
+                )
+            ]
+        ]
+    )
+    lease = await run_store.claim(admitted.run_id, worker_id="w1", lease_seconds=30)
+    assert lease is not None
+    suspended = await execute_run(
+        lease=lease,
+        run_store=run_store,
+        event_store=events,
+        approvals=approvals,
+        agent=_agent(),
+        provider=provider,
+        registry=registry,
+        permissions=permissions,
+        admit_fn=admit,
+    )
+    assert suspended.status is RunStatus.waiting_approval
+    return admitted.run_id
+
+
+async def test_resolve_approval_marks_resume_and_binds_org_state() -> None:
+    run_store = InMemoryRunStore()
+    events = InMemoryEventStore()
+    approvals = InMemoryApprovalStore()
+    enqueued: list[str] = []
+    service = _service(run_store, events, approvals, enqueued)
+    run_id = await _suspend_on_approval(service, run_store, events, approvals)
+    pending = await approvals.pending_for_run(run_id)
+    assert len(pending) == 1
+
+    # Cross-org resolution is denied (fail closed), leaving the run suspended.
+    assert (
+        await service.resolve_approval(
+            pending[0].id, approved=True, resolved_by="attacker", org_id="org-OTHER"
+        )
+        is False
+    )
+    assert (await run_store.get(run_id)).status is RunStatus.waiting_approval  # type: ignore[union-attr]
+
+    # The correct-org resolution requeues with an explicit resume marker + run_interactive job.
+    enqueued.clear()
+    assert (
+        await service.resolve_approval(
+            pending[0].id, approved=True, resolved_by="user-1", org_id="org-1"
+        )
+        is True
+    )
+    assert enqueued == [run_id]
+    record = await run_store.get(run_id)
+    assert record is not None and record.status is RunStatus.queued and record.resume_requested
+
+    # The claiming worker learns resume atomically from the claim (never inferred from status).
+    lease = await run_store.claim(run_id, worker_id="w2", lease_seconds=30)
+    assert lease is not None and lease.resume is True
+    record = await run_store.get(run_id)
+    assert record is not None and record.resume_requested is False  # marker consumed on claim
+
+
+async def test_resolve_approval_denies_when_run_not_waiting() -> None:
+    run_store = InMemoryRunStore()
+    events = InMemoryEventStore()
+    approvals = InMemoryApprovalStore()
+    service = _service(run_store, events, approvals, [])
+    # An approval whose run is not currently waiting_approval must fail closed.
+    approval_id = await approvals.create_pending(
+        scope_id=_SCOPE,
+        run_id="ghost",
+        session_id="sess-1",
+        tool="email.send",
+        args={},
+        call_id="c1",
+        idempotency_key="i1",
+        reason="first_use",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    assert await service.resolve_approval(approval_id, approved=True, resolved_by="u") is False
+
+
+async def test_expire_approvals_resumes_suspended_run() -> None:
+    run_store = InMemoryRunStore()
+    events = InMemoryEventStore()
+    approvals = InMemoryApprovalStore()
+    enqueued: list[str] = []
+    service = _service(run_store, events, approvals, enqueued)
+    run_id = await _suspend_on_approval(service, run_store, events, approvals)
+    pending = await approvals.pending_for_run(run_id)
+    # Force the approval past its deadline, then run the expiry sweep.
+    approvals._rows[pending[0].id].expires_at = datetime.now(UTC) - timedelta(seconds=1)
+    enqueued.clear()
+    resumed = await service.expire_approvals()
+    assert resumed == 1 and enqueued == [run_id]
+    record = await run_store.get(run_id)
+    assert record is not None and record.status is RunStatus.queued and record.resume_requested
+
+
+# ----- Item 4: durable controls (claim/ack semantics) -----------------------------------
+async def test_steer_is_acked_only_after_the_durable_turn_is_appended() -> None:
+    run_store = InMemoryRunStore()
+    events = InMemoryEventStore()
+    approvals = InMemoryApprovalStore()
+    service = _service(run_store, events, approvals, [])
+    run_id, lease = await _admit_and_claim(service, run_store)
+    assert await service.steer(run_id, requested_by="user-1", text="use the staging server")
+    provider = ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(
+                    tool_call=ToolCall(id="c1", name="noop", arguments={}),
+                    finish_reason=FinishReason.tool_use,
+                )
+            ],
+            [ProviderChunk(delta="ok", finish_reason=FinishReason.end_turn)],
+        ]
+    )
+
+    async def noop(args: dict[str, object], ctx: ToolContext) -> str:
+        return "ok"
+
+    final = await execute_run(
+        lease=lease,
+        run_store=run_store,
+        event_store=events,
+        approvals=approvals,
+        agent=_agent(),
+        provider=provider,
+        registry=ToolRegistry([ConnectorTool(name="noop", description="", action=noop)]),
+        permissions=RuleBasedPermissionEngine([], default=PermissionDecision.allow),
+        admit_fn=admit,
+        control_poll_seconds=0.01,
+    )
+    assert final.status is RunStatus.completed
+    messages = project_messages([e async for e in events.read("sess-1")])
+    assert any(
+        m["role"] == "user" and "staging server" in str(m.get("content", "")) for m in messages
+    )
+    assert await run_store.peek_control(run_id) == []  # steer acked after the durable turn
+
+
+# ----- Item 5: authoritative budgets ----------------------------------------------------
+async def test_persisted_max_iterations_bounds_the_run() -> None:
+    run_store = InMemoryRunStore()
+    events = InMemoryEventStore()
+    approvals = InMemoryApprovalStore()
+    service = _service(run_store, events, approvals, [])
+    run_id, lease = await _admit_and_claim(
+        service, run_store, budget=RunBudgetSpec(max_iterations=2)
+    )
+    assert lease.max_iterations == 2
+    provider = _tool_turns(20)
+    tool_runs = 0
+
+    async def noop(args: dict[str, object], ctx: ToolContext) -> str:
+        nonlocal tool_runs
+        tool_runs += 1
+        return "ok"
+
+    final = await execute_run(
+        lease=lease,
+        run_store=run_store,
+        event_store=events,
+        approvals=approvals,
+        agent=_agent(),
+        provider=provider,
+        registry=ToolRegistry([ConnectorTool(name="noop", description="", action=noop)]),
+        permissions=RuleBasedPermissionEngine([], default=PermissionDecision.allow),
+        admit_fn=admit,
+    )
+    assert final.status is RunStatus.completed  # max_iterations is a named, non-error stop
+    assert tool_runs == 2  # bounded by the persisted budget, not the 20 scripted turns
+
+
+async def test_persisted_token_budget_bounds_the_run() -> None:
+    run_store = InMemoryRunStore()
+    events = InMemoryEventStore()
+    approvals = InMemoryApprovalStore()
+    service = _service(run_store, events, approvals, [])
+    run_id, lease = await _admit_and_claim(
+        service, run_store, budget=RunBudgetSpec(max_iterations=20, token_budget=5)
+    )
+    tool_runs = 0
+
+    async def noop(args: dict[str, object], ctx: ToolContext) -> str:
+        nonlocal tool_runs
+        tool_runs += 1
+        return "ok"
+
+    # Each turn reports 10 completion tokens (> the 5-token budget) so the run stops early.
+    provider = ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(
+                    tool_call=ToolCall(id=f"c{i}", name="noop", arguments={}),
+                    finish_reason=FinishReason.tool_use,
+                    usage=Usage(completion_tokens=10),
+                )
+            ]
+            for i in range(20)
+        ]
+    )
+    final = await execute_run(
+        lease=lease,
+        run_store=run_store,
+        event_store=events,
+        approvals=approvals,
+        agent=_agent(),
+        provider=provider,
+        registry=ToolRegistry([ConnectorTool(name="noop", description="", action=noop)]),
+        permissions=RuleBasedPermissionEngine([], default=PermissionDecision.allow),
+        admit_fn=admit,
+    )
+    assert final.status is RunStatus.completed  # budget_exhausted is a named, non-error stop
+    assert tool_runs == 1  # one turn ran, then the token budget halted the loop

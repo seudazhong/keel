@@ -32,13 +32,17 @@ from keel_core.consolidation import (
     consolidation_schedule_id,
 )
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
+from keel_core.identity import NotFoundError
 from keel_core.jobs import JobStatus, JobStore, JobValidationError
-from keel_core.runs import RunControlKind, RunStore
+from keel_core.loop import admit
+from keel_core.run_service import DurableRunService
+from keel_core.runs import RunControlKind, RunRecord, RunStore
 from keel_core.search import hybrid_search_sessions
-from keel_core.state import PostgresEventStore, list_sessions
+from keel_core.state import InMemoryEventStore, PostgresEventStore, list_sessions
 from keel_core.tokens import delete_token, list_connected
 from keel_core.types import PermissionDecision
 from keel_server.auth import Role, require_role
+from keel_server.identity_context import resolve_actor
 from keel_server.runtime import AgentRuntime
 
 # Baseline authorization: every /v1 route needs at least `viewer`. In open mode (no
@@ -79,6 +83,57 @@ def _runs(request: Request) -> RunStore:
     return store
 
 
+async def _authorize_run(request: Request, record: RunRecord) -> None:
+    """Authorize the request's actor against a durable run's owning org (M3.6, item 6).
+
+    A real authenticated **user** may only touch a run whose ``org_id`` they are an active
+    member of — a cross-org run answers with the same 404 as an unknown run (no existence
+    leak). The open-mode **local** operator and configured **API-key** machines stay within
+    their single scope-bound tenant (local-preview compatibility) and are allowed; a user is
+    never permitted to use the local-preview path to cross orgs.
+    """
+    actor = await resolve_actor(request)
+    if not actor.is_user:
+        return  # local-preview / API-key machine: single scope-bound tenant
+    service = getattr(request.app.state, "identity", None)
+    if service is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "identity service unavailable")
+    assert actor.user_id is not None
+    try:
+        await service.select_org(actor.user_id, record.org_id)
+    except NotFoundError:
+        # Not a member of the run's org: same response as a nonexistent run (no info leak).
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found") from None
+
+
+def _durable_run_service(request: Request) -> DurableRunService:
+    """Build a :class:`DurableRunService` bound to the server's durable run/approval stores.
+
+    Used by the durable interactive approval path so resolution goes through the fully bound
+    service (org/actor/action-hash/attempt/state/expiry) and enqueues ``run_interactive``.
+    """
+    scope: str = getattr(request.app.state, "durable_scope", "web:local")
+    engine = getattr(request.app.state, "engine", None)
+    approvals, _ = _durable_approvals(request)
+    # resolve_approval never reads the event store; a lightweight fallback is safe when the
+    # server runs without Postgres (in-memory preview).
+    events = PostgresEventStore(engine, scope) if engine is not None else InMemoryEventStore()
+    enqueue_raw = getattr(request.app.state, "enqueue", None)
+
+    async def _enqueue(run_id: str) -> None:
+        if enqueue_raw is not None:
+            await enqueue_raw("run_interactive", run_id, scope)
+
+    return DurableRunService(
+        run_store=_runs(request),
+        event_store=events,
+        approvals=approvals,
+        scope_id=scope,
+        enqueue=_enqueue,
+        admit_fn=admit,
+    )
+
+
 @router.post(
     "/sessions/{session_id}/messages",
     response_model=CreateMessageResponse,
@@ -109,10 +164,13 @@ async def interrupt_run(run_id: str, request: Request) -> dict[str, bool]:
     """
     durable = False
     store: RunStore | None = getattr(request.app.state, "runs", None)
-    if store is not None and await store.get(run_id) is not None:
-        durable = await store.request_control(
-            run_id, kind=RunControlKind.interrupt, requested_by="web"
-        )
+    if store is not None:
+        record = await store.get(run_id)
+        if record is not None:
+            await _authorize_run(request, record)
+            durable = await store.request_control(
+                run_id, kind=RunControlKind.interrupt, requested_by="web"
+            )
     local = _runtime(request).interrupt_run(run_id)
     return {"ok": durable or local}
 
@@ -128,6 +186,10 @@ async def steer_run(run_id: str, body: dict[str, Any], request: Request) -> dict
     if not text_value:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "text is required")
     store = _runs(request)
+    record = await store.get(run_id)
+    if record is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown or terminal run")
+    await _authorize_run(request, record)
     ok = await store.request_control(
         run_id, kind=RunControlKind.steer, requested_by="web", payload={"text": text_value}
     )
@@ -142,6 +204,7 @@ async def get_run(run_id: str, request: Request) -> dict[str, object]:
     record = await _runs(request).get(run_id)
     if record is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
+    await _authorize_run(request, record)
     return {
         "id": record.id,
         "status": record.status.value,
@@ -390,14 +453,41 @@ async def list_approvals(
 
 
 async def _resolve_durable(request: Request, approval_id: str, decision: str) -> dict[str, bool]:
+    """Resolve a durable approval, routing durable-interactive runs through the bound service.
+
+    A durable **interactive** run's approval (its ``run_id`` is a row in the durable run
+    store) resolves through :class:`DurableRunService` — fully bound to the resolver's
+    org/actor and the approval's action-hash/attempt, gated on the run being
+    ``waiting_approval`` and not expired — which transitions ``waiting_approval -> queued``
+    and enqueues ``run_interactive`` (the worker owns the resume). A **legacy** scheduled/
+    digest approval keeps the existing ``resume_run`` behavior.
+    """
     store, _ = _durable_approvals(request)
+    record = await store.get(approval_id)
+    if record is None:
+        return {"ok": False}
+    run_store: RunStore | None = getattr(request.app.state, "runs", None)
+    durable_run = await run_store.get(record.run_id) if run_store is not None else None
+    if durable_run is not None:
+        # Durable interactive path — bound resolution + run_interactive resume.
+        await _authorize_run(request, durable_run)
+        actor = await resolve_actor(request)
+        service = _durable_run_service(request)
+        ok = await service.resolve_approval(
+            approval_id,
+            approved=decision == "granted",
+            resolved_by=actor.display_name,
+            org_id=durable_run.org_id if actor.is_user else None,
+        )
+        return {"ok": ok}
+    # Legacy scheduled/digest path — unchanged resume_run behavior.
     ok = await store.resolve(approval_id, decision, "web")
     if ok:
-        record = await store.get(approval_id)
+        resolved = await store.get(approval_id)
         enqueue = getattr(request.app.state, "enqueue", None)
-        if record is not None and enqueue is not None:
+        if resolved is not None and enqueue is not None:
             # Continue the suspended run: resume executes-or-denies the gated call (G5).
-            await enqueue("resume_run", record.session_id, record.run_id, record.scope_id)
+            await enqueue("resume_run", resolved.session_id, resolved.run_id, resolved.scope_id)
     return {"ok": ok}
 
 

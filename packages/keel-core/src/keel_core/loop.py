@@ -224,6 +224,24 @@ async def admit(store: EventStore, session_id: SessionId, scope_id: ScopeId, con
     )
 
 
+async def admit_run(
+    store: EventStore, session_id: SessionId, scope_id: ScopeId, content: str, run_id: RunId
+) -> None:
+    """Persist a durable run's user turn, tagged with an admission marker for ``run_id``.
+
+    The ``admission_run`` payload marker makes admission **idempotent**: a repair/retry can
+    detect an already-persisted prompt (see the durable run service) and never append a
+    duplicate user turn or dispatch a prompt-less run (invariant I2, M3.6)."""
+    await _emit(
+        store,
+        EventType.message_token,
+        session_id,
+        scope_id,
+        run_id,
+        {"role": "user", "text": content, "admission_run": run_id},
+    )
+
+
 async def admit_system(
     store: EventStore, session_id: SessionId, scope_id: ScopeId, content: str
 ) -> None:
@@ -662,6 +680,7 @@ async def resume(
     permissions: PermissionEngine,
     approvals: ApprovalStore,
     budget: RunBudget | None = None,
+    interrupt: Callable[[], bool] | None = None,
     on_event: EventObserver | None = None,
     on_delta: DeltaObserver | None = None,
     stream_deltas: bool = False,
@@ -675,7 +694,12 @@ async def resume(
     tool.call events with no matching tool.result; each granted (or auto-allowed) call
     executes idempotently, each denied/expired call gets a failed result. Only after the
     thread is complete does :func:`_agent_loop` call the provider again — so the model's
-    continuation never depends on non-deterministically reproducing the same tool call."""
+    continuation never depends on non-deterministically reproducing the same tool call.
+
+    ``interrupt`` fences the resume against a lost lease / durable cancel: if it trips
+    before a pending call is replayed, the (possibly external) tool is **not** executed and
+    the batch is left unresolved for a fresh owner to replay — no effect proceeds under a
+    stale lease."""
     budget = budget or RunBudget(
         max_iterations=agent.max_iterations, token_budget=agent.token_budget
     )
@@ -700,6 +724,10 @@ async def resume(
     }
 
     for call in await _suspended_calls(store, session_id):
+        # Fail closed under a lost lease / durable cancel: never run an external effect and
+        # never write a result the fresh owner would double-apply. Leave the batch pending.
+        if interrupt is not None and interrupt():
+            return RunResult(run_id=run_id, reason=StopReason.interrupted)
         decision = permissions.evaluate(call.name, call.arguments, ctx)
         granted = decision is PermissionDecision.allow
         if decision is PermissionDecision.ask and call.id in approval_of:
@@ -742,7 +770,7 @@ async def resume(
         provider=provider,
         registry=registry,
         budget=budget,
-        interrupt=None,
+        interrupt=interrupt,
         permissions=permissions,
         approve=None,
         run_id=run_id,

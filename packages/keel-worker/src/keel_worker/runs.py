@@ -18,11 +18,17 @@ from datetime import UTC, datetime
 from typing import Any
 
 from keel_core.agents import AgentSpec, Scope
+from keel_core.approvals import ApprovalStore
 from keel_core.config import Settings, get_settings
 from keel_core.interactive import build_interactive_tools, interactive_permissions
 from keel_core.loop import ToolRegistry, admit
-from keel_core.run_service import execute_run, reconcile_runs
-from keel_core.runs import RunStatus, RunStore
+from keel_core.run_service import (
+    DurableRunService,
+    execute_run,
+    prompt_persisted_in_log,
+    reconcile_runs,
+)
+from keel_core.runs import RunRecord, RunStatus, RunStore
 from keel_core.types import ScopeKind, TrustLevel
 
 logger = logging.getLogger("keel.worker.runs")
@@ -51,6 +57,7 @@ async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> st
         )
         return "scope_mismatch"
     run_store: RunStore = ctx["runs"]
+    event_store = ctx["store"]
     record = await run_store.get(run_id)
     if record is None:
         return "missing"
@@ -63,6 +70,11 @@ async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> st
     }:
         return record.status.value
 
+    # Fail closed: never drive a run whose prompt was not durably admitted (invariant I2).
+    if not await prompt_persisted_in_log(event_store, record.session_id, run_id):
+        logger.warning("run_interactive prompt-less run=%s scope=%s", run_id, scope_id)
+        return "prompt_missing"
+
     lease = await run_store.claim(
         run_id,
         worker_id=_WORKER_ID,
@@ -74,15 +86,12 @@ async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> st
         current = await run_store.get(run_id)
         return current.status.value if current is not None else "missing"
 
-    # A run that had already suspended once and is now being resumed replays over the log.
-    resume = record.attempt >= 1 and record.status is RunStatus.waiting_approval
-
     environment = ctx["execution_environment"]
     registry = ToolRegistry(build_interactive_tools(environment))
     final = await execute_run(
         lease=lease,
         run_store=run_store,
-        event_store=ctx["store"],
+        event_store=event_store,
         approvals=ctx["approvals"],
         agent=_interactive_agent(lease.scope_id, settings.default_model),
         provider=ctx["provider"],
@@ -90,13 +99,16 @@ async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> st
         permissions=interactive_permissions(),
         admit_fn=admit,
         approval_ttl_hours=settings.approval_timeout_hours,
-        resume=resume,
+        # Resume vs fresh-start is decided atomically at claim time (explicit durable marker
+        # or a reclaimed mid-approval run), never inferred from a mutable pre-claim status.
+        resume=lease.resume,
     )
     logger.info(
-        "run_interactive scope=%s run=%s attempt=%d status=%s worker=%s",
+        "run_interactive scope=%s run=%s attempt=%d resume=%s status=%s worker=%s",
         lease.scope_id,
         run_id,
         lease.attempt,
+        lease.resume,
         final.status.value,
         _WORKER_ID,
     )
@@ -104,16 +116,39 @@ async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> st
 
 
 async def reconcile_runs_tick(ctx: dict[str, Any]) -> int:
-    """Recover admitted-but-undispatched / expired-lease / past-deadline runs (cron)."""
+    """Recover stuck runs + expire timed-out approvals (cron).
+
+    Redispatches admitted/queued-but-undispatched runs (never prompt-less), reclaims expired
+    leases, expires past-deadline runs, and resumes runs whose durable approval timed out."""
     run_store: RunStore = ctx["runs"]
+    event_store = ctx["store"]
+    approvals: ApprovalStore = ctx["approvals"]
     enqueue = ctx["enqueue"]
     scope_id = str(ctx["durable_scope"])
 
     async def _enqueue(run_id: str) -> None:
         await enqueue("run_interactive", run_id, scope_id)
 
-    result = await reconcile_runs(run_store=run_store, enqueue=_enqueue, now=datetime.now(UTC))
-    return result.redispatched + result.reclaimed + result.expired
+    async def _prompt_persisted(record: RunRecord) -> bool:
+        return await prompt_persisted_in_log(event_store, record.session_id, record.id)
+
+    now = datetime.now(UTC)
+    result = await reconcile_runs(
+        run_store=run_store,
+        enqueue=_enqueue,
+        prompt_persisted=_prompt_persisted,
+        now=now,
+    )
+    service = DurableRunService(
+        run_store=run_store,
+        event_store=event_store,
+        approvals=approvals,
+        scope_id=scope_id,
+        enqueue=_enqueue,
+        admit_fn=admit,
+    )
+    resumed = await service.expire_approvals(now=now)
+    return result.redispatched + result.reclaimed + result.expired + resumed
 
 
 __all__ = ["reconcile_runs_tick", "run_interactive"]

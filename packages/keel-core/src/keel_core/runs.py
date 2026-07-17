@@ -195,6 +195,13 @@ class RunRecord:
     result_ref: str | None = None
     error_kind: str | None = None
     error_message: str | None = None
+    # Explicit durable resume/checkpoint marker: set when an approval resolves and the run is
+    # requeued (waiting_approval -> queued) so the claiming worker calls loop.resume() instead
+    # of inferring resume from a pre-claim status that requeue has already overwritten.
+    resume_requested: bool = False
+    # Durable admission progress: the user turn is persisted before the run is dispatched.
+    # Reconciliation must never dispatch a run whose prompt was not durably admitted.
+    prompt_persisted: bool = False
 
     @property
     def is_terminal(self) -> bool:
@@ -224,6 +231,14 @@ class RunLease:
     agent_id: str
     session_id: SessionId
     lease_seconds: int
+    # Whether the claimed run should be resumed (loop.resume) rather than started fresh:
+    # true when it was reclaimed mid-approval or explicitly requeued after an approval
+    # resolution. Captured atomically at claim time so it cannot be inferred incorrectly.
+    resume: bool = False
+    max_iterations: int = 20
+    token_budget: int | None = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -288,6 +303,10 @@ class RunStore(Protocol):
 
     async def mark_queued(self, run_id: RunId, *, now: datetime | None = None) -> bool: ...
 
+    async def mark_prompt_persisted(
+        self, run_id: RunId, *, now: datetime | None = None
+    ) -> bool: ...
+
     async def requeue(self, run_id: RunId, *, now: datetime | None = None) -> bool: ...
 
     async def claim(
@@ -341,7 +360,15 @@ class RunStore(Protocol):
         self, run_id: RunId, *, now: datetime | None = None
     ) -> list[RunControl]: ...
 
+    async def peek_control(self, run_id: RunId) -> list[RunControl]: ...
+
+    async def ack_controls(self, control_ids: list[str], *, now: datetime | None = None) -> int: ...
+
     async def undispatched(self, now: datetime, limit: int) -> list[str]: ...
+
+    async def redispatchable(
+        self, now: datetime, limit: int, *, grace_seconds: int = 0
+    ) -> list[str]: ...
 
     async def reclaimable(self, now: datetime, limit: int) -> list[str]: ...
 
@@ -454,12 +481,21 @@ class InMemoryRunStore:
         record.updated_at = now or _now()
         return True
 
+    async def mark_prompt_persisted(self, run_id: RunId, *, now: datetime | None = None) -> bool:
+        record = self._rows.get(run_id)
+        if record is None or record.prompt_persisted:
+            return False
+        record.prompt_persisted = True
+        record.updated_at = now or _now()
+        return True
+
     async def requeue(self, run_id: RunId, *, now: datetime | None = None) -> bool:
         """Move a suspended run back onto the queue after its approval resolved."""
         record = self._rows.get(run_id)
         if record is None or record.status is not RunStatus.waiting_approval:
             return False
         record.status = RunStatus.queued
+        record.resume_requested = True
         record.version += 1
         record.updated_at = now or _now()
         return True
@@ -485,6 +521,7 @@ class InMemoryRunStore:
         )
         if not claimable:
             return None
+        resume = record.status is RunStatus.waiting_approval or record.resume_requested
         token = uuid.uuid4().hex
         record.status = RunStatus.running
         record.attempt += 1
@@ -494,6 +531,7 @@ class InMemoryRunStore:
         record.lease_expires_at = now + timedelta(seconds=lease_seconds)
         record.heartbeat_at = now
         record.started_at = record.started_at or now
+        record.resume_requested = False
         record.updated_at = now
         return RunLease(
             run_id=run_id,
@@ -505,6 +543,11 @@ class InMemoryRunStore:
             agent_id=record.agent_id,
             session_id=record.session_id,
             lease_seconds=lease_seconds,
+            resume=resume,
+            max_iterations=record.max_iterations,
+            token_budget=record.token_budget,
+            prompt_tokens=record.prompt_tokens,
+            completion_tokens=record.completion_tokens,
         )
 
     def _owned(self, lease: RunLease) -> RunRecord:
@@ -635,17 +678,44 @@ class InMemoryRunStore:
     async def consume_control(
         self, run_id: RunId, *, now: datetime | None = None
     ) -> list[RunControl]:
+        pending = await self.peek_control(run_id)
+        await self.ack_controls([c.id for c in pending], now=now)
+        return pending
+
+    async def peek_control(self, run_id: RunId) -> list[RunControl]:
         pending = [
             c for c in self._control.values() if c.run_id == run_id and c.id not in self._consumed
         ]
         pending.sort(key=lambda c: c.requested_at)
-        for control in pending:
-            self._consumed.add(control.id)
         return pending
+
+    async def ack_controls(self, control_ids: list[str], *, now: datetime | None = None) -> int:
+        acked = 0
+        for control_id in control_ids:
+            if control_id in self._control and control_id not in self._consumed:
+                self._consumed.add(control_id)
+                acked += 1
+        return acked
 
     async def undispatched(self, now: datetime, limit: int) -> list[str]:
         rows = [
             r for r in self._rows.values() if r.status is RunStatus.admitted and r.expires_at > now
+        ]
+        rows.sort(key=lambda r: r.created_at)
+        return [r.id for r in rows[:limit]]
+
+    async def redispatchable(
+        self, now: datetime, limit: int, *, grace_seconds: int = 0
+    ) -> list[str]:
+        cutoff = now - timedelta(seconds=grace_seconds)
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.status in (RunStatus.admitted, RunStatus.queued)
+            and r.lease_token is None
+            and r.worker_id is None
+            and r.expires_at > now
+            and r.updated_at <= cutoff
         ]
         rows.sort(key=lambda r: r.created_at)
         return [r.id for r in rows[:limit]]
@@ -685,7 +755,8 @@ _RUN_COLUMNS = (
     "id, scope_id, org_id, actor, agent_id, session_id, surface, idempotency_key, status, "
     "stop_reason, attempt, version, worker_id, lease_token, lease_expires_at, heartbeat_at, "
     "max_iterations, token_budget, prompt_tokens, completion_tokens, cost_usd, result_ref, "
-    "error_kind, error_message, created_at, updated_at, started_at, finished_at, expires_at"
+    "error_kind, error_message, resume_requested, prompt_persisted, created_at, updated_at, "
+    "started_at, finished_at, expires_at"
 )
 
 
@@ -715,6 +786,8 @@ def _to_record(row: Mapping[Any, Any]) -> RunRecord:
         result_ref=row["result_ref"],
         error_kind=row["error_kind"],
         error_message=row["error_message"],
+        resume_requested=bool(row["resume_requested"]),
+        prompt_persisted=bool(row["prompt_persisted"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         started_at=row["started_at"],
@@ -875,15 +948,28 @@ class PostgresRunStore:
             )
         return result.rowcount == 1
 
+    async def mark_prompt_persisted(self, run_id: RunId, *, now: datetime | None = None) -> bool:
+        now = now or _now()
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    "UPDATE runs SET prompt_persisted = true, updated_at = :now "
+                    "WHERE scope_id = :scope AND id = :id AND prompt_persisted = false"
+                ),
+                {"scope": self._scope_id, "id": run_id, "now": now},
+            )
+        return result.rowcount == 1
+
     async def requeue(self, run_id: RunId, *, now: datetime | None = None) -> bool:
         now = now or _now()
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             result = await conn.execute(
                 text(
-                    "UPDATE runs SET status = 'queued', version = version + 1, "
-                    "updated_at = :now WHERE scope_id = :scope AND id = :id "
-                    "AND status = 'waiting_approval'"
+                    "UPDATE runs SET status = 'queued', resume_requested = true, "
+                    "version = version + 1, updated_at = :now "
+                    "WHERE scope_id = :scope AND id = :id AND status = 'waiting_approval'"
                 ),
                 {"scope": self._scope_id, "id": run_id, "now": now},
             )
@@ -902,21 +988,29 @@ class PostgresRunStore:
         now = now or _now()
         token = uuid.uuid4().hex
         expires = now + timedelta(seconds=lease_seconds)
+        run_cols_r = ", ".join(f"r.{c}" for c in _RUN_COLUMNS.replace(" ", "").split(","))
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             row = (
                 (
                     await conn.execute(
                         text(
-                            "UPDATE runs SET status = 'running', attempt = attempt + 1, "
+                            "WITH claimable AS ("
+                            "  SELECT id, status, resume_requested FROM runs "
+                            "  WHERE scope_id = :scope AND id = :id AND expires_at > :now AND ("
+                            "    status IN ('admitted', 'queued') OR "
+                            "    (status IN ('running', 'waiting_approval') "
+                            "     AND lease_expires_at <= :now)"
+                            "  ) FOR UPDATE"
+                            ") "
+                            "UPDATE runs r SET status = 'running', attempt = attempt + 1, "
                             "version = version + 1, worker_id = :worker, lease_token = :token, "
                             "lease_expires_at = :expires, heartbeat_at = :now, "
-                            "started_at = COALESCE(started_at, :now), updated_at = :now "
-                            "WHERE scope_id = :scope AND id = :id AND expires_at > :now AND ("
-                            "  status IN ('admitted', 'queued') OR "
-                            "  (status IN ('running', 'waiting_approval') "
-                            "   AND lease_expires_at <= :now)"
-                            f") RETURNING {_RUN_COLUMNS}"
+                            "started_at = COALESCE(started_at, :now), updated_at = :now, "
+                            "resume_requested = false "
+                            "FROM claimable c WHERE r.id = c.id "
+                            f"RETURNING {run_cols_r}, "
+                            "(c.status = 'waiting_approval' OR c.resume_requested) AS resume"
                         ),
                         {
                             "scope": self._scope_id,
@@ -944,6 +1038,11 @@ class PostgresRunStore:
             agent_id=record.agent_id,
             session_id=record.session_id,
             lease_seconds=lease_seconds,
+            resume=bool(row["resume"]),
+            max_iterations=record.max_iterations,
+            token_budget=record.token_budget,
+            prompt_tokens=record.prompt_tokens,
+            completion_tokens=record.completion_tokens,
         )
 
     async def heartbeat(self, lease: RunLease, now: datetime | None = None) -> bool:
@@ -1141,25 +1240,29 @@ class PostgresRunStore:
     async def consume_control(
         self, run_id: RunId, *, now: datetime | None = None
     ) -> list[RunControl]:
-        now = now or _now()
+        controls = await self.peek_control(run_id)
+        await self.ack_controls([c.id for c in controls], now=now)
+        return controls
+
+    async def peek_control(self, run_id: RunId) -> list[RunControl]:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             rows = (
                 (
                     await conn.execute(
                         text(
-                            "UPDATE run_control SET consumed_at = :now "
+                            "SELECT id, scope_id, run_id, kind, payload, requested_by, "
+                            "requested_at FROM run_control "
                             "WHERE scope_id = :scope AND run_id = :run AND consumed_at IS NULL "
-                            "RETURNING id, scope_id, run_id, kind, payload, requested_by, "
-                            "requested_at"
+                            "ORDER BY requested_at"
                         ),
-                        {"scope": self._scope_id, "run": run_id, "now": now},
+                        {"scope": self._scope_id, "run": run_id},
                     )
                 )
                 .mappings()
                 .all()
             )
-        controls = [
+        return [
             RunControl(
                 id=row["id"],
                 scope_id=row["scope_id"],
@@ -1171,8 +1274,21 @@ class PostgresRunStore:
             )
             for row in rows
         ]
-        controls.sort(key=lambda c: c.requested_at)
-        return controls
+
+    async def ack_controls(self, control_ids: list[str], *, now: datetime | None = None) -> int:
+        if not control_ids:
+            return 0
+        now = now or _now()
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    "UPDATE run_control SET consumed_at = :now "
+                    "WHERE scope_id = :scope AND id = ANY(:ids) AND consumed_at IS NULL"
+                ),
+                {"scope": self._scope_id, "now": now, "ids": list(control_ids)},
+            )
+        return int(result.rowcount or 0)
 
     async def _select_ids(self, sql: str, params: Mapping[str, Any]) -> list[str]:
         async with self._engine.begin() as conn:
@@ -1185,6 +1301,18 @@ class PostgresRunStore:
             "SELECT id FROM runs WHERE scope_id = :scope AND status = 'admitted' "
             "AND expires_at > :now ORDER BY created_at LIMIT :limit",
             {"scope": self._scope_id, "now": now, "limit": limit},
+        )
+
+    async def redispatchable(
+        self, now: datetime, limit: int, *, grace_seconds: int = 0
+    ) -> list[str]:
+        cutoff = now - timedelta(seconds=grace_seconds)
+        return await self._select_ids(
+            "SELECT id FROM runs WHERE scope_id = :scope "
+            "AND status IN ('admitted', 'queued') AND lease_token IS NULL "
+            "AND worker_id IS NULL AND expires_at > :now AND updated_at <= :cutoff "
+            "ORDER BY created_at LIMIT :limit",
+            {"scope": self._scope_id, "now": now, "cutoff": cutoff, "limit": limit},
         )
 
     async def reclaimable(self, now: datetime, limit: int) -> list[str]:
