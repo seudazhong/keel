@@ -22,6 +22,7 @@ from keel_core.connector_contracts import (
     ConnectorChangeKind,
     ConnectorHealth,
     ConnectorHealthStatus,
+    ConnectorIngressFailure,
     ConnectorIngressRequest,
     ConnectorIngressResponse,
     ConnectorItem,
@@ -719,12 +720,14 @@ class ConnectorService:
                 )
             await self.repository.record_health(
                 connector_id,
+                binding.id,
                 ConnectorHealth(ConnectorHealthStatus.healthy, datetime.now(UTC)),
             )
             return len(result.changes)
         except Exception as exc:
             await self.repository.record_health(
                 connector_id,
+                binding.id,
                 ConnectorHealth(
                     ConnectorHealthStatus.error,
                     datetime.now(UTC),
@@ -862,11 +865,13 @@ class ConnectorService:
             )
             await self.repository.record_health(
                 connector_id,
+                binding.id,
                 ConnectorHealth(ConnectorHealthStatus.healthy, datetime.now(UTC)),
             )
         except Exception as exc:
             await self.repository.record_health(
                 connector_id,
+                binding.id,
                 ConnectorHealth(
                     ConnectorHealthStatus.error,
                     datetime.now(UTC),
@@ -880,7 +885,7 @@ class ConnectorService:
         provider = self.registry.create(connector_id)
         binding = await self._required_binding(connector_id)
         health = await provider.health(await self._operation_context(connector_id, binding=binding))
-        await self.repository.record_health(connector_id, health)
+        await self.repository.record_health(connector_id, binding.id, health)
         return health
 
     async def ingress(
@@ -895,27 +900,32 @@ class ConnectorService:
         if result.delivery_id is None:
             return ConnectorIngressOutcome(result.response, False, 0)
         assert result.payload_hash is not None
-        claimed = await self.repository.claim_delivery(
+        claim = await self.repository.claim_delivery(
             connector_id,
             binding.id,
             result.delivery_id,
             result.payload_hash,
         )
-        if not claimed:
+        if claim is None:
+            return ConnectorIngressOutcome(result.response, False, 0)
+        if result.failure is not None:
+            await self.repository.finish_delivery(claim, failure=result.failure)
             return ConnectorIngressOutcome(result.response, False, 0)
         try:
             for change in result.changes:
                 self._validate_change(connector_id, binding.id, change)
                 await self._change_sink.apply(change)
-        except Exception as exc:
+        except Exception:
             await self.repository.finish_delivery(
-                connector_id,
-                result.delivery_id,
-                error_code=type(exc).__name__,
-                error_summary="connector delivery processing failed",
+                claim,
+                failure=ConnectorIngressFailure(
+                    "change_sink_failed",
+                    "connector delivery processing failed",
+                    retryable=True,
+                ),
             )
             raise
-        await self.repository.finish_delivery(connector_id, result.delivery_id)
+        await self.repository.finish_delivery(claim)
         return ConnectorIngressOutcome(result.response, True, len(result.changes))
 
     async def revoke(
@@ -1099,6 +1109,7 @@ class ConnectorService:
         )
         items = tuple(await self.repository.list_items(connector_id))
         cursors = tuple(await self.repository.list_cursors(connector_id, current.id))
+        delivery_health = await self.repository.get_delivery_health(connector_id, current.id)
         if selected_resources:
             selected_ids = {item.id for item in resources}
             items = tuple(
@@ -1122,6 +1133,7 @@ class ConnectorService:
             targets=tuple(await self.repository.list_targets(connector_id)),
             items=items,
             cursors=cursors,
+            delivery_health=delivery_health,
         )
 
     async def _validate_required_targets(

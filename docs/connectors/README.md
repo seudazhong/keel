@@ -75,7 +75,11 @@ provider-local manifest/operation implementations.
 URL/feed providers use the shared pinned transport. Every initial and redirected address is
 validated once and pinned while retaining the original Host and TLS SNI. Private, loopback,
 link-local, reserved, IPv4-mapped private, and RFC6598 `100.64.0.0/10` shared address space are
-rejected.
+rejected. `ConnectorHttpClient.get()` remains the bytes-only convenience API. Providers that need
+conditional polling use `get_response()` with `If-None-Match` / `If-Modified-Since` request headers
+and an explicit accepted-status set such as `{200, 304}`; the immutable response includes the final
+URL, status, case-insensitive duplicate-preserving headers, and body. Conditional headers survive
+only same-origin redirects, and other caller-supplied request headers are rejected.
 
 Normal disconnect remains fail-closed when remote revoke fails. If a provider module or optional
 SDK cannot load, operators can explicitly use local forget (`DELETE .../{id}/local`) or forced
