@@ -1,0 +1,31 @@
+{
+  "new_start_page_token": "cursor-2",
+  "pages": {
+    "cursor-1": {
+      "next_page_token": "cursor-1-page-2",
+      "changes": [
+        {
+          "file_id": "doc-1",
+          "removed": false
+        },
+        {
+          "file_id": "deleted-1",
+          "removed": true
+        }
+      ]
+    },
+    "cursor-1-page-2": {
+      "new_start_page_token": "cursor-2",
+      "changes": [
+        {
+          "file_id": "doc-1",
+          "removed": false
+        },
+        {
+          "file_id": "moved-1",
+          "removed": false
+        }
+      ]
+    }
+  }
+}
