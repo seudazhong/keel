@@ -190,10 +190,10 @@ class MicrosoftGraphClient:
     ) -> dict[str, Any]:
         _validate_graph_url(url)
         request_headers = {
-            "Authorization": f"Bearer {self._access_token}",
             "Accept": "application/json",
         }
         request_headers.update(headers or {})
+        request_headers["Authorization"] = f"Bearer {self._access_token}"
         for attempt in range(self._max_throttle_retries + 1):
             response = await self._transport.request("GET", url, headers=request_headers)
             if response.status_code == 429:
@@ -1563,9 +1563,11 @@ __all__ = [
     "MAIL_GET_ACTION",
     "MAIL_SEARCH_ACTION",
     "MICROSOFT_365_CONNECTOR_ID",
+    "HttpxMicrosoft365Transport",
     "Microsoft365AccountMismatchError",
     "Microsoft365CursorInvalidError",
     "Microsoft365Error",
+    "MicrosoftGraphClient",
     "Microsoft365HttpResponse",
     "Microsoft365HttpTransport",
     "Microsoft365PermissionError",

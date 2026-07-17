@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+import httpx
 import pytest
 
 from keel_core.connector_contracts import (
@@ -35,12 +37,15 @@ from keel_core.connector_providers.microsoft_365 import (
     MICROSOFT_365_CONNECTOR_ID,
     OAUTH_CREDENTIAL_KIND,
     SCOPES,
+    HttpxMicrosoft365Transport,
     Microsoft365HttpResponse,
     Microsoft365Provider,
     Microsoft365TenantMismatchError,
     Microsoft365ThrottledError,
+    MicrosoftGraphClient,
     manifest,
 )
+from keel_core.connector_registry import discover_connector_registry
 from keel_core.connector_repository import InMemoryConnectorRepository
 from keel_core.protocols import ToolContext
 from keel_core.secrets import EnvelopeCipher
@@ -278,6 +283,54 @@ def test_manifest_is_read_only_and_declares_least_mvp_scopes() -> None:
     assert all(action.semantics.value == "read" for action in manifest.actions)
     forbidden = {"Mail.Send", "Calendars.ReadWrite", "Files.Read", "Contacts.Read", "Chat.Read"}
     assert forbidden.isdisjoint(manifest.scopes)
+
+
+def test_builtin_registry_discovers_microsoft_365_locally() -> None:
+    registry = discover_connector_registry()
+    registration = registry.get(MICROSOFT_365_CONNECTOR_ID)
+    assert registration is not None
+    assert registration.manifest is manifest
+    assert registry.create(MICROSOFT_365_CONNECTOR_ID).manifest is manifest
+
+
+async def test_live_http_transport_sends_bearer_header_without_logging_token(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    token = "sanitized-opaque-access-token"
+    expected_header_digest = hashlib.sha256(f"Bearer {token}".encode()).hexdigest()
+    seen: dict[str, str] = {}
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        authorization = request.headers.get("Authorization", "")
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["authorization_scheme"] = authorization.partition(" ")[0]
+        seen["authorization_digest"] = hashlib.sha256(authorization.encode()).hexdigest()
+        return httpx.Response(200, json={"value": []})
+
+    real_async_client = httpx.AsyncClient
+    mock_transport = httpx.MockTransport(handle)
+
+    def client_factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        return real_async_client(*args, transport=mock_transport, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    caplog.set_level("DEBUG")
+    url = f"{GRAPH_ROOT}/me/mailFolders"
+    payload = await MicrosoftGraphClient(
+        token,
+        HttpxMicrosoft365Transport(),
+    ).get(url, headers={"Authorization": "Bearer caller-must-not-override"})
+
+    assert payload == {"value": []}
+    assert seen == {
+        "method": "GET",
+        "url": url,
+        "authorization_scheme": "Bearer",
+        "authorization_digest": expected_header_digest,
+    }
+    assert token not in caplog.text
 
 
 async def test_staged_setup_authorization_and_callback() -> None:
