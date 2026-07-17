@@ -6,7 +6,7 @@ import copy
 import json
 import uuid
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
@@ -19,8 +19,10 @@ from keel_core.connector_contracts import (
     ConnectorBindingStatus,
     ConnectorBindingTarget,
     ConnectorCursor,
+    ConnectorDeliveryHealth,
     ConnectorHealth,
     ConnectorHealthStatus,
+    ConnectorIngressFailure,
     ConnectorItem,
     ConnectorItemDraft,
     ConnectorRenewalExpiryBehavior,
@@ -177,6 +179,39 @@ class ConnectorScheduleLeaseLostError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class ConnectorDeliveryClaim:
+    scope_id: str
+    connector_id: str
+    binding_id: str
+    delivery_id: str
+    token: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if not all(
+            value.strip()
+            for value in (self.scope_id, self.connector_id, self.binding_id, self.delivery_id)
+        ):
+            raise ValueError("connector delivery claim identifiers must not be blank")
+        if len(self.token) != 32 or any(ch not in "0123456789abcdef" for ch in self.token):
+            raise ValueError("connector delivery claim token is invalid")
+
+
+class ConnectorDeliveryClaimLostError(LookupError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class _InMemoryConnectorDelivery:
+    binding_id: str
+    payload_hash: str
+    status: str
+    claim_token: str
+    updated_at: datetime
+    processed_at: datetime | None = None
+    failure: ConnectorIngressFailure | None = None
+
+
 def next_schedule_time(due_at: datetime, now: datetime, cadence_seconds: int) -> datetime:
     next_at = due_at + timedelta(seconds=cadence_seconds)
     if next_at > now:
@@ -220,7 +255,7 @@ class ConnectorRepository(Protocol):
     ) -> ConnectorBinding: ...
 
     async def record_health(
-        self, connector_id: str, health: ConnectorHealth
+        self, connector_id: str, binding_id: str, health: ConnectorHealth
     ) -> ConnectorBinding | None: ...
 
     async def replace_binding_metadata(
@@ -308,17 +343,19 @@ class ConnectorRepository(Protocol):
         binding_id: str,
         delivery_id: str,
         payload_hash: str,
-    ) -> bool: ...
+    ) -> ConnectorDeliveryClaim | None: ...
 
     async def finish_delivery(
         self,
-        connector_id: str,
-        delivery_id: str,
+        claim: ConnectorDeliveryClaim,
         *,
         event_id: str | None = None,
-        error_code: str | None = None,
-        error_summary: str | None = None,
+        failure: ConnectorIngressFailure | None = None,
     ) -> None: ...
+
+    async def get_delivery_health(
+        self, connector_id: str, binding_id: str
+    ) -> ConnectorDeliveryHealth | None: ...
 
     async def claim_due_schedules(
         self, now: datetime, *, limit: int, lease_seconds: int
@@ -350,7 +387,7 @@ class InMemoryConnectorRepository:
         self._resources: dict[tuple[str, str], ConnectorResource] = {}
         self._items: dict[tuple[str, str], ConnectorItem] = {}
         self._cursors: dict[tuple[str, str, str, str], ConnectorCursor] = {}
-        self._deliveries: dict[tuple[str, str], tuple[str, str, datetime]] = {}
+        self._deliveries: dict[tuple[str, str], _InMemoryConnectorDelivery] = {}
         self._schedule_leases: dict[str, ConnectorScheduleLease] = {}
 
     @property
@@ -488,10 +525,10 @@ class InMemoryConnectorRepository:
         return copy.deepcopy(row)
 
     async def record_health(
-        self, connector_id: str, health: ConnectorHealth
+        self, connector_id: str, binding_id: str, health: ConnectorHealth
     ) -> ConnectorBinding | None:
         prior = self._bindings.get(connector_id)
-        if prior is None:
+        if prior is None or prior.id != binding_id:
             return None
         healthy = health.status is ConnectorHealthStatus.healthy
         mapped_status = {
@@ -810,38 +847,109 @@ class InMemoryConnectorRepository:
         binding_id: str,
         delivery_id: str,
         payload_hash: str,
-    ) -> bool:
+    ) -> ConnectorDeliveryClaim | None:
+        binding = self._bindings.get(connector_id)
+        if binding is None or binding.id != binding_id:
+            raise LookupError("connector binding changed before delivery claim")
         key = (connector_id, delivery_id)
-        if key in self._deliveries:
-            existing_hash, delivery_status, updated_at = self._deliveries[key]
-            if existing_hash != payload_hash:
+        existing = self._deliveries.get(key)
+        now = datetime.now(UTC)
+        if existing is not None:
+            if existing.binding_id != binding_id:
+                raise LookupError("connector delivery belongs to a replaced binding")
+            if existing.payload_hash != payload_hash:
                 raise ValueError("connector delivery id was reused with a different payload")
-            stale = (datetime.now(UTC) - updated_at).total_seconds() >= 300
-            if delivery_status == "failed" or (
-                delivery_status in {"received", "processing"} and stale
+            stale = now - existing.updated_at >= timedelta(minutes=5)
+            if existing.status != "failed" and not (
+                existing.status == "processing" and stale
             ):
-                self._deliveries[key] = (payload_hash, "processing", datetime.now(UTC))
-                return True
-            return False
-        self._deliveries[key] = (payload_hash, "processing", datetime.now(UTC))
-        return True
+                return None
+            token = uuid.uuid4().hex
+            self._deliveries[key] = replace(
+                existing,
+                status="processing",
+                claim_token=token,
+                updated_at=now,
+            )
+            return ConnectorDeliveryClaim(
+                self._scope_id, connector_id, binding_id, delivery_id, token
+            )
+        token = uuid.uuid4().hex
+        self._deliveries[key] = _InMemoryConnectorDelivery(
+            binding_id,
+            payload_hash,
+            "processing",
+            token,
+            now,
+        )
+        return ConnectorDeliveryClaim(
+            self._scope_id, connector_id, binding_id, delivery_id, token
+        )
 
     async def finish_delivery(
         self,
-        connector_id: str,
-        delivery_id: str,
+        claim: ConnectorDeliveryClaim,
         *,
         event_id: str | None = None,
-        error_code: str | None = None,
-        error_summary: str | None = None,
+        failure: ConnectorIngressFailure | None = None,
     ) -> None:
-        if (connector_id, delivery_id) not in self._deliveries:
-            raise LookupError("connector delivery was not claimed")
-        payload_hash, _, _ = self._deliveries[(connector_id, delivery_id)]
-        self._deliveries[(connector_id, delivery_id)] = (
-            payload_hash,
-            "failed" if error_code is not None else "processed",
-            datetime.now(UTC),
+        key = (claim.connector_id, claim.delivery_id)
+        current = self._deliveries.get(key)
+        binding = self._bindings.get(claim.connector_id)
+        if (
+            claim.scope_id != self._scope_id
+            or binding is None
+            or binding.id != claim.binding_id
+            or current is None
+            or current.binding_id != claim.binding_id
+            or current.status != "processing"
+            or current.claim_token != claim.token
+        ):
+            raise ConnectorDeliveryClaimLostError("connector delivery claim was lost")
+        now = datetime.now(UTC)
+        self._deliveries[key] = replace(
+            current,
+            status="failed" if failure is not None else "processed",
+            updated_at=now,
+            processed_at=now,
+            failure=failure,
+        )
+
+    async def get_delivery_health(
+        self, connector_id: str, binding_id: str
+    ) -> ConnectorDeliveryHealth | None:
+        binding = self._bindings.get(connector_id)
+        if binding is None or binding.id != binding_id:
+            return None
+        now = datetime.now(UTC)
+        unresolved = [
+            row
+            for (cid, _), row in self._deliveries.items()
+            if cid == connector_id
+            and row.binding_id == binding_id
+            and (
+                row.status == "failed"
+                or (
+                    row.status == "processing"
+                    and (
+                        row.failure is not None
+                        or now - row.updated_at >= timedelta(minutes=5)
+                    )
+                )
+            )
+        ]
+        if not unresolved:
+            return None
+        latest = max(unresolved, key=lambda row: row.processed_at or row.updated_at)
+        return ConnectorDeliveryHealth(
+            unresolved_count=min(len(unresolved), 1000),
+            latest_at=latest.processed_at or latest.updated_at,
+            summary=(
+                latest.failure.summary
+                if latest.failure is not None
+                else "connector delivery processing timed out"
+            ),
+            retryable=True if latest.failure is None else latest.failure.retryable,
         )
 
     async def claim_due_schedules(
@@ -1229,7 +1337,7 @@ class PostgresConnectorRepository:
         return _binding_from_row(row)
 
     async def record_health(
-        self, connector_id: str, health: ConnectorHealth
+        self, connector_id: str, binding_id: str, health: ConnectorHealth
     ) -> ConnectorBinding | None:
         healthy = health.status is ConnectorHealthStatus.healthy
         binding_status = {
@@ -1254,7 +1362,8 @@ class PostgresConnectorRepository:
                         "error_code = CASE WHEN status = 'revoked' THEN error_code "
                         "ELSE :code END, error_summary = CASE WHEN status = 'revoked' "
                         "THEN error_summary ELSE :summary END, updated_at = :checked "
-                        "WHERE scope_id = :scope AND connector_id = :cid RETURNING *"
+                        "WHERE scope_id = :scope AND connector_id = :cid "
+                        "AND id = :binding RETURNING *"
                     ),
                     {
                         "status": binding_status.value,
@@ -1266,6 +1375,7 @@ class PostgresConnectorRepository:
                         "summary": None if healthy else health.message,
                         "scope": self._scope_id,
                         "cid": connector_id,
+                        "binding": binding_id,
                     },
                 )
             ).one_or_none()
@@ -1672,7 +1782,8 @@ class PostgresConnectorRepository:
         binding_id: str,
         delivery_id: str,
         payload_hash: str,
-    ) -> bool:
+    ) -> ConnectorDeliveryClaim | None:
+        token = uuid.uuid4().hex
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             row = (
@@ -1680,8 +1791,10 @@ class PostgresConnectorRepository:
                     text(
                         "INSERT INTO connector_deliveries "
                         "(id, scope_id, connector_id, binding_id, delivery_id, payload_hash, "
-                        "status) VALUES (:id, :scope, :cid, :binding, :delivery, :hash, "
-                        "'processing') "
+                        "status, claim_token) "
+                        "SELECT :id, :scope, :cid, :binding, :delivery, :hash, "
+                        "'processing', :token FROM connector_bindings "
+                        "WHERE scope_id = :scope AND connector_id = :cid AND id = :binding "
                         "ON CONFLICT (scope_id, connector_id, delivery_id) DO NOTHING RETURNING id"
                     ),
                     {
@@ -1691,15 +1804,18 @@ class PostgresConnectorRepository:
                         "binding": binding_id,
                         "delivery": delivery_id,
                         "hash": payload_hash,
+                        "token": token,
                     },
                 )
             ).one_or_none()
             if row is not None:
-                return True
+                return ConnectorDeliveryClaim(
+                    self._scope_id, connector_id, binding_id, delivery_id, token
+                )
             existing = (
                 await conn.execute(
                     text(
-                        "SELECT payload_hash, status FROM connector_deliveries "
+                        "SELECT binding_id, payload_hash, status FROM connector_deliveries "
                         "WHERE scope_id = :scope AND connector_id = :cid "
                         "AND delivery_id = :delivery"
                     ),
@@ -1709,59 +1825,119 @@ class PostgresConnectorRepository:
                         "delivery": delivery_id,
                     },
                 )
-            ).one()
+            ).one_or_none()
+            if existing is None:
+                raise LookupError("connector binding changed before delivery claim")
+            if str(existing.binding_id) != binding_id:
+                raise LookupError("connector delivery belongs to a replaced binding")
             if existing.payload_hash != payload_hash:
                 raise ValueError("connector delivery id was reused with a different payload")
+            token = uuid.uuid4().hex
             reclaimed = (
                 await conn.execute(
                     text(
                         "UPDATE connector_deliveries SET status = 'processing', "
-                        "error_code = NULL, error_summary = NULL, processed_at = NULL, "
-                        "updated_at = now() WHERE scope_id = :scope AND connector_id = :cid "
-                        "AND delivery_id = :delivery AND (status = 'failed' OR "
-                        "(status IN ('received', 'processing') "
+                        "claim_token = :token, updated_at = now() "
+                        "WHERE scope_id = :scope AND connector_id = :cid "
+                        "AND binding_id = :binding AND delivery_id = :delivery "
+                        "AND (status = 'failed' OR (status = 'processing' "
                         "AND updated_at < now() - interval '5 minutes')) RETURNING id"
                     ),
                     {
                         "scope": self._scope_id,
                         "cid": connector_id,
+                        "binding": binding_id,
                         "delivery": delivery_id,
+                        "token": token,
                     },
                 )
             ).one_or_none()
-            return reclaimed is not None
+            if reclaimed is None:
+                return None
+            return ConnectorDeliveryClaim(
+                self._scope_id, connector_id, binding_id, delivery_id, token
+            )
 
     async def finish_delivery(
         self,
-        connector_id: str,
-        delivery_id: str,
+        claim: ConnectorDeliveryClaim,
         *,
         event_id: str | None = None,
-        error_code: str | None = None,
-        error_summary: str | None = None,
+        failure: ConnectorIngressFailure | None = None,
     ) -> None:
-        failed = error_code is not None
+        if claim.scope_id != self._scope_id:
+            raise ConnectorDeliveryClaimLostError("connector delivery claim was lost")
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             result = await conn.execute(
                 text(
                     "UPDATE connector_deliveries SET status = :status, event_id = :event, "
-                    "error_code = :code, error_summary = :summary, processed_at = now(), "
+                    "error_code = :code, error_summary = :summary, "
+                    "error_retryable = :retryable, processed_at = now(), "
                     "updated_at = now() WHERE scope_id = :scope AND connector_id = :cid "
-                    "AND delivery_id = :delivery"
+                    "AND binding_id = :binding AND delivery_id = :delivery "
+                    "AND status = 'processing' AND claim_token = :token"
                 ),
                 {
-                    "status": "failed" if failed else "processed",
+                    "status": "failed" if failure is not None else "processed",
                     "event": event_id,
-                    "code": error_code,
-                    "summary": error_summary,
+                    "code": None if failure is None else failure.code,
+                    "summary": None if failure is None else failure.summary,
+                    "retryable": None if failure is None else failure.retryable,
                     "scope": self._scope_id,
-                    "cid": connector_id,
-                    "delivery": delivery_id,
+                    "cid": claim.connector_id,
+                    "binding": claim.binding_id,
+                    "delivery": claim.delivery_id,
+                    "token": claim.token,
                 },
             )
         if not result.rowcount:
-            raise LookupError("connector delivery was not claimed")
+            raise ConnectorDeliveryClaimLostError("connector delivery claim was lost")
+
+    async def get_delivery_health(
+        self, connector_id: str, binding_id: str
+    ) -> ConnectorDeliveryHealth | None:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            latest = (
+                await conn.execute(
+                    text(
+                        "SELECT error_summary, error_retryable, latest_at, unresolved_count "
+                        "FROM (SELECT error_summary, error_retryable, "
+                        "COALESCE(processed_at, updated_at) AS latest_at, "
+                        "LEAST(count(*) OVER (), 1000) AS unresolved_count "
+                        "FROM connector_deliveries d "
+                        "WHERE d.scope_id = :scope AND d.connector_id = :cid "
+                        "AND d.binding_id = :binding "
+                        "AND EXISTS (SELECT 1 FROM connector_bindings b "
+                        "WHERE b.scope_id = d.scope_id AND b.connector_id = d.connector_id "
+                        "AND b.id = d.binding_id) "
+                        "AND (d.status = 'failed' OR (d.status = 'processing' "
+                        "AND (d.error_code IS NOT NULL "
+                        "OR d.updated_at < now() - interval '5 minutes')))) unresolved "
+                        "ORDER BY latest_at DESC LIMIT 1"
+                    ),
+                    {
+                        "scope": self._scope_id,
+                        "cid": connector_id,
+                        "binding": binding_id,
+                    },
+                )
+            ).first()
+        if latest is None:
+            return None
+        return ConnectorDeliveryHealth(
+            unresolved_count=int(latest.unresolved_count),
+            latest_at=latest.latest_at,
+            summary=(
+                str(latest.error_summary)
+                if latest.error_summary is not None
+                else "connector delivery processing timed out"
+            ),
+            retryable=(
+                True if latest.error_retryable is None else bool(latest.error_retryable)
+            ),
+        )
 
     async def claim_due_schedules(
         self, now: datetime, *, limit: int, lease_seconds: int
@@ -1993,6 +2169,8 @@ async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
 
 
 __all__ = [
+    "ConnectorDeliveryClaim",
+    "ConnectorDeliveryClaimLostError",
     "ConnectorRepository",
     "ConnectorScheduleLease",
     "ConnectorScheduleLeaseLostError",
