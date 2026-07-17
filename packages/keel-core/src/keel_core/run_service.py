@@ -61,6 +61,7 @@ from keel_core.runs import (
     RunStore,
     action_hash,
     admission_fingerprint,
+    legacy_admission_fingerprint,
     mark_checkpoint_in_transaction,
 )
 from keel_core.types import RunId, ScopeId, SessionId, StopReason
@@ -331,6 +332,19 @@ class DurableRunService:
             content=content,
             model=model,
         )
+        # Deployment-rollout compatibility: a run admitted by a *pre-model* binary stored a
+        # fingerprint that omitted the model. Recompute that precise legacy form so a retry of
+        # such an in-flight run completes idempotently across the deploy. A model-aware stored
+        # fingerprint always encodes the model field and can never equal this, so a changed
+        # model cannot hijack a new-model row through the legacy path.
+        legacy_fingerprint = legacy_admission_fingerprint(
+            org_id=org_id,
+            actor=actor,
+            agent_id=agent_id,
+            session_id=session_id,
+            surface=surface,
+            content=content,
+        )
         record, created = await self._runs.create(
             run_id=run_id,
             scope_id=self._scope_id,
@@ -342,6 +356,7 @@ class DurableRunService:
             idempotency_key=idempotency_key,
             budget=budget or RunBudgetSpec(),
             fingerprint=fingerprint,
+            legacy_fingerprint=legacy_fingerprint,
             expires_at=expires_at,
             now=now,
         )

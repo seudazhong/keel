@@ -192,9 +192,93 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Restore the global session-id namespace. Safe only when no two scopes share a session id
-    # (i.e. the composite-identity feature was not exercised); a genuine cross-scope id
-    # collision cannot be represented by the old global constraints and will surface here.
+    # Restore the global session-id namespace. Under the composite ``(scope_id, id)`` identity
+    # two different scopes may legitimately own the *same* external session id; the pre-0016
+    # global ``sessions_pkey (id)`` / ``events_session_id_seq_key (session_id, seq)`` cannot
+    # represent that, so before restoring them we must deterministically collapse every
+    # cross-scope collision down to a single global namespace. One scope keeps the original id
+    # (the canonical holder — the lexicographically smallest ``scope_id`` for that id, a stable
+    # choice); every other scope's same-id session is renamed to a stable, collision-free id
+    # derived from its original id + scope, and *all* rows that reference it (events, runs,
+    # approvals, schedules, jobs, message embeddings, tombstones, session-scoped erasure
+    # requests) are repointed in lock-step so no event is ever detached from its session and no
+    # reference is left dangling. There are no session FKs, so ON UPDATE CASCADE is unavailable
+    # — we repoint each referencing table explicitly, children before the ``sessions`` row.
+    #
+    # ``runs`` (and only ``runs`` among the session-referencing tables) is under FORCE ROW LEVEL
+    # SECURITY, so even the table owner is filtered by ``app.scope_id`` — which is unset during
+    # a migration. We drop FORCE for the duration of the cross-scope remap so the repoint reaches
+    # every scope's runs, then restore it. The derivation is deterministic and only touches rows
+    # that still collide, so a repeated/partial downgrade converges (idempotent) and the
+    # no-collision case is a pure no-op.
+    op.execute("ALTER TABLE runs NO FORCE ROW LEVEL SECURITY")
+    op.execute(
+        """
+        DO $$
+        DECLARE
+            collision RECORD;
+            new_id text;
+            base text;
+            digest text;
+            bump int;
+        BEGIN
+            -- Materialize the collision set up front (every non-canonical scoped session for a
+            -- globally-duplicated id) so repointing ``sessions`` mid-loop cannot disturb the
+            -- iteration.
+            CREATE TEMP TABLE _session_id_collisions ON COMMIT DROP AS
+            SELECT s.scope_id AS scope_id, s.id AS old_id
+            FROM sessions s
+            JOIN (
+                SELECT id, min(scope_id) AS canonical_scope
+                FROM sessions
+                GROUP BY id
+                HAVING count(*) > 1
+            ) dup ON dup.id = s.id
+            WHERE s.scope_id <> dup.canonical_scope;
+
+            FOR collision IN SELECT scope_id, old_id FROM _session_id_collisions LOOP
+                -- Deterministic, stable rename derived from the original id + owning scope.
+                -- ``(scope_id, id)`` is the composite PK, so md5(scope||id) is unique per row;
+                -- the base is truncated to keep the derived id bounded in length/format.
+                base := left(collision.old_id, 180);
+                digest := md5(collision.scope_id || '|' || collision.old_id);
+                new_id := base || '.scope-' || digest;
+                -- Guard the (astronomically unlikely) digest collision with an existing id or
+                -- one already assigned in this pass: extend deterministically until free.
+                bump := 0;
+                WHILE EXISTS (SELECT 1 FROM sessions WHERE id = new_id) LOOP
+                    bump := bump + 1;
+                    new_id := base || '.scope-' || digest || '-' || bump;
+                END LOOP;
+
+                -- Repoint every referencing row for this scoped session, then the row itself.
+                UPDATE events SET session_id = new_id
+                    WHERE scope_id = collision.scope_id AND session_id = collision.old_id;
+                UPDATE runs SET session_id = new_id
+                    WHERE scope_id = collision.scope_id AND session_id = collision.old_id;
+                UPDATE approvals SET session_id = new_id
+                    WHERE scope_id = collision.scope_id AND session_id = collision.old_id;
+                UPDATE schedules SET session_id = new_id
+                    WHERE scope_id = collision.scope_id AND session_id = collision.old_id;
+                UPDATE message_embeddings SET session_id = new_id
+                    WHERE scope_id = collision.scope_id AND session_id = collision.old_id;
+                UPDATE jobs SET target_session_id = new_id
+                    WHERE scope_id = collision.scope_id AND target_session_id = collision.old_id;
+                UPDATE event_tombstones SET session_id = new_id
+                    WHERE scope_id = collision.scope_id AND session_id = collision.old_id;
+                UPDATE erasure_requests SET target_id = new_id
+                    WHERE scope_id = collision.scope_id
+                        AND target_kind = 'session'
+                        AND target_id = collision.old_id;
+                UPDATE sessions SET id = new_id
+                    WHERE scope_id = collision.scope_id AND id = collision.old_id;
+            END LOOP;
+        END $$;
+        """
+    )
+    op.execute("ALTER TABLE runs FORCE ROW LEVEL SECURITY")
+
+    # Every cross-scope collision is now collapsed, so the global constraints are representable.
     op.execute("DROP INDEX IF EXISTS ix_events_scope_session_seq")
     op.execute("ALTER TABLE events DROP CONSTRAINT IF EXISTS events_scope_session_seq_key")
     op.execute(

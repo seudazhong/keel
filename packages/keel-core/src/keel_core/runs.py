@@ -191,20 +191,89 @@ def admission_fingerprint(
     admissions that share an idempotency identity must present an identical fingerprint; a
     mismatch is a conflict. Canonical JSON with sorted keys makes the hash stable across
     equivalent inputs."""
-    canonical = json.dumps(
-        {
-            "org_id": org_id,
-            "actor": actor,
-            "agent_id": agent_id,
-            "session_id": session_id,
-            "surface": surface,
-            "model": model or "",
-            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
-        },
-        sort_keys=True,
-        separators=(",", ":"),
+    return _fingerprint(
+        org_id=org_id,
+        actor=actor,
+        agent_id=agent_id,
+        session_id=session_id,
+        surface=surface,
+        content=content,
+        model=model,
+        include_model=True,
     )
+
+
+def legacy_admission_fingerprint(
+    *,
+    org_id: str,
+    actor: str,
+    agent_id: str,
+    session_id: str,
+    surface: str,
+    content: str,
+) -> str:
+    """The *pre-model* admission fingerprint (deployment-rollout compatibility).
+
+    Runs admitted before the model was folded into the fingerprint (M3.6) stored a hash whose
+    canonical JSON omitted the ``model`` field **entirely** — not ``"model":""``. On retry we
+    accept a match against this precise legacy form so an in-flight run admitted by the old
+    binary can be idempotently completed after a deploy, instead of being falsely rejected as a
+    :class:`RunAdmissionConflict`. A model-aware row's stored hash always includes the ``model``
+    field, so it can never equal this value — a model change therefore cannot hijack a
+    new-model row via the legacy path (only genuinely legacy rows match)."""
+    return _fingerprint(
+        org_id=org_id,
+        actor=actor,
+        agent_id=agent_id,
+        session_id=session_id,
+        surface=surface,
+        content=content,
+        model=None,
+        include_model=False,
+    )
+
+
+def _fingerprint(
+    *,
+    org_id: str,
+    actor: str,
+    agent_id: str,
+    session_id: str,
+    surface: str,
+    content: str,
+    model: str | None,
+    include_model: bool,
+) -> str:
+    payload: dict[str, str] = {
+        "org_id": org_id,
+        "actor": actor,
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "surface": surface,
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }
+    # The model key is present for model-aware fingerprints and absent for the legacy form, so
+    # the two hashes are structurally distinct and never collide across the model boundary.
+    if include_model:
+        payload["model"] = model or ""
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _fingerprint_matches(stored: str, current: str, legacy: str = "") -> bool:
+    """Whether a retry's fingerprint is compatible with an existing run's stored one.
+
+    An empty ``stored`` or empty ``current`` fingerprint is treated as "unverifiable" and
+    accepted (back-compat with rows/callers that never carried a fingerprint). Otherwise the
+    stored hash must equal the current model-aware fingerprint **or** the precise legacy
+    pre-model fingerprint (deployment rollout). Because a model-aware stored hash always
+    encodes the ``model`` field it can never equal ``legacy``, so a changed model can never be
+    laundered through the legacy path onto a new-model row."""
+    if not current or not stored:
+        return True
+    if stored == current:
+        return True
+    return bool(legacy) and stored == legacy
 
 
 @dataclass(frozen=True)
@@ -368,6 +437,7 @@ class RunStore(Protocol):
         budget: RunBudgetSpec,
         expires_at: datetime,
         fingerprint: str = "",
+        legacy_fingerprint: str = "",
         now: datetime | None = None,
     ) -> tuple[RunRecord, bool]: ...
 
@@ -385,6 +455,7 @@ class RunStore(Protocol):
         budget: RunBudgetSpec,
         expires_at: datetime,
         fingerprint: str = "",
+        legacy_fingerprint: str = "",
         now: datetime | None = None,
     ) -> RunRecord: ...
 
@@ -522,6 +593,7 @@ class InMemoryRunStore:
         budget: RunBudgetSpec,
         expires_at: datetime,
         fingerprint: str = "",
+        legacy_fingerprint: str = "",
         now: datetime | None = None,
     ) -> tuple[RunRecord, bool]:
         now = now or _now()
@@ -532,8 +604,10 @@ class InMemoryRunStore:
         if existing_id is not None:
             existing = self._rows[existing_id]
             # A retry that reuses the identity but presents a different immutable fingerprint
-            # is a conflict (never repaired with the caller-supplied binding/content).
-            if fingerprint and existing.fingerprint and existing.fingerprint != fingerprint:
+            # is a conflict (never repaired with the caller-supplied binding/content). A row
+            # admitted by a pre-model binary matches the precise legacy fingerprint, so an
+            # in-flight legacy run still completes idempotently across a deploy.
+            if not _fingerprint_matches(existing.fingerprint, fingerprint, legacy_fingerprint):
                 raise RunAdmissionConflict(existing_id)
             return existing, False
         record = RunRecord(
@@ -576,6 +650,7 @@ class InMemoryRunStore:
         budget: RunBudgetSpec,
         expires_at: datetime,
         fingerprint: str = "",
+        legacy_fingerprint: str = "",
         now: datetime | None = None,
     ) -> RunRecord:
         record, _ = await self.create(
@@ -590,6 +665,7 @@ class InMemoryRunStore:
             budget=budget,
             expires_at=expires_at,
             fingerprint=fingerprint,
+            legacy_fingerprint=legacy_fingerprint,
             now=now,
         )
         return record
@@ -1120,6 +1196,7 @@ class PostgresRunStore:
         budget: RunBudgetSpec,
         expires_at: datetime,
         fingerprint: str = "",
+        legacy_fingerprint: str = "",
         now: datetime | None = None,
     ) -> tuple[RunRecord, bool]:
         if scope_id != self._scope_id:
@@ -1183,8 +1260,12 @@ class PostgresRunStore:
             )
         record = _to_record(row)
         # A retry that reuses the identity but mismatches the immutable fingerprint is a
-        # conflict — never repaired using the caller-supplied binding/content.
-        if not created and fingerprint and record.fingerprint and record.fingerprint != fingerprint:
+        # conflict — never repaired using the caller-supplied binding/content. A run admitted
+        # by a pre-model binary matches the precise legacy fingerprint, so an in-flight legacy
+        # run still completes idempotently across a deploy without a model change hijacking it.
+        if not created and not _fingerprint_matches(
+            record.fingerprint, fingerprint, legacy_fingerprint
+        ):
             raise RunAdmissionConflict(record.id)
         return record, created
 
@@ -1202,6 +1283,7 @@ class PostgresRunStore:
         budget: RunBudgetSpec,
         expires_at: datetime,
         fingerprint: str = "",
+        legacy_fingerprint: str = "",
         now: datetime | None = None,
     ) -> RunRecord:
         record, _ = await self.create(
@@ -1216,6 +1298,7 @@ class PostgresRunStore:
             budget=budget,
             expires_at=expires_at,
             fingerprint=fingerprint,
+            legacy_fingerprint=legacy_fingerprint,
             now=now,
         )
         return record
