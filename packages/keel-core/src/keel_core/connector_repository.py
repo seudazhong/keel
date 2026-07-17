@@ -1899,31 +1899,13 @@ class PostgresConnectorRepository:
     ) -> ConnectorDeliveryHealth | None:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            count = await conn.scalar(
-                text(
-                    "SELECT LEAST(count(*), 1000) FROM connector_deliveries d "
-                    "WHERE d.scope_id = :scope AND d.connector_id = :cid "
-                    "AND d.binding_id = :binding "
-                    "AND EXISTS (SELECT 1 FROM connector_bindings b "
-                    "WHERE b.scope_id = d.scope_id AND b.connector_id = d.connector_id "
-                    "AND b.id = d.binding_id) "
-                    "AND (d.status = 'failed' OR (d.status = 'processing' "
-                    "AND (d.error_code IS NOT NULL "
-                    "OR d.updated_at < now() - interval '5 minutes')))"
-                ),
-                {
-                    "scope": self._scope_id,
-                    "cid": connector_id,
-                    "binding": binding_id,
-                },
-            )
-            if not count:
-                return None
             latest = (
                 await conn.execute(
                     text(
-                        "SELECT error_summary, error_retryable, "
-                        "COALESCE(processed_at, updated_at) AS latest_at "
+                        "SELECT error_summary, error_retryable, latest_at, unresolved_count "
+                        "FROM (SELECT error_summary, error_retryable, "
+                        "COALESCE(processed_at, updated_at) AS latest_at, "
+                        "LEAST(count(*) OVER (), 1000) AS unresolved_count "
                         "FROM connector_deliveries d "
                         "WHERE d.scope_id = :scope AND d.connector_id = :cid "
                         "AND d.binding_id = :binding "
@@ -1932,8 +1914,8 @@ class PostgresConnectorRepository:
                         "AND b.id = d.binding_id) "
                         "AND (d.status = 'failed' OR (d.status = 'processing' "
                         "AND (d.error_code IS NOT NULL "
-                        "OR d.updated_at < now() - interval '5 minutes'))) "
-                        "ORDER BY COALESCE(processed_at, updated_at) DESC LIMIT 1"
+                        "OR d.updated_at < now() - interval '5 minutes')))) unresolved "
+                        "ORDER BY latest_at DESC LIMIT 1"
                     ),
                     {
                         "scope": self._scope_id,
@@ -1941,9 +1923,11 @@ class PostgresConnectorRepository:
                         "binding": binding_id,
                     },
                 )
-            ).one()
+            ).first()
+        if latest is None:
+            return None
         return ConnectorDeliveryHealth(
-            unresolved_count=int(count),
+            unresolved_count=int(latest.unresolved_count),
             latest_at=latest.latest_at,
             summary=(
                 str(latest.error_summary)
