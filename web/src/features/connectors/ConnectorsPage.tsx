@@ -27,6 +27,8 @@ function healthTone(connector: Connector): "green" | "red" | "amber" {
 function ConnectedConnector({ connector }: { connector: Connector }) {
   const revoke = useRevokeConnector();
   const purge = useRevokeConnector(true);
+  const forget = useRevokeConnector(false, true);
+  const forcePurge = useRevokeConnector(true, true);
   const sync = useSyncConnector();
 
   return (
@@ -51,6 +53,15 @@ function ConnectedConnector({ connector }: { connector: Connector }) {
         ))}
       </div>
       <p className="mt-3 text-xs text-text-muted">Updated {fmtDate(connector.updated_at)}</p>
+      {!connector.available && (
+        <Banner tone="warn" className="mt-3">
+          <span>⚠️</span>
+          <div>
+            {connector.availability_error ?? "The provider cannot be loaded."} Remote revoke is
+            unavailable; local removal remains explicit.
+          </div>
+        </Banner>
+      )}
       <ConnectorTargets connector={connector} />
       <ConnectorResources connector={connector} />
       <div className="mt-3 flex flex-wrap gap-2">
@@ -70,10 +81,40 @@ function ConnectedConnector({ connector }: { connector: Connector }) {
         <Button variant="danger" onClick={() => purge.mutate(connector.id)} disabled={purge.isPending}>
           Disconnect and purge
         </Button>
+        <Button
+          variant="danger"
+          onClick={() => {
+            if (
+              window.confirm(
+                "Forget local credentials and state without remote revoke? Imported data will remain and its connector mappings will be lost.",
+              )
+            ) {
+              forget.mutate(connector.id);
+            }
+          }}
+          disabled={forget.isPending}
+        >
+          Forget local state
+        </Button>
+        <Button
+          variant="danger"
+          onClick={() => {
+            if (
+              window.confirm(
+                "Force local purge without remote revoke? Imported connector data will be removed.",
+              )
+            ) {
+              forcePurge.mutate(connector.id);
+            }
+          }}
+          disabled={forcePurge.isPending}
+        >
+          Force local purge
+        </Button>
       </div>
-      {(revoke.isError || purge.isError || sync.isError) && (
+      {(revoke.isError || purge.isError || forget.isError || forcePurge.isError || sync.isError) && (
         <p className="mt-2 text-xs text-red">
-          {(revoke.error ?? purge.error ?? sync.error)?.message}
+          {(revoke.error ?? purge.error ?? forget.error ?? forcePurge.error ?? sync.error)?.message}
         </p>
       )}
     </Card>

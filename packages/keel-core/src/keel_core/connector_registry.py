@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from functools import lru_cache
 from types import ModuleType
+from typing import Any
 
 from keel_core.connector_contracts import (
     ConnectorAction,
@@ -17,6 +18,8 @@ from keel_core.connector_contracts import (
     ConnectorProviderFactory,
     ConnectorUnavailableError,
 )
+from keel_core.connectors import ActionFn
+from keel_core.protocols import ToolContext
 
 
 def _enabled() -> bool:
@@ -151,8 +154,20 @@ class ConnectorRegistry:
                     )
                 if action.manifest.name in actions:
                     raise ValueError(f"duplicate connector action {action.manifest.name!r}")
-                actions[action.manifest.name] = action
+                actions[action.manifest.name] = ConnectorAction(
+                    action.manifest,
+                    _scope_bound_action(action.action, context.scope_id),
+                )
         return tuple(actions[name] for name in sorted(actions))
+
+
+def _scope_bound_action(action: ActionFn, scope_id: str) -> ActionFn:
+    async def invoke(arguments: dict[str, Any], tool_context: ToolContext) -> str:
+        if tool_context.scope_id != scope_id:
+            raise PermissionError("connector action cannot cross its configured scope")
+        return await action(arguments, tool_context)
+
+    return invoke
 
 
 def _registration_from_module(module: ModuleType) -> ConnectorRegistration | None:

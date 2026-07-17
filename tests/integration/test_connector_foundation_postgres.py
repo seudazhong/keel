@@ -21,7 +21,10 @@ from keel_core.connector_contracts import (
     ConnectorResourceDraft,
     ConnectorTargetKind,
 )
+from keel_core.connector_credentials import ConnectorCredentialStore, CredentialEnvelope
 from keel_core.connector_repository import PostgresConnectorRepository
+from keel_core.secrets import EnvelopeCipher
+from keel_core.tokens import PostgresTokenStore
 
 pytestmark = pytest.mark.integration
 _ROOT = Path(__file__).resolve().parents[2]
@@ -48,6 +51,12 @@ async def test_connector_foundation_schema_and_rls(migrated_db: AsyncEngine) -> 
         ).all()
         assert {row.relname for row in rows} == tables
         assert all(row.relrowsecurity and row.relforcerowsecurity for row in rows)
+        assert await conn.scalar(
+            text(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = 'connector_tokens' AND column_name = 'version')"
+            )
+        )
         head = await conn.scalar(text("SELECT version_num FROM alembic_version"))
         assert head == "0015_connector_foundation"
 
@@ -147,6 +156,98 @@ async def test_database_rejects_top_level_plaintext_secret_metadata(
                 ),
                 {"scope": scope},
             )
+
+
+async def test_repository_pruning_cascades_and_is_scope_isolated(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope_a = f"connector:prune:a:{uuid.uuid4().hex}"
+    scope_b = f"connector:prune:b:{uuid.uuid4().hex}"
+    repo_a = PostgresConnectorRepository(migrated_db, scope_a)
+    repo_b = PostgresConnectorRepository(migrated_db, scope_b)
+    binding_a = await repo_a.upsert_binding(
+        "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    binding_b = await repo_b.upsert_binding(
+        "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    resource_a = (
+        await repo_a.upsert_resources(
+            "fixture",
+            binding_a.id,
+            (ConnectorResourceDraft("shared", "repository", "A", selected=True),),
+        )
+    )[0]
+    resource_b = (
+        await repo_b.upsert_resources(
+            "fixture",
+            binding_b.id,
+            (ConnectorResourceDraft("shared", "repository", "B", selected=True),),
+        )
+    )[0]
+    item_a = (
+        await repo_a.upsert_items(
+            "fixture",
+            binding_a.id,
+            (ConnectorItemDraft("item", "document", "A", resource_id=resource_a.id),),
+        )
+    )[0]
+    await repo_b.upsert_items(
+        "fixture",
+        binding_b.id,
+        (ConnectorItemDraft("item", "document", "B", resource_id=resource_b.id),),
+    )
+    await repo_a.put_cursor("fixture", binding_a.id, "documents", "a", resource_id=resource_a.id)
+    await repo_b.put_cursor("fixture", binding_b.id, "documents", "b", resource_id=resource_b.id)
+
+    assert await repo_a.prune_resources("fixture", binding_a.id, set()) == 1
+    assert await repo_a.list_resources("fixture") == []
+    assert await repo_a.list_items("fixture") == []
+    assert await repo_a.list_cursors("fixture", binding_a.id) == []
+    assert [item.external_id for item in await repo_b.list_resources("fixture")] == ["shared"]
+    assert [item.external_id for item in await repo_b.list_items("fixture")] == ["item"]
+    assert len(await repo_b.list_cursors("fixture", binding_b.id)) == 1
+
+    recreated = (
+        await repo_a.upsert_items(
+            "fixture",
+            binding_a.id,
+            (ConnectorItemDraft("item", "document", "Recreated"),),
+        )
+    )[0]
+    assert recreated.id != item_a.id
+    assert await repo_a.delete_item("fixture", binding_a.id, "item")
+    assert not await repo_a.delete_item("fixture", binding_b.id, "item")
+
+
+async def test_postgres_credential_updates_are_versioned_compare_and_set(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = f"connector:credential:{uuid.uuid4().hex}"
+    store = ConnectorCredentialStore(PostgresTokenStore(migrated_db, scope, EnvelopeCipher("key")))
+    await store.put("fixture", CredentialEnvelope("oauth", {"access_token": "old"}))
+    initial = await store.get_versioned("fixture")
+    assert initial is not None and initial.version == 1
+    assert (
+        await store.put_if_version(
+            "fixture",
+            CredentialEnvelope("oauth", {"access_token": "stale"}),
+            0,
+        )
+        is None
+    )
+    assert (
+        await store.put_if_version(
+            "fixture",
+            CredentialEnvelope("oauth", {"access_token": "rotated"}),
+            1,
+        )
+        == 2
+    )
+    updated = await store.get_versioned("fixture")
+    assert updated is not None
+    assert updated.version == 2
+    assert updated.envelope.values["access_token"] == "rotated"
 
 
 async def test_connector_migration_downgrade_and_upgrade(migrated_db: AsyncEngine) -> None:

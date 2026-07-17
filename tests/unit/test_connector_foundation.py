@@ -10,14 +10,19 @@ import pytest
 
 from keel_core.connector_contracts import (
     BaseConnectorProvider,
+    ConnectorAction,
+    ConnectorActionApproval,
+    ConnectorActionContext,
+    ConnectorActionIdempotency,
+    ConnectorActionManifest,
+    ConnectorActionSemantics,
     ConnectorAuthKind,
-    ConnectorBinding,
     ConnectorBindingDraft,
     ConnectorBindingStatus,
     ConnectorCapability,
     ConnectorChange,
     ConnectorChangeKind,
-    ConnectorCursor,
+    ConnectorCredentialUpdate,
     ConnectorCursorUpdate,
     ConnectorEvent,
     ConnectorHealth,
@@ -25,13 +30,17 @@ from keel_core.connector_contracts import (
     ConnectorIngressResult,
     ConnectorItemDraft,
     ConnectorManifest,
+    ConnectorOperationContext,
     ConnectorProvenance,
-    ConnectorResource,
+    ConnectorResourceDraft,
+    ConnectorResourceRefreshMode,
+    ConnectorResourceResult,
+    ConnectorStateUpdate,
     ConnectorSyncResult,
     ConnectorTargetField,
     ConnectorTargetKind,
 )
-from keel_core.connector_credentials import CredentialEnvelope
+from keel_core.connector_credentials import ConnectorCredentialStore, CredentialEnvelope
 from keel_core.connector_registry import (
     ConnectorDiscoveryFailure,
     ConnectorProviderUnavailableError,
@@ -50,6 +59,9 @@ from keel_core.knowledge.models import (
     DeleteKnowledgeCommand,
     UpdateKnowledgeDocumentCommand,
 )
+from keel_core.protocols import ToolContext
+from keel_core.secrets import EnvelopeCipher
+from keel_core.tokens import InMemoryTokenStore
 from keel_core.types import ContentTaint
 
 
@@ -85,9 +97,18 @@ def test_registry_rejects_duplicate_ids() -> None:
 
 
 def test_credential_envelope_is_versioned_and_legacy_safe() -> None:
-    envelope = CredentialEnvelope("secret", {"api_key": "value"})
+    envelope = CredentialEnvelope("secret", {"api_key": "super-secret-value"})
     encoded = envelope.serialize()
     assert CredentialEnvelope.parse(encoded) == envelope
+    assert "super-secret-value" not in repr(envelope)
+    assert "super-secret-value" not in repr(
+        ConnectorOperationContext(
+            "scope:a",
+            "fixture",
+            credential=envelope,
+            credential_version=1,
+        )
+    )
     assert CredentialEnvelope.parse('{"token":"legacy-provider-json"}') is None
     with pytest.raises(ValueError, match="unsupported"):
         CredentialEnvelope("secret", {}, version=2)
@@ -102,20 +123,15 @@ class _Provider(BaseConnectorProvider):
         capabilities=(ConnectorCapability.sync, ConnectorCapability.webhook),
     )
 
-    async def sync(
-        self,
-        binding: ConnectorBinding,
-        resources: tuple[ConnectorResource, ...],
-        cursors: tuple[ConnectorCursor, ...],
-        credential: CredentialEnvelope | None,
-    ) -> ConnectorSyncResult:
+    async def sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult:
+        assert context.binding is not None
         return ConnectorSyncResult(
             changes=(
                 ConnectorChange(
                     ConnectorChangeKind.upsert,
                     ConnectorProvenance(
                         connector_id="fixture",
-                        binding_id=binding.id,
+                        binding_id=context.binding.id,
                         external_resource_id="doc-1",
                         source_url="https://example.invalid/doc-1",
                         revision="r1",
@@ -124,15 +140,18 @@ class _Provider(BaseConnectorProvider):
                     content="untrusted external content",
                 ),
             ),
-            cursor_updates=(
-                ConnectorCursorUpdate("messages", "next"),
-                ConnectorCursorUpdate("labels", "labels-next"),
+            state=ConnectorStateUpdate(
+                cursor_updates=(
+                    ConnectorCursorUpdate("messages", "next"),
+                    ConnectorCursorUpdate("labels", "labels-next"),
+                ),
             ),
         )
 
     async def ingress(
-        self, headers: dict[str, str], body: bytes, binding: ConnectorBinding
+        self, context: ConnectorOperationContext, headers: dict[str, str], body: bytes
     ) -> ConnectorIngressResult:
+        assert context.binding is not None
         if headers.get("x-signature") != "valid":
             raise ValueError("invalid signature")
         return ConnectorIngressResult(
@@ -140,19 +159,21 @@ class _Provider(BaseConnectorProvider):
             (
                 ConnectorChange(
                     ConnectorChangeKind.event,
-                    ConnectorProvenance("fixture", binding.id, "event-1", event_id="event-1"),
+                    ConnectorProvenance(
+                        "fixture", context.binding.id, "event-1", event_id="event-1"
+                    ),
                     event=ConnectorEvent(
                         "fixture.event",
-                        ConnectorProvenance("fixture", binding.id, "event-1", event_id="event-1"),
+                        ConnectorProvenance(
+                            "fixture", context.binding.id, "event-1", event_id="event-1"
+                        ),
                         {"summary": "changed"},
                     ),
                 ),
             ),
         )
 
-    async def health(
-        self, binding: ConnectorBinding, credential: CredentialEnvelope | None
-    ) -> ConnectorHealth:
+    async def health(self, context: ConnectorOperationContext) -> ConnectorHealth:
         return ConnectorHealth(ConnectorHealthStatus.healthy, datetime.now(UTC))
 
 
@@ -232,18 +253,13 @@ async def test_failed_delivery_can_be_retried() -> None:
 
 async def test_sync_rejects_clean_external_change() -> None:
     class CleanProvider(_Provider):
-        async def sync(
-            self,
-            binding: ConnectorBinding,
-            resources: tuple[ConnectorResource, ...],
-            cursors: tuple[ConnectorCursor, ...],
-            credential: CredentialEnvelope | None,
-        ) -> ConnectorSyncResult:
+        async def sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult:
+            assert context.binding is not None
             return ConnectorSyncResult(
                 changes=(
                     ConnectorChange(
                         ConnectorChangeKind.delete,
-                        ConnectorProvenance("fixture", binding.id, "doc"),
+                        ConnectorProvenance("fixture", context.binding.id, "doc"),
                         taint=ContentTaint.clean,
                     ),
                 )
@@ -290,7 +306,8 @@ async def test_durable_change_sink_reuses_knowledge_and_trigger_admission() -> N
             idempotency_key: str,
         ) -> Any:
             knowledge_calls.append(("create", kb_id))
-            return SimpleNamespace(document=SimpleNamespace(id="document-1"))
+            created = sum(1 for operation, _ in knowledge_calls if operation == "create")
+            return SimpleNamespace(document=SimpleNamespace(id=f"document-{created}"))
 
         async def update_document(
             self,
@@ -344,6 +361,19 @@ async def test_durable_change_sink_reuses_knowledge_and_trigger_admission() -> N
     assert item.destination_id == "document-1"
     await sink.apply(ConnectorChange(ConnectorChangeKind.delete, provenance))
     assert knowledge_calls == [("create", "kb-1"), ("delete", "document-1")]
+    assert await repository.list_items("fixture") == []
+    await sink.apply(
+        ConnectorChange(
+            ConnectorChangeKind.upsert,
+            ConnectorProvenance("fixture", binding.id, "doc-1", revision="r2"),
+            title="Document recreated",
+            content="new content",
+            mime_type="text/plain",
+        )
+    )
+    recreated = (await repository.list_items("fixture"))[0]
+    assert recreated.destination_id == "document-2"
+    assert knowledge_calls[-1] == ("create", "kb-1")
 
     event = ConnectorEvent("push", provenance, {"summary": "changed"})
     await sink.apply(
@@ -375,13 +405,7 @@ async def test_sync_requires_manifest_targets_before_provider_work() -> None:
             nonlocal instantiated
             instantiated = True
 
-        async def sync(
-            self,
-            binding: ConnectorBinding,
-            resources: tuple[ConnectorResource, ...],
-            cursors: tuple[ConnectorCursor, ...],
-            credential: CredentialEnvelope | None,
-        ) -> ConnectorSyncResult:
+        async def sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult:
             nonlocal called
             called = True
             return ConnectorSyncResult()
@@ -503,7 +527,16 @@ async def test_purge_fails_closed_without_knowledge_handoff() -> None:
     await repository.upsert_items(
         "fixture",
         binding.id,
-        (ConnectorItemDraft("doc", "document", "Document"),),
+        (
+            ConnectorItemDraft(
+                "doc",
+                "document",
+                "Document",
+                destination_kind=ConnectorTargetKind.knowledge,
+                destination_target_id="kb-1",
+                destination_id="document-1",
+            ),
+        ),
     )
     with pytest.raises(RuntimeError, match="purge service is unavailable"):
         await service.revoke("fixture", purge=True)
@@ -565,3 +598,363 @@ async def test_catalog_isolates_broken_provider_factory() -> None:
         registry.create("import_broken")
     with pytest.raises(ConnectorProviderUnavailableError, match="broken_sdk"):
         registry.create("broken")
+
+
+async def test_local_forget_survives_unavailable_provider_but_remote_revoke_fails_closed() -> None:
+    manifest = ConnectorManifest(
+        id="optional",
+        name="Optional",
+        description="optional provider",
+        auth_kind=ConnectorAuthKind.oauth,
+        capabilities=(ConnectorCapability.sync,),
+    )
+
+    class Provider(BaseConnectorProvider):
+        pass
+
+    Provider.manifest = manifest
+
+    def unavailable() -> None:
+        raise ModuleNotFoundError("missing optional", name="optional_sdk")
+
+    registry = ConnectorRegistry(
+        (
+            ConnectorRegistration(
+                manifest,
+                Provider,
+                "tests.optional",
+                availability=unavailable,
+            ),
+        )
+    )
+    repository = InMemoryConnectorRepository("scope:a")
+    binding = await repository.upsert_binding(
+        "optional", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    resource = (
+        await repository.upsert_resources(
+            "optional",
+            binding.id,
+            (ConnectorResourceDraft("calendar", "calendar", "Calendar", selected=True),),
+        )
+    )[0]
+    await repository.upsert_items(
+        "optional",
+        binding.id,
+        (ConnectorItemDraft("event", "event", "Event", resource_id=resource.id),),
+    )
+    await repository.put_cursor("optional", binding.id, "events", "next", resource_id=resource.id)
+    token_store = InMemoryTokenStore("scope:a", EnvelopeCipher("key"))
+    credentials = ConnectorCredentialStore(token_store)
+    await credentials.put("optional", CredentialEnvelope("oauth", {"refresh_token": "secret"}))
+
+    service = ConnectorService(
+        registry,
+        repository,
+        credentials=credentials,
+    )
+    with pytest.raises(ConnectorProviderUnavailableError, match="optional_sdk"):
+        await service.revoke("optional", purge=True)
+    assert await repository.get_binding("optional") is not None
+    assert await credentials.get("optional") is not None
+
+    assert await service.revoke("optional", purge=True, local_only=True)
+    assert await repository.get_binding("optional") is None
+    assert await credentials.get("optional") is None
+
+
+async def test_remote_revoke_receives_full_state_and_failure_retains_local_data() -> None:
+    manifest = ConnectorManifest(
+        id="subscription",
+        name="Subscription",
+        description="subscription provider",
+        auth_kind=ConnectorAuthKind.oauth,
+        capabilities=(ConnectorCapability.webhook, ConnectorCapability.resources),
+    )
+    fail = True
+    captured: list[ConnectorOperationContext] = []
+
+    class Provider(BaseConnectorProvider):
+        async def revoke(self, context: ConnectorOperationContext) -> None:
+            captured.append(context)
+            if fail:
+                raise RuntimeError("upstream revoke failed")
+
+    Provider.manifest = manifest
+    repository = InMemoryConnectorRepository("scope:a")
+    binding = await repository.upsert_binding(
+        "subscription", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    resource = (
+        await repository.upsert_resources(
+            "subscription",
+            binding.id,
+            (ConnectorResourceDraft("repo", "repository", "Repo", selected=True),),
+        )
+    )[0]
+    await repository.replace_targets(
+        "subscription",
+        binding.id,
+        {ConnectorTargetKind.trigger_session: "session"},
+    )
+    await repository.upsert_items(
+        "subscription",
+        binding.id,
+        (ConnectorItemDraft("watch", "watch", "Watch", resource_id=resource.id),),
+    )
+    await repository.put_cursor(
+        "subscription", binding.id, "watch", "next", resource_id=resource.id
+    )
+    credentials = ConnectorCredentialStore(InMemoryTokenStore("scope:a", EnvelopeCipher("key")))
+    await credentials.put(
+        "subscription",
+        CredentialEnvelope("oauth", {"refresh_token": "secret"}),
+    )
+    service = ConnectorService(
+        ConnectorRegistry((ConnectorRegistration(manifest, Provider, "tests.subscription"),)),
+        repository,
+        credentials=credentials,
+    )
+
+    with pytest.raises(RuntimeError, match="upstream revoke failed"):
+        await service.revoke("subscription")
+    state = captured[0]
+    assert state.binding == binding
+    assert state.credential is not None
+    assert state.resources == (resource,)
+    assert len(state.targets) == len(state.items) == len(state.cursors) == 1
+    assert await repository.get_binding("subscription") is not None
+    assert await credentials.get("subscription") is not None
+
+    fail = False
+    assert await service.revoke("subscription")
+    assert await repository.get_binding("subscription") is None
+    assert await credentials.get("subscription") is None
+
+
+async def test_sync_persists_versioned_credentials_and_binding_state() -> None:
+    manifest = ConnectorManifest(
+        id="rotating",
+        name="Rotating",
+        description="rotating provider",
+        auth_kind=ConnectorAuthKind.oauth,
+        capabilities=(ConnectorCapability.sync,),
+    )
+
+    class Provider(BaseConnectorProvider):
+        async def sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult:
+            assert context.credential is not None
+            assert context.credential.values["access_token"] == "old"
+            assert context.credential_version == 1
+            return ConnectorSyncResult(
+                state=ConnectorStateUpdate(
+                    credential=ConnectorCredentialUpdate(
+                        CredentialEnvelope("oauth", {"access_token": "rotated"}),
+                        expected_version=context.credential_version,
+                    ),
+                    binding_metadata={"subscription_revision": 2},
+                    cursor_updates=(ConnectorCursorUpdate("events", "next"),),
+                )
+            )
+
+    Provider.manifest = manifest
+    repository = InMemoryConnectorRepository("scope:a")
+    binding = await repository.upsert_binding(
+        "rotating",
+        ConnectorBindingDraft(metadata={"subscription_revision": 1}),
+        ConnectorBindingStatus.connected,
+    )
+    token_store = InMemoryTokenStore("scope:a", EnvelopeCipher("key"))
+    credentials = ConnectorCredentialStore(token_store)
+    await credentials.put("rotating", CredentialEnvelope("oauth", {"access_token": "old"}))
+    service = ConnectorService(
+        ConnectorRegistry((ConnectorRegistration(manifest, Provider, "tests.rotating"),)),
+        repository,
+        credentials=credentials,
+    )
+
+    assert await service.sync("rotating", binding.id) == 0
+    stored = await credentials.get_versioned("rotating")
+    assert stored is not None
+    assert stored.version == 2
+    assert stored.envelope.values["access_token"] == "rotated"
+    updated = await repository.get_binding("rotating")
+    assert updated is not None
+    assert updated.metadata == {"subscription_revision": 2}
+    assert await repository.get_cursor("rotating", binding.id, "events") is not None
+
+
+async def test_resource_refresh_prunes_only_authoritative_missing_state() -> None:
+    manifest = ConnectorManifest(
+        id="resources",
+        name="Resources",
+        description="resource provider",
+        auth_kind=ConnectorAuthKind.secret,
+        capabilities=(ConnectorCapability.resources,),
+    )
+    responses = iter(
+        (
+            ConnectorResourceResult(
+                (ConnectorResourceDraft("a", "calendar", "A"),),
+                ConnectorResourceRefreshMode.authoritative,
+            ),
+            ConnectorResourceResult(
+                (ConnectorResourceDraft("c", "calendar", "C"),),
+                ConnectorResourceRefreshMode.incremental,
+            ),
+        )
+    )
+
+    class Provider(BaseConnectorProvider):
+        async def list_resources(
+            self, context: ConnectorOperationContext
+        ) -> ConnectorResourceResult:
+            return next(responses)
+
+    Provider.manifest = manifest
+    repository = InMemoryConnectorRepository("scope:a")
+    binding = await repository.upsert_binding(
+        "resources", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    initial = await repository.upsert_resources(
+        "resources",
+        binding.id,
+        (
+            ConnectorResourceDraft("a", "calendar", "A", selected=True),
+            ConnectorResourceDraft("b", "calendar", "B", selected=True),
+        ),
+    )
+    resource_b = next(item for item in initial if item.external_id == "b")
+    await repository.upsert_items(
+        "resources",
+        binding.id,
+        (ConnectorItemDraft("event-b", "event", "Event B", resource_id=resource_b.id),),
+    )
+    await repository.put_cursor(
+        "resources", binding.id, "events", "next-b", resource_id=resource_b.id
+    )
+    await repository.put_cursor("resources", binding.id, "global", "global")
+    other_scope = InMemoryConnectorRepository("scope:b")
+    other_binding = await other_scope.upsert_binding(
+        "resources", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    await other_scope.upsert_resources(
+        "resources",
+        other_binding.id,
+        (ConnectorResourceDraft("b", "calendar", "Other B", selected=True),),
+    )
+    service = ConnectorService(
+        ConnectorRegistry((ConnectorRegistration(manifest, Provider, "tests.resources"),)),
+        repository,
+    )
+
+    await service.refresh_resources("resources")
+    assert [item.external_id for item in await repository.list_resources("resources")] == ["a"]
+    assert await repository.list_items("resources") == []
+    assert [
+        (item.resource_id, item.stream)
+        for item in await repository.list_cursors("resources", binding.id)
+    ] == [(None, "global")]
+
+    await service.refresh_resources("resources")
+    assert [item.external_id for item in await repository.list_resources("resources")] == [
+        "a",
+        "c",
+    ]
+    assert [item.external_id for item in await other_scope.list_resources("resources")] == ["b"]
+
+
+async def test_provider_action_context_enforces_scope_and_selected_resources() -> None:
+    action_manifest = ConnectorActionManifest(
+        name="calendar_create",
+        description="Create an event in a selected calendar.",
+        input_schema={"type": "object", "properties": {"calendar": {"type": "string"}}},
+        semantics=ConnectorActionSemantics.outbound,
+        idempotency=ConnectorActionIdempotency.required,
+        approval=ConnectorActionApproval.tainted,
+    )
+    manifest = ConnectorManifest(
+        id="action_fixture",
+        name="Action fixture",
+        description="action provider",
+        auth_kind=ConnectorAuthKind.oauth,
+        capabilities=(ConnectorCapability.write, ConnectorCapability.resources),
+        actions=(action_manifest,),
+    )
+
+    class Provider(BaseConnectorProvider):
+        def build_actions(self, context: ConnectorActionContext) -> tuple[ConnectorAction, ...]:
+            async def create(arguments: dict[str, Any], tool_context: ToolContext) -> str:
+                resource = await context.require_selected_resource(
+                    "action_fixture",
+                    str(arguments["calendar"]),
+                )
+                state = await context.load_state("action_fixture")
+                return (
+                    f"{resource.external_id}:{len(state.targets)}:"
+                    f"{len(state.items)}:{len(state.cursors)}"
+                )
+
+            return (ConnectorAction(action_manifest, create),)
+
+    Provider.manifest = manifest
+    repository = InMemoryConnectorRepository("scope:a")
+    binding = await repository.upsert_binding(
+        "action_fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    resources = await repository.upsert_resources(
+        "action_fixture",
+        binding.id,
+        (
+            ConnectorResourceDraft("selected", "calendar", "Selected", selected=True),
+            ConnectorResourceDraft("blocked", "calendar", "Blocked"),
+        ),
+    )
+    selected = next(item for item in resources if item.external_id == "selected")
+    blocked = next(item for item in resources if item.external_id == "blocked")
+    await repository.replace_targets(
+        "action_fixture",
+        binding.id,
+        {ConnectorTargetKind.trigger_session: "session-1"},
+    )
+    await repository.upsert_items(
+        "action_fixture",
+        binding.id,
+        (
+            ConnectorItemDraft("selected-item", "event", "Selected", resource_id=selected.id),
+            ConnectorItemDraft("blocked-item", "event", "Blocked", resource_id=blocked.id),
+        ),
+    )
+    await repository.put_cursor(
+        "action_fixture", binding.id, "events", "selected", resource_id=selected.id
+    )
+    await repository.put_cursor(
+        "action_fixture", binding.id, "events", "blocked", resource_id=blocked.id
+    )
+    registry = ConnectorRegistry(
+        (ConnectorRegistration(manifest, Provider, "tests.action_fixture"),)
+    )
+    actions = registry.build_actions(ConnectorActionContext.with_repository("scope:a", repository))
+    action = actions[0].action
+    assert (
+        await action(
+            {"calendar": "selected"},
+            ToolContext(scope_id="scope:a", session_id="session"),
+        )
+        == "selected:1:1:1"
+    )
+    with pytest.raises(PermissionError, match="not selected"):
+        await action(
+            {"calendar": "blocked"},
+            ToolContext(scope_id="scope:a", session_id="session"),
+        )
+    with pytest.raises(PermissionError, match="cannot cross"):
+        await action(
+            {"calendar": "selected"},
+            ToolContext(scope_id="scope:b", session_id="session"),
+        )
+    with pytest.raises(ValueError, match="crosses its scope"):
+        ConnectorActionContext.with_repository(
+            "scope:a",
+            InMemoryConnectorRepository("scope:b"),
+        )

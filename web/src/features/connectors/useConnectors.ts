@@ -60,11 +60,13 @@ export function useConfigureConnectorTargets(id: string) {
   });
 }
 
-export function useRevokeConnector(purge = false) {
+export function useRevokeConnector(purge = false, localOnly = false) {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) =>
-      api.del<{ ok: boolean }>(`/v1/connectors/${id}${purge ? "/purge" : ""}`),
+    mutationFn: (id: string) => {
+      const suffix = localOnly ? (purge ? "/purge/local" : "/local") : purge ? "/purge" : "";
+      return api.del<{ ok: boolean }>(`/v1/connectors/${id}${suffix}`);
+    },
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ["connectors"] });
     },

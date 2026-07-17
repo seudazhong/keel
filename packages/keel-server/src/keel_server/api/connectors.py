@@ -157,6 +157,11 @@ def _callback_url(request: Request, connector_id: str) -> str:
     return str(request.url_for("connector_callback", connector_id=connector_id))
 
 
+def _connector_callback_base_url(request: Request, connector_id: str) -> str:
+    webhook_url = str(request.url_for("connector_webhook", connector_id=connector_id))
+    return webhook_url.removesuffix("/webhook")
+
+
 @router.get(
     "",
     summary="List connector manifests and scope status",
@@ -295,7 +300,11 @@ async def connector_setup(
 ) -> dict[str, Any]:
     _provider(connector_id, request)
     try:
-        outcome = await _service(request).setup(connector_id, body.values)
+        outcome = await _service(request).setup(
+            connector_id,
+            body.values,
+            callback_base_url=_connector_callback_base_url(request, connector_id),
+        )
     except ValueError as exc:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from exc
     except RuntimeError as exc:
@@ -421,9 +430,10 @@ async def connector_health(connector_id: str, request: Request) -> dict[str, Any
     dependencies=[Depends(require_role(Role.operator))],
 )
 async def revoke_connector(connector_id: str, request: Request) -> dict[str, bool]:
-    _provider(connector_id, request)
     try:
         return {"ok": await _service(request).revoke(connector_id)}
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown connector") from exc
     except (ConnectorError, LookupError, RuntimeError, ValueError) as exc:
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY, "connector revoke failed; credentials were retained"
@@ -436,13 +446,50 @@ async def revoke_connector(connector_id: str, request: Request) -> dict[str, boo
     dependencies=[Depends(require_role(Role.operator))],
 )
 async def revoke_and_purge_connector(connector_id: str, request: Request) -> dict[str, bool]:
-    _provider(connector_id, request)
     try:
         return {"ok": await _service(request).revoke(connector_id, purge=True)}
+    except KeyError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown connector") from exc
     except (ConnectorError, LookupError, RuntimeError, ValueError) as exc:
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY,
             "connector revoke-and-purge failed; credentials were retained",
+        ) from exc
+
+
+@router.delete(
+    "/{connector_id}/local",
+    summary="Forget local connector credentials and binding without remote revoke",
+    dependencies=[Depends(require_role(Role.operator))],
+)
+async def forget_local_connector(connector_id: str, request: Request) -> dict[str, bool]:
+    try:
+        return {"ok": await _service(request).revoke(connector_id, local_only=True)}
+    except (LookupError, RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "connector local forget failed; credentials were retained",
+        ) from exc
+
+
+@router.delete(
+    "/{connector_id}/purge/local",
+    summary="Force local purge without loading or revoking the remote provider",
+    dependencies=[Depends(require_role(Role.operator))],
+)
+async def force_local_purge_connector(connector_id: str, request: Request) -> dict[str, bool]:
+    try:
+        return {
+            "ok": await _service(request).revoke(
+                connector_id,
+                purge=True,
+                local_only=True,
+            )
+        }
+    except (LookupError, RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "connector forced local purge failed; credentials were retained",
         ) from exc
 
 

@@ -165,6 +165,10 @@ class ConnectorRepository(Protocol):
         self, connector_id: str, health: ConnectorHealth
     ) -> ConnectorBinding | None: ...
 
+    async def replace_binding_metadata(
+        self, connector_id: str, binding_id: str, metadata: dict[str, Any]
+    ) -> ConnectorBinding: ...
+
     async def delete_connector(self, connector_id: str) -> int: ...
 
     async def list_targets(self, connector_id: str) -> list[ConnectorBindingTarget]: ...
@@ -184,6 +188,14 @@ class ConnectorRepository(Protocol):
         self, connector_id: str, binding_id: str, resources: Iterable[ConnectorResourceDraft]
     ) -> list[ConnectorResource]: ...
 
+    async def delete_resource(
+        self, connector_id: str, binding_id: str, external_id: str
+    ) -> bool: ...
+
+    async def prune_resources(
+        self, connector_id: str, binding_id: str, keep_external_ids: set[str]
+    ) -> int: ...
+
     async def select_resources(self, connector_id: str, external_ids: set[str]) -> int: ...
 
     async def list_items(self, connector_id: str) -> list[ConnectorItem]: ...
@@ -191,6 +203,12 @@ class ConnectorRepository(Protocol):
     async def upsert_items(
         self, connector_id: str, binding_id: str, items: Iterable[ConnectorItemDraft]
     ) -> list[ConnectorItem]: ...
+
+    async def delete_item(self, connector_id: str, binding_id: str, external_id: str) -> bool: ...
+
+    async def prune_items(
+        self, connector_id: str, binding_id: str, keep_external_ids: set[str]
+    ) -> int: ...
 
     async def get_cursor(
         self, connector_id: str, binding_id: str, stream: str, resource_id: str | None = None
@@ -210,6 +228,21 @@ class ConnectorRepository(Protocol):
         last_modified: str | None = None,
         revision: str | None = None,
     ) -> ConnectorCursor: ...
+
+    async def delete_cursor(
+        self,
+        connector_id: str,
+        binding_id: str,
+        stream: str,
+        resource_id: str | None = None,
+    ) -> bool: ...
+
+    async def prune_cursors(
+        self,
+        connector_id: str,
+        binding_id: str,
+        keep: set[tuple[str | None, str]],
+    ) -> int: ...
 
     async def claim_delivery(
         self,
@@ -289,6 +322,20 @@ class InMemoryConnectorRepository:
             error_code=None if healthy else health.status.value,
             error_summary=None if healthy else health.message,
             updated_at=health.checked_at,
+        )
+        self._bindings[connector_id] = row
+        return copy.deepcopy(row)
+
+    async def replace_binding_metadata(
+        self, connector_id: str, binding_id: str, metadata: dict[str, Any]
+    ) -> ConnectorBinding:
+        prior = self._bindings.get(connector_id)
+        if prior is None or prior.id != binding_id:
+            raise LookupError("connector binding changed before state update")
+        row = replace(
+            prior,
+            metadata=_safe_metadata(metadata, field="binding metadata"),
+            updated_at=datetime.now(UTC),
         )
         self._bindings[connector_id] = row
         return copy.deepcopy(row)
@@ -374,6 +421,34 @@ class InMemoryConnectorRepository:
             )
         return await self.list_resources(connector_id)
 
+    async def delete_resource(self, connector_id: str, binding_id: str, external_id: str) -> bool:
+        key = (connector_id, external_id)
+        resource = self._resources.get(key)
+        if resource is None or resource.binding_id != binding_id:
+            return False
+        del self._resources[key]
+        for item_key, item in list(self._items.items()):
+            if item.resource_id == resource.id:
+                del self._items[item_key]
+        for cursor_key, cursor in list(self._cursors.items()):
+            if cursor.resource_id == resource.id:
+                del self._cursors[cursor_key]
+        return True
+
+    async def prune_resources(
+        self, connector_id: str, binding_id: str, keep_external_ids: set[str]
+    ) -> int:
+        removed = 0
+        for external_id in [
+            external_id
+            for (cid, external_id), row in self._resources.items()
+            if cid == connector_id
+            and row.binding_id == binding_id
+            and external_id not in keep_external_ids
+        ]:
+            removed += int(await self.delete_resource(connector_id, binding_id, external_id))
+        return removed
+
     async def select_resources(self, connector_id: str, external_ids: set[str]) -> int:
         changed = 0
         for key, row in list(self._resources.items()):
@@ -418,6 +493,28 @@ class InMemoryConnectorRepository:
                 updated_at=now,
             )
         return await self.list_items(connector_id)
+
+    async def delete_item(self, connector_id: str, binding_id: str, external_id: str) -> bool:
+        key = (connector_id, external_id)
+        item = self._items.get(key)
+        if item is None or item.binding_id != binding_id:
+            return False
+        del self._items[key]
+        return True
+
+    async def prune_items(
+        self, connector_id: str, binding_id: str, keep_external_ids: set[str]
+    ) -> int:
+        removed = 0
+        for key, item in list(self._items.items()):
+            if (
+                key[0] == connector_id
+                and item.binding_id == binding_id
+                and item.external_id not in keep_external_ids
+            ):
+                del self._items[key]
+                removed += 1
+        return removed
 
     async def get_cursor(
         self, connector_id: str, binding_id: str, stream: str, resource_id: str | None = None
@@ -465,6 +562,33 @@ class InMemoryConnectorRepository:
         )
         self._cursors[key] = row
         return copy.deepcopy(row)
+
+    async def delete_cursor(
+        self,
+        connector_id: str,
+        binding_id: str,
+        stream: str,
+        resource_id: str | None = None,
+    ) -> bool:
+        key = (connector_id, binding_id, resource_id or "", stream)
+        return self._cursors.pop(key, None) is not None
+
+    async def prune_cursors(
+        self,
+        connector_id: str,
+        binding_id: str,
+        keep: set[tuple[str | None, str]],
+    ) -> int:
+        removed = 0
+        for key, cursor in list(self._cursors.items()):
+            if (
+                key[0] == connector_id
+                and key[1] == binding_id
+                and (cursor.resource_id, cursor.stream) not in keep
+            ):
+                del self._cursors[key]
+                removed += 1
+        return removed
 
     async def claim_delivery(
         self,
@@ -543,6 +667,31 @@ class PostgresConnectorRepository:
                 )
             ).one_or_none()
         return None if row is None else _binding_from_row(row)
+
+    async def replace_binding_metadata(
+        self, connector_id: str, binding_id: str, metadata: dict[str, Any]
+    ) -> ConnectorBinding:
+        safe = _safe_metadata(metadata, field="binding metadata")
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            row = (
+                await conn.execute(
+                    text(
+                        "UPDATE connector_bindings SET metadata = CAST(:metadata AS jsonb), "
+                        "updated_at = now() WHERE scope_id = :scope AND connector_id = :cid "
+                        "AND id = :binding RETURNING *"
+                    ),
+                    {
+                        "metadata": json.dumps(safe, ensure_ascii=False),
+                        "scope": self._scope_id,
+                        "cid": connector_id,
+                        "binding": binding_id,
+                    },
+                )
+            ).one_or_none()
+        if row is None:
+            raise LookupError("connector binding changed before state update")
+        return _binding_from_row(row)
 
     async def upsert_binding(
         self,
@@ -725,6 +874,44 @@ class PostgresConnectorRepository:
                 )
         return await self.list_resources(connector_id)
 
+    async def delete_resource(self, connector_id: str, binding_id: str, external_id: str) -> bool:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    "DELETE FROM connector_resources WHERE scope_id = :scope "
+                    "AND connector_id = :cid AND binding_id = :binding "
+                    "AND external_id = :external"
+                ),
+                {
+                    "scope": self._scope_id,
+                    "cid": connector_id,
+                    "binding": binding_id,
+                    "external": external_id,
+                },
+            )
+        return bool(result.rowcount)
+
+    async def prune_resources(
+        self, connector_id: str, binding_id: str, keep_external_ids: set[str]
+    ) -> int:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    "DELETE FROM connector_resources WHERE scope_id = :scope "
+                    "AND connector_id = :cid AND binding_id = :binding "
+                    "AND NOT (external_id = ANY(:keep))"
+                ),
+                {
+                    "scope": self._scope_id,
+                    "cid": connector_id,
+                    "binding": binding_id,
+                    "keep": sorted(keep_external_ids),
+                },
+            )
+        return int(result.rowcount or 0)
+
     async def select_resources(self, connector_id: str, external_ids: set[str]) -> int:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
@@ -795,6 +982,44 @@ class PostgresConnectorRepository:
                     },
                 )
         return await self.list_items(connector_id)
+
+    async def delete_item(self, connector_id: str, binding_id: str, external_id: str) -> bool:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    "DELETE FROM connector_items WHERE scope_id = :scope "
+                    "AND connector_id = :cid AND binding_id = :binding "
+                    "AND external_id = :external"
+                ),
+                {
+                    "scope": self._scope_id,
+                    "cid": connector_id,
+                    "binding": binding_id,
+                    "external": external_id,
+                },
+            )
+        return bool(result.rowcount)
+
+    async def prune_items(
+        self, connector_id: str, binding_id: str, keep_external_ids: set[str]
+    ) -> int:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    "DELETE FROM connector_items WHERE scope_id = :scope "
+                    "AND connector_id = :cid AND binding_id = :binding "
+                    "AND NOT (external_id = ANY(:keep))"
+                ),
+                {
+                    "scope": self._scope_id,
+                    "cid": connector_id,
+                    "binding": binding_id,
+                    "keep": sorted(keep_external_ids),
+                },
+            )
+        return int(result.rowcount or 0)
 
     async def get_cursor(
         self, connector_id: str, binding_id: str, stream: str, resource_id: str | None = None
@@ -881,6 +1106,50 @@ class PostgresConnectorRepository:
                 )
             ).one()
         return _cursor_from_row(row)
+
+    async def delete_cursor(
+        self,
+        connector_id: str,
+        binding_id: str,
+        stream: str,
+        resource_id: str | None = None,
+    ) -> bool:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    "DELETE FROM connector_cursors WHERE scope_id = :scope "
+                    "AND connector_id = :cid AND binding_id = :binding "
+                    "AND resource_key = :resource AND stream = :stream"
+                ),
+                {
+                    "scope": self._scope_id,
+                    "cid": connector_id,
+                    "binding": binding_id,
+                    "resource": resource_id or "",
+                    "stream": stream,
+                },
+            )
+        return bool(result.rowcount)
+
+    async def prune_cursors(
+        self,
+        connector_id: str,
+        binding_id: str,
+        keep: set[tuple[str | None, str]],
+    ) -> int:
+        removed = 0
+        for cursor in await self.list_cursors(connector_id, binding_id):
+            if (cursor.resource_id, cursor.stream) not in keep:
+                removed += int(
+                    await self.delete_cursor(
+                        connector_id,
+                        binding_id,
+                        cursor.stream,
+                        cursor.resource_id,
+                    )
+                )
+        return removed
 
     async def claim_delivery(
         self,

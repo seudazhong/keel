@@ -75,6 +75,11 @@ def _connector_actions(
     registry = ctx.get("connector_registry") or get_connector_registry()
     credential_store = ctx.get("connector_action_credentials")
     engine = ctx.get("engine")
+    repository = ctx.get("connector_repository")
+    if repository is None and engine is not None:
+        from keel_core.connector_repository import PostgresConnectorRepository
+
+        repository = PostgresConnectorRepository(engine, scope_id)
     if (
         credential_store is None
         and engine is not None
@@ -90,13 +95,21 @@ def _connector_actions(
         from keel_core.outbox import PostgresOutboundStore
 
         idempotency_store = PostgresOutboundStore(engine)
-    return registry.build_actions(
+    action_context = (
         ConnectorActionContext(
             scope_id,
             credential_store=credential_store,
             idempotency_store=idempotency_store,
         )
+        if repository is None
+        else ConnectorActionContext.with_repository(
+            scope_id,
+            repository,
+            credential_store=credential_store,
+            idempotency_store=idempotency_store,
+        )
     )
+    return registry.build_actions(action_context)
 
 
 def _digest_registry(
@@ -354,6 +367,7 @@ async def startup(ctx: dict[str, Any]) -> None:
         )
         connector_credentials = ConnectorCredentialStore(connector_action_credentials)
     connector_repository = PostgresConnectorRepository(engine, _DURABLE_SCOPE)
+    ctx["connector_repository"] = connector_repository
     connector_knowledge = KnowledgeService(
         cast(KnowledgeStore, knowledge),
         ctx["jobs"],

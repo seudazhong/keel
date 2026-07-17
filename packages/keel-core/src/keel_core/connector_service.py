@@ -22,6 +22,8 @@ from keel_core.connector_contracts import (
     ConnectorItem,
     ConnectorItemDraft,
     ConnectorManifest,
+    ConnectorOperationContext,
+    ConnectorResourceRefreshMode,
     ConnectorSetupArtifact,
     ConnectorSetupResult,
     ConnectorTargetKind,
@@ -161,6 +163,11 @@ class DurableConnectorChangeSink:
                     DeleteKnowledgeCommand(),
                     key,
                 )
+            await self._repository.delete_item(
+                change.provenance.connector_id,
+                binding.id,
+                change.provenance.external_resource_id,
+            )
             return
         if not change.title or not change.content:
             raise ValueError("connector knowledge upserts require title and content")
@@ -418,7 +425,13 @@ class ConnectorService:
                 await self.credentials.delete(connector_id)
             raise
 
-    async def setup(self, connector_id: str, values: dict[str, str]) -> ConnectorSetupOutcome:
+    async def setup(
+        self,
+        connector_id: str,
+        values: dict[str, str],
+        *,
+        callback_base_url: str | None = None,
+    ) -> ConnectorSetupOutcome:
         provider = self.registry.create(connector_id)
         expected = {item.id: item for item in provider.manifest.setup_fields}
         unknown = set(values) - set(expected)
@@ -431,7 +444,11 @@ class ConnectorService:
         ]
         if missing:
             raise ValueError(f"missing connector setup fields: {', '.join(sorted(missing))}")
-        result = await provider.setup(dict(values))
+        context = await self._operation_context(
+            connector_id,
+            callback_base_url=callback_base_url,
+        )
+        result = await provider.setup(context, dict(values))
         return ConnectorSetupOutcome(
             await self.save_setup(connector_id, result),
             result.artifacts,
@@ -484,9 +501,18 @@ class ConnectorService:
             raise RuntimeError(f"connector {connector_id!r} is disabled")
         binding = await self._required_binding(connector_id)
         if ConnectorCapability.resources in provider.manifest.capabilities:
-            credential = await self._credential(connector_id)
-            drafts = await provider.list_resources(binding, credential)
-            await self.repository.upsert_resources(connector_id, binding.id, drafts)
+            context = await self._operation_context(connector_id, binding=binding)
+            result = await provider.list_resources(context)
+            external_ids = [item.external_id for item in result.resources]
+            if len(set(external_ids)) != len(external_ids):
+                raise ValueError("connector resource refresh returned duplicate external ids")
+            await self.repository.upsert_resources(connector_id, binding.id, result.resources)
+            if result.mode is ConnectorResourceRefreshMode.authoritative:
+                await self.repository.prune_resources(
+                    connector_id,
+                    binding.id,
+                    set(external_ids),
+                )
         return [
             resource_to_dict(item) for item in await self.repository.list_resources(connector_id)
         ]
@@ -534,32 +560,58 @@ class ConnectorService:
         provider = self.registry.create(connector_id)
         if not provider.enabled():
             raise RuntimeError(f"connector {connector_id!r} is disabled")
-        resources = tuple(await self.repository.list_resources(connector_id, selected_only=True))
-        cursors = tuple(await self.repository.list_cursors(connector_id, binding.id))
-        credential = await self._credential(connector_id)
+        context = await self._operation_context(
+            connector_id,
+            binding=binding,
+            selected_resources=True,
+        )
         try:
-            result = await provider.sync(binding, resources, cursors, credential)
+            result = await provider.sync(context)
+            if result.state.credential is not None:
+                credential_update = result.state.credential
+                if credential_update.expected_version != context.credential_version:
+                    raise ValueError(
+                        "connector sync credential update used a stale expected version"
+                    )
+                if self.credentials is None:
+                    raise RuntimeError("encrypted connector credential storage is unavailable")
+                stored_version = await self.credentials.put_if_version(
+                    connector_id,
+                    credential_update.credential,
+                    credential_update.expected_version,
+                )
+                if stored_version is None:
+                    raise RuntimeError("connector credentials changed during sync")
             for change in result.changes:
                 self._validate_change(connector_id, binding.id, change)
                 await self._change_sink.apply(change)
-            resource_ids = {item.id for item in resources}
+            if result.state.binding_metadata is not None:
+                await self.repository.replace_binding_metadata(
+                    connector_id,
+                    binding.id,
+                    result.state.binding_metadata,
+                )
+            resource_ids = {item.id for item in context.resources}
             seen_cursors: set[tuple[str | None, str]] = set()
-            for update in result.cursor_updates:
-                key = (update.resource_id, update.stream)
+            for cursor_update in result.state.cursor_updates:
+                key = (cursor_update.resource_id, cursor_update.stream)
                 if key in seen_cursors:
                     raise ValueError("connector sync returned duplicate cursor updates")
                 seen_cursors.add(key)
-                if update.resource_id is not None and update.resource_id not in resource_ids:
+                if (
+                    cursor_update.resource_id is not None
+                    and cursor_update.resource_id not in resource_ids
+                ):
                     raise ValueError("connector sync returned a cursor for an unselected resource")
                 await self.repository.put_cursor(
                     connector_id,
                     binding.id,
-                    update.stream,
-                    update.value,
-                    resource_id=update.resource_id,
-                    etag=update.etag,
-                    last_modified=update.last_modified,
-                    revision=update.revision,
+                    cursor_update.stream,
+                    cursor_update.value,
+                    resource_id=cursor_update.resource_id,
+                    etag=cursor_update.etag,
+                    last_modified=cursor_update.last_modified,
+                    revision=cursor_update.revision,
                 )
             await self.repository.record_health(
                 connector_id,
@@ -581,7 +633,7 @@ class ConnectorService:
     async def health(self, connector_id: str) -> ConnectorHealth:
         provider = self.registry.create(connector_id)
         binding = await self._required_binding(connector_id)
-        health = await provider.health(binding, await self._credential(connector_id))
+        health = await provider.health(await self._operation_context(connector_id, binding=binding))
         await self.repository.record_health(connector_id, health)
         return health
 
@@ -592,7 +644,8 @@ class ConnectorService:
         if not provider.enabled():
             raise RuntimeError(f"connector {connector_id!r} is disabled")
         binding = await self._required_binding(connector_id)
-        result = await provider.ingress(headers, body, binding)
+        context = await self._operation_context(connector_id, binding=binding)
+        result = await provider.ingress(context, headers, body)
         payload_hash = hashlib.sha256(body).hexdigest()
         claimed = await self.repository.claim_delivery(
             connector_id, binding.id, result.delivery_id, payload_hash
@@ -614,27 +667,38 @@ class ConnectorService:
         await self.repository.finish_delivery(connector_id, result.delivery_id)
         return True, len(result.changes)
 
-    async def revoke(self, connector_id: str, *, purge: bool = False) -> bool:
-        provider = self.registry.create(connector_id)
-        credential = await self._credential(connector_id)
+    async def revoke(
+        self,
+        connector_id: str,
+        *,
+        purge: bool = False,
+        local_only: bool = False,
+    ) -> bool:
         binding = await self.repository.get_binding(connector_id)
+        context = await self._operation_context(connector_id, binding=binding)
+        if not local_only:
+            provider = self.registry.create(connector_id)
+            await provider.revoke(context)
         purged = 0
         outbound = 0
         if purge:
-            if self._purge_sink is None:
+            handoff_items = tuple(
+                item for item in context.items if item.destination_kind is not None
+            )
+            if handoff_items and self._purge_sink is None:
                 raise RuntimeError("connector Knowledge purge service is unavailable")
-            if binding is not None:
+            if binding is not None and handoff_items:
+                assert self._purge_sink is not None
                 purged = await self._purge_sink.handoff_purge(
                     binding,
-                    tuple(await self.repository.list_items(connector_id)),
+                    handoff_items,
                 )
             if self._purge_outbound is not None:
                 outbound = await self._purge_outbound(connector_id)
-        await provider.revoke(credential)
         deleted = False
         if self.credentials is not None:
             await self.credentials.delete(connector_id)
-            deleted = credential is not None
+            deleted = context.credential is not None
         elif self._delete_credential is not None:
             deleted = await self._delete_credential(connector_id)
         removed = await self.repository.delete_connector(connector_id)
@@ -657,6 +721,65 @@ class ConnectorService:
         if self.credentials is None:
             return None
         return await self.credentials.get(connector_id)
+
+    async def _operation_context(
+        self,
+        connector_id: str,
+        *,
+        binding: ConnectorBinding | None = None,
+        callback_base_url: str | None = None,
+        selected_resources: bool = False,
+    ) -> ConnectorOperationContext:
+        current = binding
+        if current is None:
+            current = await self.repository.get_binding(connector_id)
+        credential: CredentialEnvelope | None = None
+        credential_version = 0
+        if self.credentials is not None:
+            stored = await self.credentials.get_versioned(connector_id)
+            if stored is not None:
+                credential = stored.envelope
+                credential_version = stored.version
+        if current is None:
+            return ConnectorOperationContext(
+                scope_id=self.repository.scope_id,
+                connector_id=connector_id,
+                credential=credential,
+                credential_version=credential_version,
+                callback_base_url=callback_base_url,
+            )
+        resources = tuple(
+            await self.repository.list_resources(
+                connector_id,
+                selected_only=selected_resources,
+            )
+        )
+        items = tuple(await self.repository.list_items(connector_id))
+        cursors = tuple(await self.repository.list_cursors(connector_id, current.id))
+        if selected_resources:
+            selected_ids = {item.id for item in resources}
+            items = tuple(
+                item
+                for item in items
+                if item.resource_id is None or item.resource_id in selected_ids
+            )
+            cursors = tuple(
+                item
+                for item in cursors
+                if item.resource_id is None or item.resource_id in selected_ids
+            )
+        return ConnectorOperationContext(
+            scope_id=self.repository.scope_id,
+            connector_id=connector_id,
+            binding=current,
+            credential=credential,
+            credential_version=credential_version,
+            callback_base_url=callback_base_url,
+            resources=resources,
+            targets=tuple(await self.repository.list_targets(connector_id)),
+            items=items,
+            cursors=cursors,
+        )
 
     async def _validate_required_targets(
         self, manifest: ConnectorManifest, connector_id: str

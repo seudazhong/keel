@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
@@ -49,6 +49,11 @@ class ConnectorChangeKind(StrEnum):
     upsert = "upsert"
     delete = "delete"
     event = "event"
+
+
+class ConnectorResourceRefreshMode(StrEnum):
+    authoritative = "authoritative"
+    incremental = "incremental"
 
 
 class ConnectorSetupArtifactKind(StrEnum):
@@ -249,6 +254,12 @@ class ConnectorResourceDraft:
 
 
 @dataclass(frozen=True, slots=True)
+class ConnectorResourceResult:
+    resources: tuple[ConnectorResourceDraft, ...] = ()
+    mode: ConnectorResourceRefreshMode = ConnectorResourceRefreshMode.authoritative
+
+
+@dataclass(frozen=True, slots=True)
 class ConnectorItem:
     id: str
     scope_id: str
@@ -401,9 +412,30 @@ class ConnectorSetupResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ConnectorCredentialUpdate:
+    credential: CredentialEnvelope = field(repr=False)
+    expected_version: int = 0
+
+    def __post_init__(self) -> None:
+        if self.expected_version < 0:
+            raise ValueError("expected credential version must not be negative")
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorStateUpdate:
+    credential: ConnectorCredentialUpdate | None = field(default=None, repr=False)
+    binding_metadata: dict[str, Any] | None = field(default=None, repr=False)
+    cursor_updates: tuple[ConnectorCursorUpdate, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class ConnectorSyncResult:
     changes: tuple[ConnectorChange, ...] = ()
-    cursor_updates: tuple[ConnectorCursorUpdate, ...] = ()
+    state: ConnectorStateUpdate = field(default_factory=ConnectorStateUpdate)
+
+    @property
+    def cursor_updates(self) -> tuple[ConnectorCursorUpdate, ...]:
+        return self.state.cursor_updates
 
 
 @dataclass(frozen=True, slots=True)
@@ -412,11 +444,147 @@ class ConnectorAction:
     action: ActionFn
 
 
+@runtime_checkable
+class ConnectorStateReader(Protocol):
+    @property
+    def scope_id(self) -> str: ...
+
+    async def get_binding(self, connector_id: str) -> ConnectorBinding | None: ...
+
+    async def list_targets(self, connector_id: str) -> list[ConnectorBindingTarget]: ...
+
+    async def list_resources(
+        self, connector_id: str, *, selected_only: bool = False
+    ) -> list[ConnectorResource]: ...
+
+    async def list_items(self, connector_id: str) -> list[ConnectorItem]: ...
+
+    async def list_cursors(self, connector_id: str, binding_id: str) -> list[ConnectorCursor]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorOperationContext:
+    scope_id: str
+    connector_id: str
+    binding: ConnectorBinding | None = None
+    credential: CredentialEnvelope | None = field(default=None, repr=False)
+    credential_version: int = 0
+    callback_base_url: str | None = None
+    resources: tuple[ConnectorResource, ...] = ()
+    targets: tuple[ConnectorBindingTarget, ...] = ()
+    items: tuple[ConnectorItem, ...] = ()
+    cursors: tuple[ConnectorCursor, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.scope_id or not self.connector_id:
+            raise ValueError("connector operation scope and connector id must not be blank")
+        if self.credential is None and self.credential_version != 0:
+            raise ValueError("missing connector credentials cannot have a version")
+        if self.credential is not None and self.credential_version <= 0:
+            raise ValueError("connector credentials require a positive version")
+        if self.callback_base_url is not None and not self.callback_base_url.strip():
+            raise ValueError("connector callback base URL must not be blank")
+        if self.binding is None:
+            if self.resources or self.targets or self.items or self.cursors:
+                raise ValueError("connector operation state requires a binding")
+            return
+        binding = self.binding
+        if binding.scope_id != self.scope_id or binding.connector_id != self.connector_id:
+            raise ValueError("connector operation binding crosses its scope or provider")
+
+        def validate(
+            rows: Iterable[
+                ConnectorResource | ConnectorBindingTarget | ConnectorItem | ConnectorCursor
+            ],
+        ) -> None:
+            for row in rows:
+                if (
+                    row.scope_id != self.scope_id
+                    or row.connector_id != self.connector_id
+                    or row.binding_id != binding.id
+                ):
+                    raise ValueError("connector operation state crosses its scope or binding")
+
+        validate(self.resources)
+        validate(self.targets)
+        validate(self.items)
+        validate(self.cursors)
+
+
 @dataclass(frozen=True, slots=True)
 class ConnectorActionContext:
     scope_id: str
     credential_store: Any | None = None
     idempotency_store: OutboundIdempotencyStore | None = None
+    _state_loader: Callable[[str], Awaitable[ConnectorOperationContext]] | None = field(
+        default=None,
+        repr=False,
+    )
+
+    @classmethod
+    def with_repository(
+        cls,
+        scope_id: str,
+        repository: ConnectorStateReader,
+        *,
+        credential_store: Any | None = None,
+        idempotency_store: OutboundIdempotencyStore | None = None,
+    ) -> ConnectorActionContext:
+        if repository.scope_id != scope_id:
+            raise ValueError("connector action repository crosses its scope")
+
+        async def load(connector_id: str) -> ConnectorOperationContext:
+            binding = await repository.get_binding(connector_id)
+            if binding is None:
+                raise LookupError(f"connector {connector_id!r} is not configured in this scope")
+            resources = tuple(await repository.list_resources(connector_id, selected_only=True))
+            selected_ids = {item.id for item in resources}
+            targets = tuple(await repository.list_targets(connector_id))
+            items = tuple(
+                item
+                for item in await repository.list_items(connector_id)
+                if item.resource_id is None or item.resource_id in selected_ids
+            )
+            cursors = tuple(
+                item
+                for item in await repository.list_cursors(connector_id, binding.id)
+                if item.resource_id is None or item.resource_id in selected_ids
+            )
+            return ConnectorOperationContext(
+                scope_id=scope_id,
+                connector_id=connector_id,
+                binding=binding,
+                resources=resources,
+                targets=targets,
+                items=items,
+                cursors=cursors,
+            )
+
+        return cls(
+            scope_id,
+            credential_store=credential_store,
+            idempotency_store=idempotency_store,
+            _state_loader=load,
+        )
+
+    async def load_state(self, connector_id: str) -> ConnectorOperationContext:
+        if self._state_loader is None:
+            raise RuntimeError("connector action state repository is unavailable")
+        return await self._state_loader(connector_id)
+
+    async def require_selected_resource(
+        self, connector_id: str, external_id: str
+    ) -> ConnectorResource:
+        state = await self.load_state(connector_id)
+        resource = next(
+            (item for item in state.resources if item.external_id == external_id),
+            None,
+        )
+        if resource is None:
+            raise PermissionError(
+                f"connector resource {external_id!r} is not selected in this scope"
+            )
+        return resource
 
 
 @dataclass(frozen=True, slots=True)
@@ -453,28 +621,22 @@ class ConnectorProvider(Protocol):
         self, callback_url: str, parameters: dict[str, str]
     ) -> ConnectorSetupResult: ...
 
-    async def setup(self, values: dict[str, str]) -> ConnectorSetupResult: ...
+    async def setup(
+        self, context: ConnectorOperationContext, values: dict[str, str]
+    ) -> ConnectorSetupResult: ...
 
     async def list_resources(
-        self, binding: ConnectorBinding, credential: CredentialEnvelope | None
-    ) -> tuple[ConnectorResourceDraft, ...]: ...
+        self, context: ConnectorOperationContext
+    ) -> ConnectorResourceResult: ...
 
-    async def sync(
-        self,
-        binding: ConnectorBinding,
-        resources: tuple[ConnectorResource, ...],
-        cursors: tuple[ConnectorCursor, ...],
-        credential: CredentialEnvelope | None,
-    ) -> ConnectorSyncResult: ...
+    async def sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult: ...
 
-    async def health(
-        self, binding: ConnectorBinding, credential: CredentialEnvelope | None
-    ) -> ConnectorHealth: ...
+    async def health(self, context: ConnectorOperationContext) -> ConnectorHealth: ...
 
-    async def revoke(self, credential: CredentialEnvelope | None) -> None: ...
+    async def revoke(self, context: ConnectorOperationContext) -> None: ...
 
     async def ingress(
-        self, headers: dict[str, str], body: bytes, binding: ConnectorBinding
+        self, context: ConnectorOperationContext, headers: dict[str, str], body: bytes
     ) -> ConnectorIngressResult: ...
 
     def build_actions(self, context: ConnectorActionContext) -> tuple[ConnectorAction, ...]: ...
@@ -496,31 +658,23 @@ class BaseConnectorProvider:
     ) -> ConnectorSetupResult:
         raise ConnectorUnsupportedError(f"{self.manifest.id} does not support auth callbacks")
 
-    async def setup(self, values: dict[str, str]) -> ConnectorSetupResult:
+    async def setup(
+        self, context: ConnectorOperationContext, values: dict[str, str]
+    ) -> ConnectorSetupResult:
         raise ConnectorUnsupportedError(f"{self.manifest.id} does not support manual setup")
 
-    async def list_resources(
-        self, binding: ConnectorBinding, credential: CredentialEnvelope | None
-    ) -> tuple[ConnectorResourceDraft, ...]:
+    async def list_resources(self, context: ConnectorOperationContext) -> ConnectorResourceResult:
         if ConnectorCapability.resources not in self.manifest.capabilities:
-            return ()
+            return ConnectorResourceResult()
         raise ConnectorUnsupportedError(f"{self.manifest.id} resource listing is not implemented")
 
-    async def sync(
-        self,
-        binding: ConnectorBinding,
-        resources: tuple[ConnectorResource, ...],
-        cursors: tuple[ConnectorCursor, ...],
-        credential: CredentialEnvelope | None,
-    ) -> ConnectorSyncResult:
+    async def sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult:
         raise ConnectorUnsupportedError(f"{self.manifest.id} sync is not implemented")
 
-    async def health(
-        self, binding: ConnectorBinding, credential: CredentialEnvelope | None
-    ) -> ConnectorHealth:
+    async def health(self, context: ConnectorOperationContext) -> ConnectorHealth:
         raise ConnectorUnsupportedError(f"{self.manifest.id} health is not implemented")
 
-    async def revoke(self, credential: CredentialEnvelope | None) -> None:
+    async def revoke(self, context: ConnectorOperationContext) -> None:
         if self.manifest.auth_kind in {
             ConnectorAuthKind.oauth,
             ConnectorAuthKind.github_app,
@@ -529,7 +683,7 @@ class BaseConnectorProvider:
         return None
 
     async def ingress(
-        self, headers: dict[str, str], body: bytes, binding: ConnectorBinding
+        self, context: ConnectorOperationContext, headers: dict[str, str], body: bytes
     ) -> ConnectorIngressResult:
         raise ConnectorUnsupportedError(f"{self.manifest.id} webhook ingress is not implemented")
 
@@ -566,6 +720,7 @@ __all__ = [
     "ConnectorCapability",
     "ConnectorChange",
     "ConnectorChangeKind",
+    "ConnectorCredentialUpdate",
     "ConnectorCursor",
     "ConnectorCursorUpdate",
     "ConnectorError",
@@ -576,15 +731,20 @@ __all__ = [
     "ConnectorItem",
     "ConnectorItemDraft",
     "ConnectorManifest",
+    "ConnectorOperationContext",
     "ConnectorProvider",
     "ConnectorProviderFactory",
     "ConnectorProvenance",
     "ConnectorResource",
     "ConnectorResourceDraft",
+    "ConnectorResourceRefreshMode",
+    "ConnectorResourceResult",
     "ConnectorSetupArtifact",
     "ConnectorSetupArtifactKind",
     "ConnectorSetupField",
     "ConnectorSetupResult",
+    "ConnectorStateReader",
+    "ConnectorStateUpdate",
     "ConnectorSyncResult",
     "ConnectorTargetField",
     "ConnectorTargetKind",

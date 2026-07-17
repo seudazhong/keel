@@ -14,14 +14,13 @@ from keel_core.connector_contracts import (
     ConnectorActionManifest,
     ConnectorActionSemantics,
     ConnectorAuthKind,
-    ConnectorBinding,
+    ConnectorBindingDraft,
+    ConnectorBindingStatus,
     ConnectorCapability,
-    ConnectorCursor,
     ConnectorManifest,
-    ConnectorResource,
+    ConnectorOperationContext,
     ConnectorSyncResult,
 )
-from keel_core.connector_credentials import CredentialEnvelope
 from keel_core.connector_registry import ConnectorRegistration, ConnectorRegistry
 from keel_core.connector_repository import InMemoryConnectorRepository
 from keel_core.connector_service import CONNECTOR_SYNC_JOB_KIND, ConnectorService
@@ -53,18 +52,14 @@ class Provider(BaseConnectorProvider):
         actions=(ACTION,),
     )
 
-    async def sync(
-        self,
-        binding: ConnectorBinding,
-        resources: tuple[ConnectorResource, ...],
-        cursors: tuple[ConnectorCursor, ...],
-        credential: CredentialEnvelope | None,
-    ) -> ConnectorSyncResult:
+    async def sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult:
         return ConnectorSyncResult()
 
     def build_actions(self, context: ConnectorActionContext) -> tuple[ConnectorAction, ...]:
         async def create(args: dict[str, Any], tool_context: ToolContext) -> str:
-            return "created"
+            state = await context.load_state("worker_fixture")
+            assert state.binding is not None
+            return state.binding.id
 
         return (ConnectorAction(ACTION, create),)
 
@@ -82,15 +77,31 @@ def test_register_connector_jobs_adds_one_provider_agnostic_kind() -> None:
     assert jobs.kinds() == (CONNECTOR_SYNC_JOB_KIND,)
 
 
-def test_worker_discovers_provider_local_actions_without_provider_branches() -> None:
+async def test_worker_discovers_provider_local_actions_without_provider_branches() -> None:
     provider_registry = ConnectorRegistry(
         (ConnectorRegistration(Provider.manifest, Provider, "tests.worker_fixture"),)
     )
+    repository = InMemoryConnectorRepository("scope:test")
+    binding = await repository.upsert_binding(
+        "worker_fixture",
+        ConnectorBindingDraft(),
+        ConnectorBindingStatus.connected,
+    )
     actions = _connector_actions(
-        {"connector_registry": provider_registry},
+        {
+            "connector_registry": provider_registry,
+            "connector_repository": repository,
+        },
         Settings(),
         "scope:test",
     )
     assert [action.manifest.name for action in actions] == ["calendar_create"]
     assert actions[0].manifest.idempotency is ConnectorActionIdempotency.required
     assert actions[0].manifest.approval is ConnectorActionApproval.tainted
+    assert (
+        await actions[0].action(
+            {},
+            ToolContext(scope_id="scope:test", session_id="session"),
+        )
+        == binding.id
+    )

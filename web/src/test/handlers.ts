@@ -501,6 +501,18 @@ export const handlers = [
     );
     return HttpResponse.json({ ok: true });
   }),
+  http.delete("/v1/connectors/:id/local", ({ params }) => {
+    connectors = connectors.map((c) =>
+      c.id === String(params.id) ? { ...c, connected: false, updated_at: null } : c,
+    );
+    return HttpResponse.json({ ok: true });
+  }),
+  http.delete("/v1/connectors/:id/purge/local", ({ params }) => {
+    connectors = connectors.map((c) =>
+      c.id === String(params.id) ? { ...c, connected: false, updated_at: null } : c,
+    );
+    return HttpResponse.json({ ok: true });
+  }),
   http.post("/v1/connectors/:id/setup", async ({ params }) => {
     connectors = connectors.map((c) =>
       c.id === String(params.id)

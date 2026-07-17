@@ -43,6 +43,10 @@ def _metadata_check(column: str) -> str:
 
 def upgrade() -> None:
     op.execute(
+        "ALTER TABLE connector_tokens ADD COLUMN version bigint NOT NULL DEFAULT 1 "
+        "CHECK (version > 0)"
+    )
+    op.execute(
         f"""
         CREATE TABLE connector_bindings (
             id text PRIMARY KEY,
@@ -287,3 +291,4 @@ def downgrade() -> None:
     op.execute("DROP TABLE IF EXISTS connector_resources CASCADE")
     op.execute("DROP TABLE IF EXISTS connector_binding_targets CASCADE")
     op.execute("DROP TABLE IF EXISTS connector_bindings CASCADE")
+    op.execute("ALTER TABLE connector_tokens DROP COLUMN IF EXISTS version")

@@ -16,13 +16,13 @@ from keel_core.connector_contracts import (
     ConnectorAuthAction,
     ConnectorAuthKind,
     ConnectorAuthStart,
-    ConnectorBinding,
     ConnectorBindingDraft,
     ConnectorCallbackParameter,
     ConnectorCapability,
     ConnectorHealth,
     ConnectorHealthStatus,
     ConnectorManifest,
+    ConnectorOperationContext,
     ConnectorSetupResult,
 )
 from keel_core.connector_credentials import CredentialEnvelope
@@ -124,16 +124,14 @@ class GmailProvider(BaseConnectorProvider):
             credential=CredentialEnvelope(kind="oauth", values=values),
         )
 
-    async def health(
-        self, binding: ConnectorBinding, credential: CredentialEnvelope | None
-    ) -> ConnectorHealth:
+    async def health(self, context: ConnectorOperationContext) -> ConnectorHealth:
         if not self.enabled():
             return ConnectorHealth(
                 ConnectorHealthStatus.degraded,
                 datetime.now(UTC),
                 "Gmail is configured but disabled.",
             )
-        if credential is None:
+        if context.credential is None:
             return ConnectorHealth(
                 ConnectorHealthStatus.error,
                 datetime.now(UTC),
@@ -141,7 +139,7 @@ class GmailProvider(BaseConnectorProvider):
             )
         return ConnectorHealth(ConnectorHealthStatus.healthy, datetime.now(UTC))
 
-    async def revoke(self, credential: CredentialEnvelope | None) -> None:
+    async def revoke(self, context: ConnectorOperationContext) -> None:
         """Preserve Gmail's existing local encrypted-token revoke behavior."""
         return None
 

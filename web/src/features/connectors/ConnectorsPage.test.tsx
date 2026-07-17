@@ -33,6 +33,34 @@ test("revoking a connector removes it from the connected list", async () => {
   await waitFor(() => expect(screen.queryByText("gmail.readonly")).not.toBeInTheDocument());
 });
 
+test("an unavailable provider exposes explicit local-forget controls", async () => {
+  let requested = "";
+  const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+  server.use(
+    http.get("/v1/connectors", () =>
+      HttpResponse.json([
+        makeConnectorFixture({
+          id: "broken",
+          name: "Broken",
+          auth_kind: "secret",
+          connected: true,
+          available: false,
+          availability_error: "Missing optional dependency",
+        }),
+      ]),
+    ),
+    http.delete("/v1/connectors/broken/purge/local", () => {
+      requested = "forced";
+      return HttpResponse.json({ ok: true });
+    }),
+  );
+  renderWithClient(<ConnectorsPage />);
+  expect(await screen.findByText(/Missing optional dependency/)).toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Force local purge" }));
+  await waitFor(() => expect(requested).toBe("forced"));
+  confirm.mockRestore();
+});
+
 test("secret setup never echoes the entered value", async () => {
   renderWithClient(<ConnectorsPage />);
   const input = await screen.findByLabelText("Secret");

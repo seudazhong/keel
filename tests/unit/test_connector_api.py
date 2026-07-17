@@ -16,22 +16,23 @@ from keel_core.connector_contracts import (
     ConnectorAuthenticationError,
     ConnectorAuthKind,
     ConnectorAuthStart,
-    ConnectorBinding,
     ConnectorBindingDraft,
+    ConnectorBindingStatus,
     ConnectorCallbackParameter,
     ConnectorCapability,
-    ConnectorCursor,
     ConnectorCursorUpdate,
     ConnectorHealth,
     ConnectorHealthStatus,
     ConnectorIngressResult,
     ConnectorManifest,
-    ConnectorResource,
+    ConnectorOperationContext,
     ConnectorResourceDraft,
+    ConnectorResourceResult,
     ConnectorSetupArtifact,
     ConnectorSetupArtifactKind,
     ConnectorSetupField,
     ConnectorSetupResult,
+    ConnectorStateUpdate,
     ConnectorSyncResult,
     ConnectorTargetField,
     ConnectorTargetKind,
@@ -70,51 +71,54 @@ class ManualProvider(BaseConnectorProvider):
         setup_action_label="Store credential",
     )
 
-    async def setup(self, values: dict[str, str]) -> ConnectorSetupResult:
+    async def setup(
+        self, context: ConnectorOperationContext, values: dict[str, str]
+    ) -> ConnectorSetupResult:
+        assert context.callback_base_url == "http://test/v1/connectors/manual"
         return ConnectorSetupResult(
             ConnectorBindingDraft(display_name="Manual"),
             CredentialEnvelope("secret", {"api_key": values["api_key"]}),
             (
                 ConnectorSetupArtifact(
-                    ConnectorSetupArtifactKind.secret,
-                    "Generated webhook secret",
-                    "shown-once",
+                    ConnectorSetupArtifactKind.url,
+                    "Webhook URL",
+                    f"{context.callback_base_url}/webhook",
                 ),
             ),
         )
 
-    async def list_resources(
-        self, binding: ConnectorBinding, credential: CredentialEnvelope | None
-    ) -> tuple[ConnectorResourceDraft, ...]:
-        return (ConnectorResourceDraft("project-1", "project", "Project one"),)
+    async def list_resources(self, context: ConnectorOperationContext) -> ConnectorResourceResult:
+        return ConnectorResourceResult(
+            (ConnectorResourceDraft("project-1", "project", "Project one"),)
+        )
 
-    async def sync(
-        self,
-        binding: ConnectorBinding,
-        resources: tuple[ConnectorResource, ...],
-        cursors: tuple[ConnectorCursor, ...],
-        credential: CredentialEnvelope | None,
-    ) -> ConnectorSyncResult:
+    async def sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult:
         return ConnectorSyncResult(
-            cursor_updates=(
-                ConnectorCursorUpdate("items", "next", resource_id=resources[0].id),
-                ConnectorCursorUpdate("global", "global-next"),
+            state=ConnectorStateUpdate(
+                cursor_updates=(
+                    ConnectorCursorUpdate("items", "next", resource_id=context.resources[0].id),
+                    ConnectorCursorUpdate("global", "global-next"),
+                ),
             )
         )
 
-    async def health(
-        self, binding: ConnectorBinding, credential: CredentialEnvelope | None
-    ) -> ConnectorHealth:
+    async def health(self, context: ConnectorOperationContext) -> ConnectorHealth:
         return ConnectorHealth(ConnectorHealthStatus.healthy, datetime.now(UTC))
 
     async def ingress(
-        self, headers: dict[str, str], body: bytes, binding: ConnectorBinding
+        self, context: ConnectorOperationContext, headers: dict[str, str], body: bytes
     ) -> ConnectorIngressResult:
+        assert context.credential is not None
+        assert context.credential.values["api_key"] == "must-not-echo"
         if headers.get("x-signature") != "valid":
             raise ConnectorAuthenticationError("invalid signature")
         return ConnectorIngressResult("delivery-1")
 
-    async def revoke(self, credential: CredentialEnvelope | None) -> None:
+    async def revoke(self, context: ConnectorOperationContext) -> None:
+        assert context.binding is not None
+        assert context.resources
+        assert context.targets
+        assert context.cursors == ()
         _REVOKED.append("manual")
 
 
@@ -186,8 +190,7 @@ async def test_generic_catalog_setup_resources_sync_health_and_revoke(
     assert setup.status_code == 200
     assert setup.headers["cache-control"] == "no-store"
     assert "must-not-echo" not in setup.text
-    assert setup.json()["artifacts"][0]["value"] == "shown-once"
-    assert "shown-once" not in (await client.get("/v1/connectors")).text
+    assert setup.json()["artifacts"][0]["value"] == ("http://test/v1/connectors/manual/webhook")
 
     resources = (await client.get("/v1/connectors/manual/resources")).json()
     assert resources[0]["external_id"] == "project-1"
@@ -248,3 +251,54 @@ async def test_generic_oauth_callback_dispatch(
     assert callback.headers["cache-control"] == "no-store"
     binding = await app.state.connector_repository.get_binding("oauth_fixture")
     assert binding is not None and binding.status.value == "connected"
+
+
+async def test_unavailable_provider_can_be_explicitly_forgotten_locally(
+    connector_client: tuple[httpx.AsyncClient, FastAPI],
+) -> None:
+    client, app = connector_client
+    manifest = ConnectorManifest(
+        id="broken",
+        name="Broken",
+        description="Broken optional provider",
+        auth_kind=ConnectorAuthKind.oauth,
+        capabilities=(ConnectorCapability.read,),
+    )
+
+    class BrokenProvider(BaseConnectorProvider):
+        pass
+
+    BrokenProvider.manifest = manifest
+
+    def unavailable() -> None:
+        raise ModuleNotFoundError("missing optional", name="broken_sdk")
+
+    app.state.connector_registry = ConnectorRegistry(
+        (
+            ConnectorRegistration(
+                manifest,
+                BrokenProvider,
+                "tests.broken",
+                availability=unavailable,
+            ),
+        )
+    )
+    await app.state.connector_repository.upsert_binding(
+        "broken",
+        ConnectorBindingDraft(),
+        ConnectorBindingStatus.connected,
+    )
+    await app.state.connector_credentials.put(
+        "broken",
+        CredentialEnvelope("oauth", {"refresh_token": "retained"}),
+    )
+
+    failed = await client.delete("/v1/connectors/broken")
+    assert failed.status_code == 502
+    assert await app.state.connector_repository.get_binding("broken") is not None
+    assert await app.state.connector_credentials.get("broken") is not None
+
+    forgotten = await client.delete("/v1/connectors/broken/local")
+    assert forgotten.json() == {"ok": True}
+    assert await app.state.connector_repository.get_binding("broken") is None
+    assert await app.state.connector_credentials.get("broken") is None
