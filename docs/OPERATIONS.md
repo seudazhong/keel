@@ -56,6 +56,53 @@ implemented in Compose.
   tenant-owned identity tables (`memberships`, `agents`, `resource_grants`), keyed by the
   `app.org_id` GUC — connect as a `keel_runtime` member to make RLS a hard boundary.
 
+### Identity erasure (user / organization) — maintenance path (M3.6)
+
+User (data-subject) and organization erasure are **privileged, cross-tenant maintenance
+operations** and are **not** part of the `/v1/erasure` scope lifecycle API (that API erases a
+scope / session / project only — it does not erase users or orgs). They run through the
+`keel_erase_user` / `keel_erase_organization` `SECURITY DEFINER` functions installed by
+migration `0013`, which enforce the sole-owner block/archive invariant under an org-first lock
+order. Migration `0013` provisions **two** roles (least privilege):
+
+- `keel_maintenance` — **definer**, `NOLOGIN` + `BYPASSRLS`, owns the functions and their table
+  DML. Never log in as it and never grant a login membership in it.
+- `keel_maintenance_exec` — **executor**, `NOLOGIN` + `NOBYPASSRLS`, granted **only** EXECUTE on
+  the two functions (no table DML, not a member of the definer).
+
+Provision a dedicated **maintenance login** that is a member of **only** `keel_maintenance_exec`
+and point `KEEL_MAINTENANCE_DATABASE_URL` at it (it must differ from `KEEL_DATABASE_URL`;
+erasure fails closed when it is unset, and in cloud mode rejects a copy of the runtime URL):
+
+```sql
+CREATE ROLE keel_erase LOGIN PASSWORD '…' NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB;
+GRANT keel_maintenance_exec TO keel_erase;   -- executor membership only
+```
+
+On **managed Postgres** that forbids `CREATE ROLE`/`ALTER OWNER`/`GRANT`, the migration skips
+role setup with a `NOTICE` and erasure **fails closed**. Provision it manually with an
+administrative role, in this order: create `keel_maintenance` (BYPASSRLS) and grant it
+`SELECT, INSERT, UPDATE, DELETE` on `users, oidc_identities, organizations, memberships,
+agents, resource_grants`; `ALTER FUNCTION keel_erase_organization(text) OWNER TO
+keel_maintenance` and the same for `keel_erase_user(text)`; create `keel_maintenance_exec`
+(NOBYPASSRLS) and `GRANT EXECUTE ON FUNCTION keel_erase_organization(text), keel_erase_user(text)
+TO keel_maintenance_exec`; then create the login and grant it `keel_maintenance_exec`.
+
+Run the operator command (destructive; it always previews inside a rolled-back transaction
+first, requires `--yes` or typing the id at an interactive prompt, and never prints the URL):
+
+```bash
+# Preview only (no writes):
+python -m keel_core.identity.erase_cli user   <user_id> --dry-run --json
+# Erase (non-interactive):
+python -m keel_core.identity.erase_cli user   <user_id> --yes --json
+python -m keel_core.identity.erase_cli organization <org_id> --yes --json
+```
+
+A user who is the **sole active owner** of an active org that still has **other** active
+members is reported **blocked** (exit 3) with the blocking org ids — transfer ownership first.
+An org the user solely owns and is the only member of is atomically archived.
+
 ### Cloud-safety controls (M3.3)
 
 - **Runtime DB role.** Migration `0011` provisions a non-owner, non-bypass `keel_runtime`

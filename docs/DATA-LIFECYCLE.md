@@ -56,7 +56,8 @@ Notes:
   defeat anti-resurrection and lose the audit trail.
 * **Identity is org-partitioned, not scope-bound (M3.6).** Durable users/orgs/memberships/
   Agents/grants are *not* reached by scope/session/project erasure (they carry `org_id`,
-  not the runtime `scope_id`). They are erased by the dedicated identity purge in
+  not the runtime `scope_id`), and the `/v1/erasure` scope lifecycle API described below does
+  **not** erase users or organizations. They are erased by the dedicated identity purge in
   `keel_core.identity.purge`: `purge_organization(org_id)` (tenant offboarding) and
   `purge_user(user_id)` (a data subject; cascades through the user's OIDC links, owned
   Agents, memberships, and issued grants). User erasure **never orphans an active org**: it
@@ -64,15 +65,21 @@ Notes:
   sole active owner of an active org that still has other active members (ownership must be
   transferred first), and it atomically archives an active org the user solely owns and is
   the only active member of. Both primitives run through the `keel_erase_user` /
-  `keel_erase_organization` **`SECURITY DEFINER`** functions (migration `0013`, owned by the
-  dedicated `keel_maintenance` role) so the enumerate/lock/block/archive/purge is correct
-  under production RLS (`keel_runtime` is `NOBYPASSRLS` + `FORCE RLS`); normal runtime
-  principals cannot invoke cross-tenant deletion (`DELETE` on the global identity tables and
-  `EXECUTE` on the functions are revoked from `keel_runtime`). Identity is **not
-  event-sourced**, so no
-  projection rebuild can resurrect an erased identity row. When durable runs land and a
-  run's scope is derived from `(org, agent)`, org erasure will be folded into the scope
-  coordinator; until then it is a standalone primitive (tracked honestly here).
+  `keel_erase_organization` **`SECURITY DEFINER`** functions (migration `0013`) with an
+  **org-first, deterministic lock order** (matching normal membership mutations, so a
+  concurrent invite/promotion/demotion/removal can neither deadlock nor race the owner-count
+  invariant). The erasure privilege is split into a `keel_maintenance` **definer**
+  (`BYPASSRLS`, owns the functions + table DML) and a `keel_maintenance_exec` **executor**
+  (`NOBYPASSRLS`, EXECUTE-only, no table DML, cannot `SET ROLE` into the definer); a dedicated
+  maintenance **login** is a member of only the executor. `keel_runtime` can neither execute
+  the functions nor `DELETE` the global identity tables (both revoked). The
+  production-usable operator path is `python -m keel_core.identity.erase_cli
+  {user|organization} <id>` on `KEEL_MAINTENANCE_DATABASE_URL` (fail-closed when unset;
+  dry-run/preflight, explicit confirmation, structured result, explicit blocked-owner error —
+  see [`docs/OPERATIONS.md`](OPERATIONS.md)). Identity is **not event-sourced**, so no
+  projection rebuild can resurrect an erased identity row. Folding identity erasure into the
+  durable lifecycle API (once run scope is derived from `(org, agent)`) is future work; until
+  then it is a standalone maintenance command (tracked honestly here).
 
 ## 2. Retention defaults
 

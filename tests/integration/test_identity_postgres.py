@@ -9,11 +9,14 @@ policy (block vs. archive).
 from __future__ import annotations
 
 import asyncio
+import os
 
 import pytest
+import pytest_asyncio
 from sqlalchemy import text
-from sqlalchemy.exc import ProgrammingError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import DBAPIError, ProgrammingError
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from keel_core.errors import PermissionDenied
 from keel_core.identity import (
@@ -26,9 +29,12 @@ from keel_core.identity import (
     PostgresIdentityStore,
 )
 from keel_core.identity.purge import (
+    IdentityPurgeRepository,
+    MaintenancePrincipalError,
     UserErasureBlockedError,
     purge_organization,
     purge_user,
+    verify_maintenance_principal,
 )
 
 pytestmark = pytest.mark.integration
@@ -646,3 +652,212 @@ async def test_user_erasure_denied_for_runtime_role(migrated_db: AsyncEngine) ->
     # Every denied attempt left the data intact.
     assert await store.get_user(owner.id) is not None
     assert await store.get_org(org.id) is not None
+
+
+# --- #3 least-privilege maintenance EXECUTOR login (definer/executor split, WS-L) ---------
+#
+# A dedicated LOGIN role that is a member of ONLY keel_maintenance_exec models the production
+# maintenance login. It must be able to invoke the two erasure entrypoints yet hold none of the
+# definer's power: no direct table access, no SET ROLE into keel_maintenance, and NOBYPASSRLS.
+
+_EXEC_LOGIN = "keel_erase_login_test"
+_EXEC_PASSWORD = "erase-test-pw"  # noqa: S105 - throwaway local test-role password
+
+
+async def _executor_role_available(engine: AsyncEngine) -> bool:
+    async with engine.connect() as conn:
+        found = await conn.scalar(
+            text("SELECT 1 FROM pg_roles WHERE rolname = 'keel_maintenance_exec'")
+        )
+    return bool(found)
+
+
+async def _can_create_login(engine: AsyncEngine) -> bool:
+    async with engine.connect() as conn:
+        can = await conn.scalar(
+            text("SELECT rolsuper OR rolcreaterole FROM pg_roles WHERE rolname = current_user")
+        )
+    return bool(can)
+
+
+@pytest_asyncio.fixture
+async def executor_login_engine(migrated_db: AsyncEngine):
+    """A LOGIN engine for a role that is a member of ONLY keel_maintenance_exec."""
+    if not await _executor_role_available(migrated_db):
+        pytest.skip("keel_maintenance_exec role not provisioned in this database")
+    if not await _can_create_login(migrated_db):
+        pytest.skip("test principal cannot CREATE ROLE for the executor-login test")
+    async with migrated_db.begin() as conn:
+        await conn.execute(text(f"DROP ROLE IF EXISTS {_EXEC_LOGIN}"))
+        await conn.execute(
+            text(
+                f"CREATE ROLE {_EXEC_LOGIN} LOGIN PASSWORD '{_EXEC_PASSWORD}' "
+                "NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB"
+            )
+        )
+        await conn.execute(text(f"GRANT keel_maintenance_exec TO {_EXEC_LOGIN}"))
+    url = make_url(os.environ["KEEL_TEST_DATABASE_URL"]).set(
+        username=_EXEC_LOGIN, password=_EXEC_PASSWORD
+    )
+    engine = create_async_engine(url)
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+        async with migrated_db.begin() as conn:
+            await conn.execute(text(f"DROP ROLE IF EXISTS {_EXEC_LOGIN}"))
+
+
+async def test_executor_login_can_erase_but_not_touch_tables(
+    migrated_db: AsyncEngine, executor_login_engine: AsyncEngine
+) -> None:
+    store = PostgresIdentityStore(migrated_db)
+    owner, org = await _seed_org(store, "acme")
+    org2 = await store.create_org(slug="beta", display_name="Beta")
+    member2 = await store.create_user(display_name="M2", email="m2@x.com")
+    await store.create_membership(org_id=org2.id, user_id=member2.id, role=MembershipRole.owner)
+
+    # The executor login is NOBYPASSRLS.
+    async with executor_login_engine.connect() as conn:
+        bypass = await conn.scalar(
+            text("SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user")
+        )
+        assert bypass is False
+
+    # It cannot read or delete tenant/global identity tables directly...
+    for stmt in (
+        "SELECT id FROM users",
+        "SELECT id FROM organizations",
+        "SELECT id FROM memberships",
+        "DELETE FROM users",
+        "DELETE FROM organizations",
+        "DELETE FROM memberships",
+    ):
+        async with executor_login_engine.connect() as conn:
+            with pytest.raises(ProgrammingError):
+                await conn.execute(text(stmt))
+
+    # ...and it cannot SET ROLE into the definer (it is not a member of keel_maintenance).
+    async with executor_login_engine.connect() as conn:
+        with pytest.raises((ProgrammingError, DBAPIError)):
+            await conn.execute(text("SET ROLE keel_maintenance"))
+
+    # But it CAN execute BOTH erasure functions through the repository (the audited path).
+    repo = IdentityPurgeRepository(executor_login_engine)
+    principal = await repo.verify_principal()
+    assert principal == _EXEC_LOGIN
+    ures = await repo.erase_user(owner.id)
+    assert ures.user == 1
+    ores = await repo.erase_organization(org2.id)
+    assert ores.organization == 1
+    assert await store.get_user(owner.id) is None
+    assert await store.get_org(org2.id) is None
+
+
+async def test_verify_maintenance_principal_rejects_overprivileged(
+    migrated_db: AsyncEngine,
+) -> None:
+    # The schema owner (BYPASSRLS + direct DELETE) is exactly the over-privileged connection
+    # the factory must refuse: erasure should never run from it.
+    async with migrated_db.connect() as conn:
+        with pytest.raises(MaintenancePrincipalError):
+            await verify_maintenance_principal(conn)
+
+
+async def test_executor_login_preflight_is_non_destructive(
+    migrated_db: AsyncEngine, executor_login_engine: AsyncEngine
+) -> None:
+    store = PostgresIdentityStore(migrated_db)
+    owner, org = await _seed_org(store, "acme")
+    repo = IdentityPurgeRepository(executor_login_engine)
+    # A dry-run previews the real counts (the org would be archived) but persists nothing.
+    preview = await repo.erase_user(owner.id, dry_run=True)
+    assert preview.user == 1
+    assert preview.archived_organizations == 1
+    assert await store.get_user(owner.id) is not None
+    still = await store.get_org(org.id)
+    assert still is not None and still.status.value == "active"
+
+
+async def test_runtime_role_still_denied_after_split(migrated_db: AsyncEngine) -> None:
+    if not await _runtime_role_available(migrated_db):
+        pytest.skip("keel_runtime role not provisioned in this database")
+    store = PostgresIdentityStore(migrated_db)
+    owner, _org = await _seed_org(store, "acme")
+    # keel_runtime is neither the definer nor a member of the executor: EXECUTE stays revoked.
+    async with migrated_db.connect() as conn:
+        await conn.execute(text("SET ROLE keel_runtime"))
+        with pytest.raises(ProgrammingError):
+            await conn.execute(text("SELECT keel_erase_user(:u)"), {"u": owner.id})
+    assert await store.get_user(owner.id) is not None
+
+
+# --- #4 user erasure raced with concurrent membership mutations: no deadlock / no orphan ---
+
+
+async def test_erasure_raced_with_promotion_no_deadlock_no_orphan(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresIdentityStore(migrated_db)
+    for i in range(6):
+        owner, org = await _seed_org(store, f"acme{i}")
+        member = await store.create_user(display_name="M", email=f"m{i}@x.com")
+        await store.create_membership(org_id=org.id, user_id=member.id, role=MembershipRole.member)
+
+        async def erase(owner_id: str = owner.id) -> object:
+            try:
+                return await purge_user(migrated_db, owner_id)
+            except UserErasureBlockedError as exc:
+                return exc
+
+        async def promote(org_id: str = org.id, member_id: str = member.id) -> object:
+            return await store.update_membership_role(org_id, member_id, MembershipRole.owner)
+
+        # No deadlock: both tasks resolve (the org-first lock order serializes them).
+        erase_result, _ = await asyncio.gather(erase(), promote())
+
+        org_after = await store.get_org(org.id)
+        assert org_after is not None
+        if isinstance(erase_result, UserErasureBlockedError):
+            # Blocked deterministically: the owner and org are intact, still with an owner.
+            assert org.id in erase_result.blocking_org_ids
+            assert await store.get_user(owner.id) is not None
+            assert org_after.status.value == "active"
+            assert await store.count_active_owners(org.id) >= 1
+        else:
+            # Erased: the promotion committed first, so a co-owner keeps the org alive.
+            assert await store.get_user(owner.id) is None
+            assert org_after.status.value == "active"
+            assert await store.count_active_owners(org.id) >= 1
+
+
+async def test_erasure_raced_with_demotion_no_deadlock_no_orphan(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresIdentityStore(migrated_db)
+    for i in range(6):
+        owner_a, org = await _seed_org(store, f"beta{i}")
+        owner_b = await store.create_user(display_name="B", email=f"b{i}@x.com")
+        await store.create_membership(org_id=org.id, user_id=owner_b.id, role=MembershipRole.owner)
+
+        async def erase(owner_id: str = owner_a.id) -> object:
+            try:
+                return await purge_user(migrated_db, owner_id)
+            except UserErasureBlockedError as exc:
+                return exc
+
+        async def demote(org_id: str = org.id, owner_b_id: str = owner_b.id) -> object:
+            try:
+                return await store.update_membership_role(org_id, owner_b_id, MembershipRole.member)
+            except LastOwnerError as exc:
+                return exc
+
+        # Two active owners with no other members: erase(owner_a) is always allowed, but a
+        # concurrent demotion of owner_b must not leave the org ownerless nor deadlock.
+        await asyncio.gather(erase(), demote())
+
+        org_after = await store.get_org(org.id)
+        assert org_after is not None
+        # Invariant: an active org always retains at least one active owner.
+        if org_after.status.value == "active":
+            assert await store.count_active_owners(org.id) >= 1

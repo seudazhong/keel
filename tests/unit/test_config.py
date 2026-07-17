@@ -218,6 +218,50 @@ def test_knowledge_settings_reject_k_above_public_maximum() -> None:
         Settings(knowledge_search_k_max=11)
 
 
+def test_maintenance_database_url_defaults_empty() -> None:
+    from keel_core.config import Settings
+
+    assert Settings().maintenance_database_url == ""
+
+
+def test_require_maintenance_database_url_fails_closed_when_unset() -> None:
+    from keel_core.config import Settings
+    from keel_core.errors import MaintenanceDatabaseNotConfigured
+
+    with pytest.raises(MaintenanceDatabaseNotConfigured):
+        Settings(maintenance_database_url="").require_maintenance_database_url()
+
+
+def test_require_maintenance_database_url_rejects_runtime_copy_in_cloud_mode() -> None:
+    from keel_core.config import Settings
+    from keel_core.errors import MaintenanceDatabaseNotConfigured
+
+    url = "postgresql+psycopg://runtime@db/keel"
+    settings = Settings(cloud_mode=True, database_url=url, maintenance_database_url=url)
+    with pytest.raises(MaintenanceDatabaseNotConfigured):
+        settings.require_maintenance_database_url()
+
+
+def test_require_maintenance_database_url_returns_dedicated_url() -> None:
+    from keel_core.config import Settings
+
+    maint = "postgresql+psycopg://maint@db/keel"
+    settings = Settings(
+        cloud_mode=True,
+        database_url="postgresql+psycopg://runtime@db/keel",
+        maintenance_database_url=maint,
+    )
+    assert settings.require_maintenance_database_url() == maint
+
+
+def test_require_maintenance_database_url_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KEEL_MAINTENANCE_DATABASE_URL", "postgresql+psycopg://maint@db/keel")
+
+    from keel_core.config import Settings
+
+    assert Settings().require_maintenance_database_url() == "postgresql+psycopg://maint@db/keel"
+
+
 @pytest.mark.parametrize("overlap", [100, 101])
 def test_knowledge_settings_reject_overlap_at_or_above_target(overlap: int) -> None:
     from pydantic import ValidationError

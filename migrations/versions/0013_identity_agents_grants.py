@@ -285,6 +285,8 @@ def upgrade() -> None:
             IF p_org_id IS NULL OR length(p_org_id) = 0 THEN
                 RAISE EXCEPTION 'keel_erase_organization: org id is required';
             END IF;
+            -- Org-first lock (matches keel_erase_user + the normal membership mutations):
+            -- take the organization row's FOR UPDATE lock before touching any child row.
             PERFORM 1 FROM organizations WHERE id = p_org_id FOR UPDATE;
             DELETE FROM resource_grants WHERE org_id = p_org_id;
             GET DIAGNOSTICS v_grants = ROW_COUNT;
@@ -334,10 +336,25 @@ def upgrade() -> None:
             IF p_user_id IS NULL OR length(p_user_id) = 0 THEN
                 RAISE EXCEPTION 'keel_erase_user: user id is required';
             END IF;
-            -- Enumerate + FOR UPDATE-lock the active orgs the user SOLELY owns (no other
-            -- active owner), split by whether any OTHER active member remains. Locking the
-            -- membership rows freezes the block/archive decision against a concurrent
-            -- ownership change.
+            -- Org-first, deterministic lock order (identical to the normal membership
+            -- mutations, which FOR UPDATE-lock the organization row BEFORE any membership
+            -- row). FOR UPDATE-lock every organization the user is an active member of, in
+            -- ascending id order, so this cross-tenant erasure can neither deadlock with, nor
+            -- race the owner-count invariant of, a concurrent invite/promotion/demotion/
+            -- removal on those orgs. Every affected org row is held for the rest of the txn.
+            FOR r IN
+                SELECT DISTINCT m.org_id AS org_id
+                FROM memberships m
+                WHERE m.user_id = p_user_id AND m.status = 'active'
+                ORDER BY m.org_id
+            LOOP
+                PERFORM 1 FROM organizations WHERE id = r.org_id FOR UPDATE;
+            END LOOP;
+            -- Now, under those org locks, classify the active orgs the user SOLELY owns (no
+            -- other active owner) by whether any OTHER active member remains: block (other
+            -- members present) vs archive (user is the only active member). The org locks —
+            -- not a membership-row lock — freeze the block/archive decision, so the reads here
+            -- are consistent with what any concurrent membership mutation will see next.
             FOR r IN
                 SELECT m.org_id AS org_id,
                        (SELECT count(*) FROM memberships mm
@@ -351,7 +368,6 @@ def upgrade() -> None:
                       SELECT 1 FROM memberships o2
                       WHERE o2.org_id = m.org_id AND o2.status = 'active'
                         AND o2.role = 'owner' AND o2.user_id <> p_user_id)
-                FOR UPDATE OF m
             LOOP
                 IF r.other_members > 0 THEN
                     v_blocked := array_append(v_blocked, r.org_id);
@@ -407,16 +423,29 @@ def upgrade() -> None:
         """
     )
     # Never executable by PUBLIC (which would include keel_runtime). EXECUTE is granted only
-    # to the dedicated maintenance role below.
+    # to the dedicated maintenance EXECUTOR role below; the definer owns the functions.
     op.execute(
         "REVOKE ALL ON FUNCTION keel_erase_organization(text) FROM PUBLIC"
     )
     op.execute("REVOKE ALL ON FUNCTION keel_erase_user(text) FROM PUBLIC")
 
-    # Dedicated maintenance role: NOLOGIN (a group role a maintenance/admin login is granted
-    # into) + BYPASSRLS so the SECURITY DEFINER body can enumerate + delete across every org
-    # even under FORCE RLS. Guarded so a managed Postgres that forbids CREATE ROLE / ALTER
-    # OWNER / GRANT does not fail the migration (operators provision it manually there).
+    # Two-role split (least privilege). The erasure privilege is deliberately separated into a
+    # *definer* role and an *executor* role so that the principal an operator/app login is
+    # granted into is never the one that holds direct cross-tenant table DML + BYPASSRLS:
+    #
+    #  * ``keel_maintenance`` (DEFINER) — NOLOGIN + BYPASSRLS. Owns the SECURITY DEFINER
+    #    functions and holds the table DML they need. Because the functions run with the
+    #    definer's rights, this role is the only one that ever touches identity tables across
+    #    tenants. NOTHING logs in as it and NO login is granted membership in it.
+    #  * ``keel_maintenance_exec`` (EXECUTOR) — NOLOGIN + NOBYPASSRLS, granted ONLY EXECUTE on
+    #    the two functions (no table privileges, not a member of the definer). A least-
+    #    privilege maintenance LOGIN is made a member of THIS role only, so it can invoke the
+    #    audited erasure entrypoints but can neither read/delete identity tables directly nor
+    #    ``SET ROLE`` into the definer.
+    #
+    # Guarded so a managed Postgres that forbids CREATE ROLE / ALTER OWNER / GRANT does not
+    # fail the migration; there erasure fails closed until an operator provisions both roles
+    # manually (see docs/OPERATIONS.md).
     op.execute(
         """
         DO $$
@@ -436,10 +465,45 @@ def upgrade() -> None:
                         TO keel_maintenance;
                     ALTER FUNCTION keel_erase_organization(text) OWNER TO keel_maintenance;
                     ALTER FUNCTION keel_erase_user(text) OWNER TO keel_maintenance;
-                    GRANT EXECUTE ON FUNCTION keel_erase_organization(text) TO keel_maintenance;
-                    GRANT EXECUTE ON FUNCTION keel_erase_user(text) TO keel_maintenance;
                 EXCEPTION WHEN insufficient_privilege THEN
                     RAISE NOTICE 'keel_maintenance erasure grants skipped (insufficient privilege)';
+                END;
+            END IF;
+        END $$;
+        """
+    )
+
+    # Distinct maintenance EXECUTOR role (the principal a maintenance login is a member of).
+    # NOLOGIN + NOBYPASSRLS, granted ONLY EXECUTE — never any table DML and never membership
+    # in keel_maintenance (so it cannot SET ROLE into the definer). ``ALTER ROLE ... NOINHERIT``
+    # is intentionally NOT applied: EXECUTE is used directly, and it is never a member of a
+    # privileged role.
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'keel_maintenance_exec') THEN
+                BEGIN
+                    EXECUTE 'CREATE ROLE keel_maintenance_exec NOLOGIN NOSUPERUSER NOBYPASSRLS';
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'keel_maintenance_exec not created (insufficient privilege)';
+                END;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'keel_maintenance_exec') THEN
+                BEGIN
+                    -- Defensive: strip any table DML that a prior/manual provisioning may
+                    -- have granted, so the executor is EXECUTE-only regardless of history.
+                    REVOKE ALL ON
+                        users, oidc_identities, organizations,
+                        memberships, agents, resource_grants
+                        FROM keel_maintenance_exec;
+                    GRANT USAGE ON SCHEMA public TO keel_maintenance_exec;
+                    GRANT EXECUTE ON FUNCTION keel_erase_organization(text)
+                        TO keel_maintenance_exec;
+                    GRANT EXECUTE ON FUNCTION keel_erase_user(text)
+                        TO keel_maintenance_exec;
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'keel_maintenance_exec grants skipped (insufficient privilege)';
                 END;
             END IF;
         END $$;
@@ -471,8 +535,11 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     # Restore the broad keel_runtime DELETE grant (0011/0013 baseline) and drop the erasure
-    # functions. The keel_maintenance role is intentionally left in place (like keel_runtime):
-    # dropping a role that may still own objects elsewhere would fail; operators drop it.
+    # functions. The keel_maintenance and keel_maintenance_exec roles are intentionally left
+    # in place (like keel_runtime): dropping a role that may still own objects or back a
+    # maintenance login elsewhere would fail; operators drop them explicitly if desired.
+    # Dropping the functions cascades the executor's EXECUTE grants, so downgrade fails closed
+    # (erasure is unavailable) rather than leaving a dangling privileged path.
     op.execute(
         """
         DO $$

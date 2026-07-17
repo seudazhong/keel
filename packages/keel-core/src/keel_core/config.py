@@ -14,6 +14,8 @@ from typing import Self
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from keel_core.errors import MaintenanceDatabaseNotConfigured
+
 
 class Settings(BaseSettings):
     """Process-wide settings shared by every Keel service."""
@@ -177,6 +179,16 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://keel:keel@localhost:5432/keel"
     redis_url: str = "redis://localhost:6379/0"
 
+    # Separate maintenance/erasure connection (M3.6, WS-L). Identity erasure
+    # (``keel_core.identity.purge``) is a privileged, cross-tenant operation run through the
+    # ``keel_erase_user`` / ``keel_erase_organization`` SECURITY DEFINER functions. It MUST
+    # connect as a dedicated least-privilege login that is a member of ONLY the
+    # ``keel_maintenance_exec`` executor role — never the runtime login. This is intentionally
+    # a distinct URL: it never falls back to ``database_url`` in cloud mode, and when unset
+    # identity erasure fails closed. Leave empty for local/self-hosted use where erasure is
+    # not exercised. See ``require_maintenance_database_url`` and ``docs/OPERATIONS.md``.
+    maintenance_database_url: str = ""
+
     server_host: str = "0.0.0.0"
     server_port: int = 8000
 
@@ -215,6 +227,34 @@ class Settings(BaseSettings):
     def sync_database_url(self) -> str:
         """SQLAlchemy URL for the synchronous engine (Alembic uses this)."""
         return self.database_url
+
+    def require_maintenance_database_url(self) -> str:
+        """Resolve the identity-erasure maintenance URL, failing closed.
+
+        Identity erasure is privileged and cross-tenant; it must connect as a dedicated
+        least-privilege login (a member of only ``keel_maintenance_exec``), never the runtime
+        login. This resolver enforces that operationally:
+
+        * A missing ``maintenance_database_url`` always fails closed — erasure is refused
+          rather than silently reusing the runtime connection.
+        * In ``cloud_mode`` it must additionally differ from ``database_url`` (reusing the
+          runtime URL would defeat the privilege split), so an accidental copy is rejected.
+
+        Raising :class:`MaintenanceDatabaseNotConfigured` (a ``KeelError``) keeps the failure
+        typed and auditable. The URL itself is never logged by callers.
+        """
+        url = self.maintenance_database_url.strip()
+        if not url:
+            raise MaintenanceDatabaseNotConfigured(
+                "identity erasure requires KEEL_MAINTENANCE_DATABASE_URL (a dedicated "
+                "keel_maintenance_exec login); it is unset, so erasure fails closed"
+            )
+        if self.cloud_mode and url == self.database_url:
+            raise MaintenanceDatabaseNotConfigured(
+                "KEEL_MAINTENANCE_DATABASE_URL must not equal KEEL_DATABASE_URL in cloud "
+                "mode: erasure must use a separate least-privilege maintenance login"
+            )
+        return url
 
     @property
     def fallback_model_list(self) -> list[str]:

@@ -105,13 +105,38 @@ normal `keel_runtime` request: under `FORCE ROW LEVEL SECURITY` a cross-org enum
 returns nothing, which would silently skip the sole-owner block/archive guard and cascade an
 active org into an ownerless state. Erasure therefore runs through the `keel_erase_user` /
 `keel_erase_organization` **`SECURITY DEFINER`** functions installed by migration `0013`
-(locked-down `search_path`, owned by a dedicated `keel_maintenance` role with `BYPASSRLS`).
-The functions enumerate + `FOR UPDATE`-lock the affected orgs, enforce the block/archive
-semantics, and purge every identity row atomically. Normal runtime principals cannot invoke
-arbitrary cross-tenant deletion: `DELETE` on the three global identity tables (`users`,
-`oidc_identities`, `organizations`) is **revoked** from `keel_runtime`, and `EXECUTE` on the
-erasure functions is revoked from `PUBLIC` (granted only to `keel_maintenance`); the
-migration downgrade restores the prior grants.
+(locked-down `search_path`). Both functions take an **org-first, deterministic (ascending id)
+lock order** — identical to the normal membership mutations — so a cross-tenant erasure can
+neither deadlock with, nor race the owner-count invariant of, a concurrent invite / promotion
+/ demotion / removal; the block/archive decision is made under those org locks.
+
+The erasure privilege is deliberately split across two roles (least privilege):
+
+* **`keel_maintenance` (definer)** — `NOLOGIN` + `BYPASSRLS`. Owns the functions and holds the
+  table DML they run with. Because the functions execute with the definer's rights, this is
+  the only role that ever touches identity tables across tenants. **Nothing logs in as it and
+  no operator/app login is granted membership in it** (that would hand a login direct
+  cross-tenant DML + RLS bypass).
+* **`keel_maintenance_exec` (executor)** — `NOLOGIN` + `NOBYPASSRLS`, granted **only** EXECUTE
+  on the two functions: no table privileges and not a member of the definer, so it can neither
+  read/delete identity tables directly nor `SET ROLE` into `keel_maintenance`. A least-
+  privilege maintenance **login** is made a member of *only this* role.
+
+`DELETE` on the three global identity tables (`users`, `oidc_identities`, `organizations`) is
+**revoked** from `keel_runtime`, and `EXECUTE` on the functions is revoked from `PUBLIC` (and
+`keel_runtime`). On managed Postgres that forbids `CREATE ROLE`/`GRANT` the migration skips
+role setup with a `NOTICE` and erasure **fails closed** until an operator provisions both
+roles + the login manually (see [`docs/OPERATIONS.md`](OPERATIONS.md)). The migration downgrade
+drops the functions (fail-closed) and restores the prior `keel_runtime` grants.
+
+The operator entrypoint is `keel_core.identity.purge.IdentityPurgeRepository`, built by
+`create_identity_purge_repository(settings)`, which connects on the dedicated
+`KEEL_MAINTENANCE_DATABASE_URL` (fail-closed when unset; in cloud mode it must not equal the
+runtime URL) and verifies the connected principal has function EXECUTE but **lacks** direct
+identity `DELETE` and `BYPASSRLS`. The production-usable command is
+`python -m keel_core.identity.erase_cli {user|organization} <id>` (always previews inside a
+rolled-back transaction first, requires `--yes` or an interactive id confirmation, emits a
+structured result, and reports a blocked owner explicitly).
 
 ## REST API (`/v1/identity`)
 
@@ -142,6 +167,7 @@ API key, or an Agent's persona/instruction text.
 | `KEEL_OIDC_JWKS_MIN_REFRESH_INTERVAL_SECONDS` | `60` | Min interval between unknown-`kid` JWKS refreshes (anti-amplification). |
 | `KEEL_OIDC_JWKS_FAILURE_COOLDOWN_SECONDS` | `30` | Cooldown after a failed/degenerate JWKS fetch before a retry (negative provider cache). |
 | `KEEL_IDENTITY_ALLOW_JIT_PROVISIONING` | `false` | JIT-provision a first-seen verified subject. |
+| `KEEL_MAINTENANCE_DATABASE_URL` | — | Dedicated least-privilege maintenance login (member of only `keel_maintenance_exec`) for identity erasure. Fails closed when unset; in cloud mode must differ from `KEEL_DATABASE_URL`. |
 
 With OIDC disabled, only the API-key and local-operator actor paths are available; outside
 cloud mode the local operator can still use the identity APIs.
@@ -154,8 +180,10 @@ cloud mode the local operator can still use the identity APIs.
   forward-compatible bridge that resolves + authorizes the selected persisted Agent, ready
   for durable-run integration — it does not yet drive a run.
 * **Org ≠ scope until durable runs.** Identity is org-partitioned; the runtime is
-  scope-partitioned. Organization erasure is therefore a standalone primitive
-  (`keel_core.identity.purge`), not yet folded into the scope erasure coordinator (see
-  `docs/DATA-LIFECYCLE.md`).
+  scope-partitioned. User (data-subject) and organization erasure are therefore standalone
+  maintenance primitives (`keel_core.identity.purge` + the `erase_cli` operator command run on
+  the dedicated maintenance login), **not** part of the `/v1/erasure` scope lifecycle API — that
+  API erases a scope / session / project and does **not** erase users or organizations. Folding
+  identity erasure into the durable lifecycle API is future work (see `docs/DATA-LIFECYCLE.md`).
 * **Machine (API-key) callers have no durable identity** and cannot use the user-scoped
   identity APIs; configure OIDC for human users.
