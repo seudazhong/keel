@@ -406,6 +406,28 @@ class ConnectorHealth:
     retryable: bool = False
 
 
+def _normalize_delivery_summary(value: str) -> str:
+    if "\x00" in value or any(ord(ch) < 32 and not ch.isspace() for ch in value):
+        raise ValueError("connector delivery failure summary contains unsafe characters")
+    normalized = " ".join(value.split())
+    if not normalized or len(normalized.encode("utf-8")) > 512:
+        raise ValueError("connector delivery failure summary must contain 1-512 bytes")
+    return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorDeliveryHealth:
+    unresolved_count: int
+    latest_at: datetime
+    summary: str
+    retryable: bool
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.unresolved_count <= 1000:
+            raise ValueError("connector delivery health count must be between 1 and 1000")
+        object.__setattr__(self, "summary", _normalize_delivery_summary(self.summary))
+
+
 @dataclass(frozen=True, slots=True)
 class ConnectorProvenance:
     connector_id: str
@@ -527,6 +549,10 @@ class ConnectorStateReader(Protocol):
 
     async def list_cursors(self, connector_id: str, binding_id: str) -> list[ConnectorCursor]: ...
 
+    async def get_delivery_health(
+        self, connector_id: str, binding_id: str
+    ) -> ConnectorDeliveryHealth | None: ...
+
 
 @dataclass(frozen=True, slots=True)
 class ConnectorOperationContext:
@@ -540,6 +566,7 @@ class ConnectorOperationContext:
     targets: tuple[ConnectorBindingTarget, ...] = ()
     items: tuple[ConnectorItem, ...] = ()
     cursors: tuple[ConnectorCursor, ...] = ()
+    delivery_health: ConnectorDeliveryHealth | None = None
 
     def __post_init__(self) -> None:
         if not self.scope_id or not self.connector_id:
@@ -551,7 +578,13 @@ class ConnectorOperationContext:
         if self.callback_base_url is not None and not self.callback_base_url.strip():
             raise ValueError("connector callback base URL must not be blank")
         if self.binding is None:
-            if self.resources or self.targets or self.items or self.cursors:
+            if (
+                self.resources
+                or self.targets
+                or self.items
+                or self.cursors
+                or self.delivery_health is not None
+            ):
                 raise ValueError("connector operation state requires a binding")
             return
         binding = self.binding
@@ -624,6 +657,7 @@ class ConnectorActionContext:
                 targets=targets,
                 items=items,
                 cursors=cursors,
+                delivery_health=await repository.get_delivery_health(connector_id, binding.id),
             )
 
         return cls(
@@ -732,20 +766,43 @@ class ConnectorIngressResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class ConnectorIngressFailure:
+    code: str
+    summary: str
+    retryable: bool
+
+    def __post_init__(self) -> None:
+        code = self.code.strip().lower()
+        if (
+            not code
+            or len(code) > 64
+            or any(not (ch.isascii() and (ch.isalnum() or ch in "._-")) for ch in code)
+        ):
+            raise ValueError("connector delivery failure code is invalid")
+        object.__setattr__(self, "code", code)
+        object.__setattr__(self, "summary", _normalize_delivery_summary(self.summary))
+
+
+@dataclass(frozen=True, slots=True)
 class ConnectorIngressResult:
     response: ConnectorIngressResponse
     delivery_id: str | None = None
     payload_hash: str | None = None
     changes: tuple[ConnectorChange, ...] = ()
+    failure: ConnectorIngressFailure | None = None
 
     def __post_init__(self) -> None:
         immediate = self.delivery_id is None and self.payload_hash is None
         if immediate:
-            if self.changes:
-                raise ValueError("immediate connector ingress responses cannot contain changes")
+            if self.changes or self.failure is not None:
+                raise ValueError(
+                    "immediate connector ingress responses cannot contain changes or failures"
+                )
             return
         if not self.delivery_id or self.payload_hash is None:
             raise ValueError("connector ingress deliveries require an id and payload hash")
+        if self.failure is not None and self.changes:
+            raise ValueError("failed connector ingress deliveries cannot contain changes")
         if (
             "\x00" in self.delivery_id
             or len(self.delivery_id.encode("utf-8")) > 512
@@ -902,10 +959,12 @@ __all__ = [
     "ConnectorCredentialUpdate",
     "ConnectorCursor",
     "ConnectorCursorUpdate",
+    "ConnectorDeliveryHealth",
     "ConnectorError",
     "ConnectorEvent",
     "ConnectorHealth",
     "ConnectorHealthStatus",
+    "ConnectorIngressFailure",
     "ConnectorIngressResult",
     "ConnectorIngressRequest",
     "ConnectorIngressResponse",
