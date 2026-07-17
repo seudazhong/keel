@@ -28,6 +28,8 @@ not be — so a new store cannot be added without a conscious retention + erasur
 | `consolidation_cursors` | table | permanent | `scope_id` | scope-bound |
 | `knowledge_bases` / `kb_documents` / `kb_document_versions` / `kb_chunks` / `knowledge_idempotency` | table | permanent | `scope_id` | scope-bound (FK-safe physical purge) |
 | `connector_tokens` | table | permanent | `scope_id` | scope-bound (revoke + purge) |
+| `connector_bindings` / `connector_resources` / `connector_cursors` | table | permanent | `scope_id` | scope-bound connector state |
+| `connector_deliveries` | table | short (1d) | `scope_id` | scope-bound replay/processing ledger |
 | `connector_outbox` | table | short (1d) | `scope_id` | scope-bound |
 | `oauth_states` | table | transient (1h) | `scope_id` | scope-bound |
 | `webhook_deliveries` | table | short (1d) | *(global)* | **global — preserved** (no personal content) |
@@ -48,7 +50,7 @@ not be — so a new store cannot be added without a conscious retention + erasur
 
 Notes:
 
-* **User content is `permanent`** — it is removed only by an explicit erasure request,
+* **User content and connector state are `permanent`** — they are removed only by an explicit erasure request,
   never on a timer. Only derived/operational data (`oauth_states`, `webhook_deliveries`,
   `connector_outbox`, `approvals`, `jobs`, tool spill) carries a finite TTL.
 * **`webhook_deliveries` is global** and holds only `(provider, delivery_id)` dedup
@@ -91,7 +93,7 @@ each with a default horizon:
 | Class | Default TTL | Used for |
 | --- | --- | --- |
 | `transient` | 1 hour | one-time OAuth CSRF state |
-| `short` | 1 day | webhook replay dedup, outbound-idempotency claims, tool spill |
+| `short` | 1 day | webhook/delivery replay dedup, outbound-idempotency claims, tool spill |
 | `standard` | 30 days | resolved approvals, finished jobs, finished runs, coding artifacts |
 | `long` | 365 days | memory proposals, the erasure/tombstone ledger |
 | `permanent` | none | sessions, events, memory, archival, knowledge, connector tokens |

@@ -49,11 +49,11 @@ from keel_core.providers import LiteLLMGateway
 from keel_core.runs import InMemoryRunStore, PostgresRunStore
 from keel_core.tools import build_service_execution_environment
 from keel_core.webhooks import InMemoryWebhookReplayStore, PostgresWebhookReplayStore
+from keel_server.api import connectors as connectors_api
 from keel_server.api import gateway as gateway_api
 from keel_server.api import identity as identity_api
 from keel_server.api import knowledge as knowledge_api
 from keel_server.api import lifecycle as lifecycle_api
-from keel_server.api import oauth as oauth_api
 from keel_server.api import v1
 from keel_server.auth import parse_api_keys
 from keel_server.gateway import OneBotGateway, RateLimiter, TelegramGateway
@@ -268,6 +268,44 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         embedder=app.state.runtime.embedder,
         dispatch_job=_dispatch_knowledge_job,
     )
+    from keel_core.connector_repository import (
+        InMemoryConnectorRepository,
+        PostgresConnectorRepository,
+    )
+    from keel_core.connector_service import DurableConnectorChangeSink
+    from keel_core.errors import DuplicateEventError
+    from keel_core.loop import admit_external
+    from keel_core.state import InMemoryEventStore, PostgresEventStore
+
+    connector_repository = (
+        PostgresConnectorRepository(engine, _DURABLE_SCOPE)
+        if engine is not None
+        else InMemoryConnectorRepository(_DURABLE_SCOPE)
+    )
+    connector_event_store = (
+        PostgresEventStore(engine, _DURABLE_SCOPE)
+        if engine is not None
+        else InMemoryEventStore()
+    )
+
+    async def _admit_connector_event(session_id: str, content: str, run_id: str) -> None:
+        try:
+            await admit_external(
+                connector_event_store,
+                session_id,
+                _DURABLE_SCOPE,
+                content,
+                run_id,
+            )
+        except DuplicateEventError:
+            pass
+
+    app.state.connector_repository = connector_repository
+    app.state.connector_change_sink = DurableConnectorChangeSink(
+        connector_repository,
+        knowledge=app.state.knowledge,
+        admit_event=_admit_connector_event,
+    )
     app.state.erasure = _build_erasure_service(
         engine,
         _DURABLE_SCOPE,
@@ -369,7 +407,7 @@ def create_app() -> FastAPI:
     app.include_router(identity_api.router)
     app.include_router(knowledge_api.router)
     app.include_router(lifecycle_api.router)
-    app.include_router(oauth_api.router)
+    app.include_router(connectors_api.router)
     app.include_router(gateway_api.router)
     app.include_router(pages_router)
 

@@ -96,11 +96,11 @@ class ConnectorTool:
 
 
 def taint_from_events(events: Iterable[Event]) -> ContentTaint:
-    """Tainted if any prior ``tool.result`` in the run carried tainted content."""
+    """Tainted if prior connector tool output or admitted external input is tainted."""
     for event in events:
-        if event.type is EventType.tool_result and event.payload.get("taint") == str(
-            ContentTaint.tainted
-        ):
+        if event.type in {EventType.tool_result, EventType.message_token} and event.payload.get(
+            "taint"
+        ) == str(ContentTaint.tainted):
             return ContentTaint.tainted
     return ContentTaint.clean
 

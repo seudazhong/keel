@@ -14,6 +14,7 @@ import type { Project } from "../features/projects/types";
 import type { DiffFile, Run, RunApproval } from "../features/projects/runs/types";
 import type { Schedule } from "../features/schedules/types";
 import type { SessionSummary } from "../features/sessions/types";
+import { makeConnectorFixture } from "./connectorFixtures";
 
 export const sampleApproval: Approval = {
   id: "a1",
@@ -36,24 +37,26 @@ export function resetApprovals(): void {
 }
 
 const defaultConnectors: Connector[] = [
-  {
+  makeConnectorFixture({
     id: "gmail",
     name: "Gmail",
     icon: "✉️",
-    kind: "oauth",
+    auth_kind: "oauth",
+    description: "Read Gmail messages and send approved email.",
+    capabilities: ["read", "write"],
     scopes: ["gmail.readonly", "gmail.send"],
     connected: true,
-    updated_at: "2026-07-08T04:19:55Z",
-  },
-  {
-    id: "calendar",
-    name: "Google Calendar",
-    icon: "📅",
-    kind: "oauth",
-    scopes: ["calendar.events"],
-    connected: false,
-    updated_at: null,
-  },
+  }),
+  makeConnectorFixture({
+    id: "oauth-fixture",
+    name: "OAuth fixture",
+    auth_kind: "oauth",
+  }),
+  makeConnectorFixture({
+    id: "secret-fixture",
+    name: "Secret fixture",
+    auth_kind: "secret",
+  }),
 ];
 
 let connectors: Connector[] = defaultConnectors.map((c) => ({ ...c }));
@@ -492,6 +495,23 @@ export const handlers = [
     );
     return HttpResponse.json({ ok: true });
   }),
+  http.delete("/v1/connectors/:id/purge", ({ params }) => {
+    connectors = connectors.map((c) =>
+      c.id === String(params.id) ? { ...c, connected: false, updated_at: null } : c,
+    );
+    return HttpResponse.json({ ok: true });
+  }),
+  http.post("/v1/connectors/:id/setup", async ({ params }) => {
+    connectors = connectors.map((c) =>
+      c.id === String(params.id)
+        ? { ...c, connected: true, health: "healthy", updated_at: new Date().toISOString() }
+        : c,
+    );
+    return HttpResponse.json({ ok: true, binding_id: `${String(params.id)}-binding` });
+  }),
+  http.post("/v1/connectors/:id/sync", ({ params }) =>
+    HttpResponse.json({ ok: true, job_id: `${String(params.id)}-job`, status: "queued" }),
+  ),
   http.get("/v1/sessions", () => HttpResponse.json(sampleSessions)),
   http.get("/v1/sessions/search", ({ request }) => {
     const q = new URL(request.url).searchParams.get("q") ?? "";

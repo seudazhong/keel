@@ -49,6 +49,7 @@ from keel_core.runs import PostgresRunStore
 from keel_core.state import PostgresEventStore
 from keel_core.tools import build_service_execution_environment
 from keel_scheduler.store import ScheduleRow, due_tick
+from keel_worker.connectors import register_connector_jobs
 from keel_worker.jobs import dispatch_jobs, run_job
 from keel_worker.knowledge import knowledge_job_registry
 from keel_worker.runs import reconcile_runs_tick, run_interactive
@@ -300,6 +301,55 @@ async def startup(ctx: dict[str, Any]) -> None:
         embedder,
         settings,
     )
+    from keel_core.connector_credentials import ConnectorCredentialStore
+    from keel_core.connector_registry import get_connector_registry
+    from keel_core.connector_repository import PostgresConnectorRepository
+    from keel_core.connector_service import ConnectorService, DurableConnectorChangeSink
+    from keel_core.errors import DuplicateEventError
+    from keel_core.knowledge.service import KnowledgeService
+    from keel_core.loop import admit_external
+    from keel_core.secrets import keyring_from_settings
+    from keel_core.tokens import PostgresTokenStore
+
+    connector_credentials = None
+    if settings.secret_key or settings.secret_keys:
+        connector_credentials = ConnectorCredentialStore(
+            PostgresTokenStore(engine, _DURABLE_SCOPE, keyring_from_settings(settings))
+        )
+    connector_repository = PostgresConnectorRepository(engine, _DURABLE_SCOPE)
+    connector_knowledge = KnowledgeService(
+        cast(KnowledgeStore, knowledge),
+        ctx["jobs"],
+        settings,
+        embedding_model=embedder.model,
+        embedding_dim=embedder.dim,
+    )
+
+    async def admit_connector_event(session_id: str, content: str, run_id: str) -> None:
+        try:
+            await admit_external(
+                ctx["store"],
+                session_id,
+                _DURABLE_SCOPE,
+                content,
+                run_id,
+            )
+        except DuplicateEventError:
+            pass
+
+    connector_service = ConnectorService(
+        get_connector_registry(),
+        connector_repository,
+        credentials=connector_credentials,
+        jobs=ctx["jobs"],
+        change_sink=DurableConnectorChangeSink(
+            connector_repository,
+            knowledge=connector_knowledge,
+            admit_event=admit_connector_event,
+        ),
+    )
+    ctx["connector_sync_service"] = connector_service
+    register_connector_jobs(job_registry, connector_service, settings)
 
     # Durable data-erasure coordinator + job (M3.5). Bounded Redis stream cleanup uses the
     # worker's Redis connection; external provider/telemetry deletion has no API and is

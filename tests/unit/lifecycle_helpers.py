@@ -61,6 +61,9 @@ class FakePurge:
     async def connector_tokens(self, scope_id: str) -> int:
         return await self._op("connector_tokens")
 
+    async def connector_state(self, scope_id: str) -> int:
+        return await self._op("connector_state")
+
     async def connector_outbox(self, scope_id: str) -> int:
         return await self._op("connector_outbox")
 

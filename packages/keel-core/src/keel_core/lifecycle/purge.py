@@ -16,6 +16,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.approvals import purge_scope as _purge_approvals
+from keel_core.connector_repository import purge_scope as _purge_connector_state
 from keel_core.consolidation.cursor import purge_scope as _purge_cursor
 from keel_core.consolidation.proposals import purge_scope as _purge_proposals
 from keel_core.jobs import purge_scope as _purge_jobs
@@ -93,6 +94,9 @@ class ScopePurgeRepository:
 
     async def connector_tokens(self, scope_id: str) -> int:
         return await _purge_tokens(self._engine, scope_id)
+
+    async def connector_state(self, scope_id: str) -> int:
+        return await _purge_connector_state(self._engine, scope_id)
 
     async def connector_outbox(self, scope_id: str) -> int:
         return await _purge_outbox(self._engine, scope_id)

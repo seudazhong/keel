@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from keel_core import gmail
+from keel_core.connector_credentials import CredentialEnvelope
 from keel_core.gmail import (
     GmailError,
     format_inbox,
@@ -87,6 +88,22 @@ async def test_action_skips_persist_when_unchanged(monkeypatch: pytest.MonkeyPat
 
     assert result == "INBOX"
     assert store.puts == []  # nothing to persist
+
+
+async def test_action_reads_and_preserves_versioned_credential_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored = CredentialEnvelope("oauth", {"refresh_token": "old"}).serialize()
+    store = FakeTokenStore(stored)
+
+    def fake_fetch(creds_json: str, max_messages: int) -> tuple[str, str]:
+        assert '"refresh_token":"old"' in creds_json
+        return "INBOX", '{"refresh_token":"rotated"}'
+
+    monkeypatch.setattr(gmail, "_fetch_inbox_sync", fake_fetch)
+    assert await make_gmail_inbox_action(store)({}, _ctx()) == "INBOX"
+    rotated = CredentialEnvelope.parse(store.puts[0])
+    assert rotated is not None and rotated.values["refresh_token"] == "rotated"
 
 
 async def test_send_action_sends_and_persists_rotation(monkeypatch: pytest.MonkeyPatch) -> None:

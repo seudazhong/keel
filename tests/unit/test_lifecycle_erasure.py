@@ -40,6 +40,7 @@ _SCOPE_STORE_STEPS = (
     "memory_proposals",
     "consolidation_cursor",
     "knowledge",
+    "connector_state",
     "connector_tokens",
     "connector_outbox",
     "oauth_states",

@@ -6,6 +6,8 @@ import { Banner } from "../../components/ui/banner";
 import { Button } from "../../components/ui/button";
 import { Card } from "../../components/ui/card";
 import { useTranslation } from "../../lib/i18n";
+import { ConnectorSetupList } from "../connectors/ConnectorSetup";
+import { useConnectors } from "../connectors/useConnectors";
 import { useOnboarding } from "./useOnboarding";
 
 const STEPS = ["welcome", "locale", "workspace", "connectors", "finish"] as const;
@@ -14,6 +16,7 @@ type StepId = (typeof STEPS)[number];
 export function OnboardingPage() {
   const { t } = useTranslation();
   const onboarding = useOnboarding();
+  const connectors = useConnectors();
   const navigate = useNavigate();
   const [stepIndex, setStepIndex] = useState(0);
   const [workspaceName, setWorkspaceName] = useState(onboarding.config?.workspaceName ?? "");
@@ -100,10 +103,20 @@ export function OnboardingPage() {
             <div>
               <h2 className="text-lg font-semibold">{t("onboarding.step.connectors.title")}</h2>
               <p className="mt-2 text-sm text-text-soft">{t("onboarding.step.connectors.body")}</p>
-              <Banner tone="warn" className="mt-3">
-                <span>🔌</span>
-                <span>{t("onboarding.step.connectors.backendRequired")}</span>
-              </Banner>
+              <div className="mt-3">
+                {connectors.isLoading && <p className="text-sm text-text-muted">Loading connectors…</p>}
+                {connectors.isError && (
+                  <Banner tone="warn">
+                    Connector setup is unavailable. You can continue and configure it later.
+                  </Banner>
+                )}
+                {connectors.data && (
+                  <ConnectorSetupList
+                    connectors={connectors.data.filter((connector) => !connector.connected)}
+                    compact
+                  />
+                )}
+              </div>
             </div>
           )}
 
