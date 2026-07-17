@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
@@ -27,6 +28,8 @@ from keel_core.connector_contracts import (
     ConnectorEvent,
     ConnectorHealth,
     ConnectorHealthStatus,
+    ConnectorIngressRequest,
+    ConnectorIngressResponse,
     ConnectorIngressResult,
     ConnectorItemDraft,
     ConnectorManifest,
@@ -35,6 +38,7 @@ from keel_core.connector_contracts import (
     ConnectorResourceDraft,
     ConnectorResourceRefreshMode,
     ConnectorResourceResult,
+    ConnectorSetupResult,
     ConnectorStateUpdate,
     ConnectorSyncResult,
     ConnectorTargetField,
@@ -149,14 +153,21 @@ class _Provider(BaseConnectorProvider):
         )
 
     async def ingress(
-        self, context: ConnectorOperationContext, headers: dict[str, str], body: bytes
+        self, context: ConnectorOperationContext, request: ConnectorIngressRequest
     ) -> ConnectorIngressResult:
         assert context.binding is not None
-        if headers.get("x-signature") != "valid":
+        if request.headers.get("x-signature") != "valid":
             raise ValueError("invalid signature")
         return ConnectorIngressResult(
-            "delivery-1",
-            (
+            ConnectorIngressResponse(
+                status_code=202,
+                content_type="application/json",
+                headers={"x-provider-result": "accepted"},
+                body=b'{"ok":true}',
+            ),
+            delivery_id="delivery-1",
+            payload_hash=hashlib.sha256(request.body).hexdigest(),
+            changes=(
                 ConnectorChange(
                     ConnectorChangeKind.event,
                     ConnectorProvenance(
@@ -210,6 +221,64 @@ async def test_repository_rejects_plaintext_secret_metadata() -> None:
         )
 
 
+async def test_health_does_not_promote_staged_binding_to_connected() -> None:
+    repository = InMemoryConnectorRepository("scope:a")
+    await repository.upsert_binding(
+        "fixture",
+        ConnectorBindingDraft(),
+        ConnectorBindingStatus.configured,
+    )
+    updated = await repository.record_health(
+        "fixture",
+        ConnectorHealth(ConnectorHealthStatus.healthy, datetime.now(UTC)),
+    )
+    assert updated is not None
+    assert updated.status is ConnectorBindingStatus.configured
+
+
+async def test_setup_restores_prior_credential_when_binding_commit_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = InMemoryConnectorRepository("scope:a")
+    await repository.upsert_binding(
+        "fixture",
+        ConnectorBindingDraft(display_name="Before"),
+        ConnectorBindingStatus.configured,
+    )
+    credentials = ConnectorCredentialStore(
+        InMemoryTokenStore("scope:a", EnvelopeCipher("key"))
+    )
+    await credentials.put("fixture", CredentialEnvelope("secret", {"value": "before"}))
+    service = ConnectorService(
+        ConnectorRegistry(
+            (ConnectorRegistration(_Provider.manifest, _Provider, "tests.fixture"),)
+        ),
+        repository,
+        credentials=credentials,
+    )
+
+    async def fail_upsert(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("binding write failed")
+
+    monkeypatch.setattr(repository, "upsert_binding", fail_upsert)
+    with pytest.raises(RuntimeError, match="binding write failed"):
+        await service.save_setup(
+            "fixture",
+            ConnectorSetupResult(
+                ConnectorBindingDraft(display_name="After"),
+                CredentialEnvelope("secret", {"value": "after"}),
+                status=ConnectorBindingStatus.connected,
+            ),
+        )
+    stored = await credentials.get("fixture")
+    assert stored is not None
+    assert stored.values == {"value": "before"}
+    binding = await repository.get_binding("fixture")
+    assert binding is not None
+    assert binding.display_name == "Before"
+    assert binding.status is ConnectorBindingStatus.configured
+
+
 async def test_sync_normalizes_taint_provenance_and_cursor() -> None:
     service, repository, sink = _service()
     binding = await repository.upsert_binding(
@@ -227,13 +296,104 @@ async def test_ingress_verifies_before_claim_and_replays_once() -> None:
     await repository.upsert_binding(
         "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
     )
+    invalid = ConnectorIngressRequest(
+        "POST",
+        {},
+        {"x-signature": "invalid"},
+        b"body",
+        "https://keel.example/v1/connectors/fixture/webhook",
+    )
+    valid = ConnectorIngressRequest(
+        "POST",
+        {},
+        {"x-signature": "valid"},
+        b"body",
+        "https://keel.example/v1/connectors/fixture/webhook",
+    )
     with pytest.raises(ValueError, match="signature"):
-        await service.ingress("fixture", {"x-signature": "invalid"}, b"body")
-    assert await service.ingress("fixture", {"x-signature": "valid"}, b"body") == (True, 1)
-    assert await service.ingress("fixture", {"x-signature": "valid"}, b"body") == (False, 0)
+        await service.ingress("fixture", invalid)
+    first = await service.ingress("fixture", valid)
+    replay = await service.ingress("fixture", valid)
+    assert (first.accepted, first.changes, first.response.status_code) == (True, 1, 202)
+    assert (replay.accepted, replay.changes) == (False, 0)
     with pytest.raises(ValueError, match="different payload"):
-        await service.ingress("fixture", {"x-signature": "valid"}, b"different")
+        await service.ingress(
+            "fixture",
+            ConnectorIngressRequest(
+                "POST",
+                {},
+                {"x-signature": "valid"},
+                b"different",
+                "https://keel.example/v1/connectors/fixture/webhook",
+            ),
+        )
     assert len(sink.changes) == 1
+
+
+async def test_ingress_challenge_returns_before_delivery_claim() -> None:
+    class ChallengeProvider(_Provider):
+        async def ingress(
+            self,
+            context: ConnectorOperationContext,
+            request: ConnectorIngressRequest,
+        ) -> ConnectorIngressResult:
+            assert request.method == "POST"
+            assert request.query == {"validationToken": ("challenge",)}
+            assert request.public_url.endswith("?validationToken=challenge")
+            assert context.credential is not None
+            return ConnectorIngressResult(
+                ConnectorIngressResponse(
+                    status_code=200,
+                    content_type="text/plain",
+                    headers={"cache-control": "no-store"},
+                    body=b"challenge",
+                )
+            )
+
+    registry = ConnectorRegistry(
+        (ConnectorRegistration(_Provider.manifest, ChallengeProvider, "tests.challenge"),)
+    )
+    repository = InMemoryConnectorRepository("scope:a")
+    await repository.upsert_binding(
+        "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    credentials = ConnectorCredentialStore(
+        InMemoryTokenStore("scope:a", EnvelopeCipher("key"))
+    )
+    await credentials.put("fixture", CredentialEnvelope("secret", {"value": "hidden"}))
+    service = ConnectorService(registry, repository, credentials=credentials)
+    outcome = await service.ingress(
+        "fixture",
+        ConnectorIngressRequest(
+            "POST",
+            {"validationToken": ("challenge",)},
+            {},
+            b"",
+            "https://keel.example/v1/connectors/fixture/webhook?validationToken=challenge",
+        ),
+    )
+    assert outcome.response.body == b"challenge"
+    assert outcome.accepted is False
+
+
+def test_ingress_response_rejects_unsafe_hop_by_hop_headers() -> None:
+    with pytest.raises(ValueError, match="unsafe header"):
+        ConnectorIngressResponse(headers={"Transfer-Encoding": "chunked"})
+
+
+def test_ingress_request_repr_excludes_auth_material() -> None:
+    request = ConnectorIngressRequest(
+        "POST",
+        {"validationToken": ("secret-query",)},
+        {"authorization": "secret-header"},
+        b"secret-body",
+        "https://keel.example/webhook?validationToken=secret-url",
+    )
+    rendered = repr(request)
+    assert "secret-query" not in rendered
+    assert "secret-header" not in rendered
+    assert "secret-body" not in rendered
+    assert "secret-url" not in rendered
 
 
 async def test_failed_delivery_can_be_retried() -> None:

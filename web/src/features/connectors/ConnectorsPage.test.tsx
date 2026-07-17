@@ -26,6 +26,54 @@ test("a not-connected oauth connector offers an in-browser connect", async () =>
   open.mockRestore();
 });
 
+test("configured staged connector keeps setup and authorization controls visible", async () => {
+  server.use(
+    http.get("/v1/connectors", () =>
+      HttpResponse.json([
+        makeConnectorFixture({
+          id: "staged",
+          name: "Staged",
+          auth_kind: "app_credentials",
+          configured: true,
+          connected: false,
+          auth_action: {
+            label: "Authorize staged app",
+            callback_parameters: [],
+            requires_setup: true,
+            help_text: "Save app credentials, then authorize in the browser.",
+          },
+          next_action: {
+            kind: "authorize",
+            label: "Authorize staged app",
+            instructions: "Save app credentials, then authorize in the browser.",
+          },
+          binding: {
+            id: "staged-binding",
+            status: "configured",
+            display_name: "Staged",
+            external_account_id: null,
+            external_tenant_id: null,
+            metadata: {},
+            last_success_at: null,
+            error_code: null,
+            error_summary: null,
+            renewal_expires_at: null,
+            next_sync_at: null,
+            next_renewal_at: null,
+            targets: {},
+          },
+        }),
+      ]),
+    ),
+  );
+  renderWithClient(<ConnectorsPage />);
+  expect(
+    await screen.findByText("Save app credentials, then authorize in the browser."),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Authorize staged app" })).not.toBeDisabled();
+  expect(screen.getByLabelText("Client secret")).toBeInTheDocument();
+});
+
 test("revoking a connector removes it from the connected list", async () => {
   renderWithClient(<ConnectorsPage />);
   await screen.findByText("gmail.readonly");

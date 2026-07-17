@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
@@ -23,6 +24,8 @@ from keel_core.connector_contracts import (
     ConnectorCursorUpdate,
     ConnectorHealth,
     ConnectorHealthStatus,
+    ConnectorIngressRequest,
+    ConnectorIngressResponse,
     ConnectorIngressResult,
     ConnectorManifest,
     ConnectorOperationContext,
@@ -106,13 +109,33 @@ class ManualProvider(BaseConnectorProvider):
         return ConnectorHealth(ConnectorHealthStatus.healthy, datetime.now(UTC))
 
     async def ingress(
-        self, context: ConnectorOperationContext, headers: dict[str, str], body: bytes
+        self, context: ConnectorOperationContext, request: ConnectorIngressRequest
     ) -> ConnectorIngressResult:
         assert context.credential is not None
         assert context.credential.values["api_key"] == "must-not-echo"
-        if headers.get("x-signature") != "valid":
+        assert request.method in {"GET", "POST"}
+        assert request.public_url.startswith("http://test/v1/connectors/manual/webhook")
+        if request.query.get("validationToken") == ("graph-challenge",):
+            return ConnectorIngressResult(
+                ConnectorIngressResponse(
+                    status_code=200,
+                    content_type="text/plain",
+                    headers={"cache-control": "no-store"},
+                    body=b"graph-challenge",
+                )
+            )
+        if request.headers.get("x-signature") != "valid":
             raise ConnectorAuthenticationError("invalid signature")
-        return ConnectorIngressResult("delivery-1")
+        return ConnectorIngressResult(
+            ConnectorIngressResponse(
+                status_code=202,
+                content_type="application/json",
+                headers={"x-provider-result": "accepted"},
+                body=b'{"provider":"accepted"}',
+            ),
+            delivery_id="delivery-1",
+            payload_hash=hashlib.sha256(request.body).hexdigest(),
+        )
 
     async def revoke(self, context: ConnectorOperationContext) -> None:
         assert context.binding is not None
@@ -134,16 +157,94 @@ class OAuthProvider(BaseConnectorProvider):
         ),
     )
 
-    async def begin_auth(self, callback_url: str) -> ConnectorAuthStart:
+    async def begin_auth(
+        self, context: ConnectorOperationContext, callback_url: str
+    ) -> ConnectorAuthStart:
         return ConnectorAuthStart("https://provider.invalid/authorize?state=state-1", "state-1")
 
     async def complete_auth(
-        self, callback_url: str, parameters: dict[str, str]
+        self,
+        context: ConnectorOperationContext,
+        callback_url: str,
+        parameters: dict[str, str],
     ) -> ConnectorSetupResult:
+        assert context.binding is not None
+        assert context.binding.status is ConnectorBindingStatus.authorizing
         assert parameters == {"state": "state-1", "ticket": "ticket-1"}
         return ConnectorSetupResult(
             ConnectorBindingDraft(display_name="OAuth fixture"),
             CredentialEnvelope("oauth", {"refresh_token": "encrypted-at-rest"}),
+        )
+
+
+class StagedProvider(BaseConnectorProvider):
+    manifest = ConnectorManifest(
+        id="staged",
+        name="Staged",
+        description="Staged fixture",
+        auth_kind=ConnectorAuthKind.app_credentials,
+        capabilities=(ConnectorCapability.read,),
+        setup_fields=(
+            ConnectorSetupField("client_id", "Client ID"),
+            ConnectorSetupField("client_secret", "Client secret", secret=True),
+        ),
+        auth_action=ConnectorAuthAction(
+            label="Authorize staged app",
+            callback_parameters=(ConnectorCallbackParameter("ticket"),),
+            requires_setup=True,
+            help_text="Save app credentials, then authorize in the browser.",
+        ),
+    )
+
+    async def setup(
+        self, context: ConnectorOperationContext, values: dict[str, str]
+    ) -> ConnectorSetupResult:
+        return ConnectorSetupResult(
+            ConnectorBindingDraft(display_name="Staged app"),
+            CredentialEnvelope(
+                "app_credentials",
+                {
+                    "client_id": values["client_id"],
+                    "client_secret": values["client_secret"],
+                },
+            ),
+            status=ConnectorBindingStatus.configured,
+        )
+
+    async def begin_auth(
+        self, context: ConnectorOperationContext, callback_url: str
+    ) -> ConnectorAuthStart:
+        assert context.binding is not None
+        assert context.binding.status is ConnectorBindingStatus.configured
+        assert context.credential is not None
+        assert context.credential.values["client_secret"] == "staged-secret"
+        return ConnectorAuthStart(
+            "https://provider.invalid/install?state=staged-state",
+            "staged-state",
+        )
+
+    async def complete_auth(
+        self,
+        context: ConnectorOperationContext,
+        callback_url: str,
+        parameters: dict[str, str],
+    ) -> ConnectorSetupResult:
+        assert context.binding is not None
+        assert context.binding.status is ConnectorBindingStatus.authorizing
+        assert context.credential is not None
+        assert parameters == {"state": "staged-state", "ticket": "installed"}
+        return ConnectorSetupResult(
+            ConnectorBindingDraft(
+                display_name="Staged app",
+                external_account_id="installation-1",
+            ),
+            CredentialEnvelope(
+                "app_credentials",
+                {
+                    **context.credential.values,
+                    "installation_token": "encrypted-installation-context",
+                },
+            ),
         )
 
 
@@ -157,6 +258,7 @@ async def connector_client() -> AsyncIterator[tuple[httpx.AsyncClient, FastAPI]]
         (
             ConnectorRegistration(ManualProvider.manifest, ManualProvider, "tests.manual"),
             ConnectorRegistration(OAuthProvider.manifest, OAuthProvider, "tests.oauth"),
+            ConnectorRegistration(StagedProvider.manifest, StagedProvider, "tests.staged"),
         )
     )
     app.state.connector_repository = InMemoryConnectorRepository("scope:test")
@@ -180,7 +282,7 @@ async def test_generic_catalog_setup_resources_sync_health_and_revoke(
 ) -> None:
     client, app = connector_client
     catalog = (await client.get("/v1/connectors")).json()
-    assert [item["id"] for item in catalog] == ["manual", "oauth_fixture"]
+    assert [item["id"] for item in catalog] == ["manual", "oauth_fixture", "staged"]
     assert catalog[0]["setup_fields"][0]["secret"] is True
 
     setup = await client.post(
@@ -222,8 +324,17 @@ async def test_generic_catalog_setup_resources_sync_health_and_revoke(
         content=b"body",
         headers={"X-Signature": "valid"},
     )
-    assert first.json()["accepted"] is True
-    assert replay.json()["replayed"] is True
+    assert first.status_code == 202
+    assert first.headers["x-provider-result"] == "accepted"
+    assert first.json() == {"provider": "accepted"}
+    assert replay.status_code == 202
+    challenge = await client.post(
+        "/v1/connectors/manual/webhook",
+        params={"validationToken": "graph-challenge"},
+    )
+    assert challenge.status_code == 200
+    assert challenge.headers["content-type"] == "text/plain"
+    assert challenge.text == "graph-challenge"
     rejected = await client.post(
         "/v1/connectors/manual/webhook",
         content=b"body",
@@ -251,6 +362,49 @@ async def test_generic_oauth_callback_dispatch(
     assert callback.headers["cache-control"] == "no-store"
     binding = await app.state.connector_repository.get_binding("oauth_fixture")
     assert binding is not None and binding.status.value == "connected"
+
+
+async def test_staged_setup_remains_configured_until_contextual_callback(
+    connector_client: tuple[httpx.AsyncClient, FastAPI],
+) -> None:
+    client, app = connector_client
+    blocked = await client.get("/v1/connectors/staged/connect", follow_redirects=False)
+    assert blocked.status_code == 400
+    setup = await client.post(
+        "/v1/connectors/staged/setup",
+        json={
+            "values": {
+                "client_id": "staged-client",
+                "client_secret": "staged-secret",
+            }
+        },
+    )
+    assert setup.status_code == 200
+    assert setup.json()["status"] == "configured"
+    assert "staged-secret" not in setup.text
+    catalog = {
+        item["id"]: item for item in (await client.get("/v1/connectors")).json()
+    }
+    assert catalog["staged"]["configured"] is True
+    assert catalog["staged"]["connected"] is False
+    assert catalog["staged"]["next_action"]["kind"] == "authorize"
+
+    start = await client.get("/v1/connectors/staged/connect", follow_redirects=False)
+    assert start.status_code in {302, 307}
+    authorizing = await app.state.connector_repository.get_binding("staged")
+    assert authorizing.status is ConnectorBindingStatus.authorizing
+    callback = await client.get(
+        "/v1/connectors/staged/callback",
+        params={"state": "staged-state", "ticket": "installed"},
+    )
+    assert callback.status_code == 200
+    binding = await app.state.connector_repository.get_binding("staged")
+    assert binding.status is ConnectorBindingStatus.connected
+    assert binding.external_account_id == "installation-1"
+    stored = await app.state.connector_credentials.get("staged")
+    assert stored is not None
+    assert stored.values["client_secret"] == "staged-secret"
+    assert stored.values["installation_token"] == "encrypted-installation-context"
 
 
 async def test_unavailable_provider_can_be_explicitly_forgotten_locally(

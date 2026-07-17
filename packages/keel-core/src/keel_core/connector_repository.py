@@ -6,8 +6,8 @@ import copy
 import json
 import uuid
 from collections.abc import Iterable
-from dataclasses import replace
-from datetime import UTC, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy import text
@@ -23,8 +23,11 @@ from keel_core.connector_contracts import (
     ConnectorHealthStatus,
     ConnectorItem,
     ConnectorItemDraft,
+    ConnectorRenewalExpiryBehavior,
+    ConnectorRenewalPolicy,
     ConnectorResource,
     ConnectorResourceDraft,
+    ConnectorScheduleOperation,
     ConnectorTargetKind,
 )
 
@@ -74,6 +77,18 @@ def _binding_from_row(row: Any) -> ConnectorBinding:
         error_summary=row.error_summary,
         created_at=row.created_at,
         updated_at=row.updated_at,
+        sync_cadence_seconds=row.sync_cadence_seconds,
+        renewal_cadence_seconds=row.renewal_cadence_seconds,
+        renewal_expiry_behavior=(
+            None
+            if row.renewal_expiry_behavior is None
+            else ConnectorRenewalExpiryBehavior(str(row.renewal_expiry_behavior))
+        ),
+        renewal_expires_at=row.renewal_expires_at,
+        next_sync_at=row.next_sync_at,
+        next_renewal_at=row.next_renewal_at,
+        sync_failures=int(row.sync_failures),
+        renewal_failures=int(row.renewal_failures),
     )
 
 
@@ -145,6 +160,32 @@ def _cursor_from_row(row: Any) -> ConnectorCursor:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class ConnectorScheduleLease:
+    scope_id: str
+    connector_id: str
+    binding_id: str
+    operation: ConnectorScheduleOperation
+    due_at: datetime
+    cadence_seconds: int
+    attempt: int
+    token: str
+    expires_at: datetime
+
+
+class ConnectorScheduleLeaseLostError(RuntimeError):
+    pass
+
+
+def next_schedule_time(due_at: datetime, now: datetime, cadence_seconds: int) -> datetime:
+    next_at = due_at + timedelta(seconds=cadence_seconds)
+    if next_at > now:
+        return next_at
+    elapsed = (now - due_at).total_seconds()
+    intervals = int(elapsed // cadence_seconds) + 1
+    return due_at + timedelta(seconds=intervals * cadence_seconds)
+
+
 @runtime_checkable
 class ConnectorRepository(Protocol):
     @property
@@ -159,6 +200,23 @@ class ConnectorRepository(Protocol):
         connector_id: str,
         draft: ConnectorBindingDraft,
         status: ConnectorBindingStatus,
+        *,
+        sync_cadence_seconds: int | None = None,
+        renewal: ConnectorRenewalPolicy | None = None,
+        renewal_expires_at: datetime | None = None,
+        expected_binding_id: str | None = None,
+        enforce_binding_fence: bool = False,
+    ) -> ConnectorBinding: ...
+
+    async def update_binding_state(
+        self,
+        connector_id: str,
+        binding_id: str,
+        *,
+        status: ConnectorBindingStatus | None = None,
+        metadata: dict[str, Any] | None = None,
+        renewal_expires_at: datetime | None = None,
+        update_renewal_expiry: bool = False,
     ) -> ConnectorBinding: ...
 
     async def record_health(
@@ -262,6 +320,27 @@ class ConnectorRepository(Protocol):
         error_summary: str | None = None,
     ) -> None: ...
 
+    async def claim_due_schedules(
+        self, now: datetime, *, limit: int, lease_seconds: int
+    ) -> list[ConnectorScheduleLease]: ...
+
+    async def complete_schedule(
+        self, lease: ConnectorScheduleLease, *, next_at: datetime
+    ) -> None: ...
+
+    async def fail_schedule(
+        self,
+        lease: ConnectorScheduleLease,
+        *,
+        retry_at: datetime,
+        error_code: str,
+        error_summary: str,
+    ) -> None: ...
+
+    async def suspend_schedule(
+        self, lease: ConnectorScheduleLease, *, resume_at: datetime
+    ) -> None: ...
+
 
 class InMemoryConnectorRepository:
     def __init__(self, scope_id: str) -> None:
@@ -272,6 +351,7 @@ class InMemoryConnectorRepository:
         self._items: dict[tuple[str, str], ConnectorItem] = {}
         self._cursors: dict[tuple[str, str, str, str], ConnectorCursor] = {}
         self._deliveries: dict[tuple[str, str], tuple[str, str, datetime]] = {}
+        self._schedule_leases: dict[str, ConnectorScheduleLease] = {}
 
     @property
     def scope_id(self) -> str:
@@ -289,9 +369,39 @@ class InMemoryConnectorRepository:
         connector_id: str,
         draft: ConnectorBindingDraft,
         status: ConnectorBindingStatus,
+        *,
+        sync_cadence_seconds: int | None = None,
+        renewal: ConnectorRenewalPolicy | None = None,
+        renewal_expires_at: datetime | None = None,
+        expected_binding_id: str | None = None,
+        enforce_binding_fence: bool = False,
     ) -> ConnectorBinding:
         now = datetime.now(UTC)
         prior = self._bindings.get(connector_id)
+        if enforce_binding_fence and (
+            None if prior is None else prior.id
+        ) != expected_binding_id:
+            raise LookupError("connector binding changed before setup commit")
+        renewal_cadence = None if renewal is None else renewal.cadence_seconds
+        renewal_behavior = None if renewal is None else renewal.expiry_behavior
+        active = status in {
+            ConnectorBindingStatus.connected,
+            ConnectorBindingStatus.degraded,
+        }
+        next_sync_at = (
+            prior.next_sync_at
+            if prior is not None and prior.sync_cadence_seconds == sync_cadence_seconds
+            else None
+        )
+        next_renewal_at = (
+            prior.next_renewal_at
+            if prior is not None and prior.renewal_cadence_seconds == renewal_cadence
+            else None
+        )
+        if active and sync_cadence_seconds is not None and next_sync_at is None:
+            next_sync_at = now + timedelta(seconds=sync_cadence_seconds)
+        if active and renewal_cadence is not None and next_renewal_at is None:
+            next_renewal_at = now + timedelta(seconds=renewal_cadence)
         row = ConnectorBinding(
             id=prior.id if prior else uuid.uuid4().hex,
             scope_id=self._scope_id,
@@ -304,6 +414,75 @@ class InMemoryConnectorRepository:
             last_success_at=prior.last_success_at if prior else None,
             created_at=prior.created_at if prior else now,
             updated_at=now,
+            sync_cadence_seconds=sync_cadence_seconds,
+            renewal_cadence_seconds=renewal_cadence,
+            renewal_expiry_behavior=renewal_behavior,
+            renewal_expires_at=renewal_expires_at,
+            next_sync_at=next_sync_at,
+            next_renewal_at=next_renewal_at,
+            sync_failures=prior.sync_failures if prior else 0,
+            renewal_failures=prior.renewal_failures if prior else 0,
+        )
+        self._bindings[connector_id] = row
+        return copy.deepcopy(row)
+
+    async def update_binding_state(
+        self,
+        connector_id: str,
+        binding_id: str,
+        *,
+        status: ConnectorBindingStatus | None = None,
+        metadata: dict[str, Any] | None = None,
+        renewal_expires_at: datetime | None = None,
+        update_renewal_expiry: bool = False,
+    ) -> ConnectorBinding:
+        prior = self._bindings.get(connector_id)
+        if prior is None or prior.id != binding_id:
+            raise LookupError("connector binding changed before state update")
+        now = datetime.now(UTC)
+        next_sync_at = prior.next_sync_at
+        next_renewal_at = prior.next_renewal_at
+        next_status = status or prior.status
+        if next_status in {
+            ConnectorBindingStatus.connected,
+            ConnectorBindingStatus.degraded,
+        }:
+            if prior.sync_cadence_seconds is not None and next_sync_at is None:
+                next_sync_at = now + timedelta(seconds=prior.sync_cadence_seconds)
+            if prior.renewal_cadence_seconds is not None and next_renewal_at is None:
+                next_renewal_at = now + timedelta(seconds=prior.renewal_cadence_seconds)
+        row = replace(
+            prior,
+            status=next_status,
+            metadata=(
+                prior.metadata
+                if metadata is None
+                else _safe_metadata(metadata, field="binding metadata")
+            ),
+            renewal_expires_at=(
+                renewal_expires_at if update_renewal_expiry else prior.renewal_expires_at
+            ),
+            next_sync_at=next_sync_at,
+            next_renewal_at=next_renewal_at,
+            error_code=(
+                None
+                if next_status in {
+                    ConnectorBindingStatus.connected,
+                    ConnectorBindingStatus.configured,
+                    ConnectorBindingStatus.authorizing,
+                }
+                else prior.error_code
+            ),
+            error_summary=(
+                None
+                if next_status in {
+                    ConnectorBindingStatus.connected,
+                    ConnectorBindingStatus.configured,
+                    ConnectorBindingStatus.authorizing,
+                }
+                else prior.error_summary
+            ),
+            updated_at=now,
         )
         self._bindings[connector_id] = row
         return copy.deepcopy(row)
@@ -315,12 +494,46 @@ class InMemoryConnectorRepository:
         if prior is None:
             return None
         healthy = health.status is ConnectorHealthStatus.healthy
+        mapped_status = {
+            ConnectorHealthStatus.healthy: ConnectorBindingStatus.connected,
+            ConnectorHealthStatus.degraded: ConnectorBindingStatus.degraded,
+            ConnectorHealthStatus.error: ConnectorBindingStatus.error,
+            ConnectorHealthStatus.unconfigured: ConnectorBindingStatus.configured,
+        }[health.status]
+        staged = {
+            ConnectorBindingStatus.unconfigured,
+            ConnectorBindingStatus.configured,
+            ConnectorBindingStatus.authorizing,
+        }
+        next_status: ConnectorBindingStatus
+        if prior.status is ConnectorBindingStatus.revoked:
+            next_status = prior.status
+        elif prior.status in staged and health.status in {
+            ConnectorHealthStatus.healthy,
+            ConnectorHealthStatus.degraded,
+            ConnectorHealthStatus.unconfigured,
+        }:
+            next_status = prior.status
+        else:
+            next_status = mapped_status
         row = replace(
             prior,
-            status=(ConnectorBindingStatus.connected if healthy else ConnectorBindingStatus.error),
-            last_success_at=health.checked_at if healthy else prior.last_success_at,
-            error_code=None if healthy else health.status.value,
-            error_summary=None if healthy else health.message,
+            status=next_status,
+            last_success_at=(
+                health.checked_at
+                if healthy and prior.status is not ConnectorBindingStatus.revoked
+                else prior.last_success_at
+            ),
+            error_code=(
+                prior.error_code
+                if prior.status is ConnectorBindingStatus.revoked
+                else (None if healthy else health.status.value)
+            ),
+            error_summary=(
+                prior.error_summary
+                if prior.status is ConnectorBindingStatus.revoked
+                else (None if healthy else health.message)
+            ),
             updated_at=health.checked_at,
         )
         self._bindings[connector_id] = row
@@ -357,6 +570,7 @@ class InMemoryConnectorRepository:
         for delivery_key in [key for key in self._deliveries if key[0] == connector_id]:
             del self._deliveries[delivery_key]
             removed += 1
+        self._schedule_leases.pop(connector_id, None)
         return removed
 
     async def list_targets(self, connector_id: str) -> list[ConnectorBindingTarget]:
@@ -630,6 +844,156 @@ class InMemoryConnectorRepository:
             datetime.now(UTC),
         )
 
+    async def claim_due_schedules(
+        self, now: datetime, *, limit: int, lease_seconds: int
+    ) -> list[ConnectorScheduleLease]:
+        if limit <= 0 or lease_seconds <= 0:
+            raise ValueError("connector schedule bounds must be positive")
+        leases: list[ConnectorScheduleLease] = []
+        for connector_id in sorted(self._bindings):
+            if len(leases) >= limit:
+                break
+            row = self._bindings[connector_id]
+            existing = self._schedule_leases.get(connector_id)
+            if existing is not None:
+                if existing.expires_at > now:
+                    continue
+                self._schedule_leases.pop(connector_id, None)
+            if (
+                row.renewal_expires_at is not None
+                and row.renewal_expires_at <= now
+                and row.renewal_expiry_behavior is not None
+            ):
+                expired_status = {
+                    ConnectorRenewalExpiryBehavior.degraded: ConnectorBindingStatus.degraded,
+                    ConnectorRenewalExpiryBehavior.error: ConnectorBindingStatus.error,
+                    ConnectorRenewalExpiryBehavior.revoked: ConnectorBindingStatus.revoked,
+                }[row.renewal_expiry_behavior]
+                row = replace(
+                    row,
+                    status=expired_status,
+                    error_code="connector_renewal_expired",
+                    error_summary="connector subscription renewal expired",
+                    updated_at=now,
+                )
+                self._bindings[connector_id] = row
+            if row.status not in {
+                ConnectorBindingStatus.connected,
+                ConnectorBindingStatus.degraded,
+            }:
+                continue
+            due: list[tuple[datetime, ConnectorScheduleOperation, int, int]] = []
+            if row.next_sync_at is not None and row.next_sync_at <= now:
+                if row.sync_cadence_seconds is not None:
+                    due.append(
+                        (
+                            row.next_sync_at,
+                            ConnectorScheduleOperation.sync,
+                            row.sync_cadence_seconds,
+                            row.sync_failures + 1,
+                        )
+                    )
+            if row.next_renewal_at is not None and row.next_renewal_at <= now:
+                if row.renewal_cadence_seconds is not None:
+                    due.append(
+                        (
+                            row.next_renewal_at,
+                            ConnectorScheduleOperation.renewal,
+                            row.renewal_cadence_seconds,
+                            row.renewal_failures + 1,
+                        )
+                    )
+            if not due:
+                continue
+            due_at, operation, cadence, attempt = min(
+                due,
+                key=lambda item: (
+                    item[0],
+                    0 if item[1] is ConnectorScheduleOperation.renewal else 1,
+                ),
+            )
+            lease = ConnectorScheduleLease(
+                self._scope_id,
+                connector_id,
+                row.id,
+                operation,
+                due_at,
+                cadence,
+                attempt,
+                uuid.uuid4().hex,
+                now + timedelta(seconds=lease_seconds),
+            )
+            self._schedule_leases[connector_id] = lease
+            leases.append(lease)
+        return leases
+
+    def _require_schedule_lease(self, lease: ConnectorScheduleLease) -> ConnectorBinding:
+        current = self._schedule_leases.get(lease.connector_id)
+        row = self._bindings.get(lease.connector_id)
+        if (
+            current != lease
+            or row is None
+            or row.id != lease.binding_id
+            or lease.scope_id != self._scope_id
+            or lease.expires_at <= datetime.now(UTC)
+            or row.status
+            not in {
+                ConnectorBindingStatus.connected,
+                ConnectorBindingStatus.degraded,
+            }
+        ):
+            raise ConnectorScheduleLeaseLostError("connector schedule lease was lost")
+        return row
+
+    async def complete_schedule(
+        self, lease: ConnectorScheduleLease, *, next_at: datetime
+    ) -> None:
+        row = self._require_schedule_lease(lease)
+        updates: dict[str, Any] = {"updated_at": datetime.now(UTC)}
+        if lease.operation is ConnectorScheduleOperation.sync:
+            updates.update(next_sync_at=next_at, sync_failures=0)
+        else:
+            updates.update(next_renewal_at=next_at, renewal_failures=0)
+        self._bindings[lease.connector_id] = replace(row, **updates)
+        del self._schedule_leases[lease.connector_id]
+
+    async def fail_schedule(
+        self,
+        lease: ConnectorScheduleLease,
+        *,
+        retry_at: datetime,
+        error_code: str,
+        error_summary: str,
+    ) -> None:
+        row = self._require_schedule_lease(lease)
+        updates: dict[str, Any] = {
+            "status": ConnectorBindingStatus.degraded,
+            "error_code": error_code,
+            "error_summary": error_summary,
+            "updated_at": datetime.now(UTC),
+        }
+        if lease.operation is ConnectorScheduleOperation.sync:
+            updates.update(next_sync_at=retry_at, sync_failures=row.sync_failures + 1)
+        else:
+            updates.update(
+                next_renewal_at=retry_at,
+                renewal_failures=row.renewal_failures + 1,
+            )
+        self._bindings[lease.connector_id] = replace(row, **updates)
+        del self._schedule_leases[lease.connector_id]
+
+    async def suspend_schedule(
+        self, lease: ConnectorScheduleLease, *, resume_at: datetime
+    ) -> None:
+        row = self._require_schedule_lease(lease)
+        updates: dict[str, Any] = {"updated_at": datetime.now(UTC)}
+        if lease.operation is ConnectorScheduleOperation.sync:
+            updates["next_sync_at"] = resume_at
+        else:
+            updates["next_renewal_at"] = resume_at
+        self._bindings[lease.connector_id] = replace(row, **updates)
+        del self._schedule_leases[lease.connector_id]
+
 
 class PostgresConnectorRepository:
     def __init__(self, engine: AsyncEngine, scope_id: str) -> None:
@@ -693,28 +1057,155 @@ class PostgresConnectorRepository:
             raise LookupError("connector binding changed before state update")
         return _binding_from_row(row)
 
-    async def upsert_binding(
+    async def update_binding_state(
         self,
         connector_id: str,
-        draft: ConnectorBindingDraft,
-        status: ConnectorBindingStatus,
+        binding_id: str,
+        *,
+        status: ConnectorBindingStatus | None = None,
+        metadata: dict[str, Any] | None = None,
+        renewal_expires_at: datetime | None = None,
+        update_renewal_expiry: bool = False,
     ) -> ConnectorBinding:
-        metadata = _safe_metadata(draft.metadata, field="binding metadata")
+        safe_metadata = (
+            None if metadata is None else _safe_metadata(metadata, field="binding metadata")
+        )
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             row = (
                 await conn.execute(
                     text(
+                        "UPDATE connector_bindings SET "
+                        "status = COALESCE(:status, status), "
+                        "metadata = CASE WHEN :update_metadata "
+                        "THEN CAST(:metadata AS jsonb) ELSE metadata END, "
+                        "renewal_expires_at = CASE WHEN :update_expiry "
+                        "THEN :expires ELSE renewal_expires_at END, "
+                        "next_sync_at = CASE WHEN COALESCE(:status, status) "
+                        "IN ('connected', 'degraded') AND next_sync_at IS NULL "
+                        "AND sync_cadence_seconds IS NOT NULL "
+                        "THEN now() + make_interval(secs => sync_cadence_seconds) "
+                        "ELSE next_sync_at END, "
+                        "next_renewal_at = CASE WHEN COALESCE(:status, status) "
+                        "IN ('connected', 'degraded') AND next_renewal_at IS NULL "
+                        "AND renewal_cadence_seconds IS NOT NULL "
+                        "THEN now() + make_interval(secs => renewal_cadence_seconds) "
+                        "ELSE next_renewal_at END, "
+                        "error_code = CASE WHEN COALESCE(:status, status) "
+                        "IN ('connected', 'configured', 'authorizing') THEN NULL "
+                        "ELSE error_code END, "
+                        "error_summary = CASE WHEN COALESCE(:status, status) "
+                        "IN ('connected', 'configured', 'authorizing') THEN NULL "
+                        "ELSE error_summary END, updated_at = now() "
+                        "WHERE scope_id = :scope AND connector_id = :cid AND id = :binding "
+                        "RETURNING *"
+                    ),
+                    {
+                        "status": None if status is None else status.value,
+                        "update_metadata": metadata is not None,
+                        "metadata": json.dumps(safe_metadata or {}, ensure_ascii=False),
+                        "update_expiry": update_renewal_expiry,
+                        "expires": renewal_expires_at,
+                        "scope": self._scope_id,
+                        "cid": connector_id,
+                        "binding": binding_id,
+                    },
+                )
+            ).one_or_none()
+        if row is None:
+            raise LookupError("connector binding changed before state update")
+        return _binding_from_row(row)
+
+    async def upsert_binding(
+        self,
+        connector_id: str,
+        draft: ConnectorBindingDraft,
+        status: ConnectorBindingStatus,
+        *,
+        sync_cadence_seconds: int | None = None,
+        renewal: ConnectorRenewalPolicy | None = None,
+        renewal_expires_at: datetime | None = None,
+        expected_binding_id: str | None = None,
+        enforce_binding_fence: bool = False,
+    ) -> ConnectorBinding:
+        metadata = _safe_metadata(draft.metadata, field="binding metadata")
+        now = datetime.now(UTC)
+        renewal_cadence = None if renewal is None else renewal.cadence_seconds
+        renewal_behavior = None if renewal is None else renewal.expiry_behavior.value
+        active = status in {
+            ConnectorBindingStatus.connected,
+            ConnectorBindingStatus.degraded,
+        }
+        next_sync_at = (
+            now + timedelta(seconds=sync_cadence_seconds)
+            if active and sync_cadence_seconds is not None
+            else None
+        )
+        next_renewal_at = (
+            now + timedelta(seconds=renewal_cadence)
+            if active and renewal_cadence is not None
+            else None
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            if enforce_binding_fence:
+                await conn.execute(
+                    text(
+                        "SELECT pg_advisory_xact_lock("
+                        "hashtextextended(:binding_key, 0))"
+                    ),
+                    {"binding_key": f"{self._scope_id}:{connector_id}"},
+                )
+                current_id = await conn.scalar(
+                    text(
+                        "SELECT id FROM connector_bindings "
+                        "WHERE scope_id = :scope AND connector_id = :cid FOR UPDATE"
+                    ),
+                    {"scope": self._scope_id, "cid": connector_id},
+                )
+                if (
+                    None if current_id is None else str(current_id)
+                ) != expected_binding_id:
+                    raise LookupError("connector binding changed before setup commit")
+            row = (
+                await conn.execute(
+                    text(
                         "INSERT INTO connector_bindings "
                         "(id, scope_id, connector_id, status, display_name, "
-                        "external_account_id, external_tenant_id, metadata) "
+                        "external_account_id, external_tenant_id, metadata, "
+                        "sync_cadence_seconds, renewal_cadence_seconds, "
+                        "renewal_expiry_behavior, renewal_expires_at, "
+                        "next_sync_at, next_renewal_at) "
                         "VALUES (:id, :scope, :cid, :status, :name, :account, :tenant, "
-                        "CAST(:metadata AS jsonb)) "
+                        "CAST(:metadata AS jsonb), :sync_cadence, :renewal_cadence, "
+                        ":renewal_behavior, :renewal_expires, :next_sync, :next_renewal) "
                         "ON CONFLICT (scope_id, connector_id) DO UPDATE SET "
                         "status = EXCLUDED.status, display_name = EXCLUDED.display_name, "
                         "external_account_id = EXCLUDED.external_account_id, "
                         "external_tenant_id = EXCLUDED.external_tenant_id, "
-                        "metadata = EXCLUDED.metadata, error_code = NULL, error_summary = NULL, "
+                        "metadata = EXCLUDED.metadata, "
+                        "sync_cadence_seconds = EXCLUDED.sync_cadence_seconds, "
+                        "renewal_cadence_seconds = EXCLUDED.renewal_cadence_seconds, "
+                        "renewal_expiry_behavior = EXCLUDED.renewal_expiry_behavior, "
+                        "renewal_expires_at = EXCLUDED.renewal_expires_at, "
+                        "next_sync_at = CASE "
+                        "WHEN EXCLUDED.sync_cadence_seconds IS NULL THEN NULL "
+                        "WHEN connector_bindings.sync_cadence_seconds "
+                        "IS DISTINCT FROM EXCLUDED.sync_cadence_seconds "
+                        "THEN EXCLUDED.next_sync_at "
+                        "WHEN connector_bindings.next_sync_at IS NULL "
+                        "AND EXCLUDED.status IN ('connected', 'degraded') "
+                        "THEN EXCLUDED.next_sync_at ELSE connector_bindings.next_sync_at END, "
+                        "next_renewal_at = CASE "
+                        "WHEN EXCLUDED.renewal_cadence_seconds IS NULL THEN NULL "
+                        "WHEN connector_bindings.renewal_cadence_seconds "
+                        "IS DISTINCT FROM EXCLUDED.renewal_cadence_seconds "
+                        "THEN EXCLUDED.next_renewal_at "
+                        "WHEN connector_bindings.next_renewal_at IS NULL "
+                        "AND EXCLUDED.status IN ('connected', 'degraded') "
+                        "THEN EXCLUDED.next_renewal_at "
+                        "ELSE connector_bindings.next_renewal_at END, "
+                        "error_code = NULL, error_summary = NULL, "
                         "updated_at = now() RETURNING *"
                     ),
                     {
@@ -726,6 +1217,12 @@ class PostgresConnectorRepository:
                         "account": draft.external_account_id,
                         "tenant": draft.external_tenant_id,
                         "metadata": json.dumps(metadata, ensure_ascii=False),
+                        "sync_cadence": sync_cadence_seconds,
+                        "renewal_cadence": renewal_cadence,
+                        "renewal_behavior": renewal_behavior,
+                        "renewal_expires": renewal_expires_at,
+                        "next_sync": next_sync_at,
+                        "next_renewal": next_renewal_at,
                     },
                 )
             ).one()
@@ -735,24 +1232,35 @@ class PostgresConnectorRepository:
         self, connector_id: str, health: ConnectorHealth
     ) -> ConnectorBinding | None:
         healthy = health.status is ConnectorHealthStatus.healthy
+        binding_status = {
+            ConnectorHealthStatus.healthy: ConnectorBindingStatus.connected,
+            ConnectorHealthStatus.degraded: ConnectorBindingStatus.degraded,
+            ConnectorHealthStatus.error: ConnectorBindingStatus.error,
+            ConnectorHealthStatus.unconfigured: ConnectorBindingStatus.configured,
+        }[health.status]
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             row = (
                 await conn.execute(
                     text(
-                        "UPDATE connector_bindings SET status = :status, "
-                        "last_success_at = CASE WHEN :healthy THEN :checked "
+                        "UPDATE connector_bindings SET status = CASE "
+                        "WHEN status = 'revoked' THEN status "
+                        "WHEN status IN ('unconfigured', 'configured', 'authorizing') "
+                        "AND (:healthy OR :degraded OR :unconfigured) THEN status "
+                        "ELSE :status END, "
+                        "last_success_at = CASE WHEN :healthy "
+                        "AND status <> 'revoked' THEN :checked "
                         "ELSE last_success_at END, "
-                        "error_code = :code, error_summary = :summary, updated_at = :checked "
+                        "error_code = CASE WHEN status = 'revoked' THEN error_code "
+                        "ELSE :code END, error_summary = CASE WHEN status = 'revoked' "
+                        "THEN error_summary ELSE :summary END, updated_at = :checked "
                         "WHERE scope_id = :scope AND connector_id = :cid RETURNING *"
                     ),
                     {
-                        "status": (
-                            ConnectorBindingStatus.connected.value
-                            if healthy
-                            else ConnectorBindingStatus.error.value
-                        ),
+                        "status": binding_status.value,
                         "healthy": healthy,
+                        "degraded": health.status is ConnectorHealthStatus.degraded,
+                        "unconfigured": health.status is ConnectorHealthStatus.unconfigured,
                         "checked": health.checked_at,
                         "code": None if healthy else health.status.value,
                         "summary": None if healthy else health.message,
@@ -766,6 +1274,13 @@ class PostgresConnectorRepository:
     async def delete_connector(self, connector_id: str) -> int:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            await conn.execute(
+                text(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended(:binding_key, 0))"
+                ),
+                {"binding_key": f"{self._scope_id}:{connector_id}"},
+            )
             result = await conn.execute(
                 text(
                     "DELETE FROM connector_bindings WHERE scope_id = :scope AND connector_id = :cid"
@@ -1248,6 +1763,214 @@ class PostgresConnectorRepository:
         if not result.rowcount:
             raise LookupError("connector delivery was not claimed")
 
+    async def claim_due_schedules(
+        self, now: datetime, *, limit: int, lease_seconds: int
+    ) -> list[ConnectorScheduleLease]:
+        if limit <= 0 or lease_seconds <= 0:
+            raise ValueError("connector schedule bounds must be positive")
+        leases: list[ConnectorScheduleLease] = []
+        expires_at = now + timedelta(seconds=lease_seconds)
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            await conn.execute(
+                text(
+                    "UPDATE connector_bindings SET "
+                    "status = CASE renewal_expiry_behavior "
+                    "WHEN 'error' THEN 'error' WHEN 'revoked' THEN 'revoked' "
+                    "ELSE 'degraded' END, "
+                    "error_code = 'connector_renewal_expired', "
+                    "error_summary = 'connector subscription renewal expired', "
+                    "updated_at = :now "
+                    "WHERE scope_id = :scope AND status IN ('connected', 'degraded') "
+                    "AND renewal_expires_at IS NOT NULL AND renewal_expires_at <= :now "
+                    "AND renewal_expiry_behavior IS NOT NULL"
+                ),
+                {"scope": self._scope_id, "now": now},
+            )
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT *, CASE "
+                        "WHEN next_renewal_at IS NOT NULL AND next_renewal_at <= :now "
+                        "AND (next_sync_at IS NULL OR next_sync_at > :now "
+                        "OR next_renewal_at <= next_sync_at) THEN 'renewal' "
+                        "ELSE 'sync' END AS schedule_operation "
+                        "FROM connector_bindings WHERE scope_id = :scope "
+                        "AND status IN ('connected', 'degraded') "
+                        "AND (schedule_lease_expires_at IS NULL "
+                        "OR schedule_lease_expires_at <= :now) "
+                        "AND ((next_sync_at IS NOT NULL AND next_sync_at <= :now "
+                        "AND sync_cadence_seconds IS NOT NULL) "
+                        "OR (next_renewal_at IS NOT NULL AND next_renewal_at <= :now "
+                        "AND renewal_cadence_seconds IS NOT NULL)) "
+                        "ORDER BY LEAST(COALESCE(next_sync_at, 'infinity'::timestamptz), "
+                        "COALESCE(next_renewal_at, 'infinity'::timestamptz)), connector_id "
+                        "FOR UPDATE SKIP LOCKED LIMIT :limit"
+                    ),
+                    {"scope": self._scope_id, "now": now, "limit": limit},
+                )
+            ).all()
+            for row in rows:
+                operation = ConnectorScheduleOperation(str(row.schedule_operation))
+                token = uuid.uuid4().hex
+                await conn.execute(
+                    text(
+                        "UPDATE connector_bindings SET schedule_lease_token = :token, "
+                        "schedule_lease_operation = :operation, "
+                        "schedule_lease_expires_at = :expires, updated_at = :now "
+                        "WHERE scope_id = :scope AND id = :binding"
+                    ),
+                    {
+                        "token": token,
+                        "operation": operation.value,
+                        "expires": expires_at,
+                        "now": now,
+                        "scope": self._scope_id,
+                        "binding": row.id,
+                    },
+                )
+                if operation is ConnectorScheduleOperation.sync:
+                    due_at = row.next_sync_at
+                    cadence = row.sync_cadence_seconds
+                    attempt = int(row.sync_failures) + 1
+                else:
+                    due_at = row.next_renewal_at
+                    cadence = row.renewal_cadence_seconds
+                    attempt = int(row.renewal_failures) + 1
+                assert due_at is not None and cadence is not None
+                leases.append(
+                    ConnectorScheduleLease(
+                        self._scope_id,
+                        str(row.connector_id),
+                        str(row.id),
+                        operation,
+                        due_at,
+                        int(cadence),
+                        attempt,
+                        token,
+                        expires_at,
+                    )
+                )
+        return leases
+
+    async def complete_schedule(
+        self, lease: ConnectorScheduleLease, *, next_at: datetime
+    ) -> None:
+        next_column = (
+            "next_sync_at"
+            if lease.operation is ConnectorScheduleOperation.sync
+            else "next_renewal_at"
+        )
+        failures_column = (
+            "sync_failures"
+            if lease.operation is ConnectorScheduleOperation.sync
+            else "renewal_failures"
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    f"UPDATE connector_bindings SET {next_column} = :next_at, "
+                    f"{failures_column} = 0, schedule_lease_token = NULL, "
+                    "schedule_lease_operation = NULL, schedule_lease_expires_at = NULL, "
+                    "updated_at = now() WHERE scope_id = :scope AND id = :binding "
+                    "AND connector_id = :cid AND schedule_lease_token = :token "
+                    "AND schedule_lease_operation = :operation "
+                    "AND schedule_lease_expires_at > now() "
+                    "AND status IN ('connected', 'degraded')"
+                ),
+                {
+                    "next_at": next_at,
+                    "scope": self._scope_id,
+                    "binding": lease.binding_id,
+                    "cid": lease.connector_id,
+                    "token": lease.token,
+                    "operation": lease.operation.value,
+                },
+            )
+        if not result.rowcount:
+            raise ConnectorScheduleLeaseLostError("connector schedule lease was lost")
+
+    async def fail_schedule(
+        self,
+        lease: ConnectorScheduleLease,
+        *,
+        retry_at: datetime,
+        error_code: str,
+        error_summary: str,
+    ) -> None:
+        next_column = (
+            "next_sync_at"
+            if lease.operation is ConnectorScheduleOperation.sync
+            else "next_renewal_at"
+        )
+        failures_column = (
+            "sync_failures"
+            if lease.operation is ConnectorScheduleOperation.sync
+            else "renewal_failures"
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    f"UPDATE connector_bindings SET {next_column} = :retry_at, "
+                    f"{failures_column} = {failures_column} + 1, status = 'degraded', "
+                    "error_code = :code, error_summary = :summary, "
+                    "schedule_lease_token = NULL, schedule_lease_operation = NULL, "
+                    "schedule_lease_expires_at = NULL, updated_at = now() "
+                    "WHERE scope_id = :scope AND id = :binding AND connector_id = :cid "
+                    "AND schedule_lease_token = :token "
+                    "AND schedule_lease_operation = :operation "
+                    "AND schedule_lease_expires_at > now() "
+                    "AND status IN ('connected', 'degraded')"
+                ),
+                {
+                    "retry_at": retry_at,
+                    "code": error_code[:128],
+                    "summary": error_summary[:500],
+                    "scope": self._scope_id,
+                    "binding": lease.binding_id,
+                    "cid": lease.connector_id,
+                    "token": lease.token,
+                    "operation": lease.operation.value,
+                },
+            )
+        if not result.rowcount:
+            raise ConnectorScheduleLeaseLostError("connector schedule lease was lost")
+
+    async def suspend_schedule(
+        self, lease: ConnectorScheduleLease, *, resume_at: datetime
+    ) -> None:
+        next_column = (
+            "next_sync_at"
+            if lease.operation is ConnectorScheduleOperation.sync
+            else "next_renewal_at"
+        )
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    f"UPDATE connector_bindings SET {next_column} = :resume_at, "
+                    "schedule_lease_token = NULL, schedule_lease_operation = NULL, "
+                    "schedule_lease_expires_at = NULL, updated_at = now() "
+                    "WHERE scope_id = :scope AND id = :binding AND connector_id = :cid "
+                    "AND schedule_lease_token = :token "
+                    "AND schedule_lease_operation = :operation "
+                    "AND schedule_lease_expires_at > now() "
+                    "AND status IN ('connected', 'degraded')"
+                ),
+                {
+                    "resume_at": resume_at,
+                    "scope": self._scope_id,
+                    "binding": lease.binding_id,
+                    "cid": lease.connector_id,
+                    "token": lease.token,
+                    "operation": lease.operation.value,
+                },
+            )
+        if not result.rowcount:
+            raise ConnectorScheduleLeaseLostError("connector schedule lease was lost")
+
 
 async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
     total = 0
@@ -1271,7 +1994,10 @@ async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
 
 __all__ = [
     "ConnectorRepository",
+    "ConnectorScheduleLease",
+    "ConnectorScheduleLeaseLostError",
     "InMemoryConnectorRepository",
     "PostgresConnectorRepository",
+    "next_schedule_time",
     "purge_scope",
 ]

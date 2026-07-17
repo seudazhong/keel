@@ -63,9 +63,16 @@ export function makeConnectorFixture(
     auth_action:
       overrides.auth_action ??
       (overrides.auth_kind === "oauth" || overrides.auth_kind === "github_app"
-        ? { label: "Connect", callback_parameters: [] }
+        ? {
+            label: "Connect",
+            callback_parameters: [],
+            requires_setup: false,
+            help_text: null,
+          }
         : null),
     setup_action_label: overrides.setup_action_label ?? "Save",
+    default_sync_cadence_seconds: overrides.default_sync_cadence_seconds ?? null,
+    renewal: overrides.renewal ?? null,
     resource_label: overrides.resource_label ?? null,
     target_fields: overrides.target_fields ?? [],
     actions: overrides.actions ?? [],
@@ -73,7 +80,19 @@ export function makeConnectorFixture(
     availability_error: overrides.availability_error ?? null,
     enabled,
     operational: connected && enabled,
+    configured: overrides.configured ?? connected,
     connected,
+    next_action:
+      overrides.next_action ??
+      (connected
+        ? null
+        : {
+            kind: (overrides.setup_fields ?? defaultFields[overrides.auth_kind] ?? []).length
+              ? "setup"
+              : "authorize",
+            label: "Continue",
+            instructions: "Complete connector setup.",
+          }),
     updated_at: overrides.updated_at ?? (connected ? "2026-07-08T04:19:55Z" : null),
     binding:
       overrides.binding ??
@@ -88,6 +107,9 @@ export function makeConnectorFixture(
             last_success_at: "2026-07-08T04:19:55Z",
             error_code: null,
             error_summary: null,
+            renewal_expires_at: null,
+            next_sync_at: null,
+            next_renewal_at: null,
             targets: {},
           }
         : null),

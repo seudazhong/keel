@@ -95,7 +95,9 @@ class GmailProvider(BaseConnectorProvider):
     def enabled(self) -> bool:
         return enabled()
 
-    async def begin_auth(self, callback_url: str) -> ConnectorAuthStart:
+    async def begin_auth(
+        self, context: ConnectorOperationContext, callback_url: str
+    ) -> ConnectorAuthStart:
         flow = _flow(callback_url)
         auth_url, state = flow.authorization_url(  # type: ignore[attr-defined]
             access_type="offline",
@@ -105,7 +107,10 @@ class GmailProvider(BaseConnectorProvider):
         return ConnectorAuthStart(str(auth_url), str(state))
 
     async def complete_auth(
-        self, callback_url: str, parameters: dict[str, str]
+        self,
+        context: ConnectorOperationContext,
+        callback_url: str,
+        parameters: dict[str, str],
     ) -> ConnectorSetupResult:
         code = parameters.get("code", "").strip()
         if not code:

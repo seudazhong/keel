@@ -169,7 +169,9 @@ export function ConnectorsPage() {
             </Banner>
             {addable.length > 0 && (
               <>
-                <div className="mb-2.5 text-sm font-semibold text-text-soft">Available</div>
+                <div className="mb-2.5 text-sm font-semibold text-text-soft">
+                  Setup and authorization
+                </div>
                 <ConnectorSetupList connectors={addable} />
               </>
             )}

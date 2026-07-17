@@ -12,6 +12,7 @@ from typing import Protocol
 from urllib.parse import urljoin, urlsplit
 
 Resolver = Callable[[str, int], Awaitable[tuple[str, ...]]]
+_SHARED_IPV4_SPACE = ipaddress.ip_network("100.64.0.0/10")
 
 
 class ConnectorNetworkError(Exception):
@@ -94,6 +95,9 @@ async def _open_connection(
 
 def _public_address(value: str) -> bool:
     address = ipaddress.ip_address(value)
+    ipv4 = address if isinstance(address, ipaddress.IPv4Address) else address.ipv4_mapped
+    if ipv4 is not None and ipv4 in _SHARED_IPV4_SPACE:
+        return False
     return not (
         address.is_private
         or address.is_loopback

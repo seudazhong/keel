@@ -74,6 +74,8 @@ class VersionedTokenStore(Protocol):
         self, connector_id: str, secret: str, expected_version: int
     ) -> int | None: ...
 
+    async def delete_if_version(self, connector_id: str, expected_version: int) -> bool: ...
+
     async def delete(self, connector_id: str) -> None: ...
 
 
@@ -110,6 +112,9 @@ class ConnectorCredentialStore:
             envelope.serialize(),
             expected_version,
         )
+
+    async def delete_if_version(self, connector_id: str, expected_version: int) -> bool:
+        return await self._tokens.delete_if_version(connector_id, expected_version)
 
     async def delete(self, connector_id: str) -> None:
         await self._tokens.delete(connector_id)

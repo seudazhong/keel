@@ -14,6 +14,7 @@ from keel_core.config import get_settings
 from keel_core.connector_contracts import (
     ConnectorAuthenticationError,
     ConnectorError,
+    ConnectorIngressRequest,
     ConnectorSetupArtifact,
     ConnectorSetupArtifactKind,
     ConnectorUnsupportedError,
@@ -191,13 +192,18 @@ async def connector_connect(connector_id: str, request: Request) -> RedirectResp
             f"{provider.manifest.id} does not declare browser authorization",
         )
     try:
-        start = await provider.begin_auth(_callback_url(request, connector_id))
+        start = await _service(request).begin_auth(
+            connector_id,
+            _callback_url(request, connector_id),
+        )
     except ConnectorUnsupportedError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except ConnectorAuthenticationError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     parsed = urlsplit(start.url)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or not start.state.strip():
         raise HTTPException(
@@ -253,11 +259,11 @@ async def connector_callback(
     if consumed is None or consumed.connector_id != connector_id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid or expired authorization state")
     try:
-        result = await provider.complete_auth(
+        outcome = await _service(request).complete_auth(
+            connector_id,
             _callback_url(request, connector_id),
             parameters,
         )
-        await _service(request).save_setup(connector_id, result)
     except RuntimeError as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
     except ConnectorUnsupportedError as exc:
@@ -267,16 +273,21 @@ async def connector_callback(
     except ValueError as exc:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
     label = html.escape(provider.manifest.name)
-    artifacts = "".join(_artifact_html(item) for item in result.artifacts)
+    artifacts = "".join(_artifact_html(item) for item in outcome.artifacts)
     close_script = (
         ""
-        if any(item.kind is ConnectorSetupArtifactKind.secret for item in result.artifacts)
+        if any(item.kind is ConnectorSetupArtifactKind.secret for item in outcome.artifacts)
         else "<script>setTimeout(()=>window.close(),1500)</script>"
+    )
+    state_message = (
+        "已连接"
+        if outcome.binding.status.value == "connected"
+        else "授权状态已保存"
     )
     return HTMLResponse(
         "<!doctype html><meta charset=utf-8>"
         "<body style='font:16px system-ui;padding:40px'>"
-        f"✅ {label} 已连接。可关闭此标签页并返回 Keel 的 Connectors 页面刷新。"
+        f"✅ {label} {state_message}。可关闭此标签页并返回 Keel 的 Connectors 页面刷新。"
         f"{artifacts}"
         f"{close_script}</body>",
         headers={
@@ -316,6 +327,7 @@ async def connector_setup(
     return {
         "ok": True,
         "binding_id": outcome.binding.id,
+        "status": outcome.binding.status.value,
         "artifacts": [artifact_to_dict(item) for item in outcome.artifacts],
     }
 
@@ -493,17 +505,30 @@ async def force_local_purge_connector(connector_id: str, request: Request) -> di
         ) from exc
 
 
-@router.post("/{connector_id}/webhook", summary="Dispatch a signed provider webhook")
-async def connector_webhook(connector_id: str, request: Request) -> dict[str, Any]:
+@router.api_route(
+    "/{connector_id}/webhook",
+    methods=["GET", "POST", "PUT"],
+    summary="Dispatch or verify a provider webhook",
+)
+async def connector_webhook(connector_id: str, request: Request) -> Response:
     _provider(connector_id, request)
     body = await request.body()
     if len(body) > 1_048_576:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "webhook body is too large")
     try:
-        accepted, changes = await _service(request).ingress(
+        query: dict[str, tuple[str, ...]] = {
+            key: tuple(request.query_params.getlist(key))
+            for key in request.query_params
+        }
+        outcome = await _service(request).ingress(
             connector_id,
-            {key.lower(): value for key, value in request.headers.items()},
-            body,
+            ConnectorIngressRequest(
+                method=request.method,
+                query=query,
+                headers={key.lower(): value for key, value in request.headers.items()},
+                body=body,
+                public_url=str(request.url),
+            ),
         )
     except ConnectorUnsupportedError as exc:
         raise HTTPException(status.HTTP_405_METHOD_NOT_ALLOWED, str(exc)) from exc
@@ -513,7 +538,14 @@ async def connector_webhook(connector_id: str, request: Request) -> dict[str, An
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except (LookupError, RuntimeError) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
-    return {"accepted": accepted, "replayed": not accepted, "changes": changes}
+    return Response(
+        content=outcome.response.body,
+        status_code=outcome.response.status_code,
+        headers={
+            **dict(outcome.response.headers),
+            "Content-Type": outcome.response.content_type,
+        },
+    )
 
 
 def _artifact_html(artifact: ConnectorSetupArtifact) -> str:

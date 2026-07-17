@@ -126,6 +126,14 @@ class InMemoryTokenStore:
     async def delete(self, connector_id: str) -> None:
         self._rows.pop((self._scope_id, connector_id), None)
 
+    async def delete_if_version(self, connector_id: str, expected_version: int) -> bool:
+        key = (self._scope_id, connector_id)
+        row = self._rows.get(key)
+        if row is None or row[2] != expected_version:
+            return False
+        del self._rows[key]
+        return True
+
     async def purge(self) -> None:
         for key in [k for k in self._rows if k[0] == self._scope_id]:
             del self._rows[key]
@@ -247,6 +255,22 @@ class PostgresTokenStore:
                 ),
                 {"scope": self._scope_id, "cid": connector_id},
             )
+
+    async def delete_if_version(self, connector_id: str, expected_version: int) -> bool:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    "DELETE FROM connector_tokens WHERE scope_id = :scope "
+                    "AND connector_id = :cid AND version = :expected"
+                ),
+                {
+                    "scope": self._scope_id,
+                    "cid": connector_id,
+                    "expected": expected_version,
+                },
+            )
+        return bool(result.rowcount)
 
     async def purge(self) -> None:
         """Revoke every token for this scope (G18: revoke + purge on scope deletion)."""

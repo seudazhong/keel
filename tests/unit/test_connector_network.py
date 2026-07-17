@@ -41,6 +41,9 @@ class FakeTransport:
         "http://localhost/feed",
         "http://127.0.0.1/feed",
         "http://169.254.169.254/latest/meta-data",
+        "http://100.64.0.1/feed",
+        "http://100.100.100.200/latest/meta-data",
+        "http://[::ffff:100.100.100.200]/feed",
         "******example.com/feed",
     ),
 )

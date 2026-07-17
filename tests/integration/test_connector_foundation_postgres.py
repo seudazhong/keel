@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import uuid
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ from keel_core.connector_contracts import (
     ConnectorBindingDraft,
     ConnectorBindingStatus,
     ConnectorItemDraft,
+    ConnectorRenewalPolicy,
     ConnectorResourceDraft,
     ConnectorTargetKind,
 )
@@ -57,6 +59,29 @@ async def test_connector_foundation_schema_and_rls(migrated_db: AsyncEngine) -> 
                 "WHERE table_name = 'connector_tokens' AND column_name = 'version')"
             )
         )
+        schedule_columns = (
+            await conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'connector_bindings' "
+                    "AND column_name = ANY(:columns)"
+                ),
+                {
+                    "columns": [
+                        "next_sync_at",
+                        "next_renewal_at",
+                        "schedule_lease_token",
+                        "schedule_lease_expires_at",
+                    ]
+                },
+            )
+        ).scalars()
+        assert set(schedule_columns) == {
+            "next_sync_at",
+            "next_renewal_at",
+            "schedule_lease_token",
+            "schedule_lease_expires_at",
+        }
         head = await conn.scalar(text("SELECT version_num FROM alembic_version"))
         assert head == "0015_connector_foundation"
 
@@ -248,6 +273,50 @@ async def test_postgres_credential_updates_are_versioned_compare_and_set(
     assert updated is not None
     assert updated.version == 2
     assert updated.envelope.values["access_token"] == "rotated"
+
+
+async def test_postgres_recurring_schedule_claim_reclaims_and_fences(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = f"connector:schedule:{uuid.uuid4().hex}"
+    first_worker = PostgresConnectorRepository(migrated_db, scope)
+    second_worker = PostgresConnectorRepository(migrated_db, scope)
+    binding = await first_worker.upsert_binding(
+        "fixture",
+        ConnectorBindingDraft(),
+        ConnectorBindingStatus.connected,
+        sync_cadence_seconds=30,
+        renewal=ConnectorRenewalPolicy(60),
+        renewal_expires_at=datetime.now(UTC) + timedelta(minutes=10),
+    )
+    assert binding.next_sync_at is not None
+    due = binding.next_sync_at
+    first = (await first_worker.claim_due_schedules(due, limit=1, lease_seconds=10))[0]
+    assert await second_worker.claim_due_schedules(
+        due + timedelta(seconds=5),
+        limit=1,
+        lease_seconds=10,
+    ) == []
+    reclaimed = (
+        await second_worker.claim_due_schedules(
+            due + timedelta(seconds=11),
+            limit=1,
+            lease_seconds=10,
+        )
+    )[0]
+    with pytest.raises(RuntimeError, match="lease was lost"):
+        await first_worker.complete_schedule(
+            first,
+            next_at=due + timedelta(seconds=30),
+        )
+    await second_worker.complete_schedule(
+        reclaimed,
+        next_at=due + timedelta(seconds=30),
+    )
+    updated = await first_worker.get_binding("fixture")
+    assert updated is not None
+    assert updated.next_sync_at == due + timedelta(seconds=30)
+    assert updated.sync_failures == 0
 
 
 async def test_connector_migration_downgrade_and_upgrade(migrated_db: AsyncEngine) -> None:

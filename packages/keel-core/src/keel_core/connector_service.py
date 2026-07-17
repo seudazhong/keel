@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
 from keel_core.connector_contracts import (
+    ConnectorAuthStart,
     ConnectorBinding,
+    ConnectorBindingDraft,
     ConnectorBindingStatus,
     ConnectorBindingTarget,
     ConnectorCapability,
@@ -19,19 +22,29 @@ from keel_core.connector_contracts import (
     ConnectorChangeKind,
     ConnectorHealth,
     ConnectorHealthStatus,
+    ConnectorIngressRequest,
+    ConnectorIngressResponse,
     ConnectorItem,
     ConnectorItemDraft,
     ConnectorManifest,
     ConnectorOperationContext,
+    ConnectorProvider,
+    ConnectorRenewalResult,
     ConnectorResourceRefreshMode,
+    ConnectorScheduleOperation,
     ConnectorSetupArtifact,
     ConnectorSetupResult,
+    ConnectorStateUpdate,
     ConnectorTargetKind,
 )
 from keel_core.connector_credentials import ConnectorCredentialStore, CredentialEnvelope
 from keel_core.connector_registry import ConnectorRegistry
-from keel_core.connector_repository import ConnectorRepository
-from keel_core.jobs import CancelMode, JobRecord, JobStore
+from keel_core.connector_repository import (
+    ConnectorRepository,
+    ConnectorScheduleLease,
+    next_schedule_time,
+)
+from keel_core.jobs import CancelMode, JobRecord, JobStore, retry_delay_seconds
 from keel_core.knowledge.models import (
     CreateKnowledgeDocumentCommand,
     DeleteKnowledgeCommand,
@@ -41,7 +54,10 @@ from keel_core.knowledge.models import (
 from keel_core.types import ContentTaint
 
 CONNECTOR_SYNC_JOB_KIND = "connector.sync"
+CONNECTOR_RENEW_JOB_KIND = "connector.renew"
 CONNECTOR_SYNC_MAX_ATTEMPTS = 3
+CONNECTOR_RENEW_MAX_ATTEMPTS = 3
+logger = logging.getLogger("keel.connectors")
 
 
 @runtime_checkable
@@ -64,6 +80,13 @@ TriggerTargetResolver = Callable[[ConnectorTargetKind, str], Awaitable[str]]
 class ConnectorSetupOutcome:
     binding: ConnectorBinding
     artifacts: tuple[ConnectorSetupArtifact, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorIngressOutcome:
+    response: ConnectorIngressResponse
+    accepted: bool
+    changes: int
 
 
 class CallbackConnectorChangeSink:
@@ -338,7 +361,21 @@ class ConnectorService:
             connected = (
                 binding is not None
                 and binding.status
-                in {ConnectorBindingStatus.connected, ConnectorBindingStatus.configured}
+                in {
+                    ConnectorBindingStatus.connected,
+                    ConnectorBindingStatus.degraded,
+                }
+            ) or manifest.id in legacy
+            configured = (
+                binding is not None and binding.status is not ConnectorBindingStatus.revoked
+            ) or manifest.id in legacy
+            operational_binding = (
+                binding is not None
+                and binding.status
+                in {
+                    ConnectorBindingStatus.connected,
+                    ConnectorBindingStatus.degraded,
+                }
             ) or manifest.id in legacy
             updated_at = binding.updated_at if binding is not None else legacy.get(manifest.id)
             rows.append(
@@ -347,8 +384,14 @@ class ConnectorService:
                     "available": provider_status.available,
                     "availability_error": provider_status.error,
                     "enabled": provider_enabled,
-                    "operational": connected and provider_enabled and provider_status.available,
+                    "operational": (
+                        operational_binding
+                        and provider_enabled
+                        and provider_status.available
+                    ),
+                    "configured": configured,
                     "connected": connected,
+                    "next_action": _next_action(manifest, binding),
                     "updated_at": updated_at.isoformat() if updated_at else None,
                     "binding": (binding_to_dict(binding, targets) if binding is not None else None),
                     "health": (
@@ -356,9 +399,7 @@ class ConnectorService:
                         if not provider_status.available
                         or (binding is not None and binding.status is ConnectorBindingStatus.error)
                         else (
-                            ConnectorHealthStatus.healthy.value
-                            if connected
-                            else ConnectorHealthStatus.unconfigured.value
+                            _binding_health(binding, connected).value
                         )
                     ),
                 }
@@ -372,8 +413,11 @@ class ConnectorService:
             )
             connected = binding is not None and binding.status in {
                 ConnectorBindingStatus.connected,
-                ConnectorBindingStatus.configured,
+                ConnectorBindingStatus.degraded,
             }
+            configured = (
+                binding is not None and binding.status is not ConnectorBindingStatus.revoked
+            )
             rows.append(
                 {
                     "id": failure.connector_id,
@@ -394,7 +438,9 @@ class ConnectorService:
                     "availability_error": failure.error,
                     "enabled": False,
                     "operational": False,
+                    "configured": configured,
                     "connected": connected,
+                    "next_action": None,
                     "updated_at": (
                         binding.updated_at.isoformat()
                         if binding is not None and binding.updated_at is not None
@@ -407,22 +453,100 @@ class ConnectorService:
         rows.sort(key=lambda item: str(item["id"]))
         return rows
 
-    async def save_setup(self, connector_id: str, result: ConnectorSetupResult) -> ConnectorBinding:
-        stored = False
+    async def begin_auth(self, connector_id: str, callback_url: str) -> ConnectorAuthStart:
+        provider = self.registry.create(connector_id)
+        context = await self._operation_context(connector_id)
+        action = provider.manifest.auth_action
+        if action is None:
+            raise ValueError(f"{connector_id} does not declare browser authorization")
+        if action.requires_setup and (
+            context.binding is None or context.credential is None
+        ):
+            raise ValueError(f"{connector_id} requires setup before browser authorization")
+        start = await provider.begin_auth(context, callback_url)
+        draft = (
+            ConnectorBindingDraft()
+            if context.binding is None
+            else ConnectorBindingDraft(
+                display_name=context.binding.display_name,
+                external_account_id=context.binding.external_account_id,
+                external_tenant_id=context.binding.external_tenant_id,
+                metadata=context.binding.metadata,
+            )
+        )
+        await self.repository.upsert_binding(
+            connector_id,
+            draft,
+            ConnectorBindingStatus.authorizing,
+            sync_cadence_seconds=provider.manifest.default_sync_cadence_seconds,
+            renewal=provider.manifest.renewal,
+            renewal_expires_at=(
+                None if context.binding is None else context.binding.renewal_expires_at
+            ),
+            expected_binding_id=(
+                None if context.binding is None else context.binding.id
+            ),
+            enforce_binding_fence=True,
+        )
+        return start
+
+    async def complete_auth(
+        self,
+        connector_id: str,
+        callback_url: str,
+        parameters: dict[str, str],
+    ) -> ConnectorSetupOutcome:
+        provider = self.registry.create(connector_id)
+        context = await self._operation_context(connector_id)
+        result = await provider.complete_auth(
+            context,
+            callback_url,
+            dict(parameters),
+        )
+        return ConnectorSetupOutcome(
+            await self.save_setup(connector_id, result, context=context),
+            result.artifacts,
+        )
+
+    async def save_setup(
+        self,
+        connector_id: str,
+        result: ConnectorSetupResult,
+        *,
+        context: ConnectorOperationContext | None = None,
+    ) -> ConnectorBinding:
+        operation = context or await self._operation_context(connector_id)
+        latest = await self.repository.get_binding(connector_id)
+        expected_binding_id = None if operation.binding is None else operation.binding.id
+        actual_binding_id = None if latest is None else latest.id
+        if actual_binding_id != expected_binding_id:
+            raise RuntimeError("connector binding changed during setup")
+        manifest = self._manifest(connector_id)
+        stored_version: int | None = None
         if result.credential is not None:
             if self.credentials is None:
                 raise RuntimeError("encrypted connector credential storage is unavailable")
-            await self.credentials.put(connector_id, result.credential)
-            stored = True
+            stored_version = await self.credentials.put_if_version(
+                connector_id,
+                result.credential,
+                operation.credential_version,
+            )
+            if stored_version is None:
+                raise RuntimeError("connector credentials changed during setup")
         try:
             return await self.repository.upsert_binding(
                 connector_id,
                 result.binding,
-                ConnectorBindingStatus.connected,
+                result.status,
+                sync_cadence_seconds=manifest.default_sync_cadence_seconds,
+                renewal=manifest.renewal,
+                renewal_expires_at=result.renewal_expires_at,
+                expected_binding_id=expected_binding_id,
+                enforce_binding_fence=True,
             )
-        except Exception:
-            if stored and self.credentials is not None:
-                await self.credentials.delete(connector_id)
+        except Exception as exc:
+            if stored_version is not None:
+                await self._rollback_credential(connector_id, operation, stored_version, exc)
             raise
 
     async def setup(
@@ -450,7 +574,7 @@ class ConnectorService:
         )
         result = await provider.setup(context, dict(values))
         return ConnectorSetupOutcome(
-            await self.save_setup(connector_id, result),
+            await self.save_setup(connector_id, result, context=context),
             result.artifacts,
         )
 
@@ -458,7 +582,7 @@ class ConnectorService:
         self, connector_id: str, values: dict[str, str | None]
     ) -> list[ConnectorBindingTarget]:
         manifest = self._manifest(connector_id)
-        binding = await self._required_binding(connector_id)
+        binding = await self._required_active_binding(connector_id)
         declared = {item.kind: item for item in manifest.target_fields}
         try:
             requested = {
@@ -496,10 +620,8 @@ class ConnectorService:
         )
 
     async def refresh_resources(self, connector_id: str) -> list[dict[str, Any]]:
-        provider = self.registry.create(connector_id)
-        if not provider.enabled():
-            raise RuntimeError(f"connector {connector_id!r} is disabled")
-        binding = await self._required_binding(connector_id)
+        provider = self._enabled_provider(connector_id)
+        binding = await self._required_active_binding(connector_id)
         if ConnectorCapability.resources in provider.manifest.capabilities:
             context = await self._operation_context(connector_id, binding=binding)
             result = await provider.list_resources(context)
@@ -531,11 +653,9 @@ class ConnectorService:
         manifest = self._manifest(connector_id)
         if ConnectorCapability.sync not in manifest.capabilities:
             raise ValueError(f"connector {connector_id!r} does not support sync")
-        binding = await self._required_binding(connector_id)
+        binding = await self._required_active_binding(connector_id)
         await self._validate_required_targets(manifest, connector_id)
-        provider = self.registry.create(connector_id)
-        if not provider.enabled():
-            raise RuntimeError(f"connector {connector_id!r} is disabled")
+        self._enabled_provider(connector_id)
         if self.jobs is None:
             raise RuntimeError("durable connector jobs are unavailable")
         key = idempotency_key.strip() if idempotency_key else uuid.uuid4().hex
@@ -553,13 +673,11 @@ class ConnectorService:
 
     async def sync(self, connector_id: str, binding_id: str | None = None) -> int:
         manifest = self._manifest(connector_id)
-        binding = await self._required_binding(connector_id)
+        binding = await self._required_active_binding(connector_id)
         if binding_id is not None and binding.id != binding_id:
             raise ValueError("connector binding changed before sync execution")
         await self._validate_required_targets(manifest, connector_id)
-        provider = self.registry.create(connector_id)
-        if not provider.enabled():
-            raise RuntimeError(f"connector {connector_id!r} is disabled")
+        provider = self._enabled_provider(connector_id)
         context = await self._operation_context(
             connector_id,
             binding=binding,
@@ -567,30 +685,15 @@ class ConnectorService:
         )
         try:
             result = await provider.sync(context)
-            if result.state.credential is not None:
-                credential_update = result.state.credential
-                if credential_update.expected_version != context.credential_version:
-                    raise ValueError(
-                        "connector sync credential update used a stale expected version"
-                    )
-                if self.credentials is None:
-                    raise RuntimeError("encrypted connector credential storage is unavailable")
-                stored_version = await self.credentials.put_if_version(
-                    connector_id,
-                    credential_update.credential,
-                    credential_update.expected_version,
-                )
-                if stored_version is None:
-                    raise RuntimeError("connector credentials changed during sync")
+            await self._apply_state_update(
+                connector_id,
+                binding,
+                context,
+                result.state,
+            )
             for change in result.changes:
                 self._validate_change(connector_id, binding.id, change)
                 await self._change_sink.apply(change)
-            if result.state.binding_metadata is not None:
-                await self.repository.replace_binding_metadata(
-                    connector_id,
-                    binding.id,
-                    result.state.binding_metadata,
-                )
             resource_ids = {item.id for item in context.resources}
             seen_cursors: set[tuple[str | None, str]] = set()
             for cursor_update in result.state.cursor_updates:
@@ -630,6 +733,140 @@ class ConnectorService:
             )
             raise
 
+    async def enqueue_recurring(self, lease: ConnectorScheduleLease) -> JobRecord:
+        if self.jobs is None:
+            raise RuntimeError("durable connector jobs are unavailable")
+        if lease.scope_id != self.repository.scope_id:
+            raise ValueError("connector schedule lease crosses its scope")
+        manifest = self._manifest(lease.connector_id)
+        if lease.operation is ConnectorScheduleOperation.sync:
+            if (
+                ConnectorCapability.sync not in manifest.capabilities
+                or manifest.default_sync_cadence_seconds is None
+            ):
+                raise ValueError("connector no longer declares recurring sync")
+            kind = CONNECTOR_SYNC_JOB_KIND
+            max_attempts = CONNECTOR_SYNC_MAX_ATTEMPTS
+        else:
+            if manifest.renewal is None:
+                raise ValueError("connector no longer declares recurring renewal")
+            kind = CONNECTOR_RENEW_JOB_KIND
+            max_attempts = CONNECTOR_RENEW_MAX_ATTEMPTS
+        job, _ = await self.jobs.enqueue_once(
+            kind=kind,
+            payload={
+                "connector_id": lease.connector_id,
+                "binding_id": lease.binding_id,
+            },
+            target_session_id=None,
+            idempotency_key=(
+                f"recurring:{lease.operation.value}:{lease.binding_id}:"
+                f"{lease.due_at.isoformat()}"
+            ),
+            max_attempts=max_attempts,
+            cancel_mode=CancelMode.cooperative,
+        )
+        return job
+
+    async def reconcile_recurring(
+        self,
+        now: datetime,
+        *,
+        limit: int,
+        lease_seconds: int,
+        retry_base_seconds: int,
+        retry_max_seconds: int,
+    ) -> int:
+        leases = await self.repository.claim_due_schedules(
+            now,
+            limit=limit,
+            lease_seconds=lease_seconds,
+        )
+        enqueued = 0
+        for lease in leases:
+            try:
+                provider_status = self.registry.status(lease.connector_id)
+                if provider_status.available and not provider_status.enabled:
+                    await self.repository.suspend_schedule(
+                        lease,
+                        resume_at=next_schedule_time(
+                            lease.due_at,
+                            now,
+                            lease.cadence_seconds,
+                        ),
+                    )
+                    continue
+                if not provider_status.available:
+                    raise RuntimeError("connector provider is unavailable")
+                await self.enqueue_recurring(lease)
+                await self.repository.complete_schedule(
+                    lease,
+                    next_at=next_schedule_time(
+                        lease.due_at,
+                        now,
+                        lease.cadence_seconds,
+                    ),
+                )
+                enqueued += 1
+            except Exception as exc:
+                retry_at = now + timedelta(
+                    seconds=retry_delay_seconds(
+                        lease.attempt,
+                        retry_base_seconds,
+                        retry_max_seconds,
+                    )
+                )
+                await self.repository.fail_schedule(
+                    lease,
+                    retry_at=retry_at,
+                    error_code="connector_schedule_dispatch_failed",
+                    error_summary="connector recurring operation dispatch failed",
+                )
+                logger.warning(
+                    "connector recurring dispatch failed connector=%s operation=%s "
+                    "attempt=%d error_type=%s",
+                    lease.connector_id,
+                    lease.operation.value,
+                    lease.attempt,
+                    type(exc).__name__,
+                )
+        return enqueued
+
+    async def renew(self, connector_id: str, binding_id: str | None = None) -> None:
+        manifest = self._manifest(connector_id)
+        if manifest.renewal is None:
+            raise ValueError(f"connector {connector_id!r} does not support renewal")
+        binding = await self._required_active_binding(connector_id)
+        if binding_id is not None and binding.id != binding_id:
+            raise ValueError("connector binding changed before renewal execution")
+        provider = self._enabled_provider(connector_id)
+        context = await self._operation_context(connector_id, binding=binding)
+        try:
+            result: ConnectorRenewalResult = await provider.renew(context)
+            await self._apply_state_update(
+                connector_id,
+                binding,
+                context,
+                result.state,
+                renewal_expires_at=result.renewal_expires_at,
+                update_renewal_expiry=result.update_renewal_expiry,
+            )
+            await self.repository.record_health(
+                connector_id,
+                ConnectorHealth(ConnectorHealthStatus.healthy, datetime.now(UTC)),
+            )
+        except Exception as exc:
+            await self.repository.record_health(
+                connector_id,
+                ConnectorHealth(
+                    ConnectorHealthStatus.error,
+                    datetime.now(UTC),
+                    f"{type(exc).__name__}: connector renewal failed",
+                    retryable=True,
+                ),
+            )
+            raise
+
     async def health(self, connector_id: str) -> ConnectorHealth:
         provider = self.registry.create(connector_id)
         binding = await self._required_binding(connector_id)
@@ -638,20 +875,25 @@ class ConnectorService:
         return health
 
     async def ingress(
-        self, connector_id: str, headers: dict[str, str], body: bytes
-    ) -> tuple[bool, int]:
-        provider = self.registry.create(connector_id)
-        if not provider.enabled():
-            raise RuntimeError(f"connector {connector_id!r} is disabled")
-        binding = await self._required_binding(connector_id)
+        self,
+        connector_id: str,
+        request: ConnectorIngressRequest,
+    ) -> ConnectorIngressOutcome:
+        provider = self._enabled_provider(connector_id)
+        binding = await self._required_active_binding(connector_id)
         context = await self._operation_context(connector_id, binding=binding)
-        result = await provider.ingress(context, headers, body)
-        payload_hash = hashlib.sha256(body).hexdigest()
+        result = await provider.ingress(context, request)
+        if result.delivery_id is None:
+            return ConnectorIngressOutcome(result.response, False, 0)
+        assert result.payload_hash is not None
         claimed = await self.repository.claim_delivery(
-            connector_id, binding.id, result.delivery_id, payload_hash
+            connector_id,
+            binding.id,
+            result.delivery_id,
+            result.payload_hash,
         )
         if not claimed:
-            return False, 0
+            return ConnectorIngressOutcome(result.response, False, 0)
         try:
             for change in result.changes:
                 self._validate_change(connector_id, binding.id, change)
@@ -665,7 +907,7 @@ class ConnectorService:
             )
             raise
         await self.repository.finish_delivery(connector_id, result.delivery_id)
-        return True, len(result.changes)
+        return ConnectorIngressOutcome(result.response, True, len(result.changes))
 
     async def revoke(
         self,
@@ -710,12 +952,104 @@ class ConnectorService:
             raise LookupError(f"connector {connector_id!r} is not configured")
         return binding
 
+    async def _required_active_binding(self, connector_id: str) -> ConnectorBinding:
+        binding = await self._required_binding(connector_id)
+        if binding.status not in {
+            ConnectorBindingStatus.connected,
+            ConnectorBindingStatus.degraded,
+            ConnectorBindingStatus.error,
+        }:
+            raise LookupError(f"connector {connector_id!r} is not connected")
+        return binding
+
+    async def _rollback_credential(
+        self,
+        connector_id: str,
+        context: ConnectorOperationContext,
+        stored_version: int,
+        cause: Exception,
+    ) -> None:
+        assert self.credentials is not None
+        if context.credential is None:
+            restored = await self.credentials.delete_if_version(
+                connector_id,
+                stored_version,
+            )
+        else:
+            restored = (
+                await self.credentials.put_if_version(
+                    connector_id,
+                    context.credential,
+                    stored_version,
+                )
+                is not None
+            )
+        if not restored:
+            raise RuntimeError("connector credential rollback lost its version fence") from cause
+
+    async def _apply_state_update(
+        self,
+        connector_id: str,
+        binding: ConnectorBinding,
+        context: ConnectorOperationContext,
+        state: ConnectorStateUpdate,
+        *,
+        renewal_expires_at: datetime | None = None,
+        update_renewal_expiry: bool = False,
+    ) -> None:
+        stored_version: int | None = None
+        if state.credential is not None:
+            credential_update = state.credential
+            if credential_update.expected_version != context.credential_version:
+                raise ValueError("connector credential update used a stale expected version")
+            if self.credentials is None:
+                raise RuntimeError("encrypted connector credential storage is unavailable")
+            stored_version = await self.credentials.put_if_version(
+                connector_id,
+                credential_update.credential,
+                credential_update.expected_version,
+            )
+            if stored_version is None:
+                raise RuntimeError("connector credentials changed during operation")
+        if (
+            state.binding_metadata is None
+            and state.binding_status is None
+            and not update_renewal_expiry
+        ):
+            return
+        try:
+            await self.repository.update_binding_state(
+                connector_id,
+                binding.id,
+                status=state.binding_status,
+                metadata=state.binding_metadata,
+                renewal_expires_at=renewal_expires_at,
+                update_renewal_expiry=update_renewal_expiry,
+            )
+        except Exception as exc:
+            if stored_version is not None:
+                await self._rollback_credential(connector_id, context, stored_version, exc)
+            raise
+
     def _manifest(self, connector_id: str) -> ConnectorManifest:
         registration = self.registry.get(connector_id)
         if registration is not None:
             return registration.manifest
         self.registry.create(connector_id)
         raise AssertionError("connector registry create unexpectedly returned")
+
+    def _enabled_provider(self, connector_id: str) -> ConnectorProvider:
+        provider_status = self.registry.status(connector_id)
+        if not provider_status.available:
+            raise RuntimeError(
+                provider_status.error or f"connector {connector_id!r} is unavailable"
+            )
+        if not provider_status.enabled:
+            raise RuntimeError(f"connector {connector_id!r} is disabled")
+        provider = self.registry.create(connector_id)
+        if not provider.enabled():
+            raise RuntimeError(f"connector {connector_id!r} is disabled")
+        return provider
 
     async def _credential(self, connector_id: str) -> CredentialEnvelope | None:
         if self.credentials is None:
@@ -835,6 +1169,83 @@ def _purge_idempotency_key(binding: ConnectorBinding, item: ConnectorItem) -> st
     return f"connector-purge:{hashlib.sha256(raw.encode()).hexdigest()}"
 
 
+def _binding_health(
+    binding: ConnectorBinding | None,
+    connected: bool,
+) -> ConnectorHealthStatus:
+    if binding is None:
+        return ConnectorHealthStatus.healthy if connected else ConnectorHealthStatus.unconfigured
+    if binding.status in {
+        ConnectorBindingStatus.unconfigured,
+        ConnectorBindingStatus.configured,
+        ConnectorBindingStatus.authorizing,
+    }:
+        if binding.error_code == ConnectorHealthStatus.degraded.value:
+            return ConnectorHealthStatus.degraded
+        if binding.error_code == ConnectorHealthStatus.error.value:
+            return ConnectorHealthStatus.error
+    return {
+        ConnectorBindingStatus.unconfigured: ConnectorHealthStatus.unconfigured,
+        ConnectorBindingStatus.configured: ConnectorHealthStatus.unconfigured,
+        ConnectorBindingStatus.authorizing: ConnectorHealthStatus.degraded,
+        ConnectorBindingStatus.connected: ConnectorHealthStatus.healthy,
+        ConnectorBindingStatus.degraded: ConnectorHealthStatus.degraded,
+        ConnectorBindingStatus.error: ConnectorHealthStatus.error,
+        ConnectorBindingStatus.revoked: ConnectorHealthStatus.error,
+    }[binding.status]
+
+
+def _next_action(
+    manifest: ConnectorManifest,
+    binding: ConnectorBinding | None,
+) -> dict[str, str] | None:
+    status = (
+        ConnectorBindingStatus.unconfigured
+        if binding is None
+        else binding.status
+    )
+    if status in {
+        ConnectorBindingStatus.connected,
+        ConnectorBindingStatus.degraded,
+    }:
+        return None
+    if status is ConnectorBindingStatus.error and manifest.auth_action is not None:
+        return {
+            "kind": "authorize",
+            "label": f"Reconnect: {manifest.auth_action.label}",
+            "instructions": (
+                manifest.auth_action.help_text
+                or "Restart browser authorization to restore this connector."
+            ),
+        }
+    if manifest.setup_fields and status is ConnectorBindingStatus.unconfigured:
+        return {
+            "kind": "setup",
+            "label": manifest.setup_action_label,
+            "instructions": "Save the required connector configuration to continue.",
+        }
+    if manifest.auth_action is not None:
+        return {
+            "kind": "authorize",
+            "label": manifest.auth_action.label,
+            "instructions": (
+                manifest.auth_action.help_text
+                or (
+                    "Authorization is in progress; complete or restart the browser flow."
+                    if status is ConnectorBindingStatus.authorizing
+                    else "Continue with browser authorization to connect this provider."
+                )
+            ),
+        }
+    if manifest.setup_fields:
+        return {
+            "kind": "setup",
+            "label": manifest.setup_action_label,
+            "instructions": "Complete the remaining provider setup steps.",
+        }
+    return None
+
+
 def manifest_to_dict(manifest: ConnectorManifest) -> dict[str, Any]:
     return {
         "id": manifest.id,
@@ -861,6 +1272,8 @@ def manifest_to_dict(manifest: ConnectorManifest) -> dict[str, Any]:
             if manifest.auth_action is None
             else {
                 "label": manifest.auth_action.label,
+                "requires_setup": manifest.auth_action.requires_setup,
+                "help_text": manifest.auth_action.help_text,
                 "callback_parameters": [
                     {"id": item.id, "required": item.required}
                     for item in manifest.auth_action.callback_parameters
@@ -868,6 +1281,15 @@ def manifest_to_dict(manifest: ConnectorManifest) -> dict[str, Any]:
             }
         ),
         "setup_action_label": manifest.setup_action_label,
+        "default_sync_cadence_seconds": manifest.default_sync_cadence_seconds,
+        "renewal": (
+            None
+            if manifest.renewal is None
+            else {
+                "cadence_seconds": manifest.renewal.cadence_seconds,
+                "expiry_behavior": manifest.renewal.expiry_behavior.value,
+            }
+        ),
         "resource_label": manifest.resource_label,
         "target_fields": [
             {
@@ -908,6 +1330,13 @@ def binding_to_dict(
         ),
         "error_code": binding.error_code,
         "error_summary": binding.error_summary,
+        "renewal_expires_at": (
+            binding.renewal_expires_at.isoformat() if binding.renewal_expires_at else None
+        ),
+        "next_sync_at": binding.next_sync_at.isoformat() if binding.next_sync_at else None,
+        "next_renewal_at": (
+            binding.next_renewal_at.isoformat() if binding.next_renewal_at else None
+        ),
         "targets": {item.kind.value: item.target_id for item in targets},
     }
 
@@ -934,11 +1363,14 @@ def resource_to_dict(resource: Any) -> dict[str, Any]:
 
 
 __all__ = [
+    "CONNECTOR_RENEW_JOB_KIND",
+    "CONNECTOR_RENEW_MAX_ATTEMPTS",
     "CONNECTOR_SYNC_JOB_KIND",
     "CONNECTOR_SYNC_MAX_ATTEMPTS",
     "CallbackConnectorChangeSink",
     "ConnectorChangeSink",
     "ConnectorKnowledgeService",
+    "ConnectorIngressOutcome",
     "ConnectorPurgeSink",
     "ConnectorService",
     "ConnectorSetupOutcome",

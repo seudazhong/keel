@@ -96,8 +96,20 @@ export function ConnectorSetup({ connector, compact = false }: { connector: Conn
       {!connector.available && (
         <p className="text-xs text-red">{connector.availability_error ?? "Provider unavailable"}</p>
       )}
+      {connector.next_action && (
+        <p className="rounded-sm border border-border p-2 text-xs text-text-soft">
+          <strong>{connector.next_action.label}:</strong> {connector.next_action.instructions}
+        </p>
+      )}
       {connector.auth_action && (
-        <Button className="w-full" onClick={connect} disabled={!connector.available}>
+        <Button
+          className="w-full"
+          onClick={connect}
+          disabled={
+            !connector.available ||
+            (connector.auth_action.requires_setup && !connector.configured)
+          }
+        >
           {connector.auth_action.label}
         </Button>
       )}

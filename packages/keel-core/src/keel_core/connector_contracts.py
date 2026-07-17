@@ -32,8 +32,11 @@ class ConnectorCapability(StrEnum):
 
 
 class ConnectorBindingStatus(StrEnum):
+    unconfigured = "unconfigured"
     configured = "configured"
+    authorizing = "authorizing"
     connected = "connected"
+    degraded = "degraded"
     error = "error"
     revoked = "revoked"
 
@@ -54,6 +57,17 @@ class ConnectorChangeKind(StrEnum):
 class ConnectorResourceRefreshMode(StrEnum):
     authoritative = "authoritative"
     incremental = "incremental"
+
+
+class ConnectorScheduleOperation(StrEnum):
+    sync = "sync"
+    renewal = "renewal"
+
+
+class ConnectorRenewalExpiryBehavior(StrEnum):
+    degraded = "degraded"
+    error = "error"
+    revoked = "revoked"
 
 
 class ConnectorSetupArtifactKind(StrEnum):
@@ -114,10 +128,14 @@ class ConnectorCallbackParameter:
 class ConnectorAuthAction:
     label: str = "Connect"
     callback_parameters: tuple[ConnectorCallbackParameter, ...] = ()
+    requires_setup: bool = False
+    help_text: str | None = None
 
     def __post_init__(self) -> None:
         if not self.label.strip():
             raise ValueError("connector auth action label must not be blank")
+        if self.help_text is not None and not self.help_text.strip():
+            raise ValueError("connector auth action help text must not be blank")
         ids = [item.id for item in self.callback_parameters]
         if len(set(ids)) != len(ids):
             raise ValueError("connector auth action has duplicate callback parameters")
@@ -164,6 +182,16 @@ class ConnectorActionManifest:
 
 
 @dataclass(frozen=True, slots=True)
+class ConnectorRenewalPolicy:
+    cadence_seconds: int
+    expiry_behavior: ConnectorRenewalExpiryBehavior = ConnectorRenewalExpiryBehavior.degraded
+
+    def __post_init__(self) -> None:
+        if self.cadence_seconds <= 0:
+            raise ValueError("connector renewal cadence must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class ConnectorManifest:
     id: str
     name: str
@@ -178,6 +206,8 @@ class ConnectorManifest:
     resource_label: str | None = None
     target_fields: tuple[ConnectorTargetField, ...] = ()
     actions: tuple[ConnectorActionManifest, ...] = ()
+    default_sync_cadence_seconds: int | None = None
+    renewal: ConnectorRenewalPolicy | None = None
 
     def __post_init__(self) -> None:
         connector_id = self.id.strip()
@@ -200,6 +230,16 @@ class ConnectorManifest:
         action_names = [item.name for item in self.actions]
         if len(set(action_names)) != len(action_names):
             raise ValueError(f"connector {connector_id!r} has duplicate action names")
+        if (
+            self.default_sync_cadence_seconds is not None
+            and self.default_sync_cadence_seconds <= 0
+        ):
+            raise ValueError("connector sync cadence must be positive")
+        if (
+            self.default_sync_cadence_seconds is not None
+            and ConnectorCapability.sync not in self.capabilities
+        ):
+            raise ValueError("connector sync cadence requires the sync capability")
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +257,14 @@ class ConnectorBinding:
     error_summary: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    sync_cadence_seconds: int | None = None
+    renewal_cadence_seconds: int | None = None
+    renewal_expiry_behavior: ConnectorRenewalExpiryBehavior | None = None
+    renewal_expires_at: datetime | None = None
+    next_sync_at: datetime | None = None
+    next_renewal_at: datetime | None = None
+    sync_failures: int = 0
+    renewal_failures: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +457,12 @@ class ConnectorSetupResult:
     binding: ConnectorBindingDraft
     credential: CredentialEnvelope | None = None
     artifacts: tuple[ConnectorSetupArtifact, ...] = ()
+    status: ConnectorBindingStatus = ConnectorBindingStatus.connected
+    renewal_expires_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.status is ConnectorBindingStatus.unconfigured:
+            raise ValueError("connector setup cannot persist an unconfigured binding")
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +479,7 @@ class ConnectorCredentialUpdate:
 class ConnectorStateUpdate:
     credential: ConnectorCredentialUpdate | None = field(default=None, repr=False)
     binding_metadata: dict[str, Any] | None = field(default=None, repr=False)
+    binding_status: ConnectorBindingStatus | None = None
     cursor_updates: tuple[ConnectorCursorUpdate, ...] = ()
 
 
@@ -436,6 +491,17 @@ class ConnectorSyncResult:
     @property
     def cursor_updates(self) -> tuple[ConnectorCursorUpdate, ...]:
         return self.state.cursor_updates
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorRenewalResult:
+    state: ConnectorStateUpdate = field(default_factory=ConnectorStateUpdate)
+    renewal_expires_at: datetime | None = None
+    update_renewal_expiry: bool = False
+
+    def __post_init__(self) -> None:
+        if self.renewal_expires_at is not None and not self.update_renewal_expiry:
+            object.__setattr__(self, "update_renewal_expiry", True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -588,9 +654,107 @@ class ConnectorActionContext:
 
 
 @dataclass(frozen=True, slots=True)
+class ConnectorIngressRequest:
+    method: str
+    query: Mapping[str, tuple[str, ...]] = field(repr=False)
+    headers: Mapping[str, str] = field(repr=False)
+    body: bytes = field(repr=False)
+    public_url: str = field(repr=False)
+
+    def __post_init__(self) -> None:
+        if not self.method.strip() or not self.public_url.strip():
+            raise ValueError("connector ingress method and public URL must not be blank")
+
+
+_UNSAFE_RESPONSE_HEADERS = frozenset(
+    {
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "proxy-connection",
+        "set-cookie",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+    }
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorIngressResponse:
+    status_code: int = 202
+    content_type: str = "application/json"
+    headers: Mapping[str, str] = field(default_factory=dict, repr=False)
+    body: bytes = field(default=b"{}", repr=False)
+
+    def __post_init__(self) -> None:
+        if not 200 <= self.status_code <= 599:
+            raise ValueError("connector ingress response status must be between 200 and 599")
+        if (
+            not self.content_type.strip()
+            or len(self.content_type) > 255
+            or "/" not in self.content_type
+            or any(not 32 <= ord(ch) <= 126 for ch in self.content_type)
+        ):
+            raise ValueError("connector ingress response content type is invalid")
+        if len(self.body) > 1_048_576:
+            raise ValueError("connector ingress response body is too large")
+        if self.status_code in {204, 304} and self.body:
+            raise ValueError("connector ingress response status does not allow a body")
+        for raw_name, value in self.headers.items():
+            if not isinstance(raw_name, str) or not isinstance(value, str):
+                raise ValueError("connector ingress response headers must be text")
+            name = raw_name.strip().lower()
+            if (
+                not name
+                or name in _UNSAFE_RESPONSE_HEADERS
+                or any(
+                    not ch.isascii()
+                    or not (ch.isalnum() or ch in "!#$%&'*+-.^_`|~")
+                    for ch in name
+                )
+                or "\r" in value
+                or "\n" in value
+                or "\x00" in value
+            ):
+                raise ValueError("connector ingress response contains an unsafe header")
+            try:
+                value.encode("latin-1")
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    "connector ingress response header is not HTTP-compatible"
+                ) from exc
+
+
+@dataclass(frozen=True, slots=True)
 class ConnectorIngressResult:
-    delivery_id: str
+    response: ConnectorIngressResponse
+    delivery_id: str | None = None
+    payload_hash: str | None = None
     changes: tuple[ConnectorChange, ...] = ()
+
+    def __post_init__(self) -> None:
+        immediate = self.delivery_id is None and self.payload_hash is None
+        if immediate:
+            if self.changes:
+                raise ValueError("immediate connector ingress responses cannot contain changes")
+            return
+        if not self.delivery_id or self.payload_hash is None:
+            raise ValueError("connector ingress deliveries require an id and payload hash")
+        if (
+            "\x00" in self.delivery_id
+            or len(self.delivery_id.encode("utf-8")) > 512
+        ):
+            raise ValueError("connector ingress delivery id is invalid")
+        if len(self.payload_hash) != 64 or any(
+            ch not in "0123456789abcdef" for ch in self.payload_hash
+        ):
+            raise ValueError("connector ingress payload hash must be lowercase SHA-256")
 
 
 class ConnectorError(Exception):
@@ -615,10 +779,15 @@ class ConnectorProvider(Protocol):
 
     def enabled(self) -> bool: ...
 
-    async def begin_auth(self, callback_url: str) -> ConnectorAuthStart: ...
+    async def begin_auth(
+        self, context: ConnectorOperationContext, callback_url: str
+    ) -> ConnectorAuthStart: ...
 
     async def complete_auth(
-        self, callback_url: str, parameters: dict[str, str]
+        self,
+        context: ConnectorOperationContext,
+        callback_url: str,
+        parameters: dict[str, str],
     ) -> ConnectorSetupResult: ...
 
     async def setup(
@@ -631,12 +800,14 @@ class ConnectorProvider(Protocol):
 
     async def sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult: ...
 
+    async def renew(self, context: ConnectorOperationContext) -> ConnectorRenewalResult: ...
+
     async def health(self, context: ConnectorOperationContext) -> ConnectorHealth: ...
 
     async def revoke(self, context: ConnectorOperationContext) -> None: ...
 
     async def ingress(
-        self, context: ConnectorOperationContext, headers: dict[str, str], body: bytes
+        self, context: ConnectorOperationContext, request: ConnectorIngressRequest
     ) -> ConnectorIngressResult: ...
 
     def build_actions(self, context: ConnectorActionContext) -> tuple[ConnectorAction, ...]: ...
@@ -650,11 +821,16 @@ class BaseConnectorProvider:
     def enabled(self) -> bool:
         return True
 
-    async def begin_auth(self, callback_url: str) -> ConnectorAuthStart:
+    async def begin_auth(
+        self, context: ConnectorOperationContext, callback_url: str
+    ) -> ConnectorAuthStart:
         raise ConnectorUnsupportedError(f"{self.manifest.id} does not support browser auth")
 
     async def complete_auth(
-        self, callback_url: str, parameters: dict[str, str]
+        self,
+        context: ConnectorOperationContext,
+        callback_url: str,
+        parameters: dict[str, str],
     ) -> ConnectorSetupResult:
         raise ConnectorUnsupportedError(f"{self.manifest.id} does not support auth callbacks")
 
@@ -671,6 +847,9 @@ class BaseConnectorProvider:
     async def sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult:
         raise ConnectorUnsupportedError(f"{self.manifest.id} sync is not implemented")
 
+    async def renew(self, context: ConnectorOperationContext) -> ConnectorRenewalResult:
+        raise ConnectorUnsupportedError(f"{self.manifest.id} renewal is not implemented")
+
     async def health(self, context: ConnectorOperationContext) -> ConnectorHealth:
         raise ConnectorUnsupportedError(f"{self.manifest.id} health is not implemented")
 
@@ -683,7 +862,7 @@ class BaseConnectorProvider:
         return None
 
     async def ingress(
-        self, context: ConnectorOperationContext, headers: dict[str, str], body: bytes
+        self, context: ConnectorOperationContext, request: ConnectorIngressRequest
     ) -> ConnectorIngressResult:
         raise ConnectorUnsupportedError(f"{self.manifest.id} webhook ingress is not implemented")
 
@@ -728,6 +907,8 @@ __all__ = [
     "ConnectorHealth",
     "ConnectorHealthStatus",
     "ConnectorIngressResult",
+    "ConnectorIngressRequest",
+    "ConnectorIngressResponse",
     "ConnectorItem",
     "ConnectorItemDraft",
     "ConnectorManifest",
@@ -739,6 +920,10 @@ __all__ = [
     "ConnectorResourceDraft",
     "ConnectorResourceRefreshMode",
     "ConnectorResourceResult",
+    "ConnectorRenewalExpiryBehavior",
+    "ConnectorRenewalPolicy",
+    "ConnectorRenewalResult",
+    "ConnectorScheduleOperation",
     "ConnectorSetupArtifact",
     "ConnectorSetupArtifactKind",
     "ConnectorSetupField",

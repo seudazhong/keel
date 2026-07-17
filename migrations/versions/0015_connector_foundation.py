@@ -53,7 +53,10 @@ def upgrade() -> None:
             scope_id text NOT NULL,
             connector_id text NOT NULL,
             status text NOT NULL
-                CHECK (status IN ('configured', 'connected', 'error', 'revoked')),
+                CHECK (status IN (
+                    'unconfigured', 'configured', 'authorizing', 'connected',
+                    'degraded', 'error', 'revoked'
+                )),
             display_name text,
             external_account_id text,
             external_tenant_id text,
@@ -61,10 +64,32 @@ def upgrade() -> None:
             last_success_at timestamptz,
             error_code text,
             error_summary text,
+            sync_cadence_seconds integer CHECK (sync_cadence_seconds > 0),
+            renewal_cadence_seconds integer CHECK (renewal_cadence_seconds > 0),
+            renewal_expiry_behavior text
+                CHECK (renewal_expiry_behavior IN ('degraded', 'error', 'revoked')),
+            renewal_expires_at timestamptz,
+            next_sync_at timestamptz,
+            next_renewal_at timestamptz,
+            sync_failures integer NOT NULL DEFAULT 0 CHECK (sync_failures >= 0),
+            renewal_failures integer NOT NULL DEFAULT 0 CHECK (renewal_failures >= 0),
+            schedule_lease_token text,
+            schedule_lease_operation text
+                CHECK (schedule_lease_operation IN ('sync', 'renewal')),
+            schedule_lease_expires_at timestamptz,
             created_at timestamptz NOT NULL DEFAULT now(),
             updated_at timestamptz NOT NULL DEFAULT now(),
             UNIQUE (scope_id, connector_id),
             UNIQUE (scope_id, id),
+            CHECK (
+                (schedule_lease_token IS NULL
+                    AND schedule_lease_operation IS NULL
+                    AND schedule_lease_expires_at IS NULL)
+                OR
+                (schedule_lease_token IS NOT NULL
+                    AND schedule_lease_operation IS NOT NULL
+                    AND schedule_lease_expires_at IS NOT NULL)
+            ),
             {_metadata_check("metadata")}
         )
         """
@@ -72,6 +97,10 @@ def upgrade() -> None:
     op.execute(
         "CREATE INDEX ix_connector_bindings_status "
         "ON connector_bindings (scope_id, status, updated_at)"
+    )
+    op.execute(
+        "CREATE INDEX ix_connector_bindings_due "
+        "ON connector_bindings (scope_id, status, next_sync_at, next_renewal_at)"
     )
 
     op.execute(

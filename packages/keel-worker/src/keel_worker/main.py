@@ -50,7 +50,7 @@ from keel_core.runs import PostgresRunStore
 from keel_core.state import PostgresEventStore
 from keel_core.tools import build_service_execution_environment
 from keel_scheduler.store import ScheduleRow, due_tick
-from keel_worker.connectors import register_connector_jobs
+from keel_worker.connectors import reconcile_connectors_tick, register_connector_jobs
 from keel_worker.jobs import dispatch_jobs, run_job
 from keel_worker.knowledge import knowledge_job_registry
 from keel_worker.runs import reconcile_runs_tick, run_interactive
@@ -493,6 +493,7 @@ class WorkerSettings:
         resume_run,
         run_interactive,
         scheduler_tick,
+        reconcile_connectors_tick,
         reconcile_runs_tick,
         func(
             run_job,
@@ -504,6 +505,7 @@ class WorkerSettings:
     cron_jobs = [
         cron(scheduler_tick, second={0, 30}),
         cron(dispatch_jobs, second={0, 30}),
+        cron(reconcile_connectors_tick, second={0, 30}),
         cron(reconcile_runs_tick, second={0, 30}),
     ]
     on_startup = startup
