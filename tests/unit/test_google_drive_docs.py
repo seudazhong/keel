@@ -1,0 +1,682 @@
+"""Provider-local Google Drive/Docs sync and Knowledge lifecycle contracts."""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
+
+import pytest
+
+from keel_core.connector_contracts import (
+    ConnectorBinding,
+    ConnectorBindingDraft,
+    ConnectorBindingStatus,
+    ConnectorChangeKind,
+    ConnectorCursor,
+    ConnectorHealthStatus,
+    ConnectorItem,
+    ConnectorOperationContext,
+    ConnectorResource,
+    ConnectorResourceDraft,
+    ConnectorTargetKind,
+)
+from keel_core.connector_credentials import ConnectorCredentialStore, CredentialEnvelope
+from keel_core.connector_providers import google_drive_docs
+from keel_core.connector_providers.google_drive_docs import (
+    GOOGLE_DOC_MIME_TYPE,
+    GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+    GOOGLE_DRIVE_DOCS_SCOPES,
+    TEXT_MIME_TYPE,
+    DriveChange,
+    DriveChangePage,
+    DriveFile,
+    DriveFilePage,
+    GoogleDriveCursorInvalidError,
+    GoogleDriveDocsProvider,
+    GoogleDriveRateLimitError,
+)
+from keel_core.connector_registry import ConnectorRegistration, ConnectorRegistry
+from keel_core.connector_repository import InMemoryConnectorRepository
+from keel_core.connector_service import ConnectorService, DurableConnectorChangeSink
+from keel_core.knowledge.models import (
+    CreateKnowledgeDocumentCommand,
+    DeleteKnowledgeCommand,
+    UpdateKnowledgeDocumentCommand,
+)
+from keel_core.secrets import EnvelopeCipher
+from keel_core.tokens import InMemoryTokenStore
+from keel_core.types import ContentTaint
+
+_FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "connectors" / "google_drive_docs"
+
+
+def _load_fixture(name: str) -> dict[str, Any]:
+    value = json.loads((_FIXTURES / name).read_text(encoding="utf-8"))
+    assert isinstance(value, dict)
+    return value
+
+
+def _drive_file(value: Mapping[str, Any]) -> DriveFile:
+    return DriveFile(
+        id=str(value["id"]),
+        name=str(value["name"]),
+        mime_type=str(value["mime_type"]),
+        parents=tuple(str(item) for item in value.get("parents", [])),
+        source_url=str(value["source_url"]) if value.get("source_url") else None,
+        modified_time=str(value["modified_time"]) if value.get("modified_time") else None,
+        version=str(value["version"]) if value.get("version") else None,
+    )
+
+
+class FakeDriveClient:
+    def __init__(
+        self,
+        fixture: dict[str, Any],
+        *,
+        credential: CredentialEnvelope | None = None,
+    ) -> None:
+        self.files = {
+            file.id: file
+            for raw in fixture.get("files", [])
+            if isinstance(raw, dict)
+            for file in (_drive_file(raw),)
+        }
+        self.content = {
+            str(key): str(value).encode() for key, value in dict(fixture.get("content", {})).items()
+        }
+        self.start_page_token = str(fixture.get("start_page_token", "cursor-1"))
+        self.change_pages: dict[str, DriveChangePage] = {}
+        self.invalid_tokens: set[str] = set()
+        self.list_calls: list[tuple[str | None, str | None]] = []
+        self.change_calls: list[str] = []
+        self.read_calls: list[str] = []
+        self.health_error: Exception | None = None
+        self._credential = credential or CredentialEnvelope(
+            "oauth",
+            {"refresh_token": "drive-refresh", "token": "drive-access"},
+        )
+
+    @property
+    def credential(self) -> CredentialEnvelope:
+        return self._credential
+
+    def rotate(self, token: str) -> None:
+        self._credential = CredentialEnvelope(
+            "oauth",
+            {"refresh_token": "drive-refresh", "token": token},
+        )
+
+    def list_files(
+        self,
+        *,
+        page_token: str | None = None,
+        parent_id: str | None = None,
+    ) -> DriveFilePage:
+        self.list_calls.append((page_token, parent_id))
+        files = sorted(self.files.values(), key=lambda item: item.id)
+        if parent_id is not None:
+            return DriveFilePage(tuple(file for file in files if parent_id in file.parents))
+        midpoint = max(1, len(files) // 2)
+        if page_token is None:
+            return DriveFilePage(tuple(files[:midpoint]), "files-page-2")
+        if page_token == "files-page-2":
+            return DriveFilePage(tuple(files[midpoint:]))
+        raise AssertionError(f"unexpected files page token: {page_token}")
+
+    def get_file(self, file_id: str) -> DriveFile | None:
+        return self.files.get(file_id)
+
+    def get_start_page_token(self) -> str:
+        return self.start_page_token
+
+    def list_changes(self, page_token: str) -> DriveChangePage:
+        self.change_calls.append(page_token)
+        if page_token in self.invalid_tokens:
+            raise GoogleDriveCursorInvalidError("expired")
+        return self.change_pages[page_token]
+
+    def read_content(self, file: DriveFile) -> tuple[str, str]:
+        self.read_calls.append(file.id)
+        mime_type = TEXT_MIME_TYPE if file.mime_type == GOOGLE_DOC_MIME_TYPE else file.mime_type
+        return self.content[file.id].decode().replace("\r\n", "\n"), mime_type
+
+    def check_health(self) -> None:
+        if self.health_error is not None:
+            raise self.health_error
+
+
+def _binding(scope_id: str = "scope:a") -> ConnectorBinding:
+    return ConnectorBinding(
+        id="binding-drive",
+        scope_id=scope_id,
+        connector_id=GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        status=ConnectorBindingStatus.connected,
+    )
+
+
+def _resource(
+    *,
+    external_id: str = "root",
+    kind: str = "folder",
+    scope_id: str = "scope:a",
+) -> ConnectorResource:
+    return ConnectorResource(
+        id=f"resource-{external_id}",
+        scope_id=scope_id,
+        connector_id=GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        binding_id="binding-drive",
+        external_id=external_id,
+        kind=kind,
+        display_name=external_id,
+        selected=True,
+    )
+
+
+def _item(file: DriveFile, *, revision: str = "old") -> ConnectorItem:
+    return ConnectorItem(
+        id=f"item-{file.id}",
+        scope_id="scope:a",
+        connector_id=GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        binding_id="binding-drive",
+        external_id=file.id,
+        kind="knowledge_document",
+        display_name=file.name,
+        url=file.source_url,
+        destination_kind=ConnectorTargetKind.knowledge,
+        destination_target_id="kb-1",
+        destination_id=f"knowledge-{file.id}",
+        config={"revision": revision},
+    )
+
+
+def _context(
+    client: FakeDriveClient,
+    *,
+    resources: tuple[ConnectorResource, ...] | None = None,
+    items: tuple[ConnectorItem, ...] = (),
+    cursors: tuple[ConnectorCursor, ...] = (),
+) -> ConnectorOperationContext:
+    return ConnectorOperationContext(
+        scope_id="scope:a",
+        connector_id=GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        binding=_binding(),
+        credential=CredentialEnvelope(
+            "oauth",
+            {"refresh_token": "drive-refresh", "token": "drive-access"},
+        ),
+        credential_version=1,
+        resources=resources or (_resource(),),
+        items=items,
+        cursors=cursors,
+    )
+
+
+class EnabledGoogleDriveProvider(GoogleDriveDocsProvider):
+    def enabled(self) -> bool:
+        return True
+
+
+def test_manifest_is_read_only_independent_and_requires_knowledge() -> None:
+    assert google_drive_docs.manifest.id == GOOGLE_DRIVE_DOCS_CONNECTOR_ID
+    assert google_drive_docs.manifest.scopes == GOOGLE_DRIVE_DOCS_SCOPES
+    assert GOOGLE_DRIVE_DOCS_SCOPES == ("https://www.googleapis.com/auth/drive.readonly",)
+    assert all("gmail" not in scope for scope in google_drive_docs.manifest.scopes)
+    assert [field.kind for field in google_drive_docs.manifest.target_fields] == [
+        ConnectorTargetKind.knowledge
+    ]
+    assert google_drive_docs.manifest.actions == ()
+
+
+def test_removed_change_accepts_partial_google_file_metadata() -> None:
+    file = DriveFile.from_change_api({"id": "deleted-1"}, "deleted-1")
+    assert file.id == "deleted-1"
+    assert file.name == "deleted-1"
+    assert file.mime_type == ""
+
+
+async def test_auth_requests_only_drive_scope_without_incremental_grants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, Any] = {}
+
+    class Flow:
+        def authorization_url(self, **kwargs: Any) -> tuple[str, str]:
+            seen.update(kwargs)
+            return "https://accounts.google.test/auth", "state"
+
+    monkeypatch.setattr(google_drive_docs, "_flow", lambda callback_url: Flow())
+    result = await GoogleDriveDocsProvider().begin_auth(
+        ConnectorOperationContext("scope:a", GOOGLE_DRIVE_DOCS_CONNECTOR_ID),
+        "https://keel.test/callback",
+    )
+    assert result.state == "state"
+    assert seen == {
+        "access_type": "offline",
+        "prompt": "consent",
+        "include_granted_scopes": "false",
+    }
+
+
+async def test_resource_discovery_is_paginated_and_excludes_binary_formats() -> None:
+    fake = FakeDriveClient(_load_fixture("initial.json"))
+    provider = EnabledGoogleDriveProvider(lambda credential: fake)
+    result = await provider.list_resources(_context(fake))
+
+    assert [item.external_id for item in result.resources] == [
+        "nested",
+        "root",
+        "txt-1",
+        "outside",
+        "doc-1",
+        "md-1",
+    ]
+    assert "pdf-1" not in {item.external_id for item in result.resources}
+    assert "office-1" not in {item.external_id for item in result.resources}
+    assert fake.list_calls[:2] == [(None, None), ("files-page-2", None)]
+
+
+async def test_initial_sync_crawls_nested_roots_with_taint_and_provenance() -> None:
+    fake = FakeDriveClient(_load_fixture("initial.json"))
+    provider = EnabledGoogleDriveProvider(lambda credential: fake)
+    result = await provider.sync(_context(fake))
+
+    assert [change.provenance.external_resource_id for change in result.changes] == [
+        "doc-1",
+        "md-1",
+        "txt-1",
+    ]
+    assert all(change.kind is ConnectorChangeKind.upsert for change in result.changes)
+    assert all(change.taint is ContentTaint.tainted for change in result.changes)
+    roadmap = result.changes[0]
+    assert roadmap.content == "Roadmap body\nSecond line"
+    assert roadmap.provenance.source_url == "https://docs.google.com/document/d/doc-1/edit"
+    revision = json.loads(str(roadmap.provenance.revision))
+    assert revision == {
+        "modified_time": "2026-07-10T10:00:00Z",
+        "name": "Roadmap",
+        "version": "7",
+    }
+    assert result.cursor_updates[0].resource_id == "resource-root"
+    assert result.cursor_updates[0].value == "cursor-1"
+    assert set(fake.read_calls) == {"doc-1", "md-1", "txt-1"}
+
+
+async def test_initial_sync_keeps_a_cursor_for_each_selected_root() -> None:
+    fake = FakeDriveClient(_load_fixture("initial.json"))
+    provider = EnabledGoogleDriveProvider(lambda credential: fake)
+    resources = (
+        _resource(),
+        _resource(external_id="outside", kind="file"),
+    )
+    result = await provider.sync(_context(fake, resources=resources))
+
+    assert {change.provenance.external_resource_id for change in result.changes} == {
+        "doc-1",
+        "md-1",
+        "outside",
+        "txt-1",
+    }
+    assert {(cursor.resource_id, cursor.value) for cursor in result.cursor_updates} == {
+        ("resource-root", "cursor-1"),
+        ("resource-outside", "cursor-1"),
+    }
+
+
+async def test_changes_cursor_paginates_deduplicates_updates_moves_and_deletes() -> None:
+    initial = _load_fixture("initial.json")
+    fake = FakeDriveClient(initial)
+    doc = fake.files["doc-1"]
+    fake.files["doc-1"] = DriveFile(
+        id=doc.id,
+        name="Roadmap renamed",
+        mime_type=doc.mime_type,
+        parents=doc.parents,
+        source_url=doc.source_url,
+        modified_time="2026-07-18T01:00:00Z",
+        version="8",
+    )
+    fake.content["doc-1"] = b"Updated roadmap"
+    moved = DriveFile(
+        id="moved-1",
+        name="Moved.txt",
+        mime_type=TEXT_MIME_TYPE,
+        parents=("other-root",),
+        source_url="https://drive.google.com/file/d/moved-1/view",
+        modified_time="2026-07-18T01:01:00Z",
+        version="4",
+    )
+    fake.files[moved.id] = moved
+    fake.content[moved.id] = b"Moved away"
+    incoming = DriveFile(
+        id="incoming-1",
+        name="Incoming.md",
+        mime_type="text/markdown",
+        parents=("root",),
+        source_url="https://drive.google.com/file/d/incoming-1/view",
+        modified_time="2026-07-18T01:02:00Z",
+        version="1",
+    )
+    fake.files[incoming.id] = incoming
+    fake.content[incoming.id] = b"# Moved in"
+    fixture = _load_fixture("changes.json")
+    pages = fixture["pages"]
+    assert isinstance(pages, dict)
+    for token, raw in pages.items():
+        assert isinstance(raw, dict)
+        changes = tuple(
+            DriveChange(
+                str(item["file_id"]),
+                bool(item["removed"]),
+            )
+            for item in raw["changes"]
+        )
+        fake.change_pages[str(token)] = DriveChangePage(
+            changes,
+            str(raw["next_page_token"]) if raw.get("next_page_token") else None,
+            str(raw["new_start_page_token"]) if raw.get("new_start_page_token") else None,
+        )
+    last_page = fake.change_pages["cursor-1-page-2"]
+    fake.change_pages["cursor-1-page-2"] = DriveChangePage(
+        last_page.changes + (DriveChange("incoming-1", False),),
+        last_page.next_page_token,
+        last_page.new_start_page_token,
+    )
+    deleted = DriveFile(
+        "deleted-1",
+        "Deleted.txt",
+        TEXT_MIME_TYPE,
+        ("root",),
+        "https://drive.google.com/file/d/deleted-1/view",
+        "2026-07-12T00:00:00Z",
+        "1",
+    )
+    cursor = ConnectorCursor(
+        id="cursor-row",
+        scope_id="scope:a",
+        connector_id=GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        binding_id="binding-drive",
+        stream="drive_changes",
+        value="cursor-1",
+        resource_id="resource-root",
+    )
+    provider = EnabledGoogleDriveProvider(lambda credential: fake)
+    result = await provider.sync(
+        _context(
+            fake,
+            items=(_item(doc), _item(deleted), _item(moved)),
+            cursors=(cursor,),
+        )
+    )
+
+    by_id = {change.provenance.external_resource_id: change for change in result.changes}
+    assert by_id["doc-1"].kind is ConnectorChangeKind.upsert
+    assert by_id["doc-1"].title == "Roadmap renamed"
+    assert by_id["deleted-1"].kind is ConnectorChangeKind.delete
+    assert by_id["moved-1"].kind is ConnectorChangeKind.delete
+    assert by_id["incoming-1"].kind is ConnectorChangeKind.upsert
+    assert list(by_id).count("doc-1") == 1
+    assert fake.change_calls == ["cursor-1", "cursor-1-page-2"]
+    assert result.cursor_updates[0].value == "cursor-2"
+
+
+async def test_invalid_cursor_runs_one_controlled_full_resync() -> None:
+    fake = FakeDriveClient(_load_fixture("initial.json"))
+    fake.invalid_tokens.add("expired")
+    stale = DriveFile(
+        "stale",
+        "Stale.txt",
+        TEXT_MIME_TYPE,
+        ("root",),
+        "https://drive.google.com/file/d/stale/view",
+        "2026-07-01T00:00:00Z",
+        "1",
+    )
+    cursor = ConnectorCursor(
+        id="cursor-row",
+        scope_id="scope:a",
+        connector_id=GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        binding_id="binding-drive",
+        stream="drive_changes",
+        value="expired",
+        resource_id="resource-root",
+    )
+    provider = EnabledGoogleDriveProvider(lambda credential: fake)
+    result = await provider.sync(_context(fake, items=(_item(stale),), cursors=(cursor,)))
+
+    assert fake.change_calls == ["expired"]
+    assert result.cursor_updates[0].value == "cursor-1"
+    assert any(
+        change.kind is ConnectorChangeKind.delete
+        and change.provenance.external_resource_id == "stale"
+        for change in result.changes
+    )
+
+
+async def test_sync_reports_credential_refresh_and_rate_limit_health() -> None:
+    fake = FakeDriveClient(_load_fixture("initial.json"))
+    fake.rotate("rotated-access")
+    provider = EnabledGoogleDriveProvider(lambda credential: fake)
+    result = await provider.sync(_context(fake))
+    assert result.state.credential is not None
+    assert result.state.credential.expected_version == 1
+    assert result.state.credential.credential.values["token"] == "rotated-access"
+
+    fake.health_error = GoogleDriveRateLimitError("retry later")
+    health = await provider.health(_context(fake))
+    assert health.status is ConnectorHealthStatus.degraded
+    assert health.retryable is True
+
+
+async def test_service_requires_explicit_knowledge_target_before_provider_work() -> None:
+    fake = FakeDriveClient(_load_fixture("initial.json"))
+    provider = EnabledGoogleDriveProvider(lambda credential: fake)
+    repository = InMemoryConnectorRepository("scope:a")
+    binding = await repository.upsert_binding(
+        GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        ConnectorBindingDraft(),
+        ConnectorBindingStatus.connected,
+    )
+    await repository.upsert_resources(
+        GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        binding.id,
+        (ConnectorResourceDraft("root", "folder", "Root", selected=True),),
+    )
+    credentials = ConnectorCredentialStore(
+        InMemoryTokenStore("scope:a", EnvelopeCipher("drive-test-key"))
+    )
+    await credentials.put(
+        GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        CredentialEnvelope("oauth", {"refresh_token": "drive-refresh"}),
+    )
+    service = ConnectorService(
+        ConnectorRegistry(
+            (
+                ConnectorRegistration(
+                    google_drive_docs.manifest,
+                    lambda: provider,
+                    "tests.google_drive_docs",
+                ),
+            )
+        ),
+        repository,
+        credentials=credentials,
+    )
+
+    with pytest.raises(RuntimeError, match="requires configured targets: knowledge"):
+        await service.sync(GOOGLE_DRIVE_DOCS_CONNECTOR_ID, binding.id)
+    assert fake.read_calls == []
+
+
+async def test_scope_bound_credentials_are_isolated_from_other_scopes_and_gmail() -> None:
+    store_a = ConnectorCredentialStore(InMemoryTokenStore("scope:a", EnvelopeCipher("scope-a-key")))
+    store_b = ConnectorCredentialStore(InMemoryTokenStore("scope:b", EnvelopeCipher("scope-b-key")))
+    await store_a.put(
+        GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        CredentialEnvelope("oauth", {"refresh_token": "drive-only"}),
+    )
+    await store_a.put(
+        "gmail",
+        CredentialEnvelope("oauth", {"refresh_token": "gmail-only"}),
+    )
+
+    drive = await store_a.get(GOOGLE_DRIVE_DOCS_CONNECTOR_ID)
+    gmail = await store_a.get("gmail")
+    assert drive is not None and drive.values["refresh_token"] == "drive-only"
+    assert gmail is not None and gmail.values["refresh_token"] == "gmail-only"
+    assert await store_b.get(GOOGLE_DRIVE_DOCS_CONNECTOR_ID) is None
+    with pytest.raises(ValueError, match="crosses its scope or provider"):
+        ConnectorOperationContext(
+            scope_id="scope:b",
+            connector_id=GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+            binding=_binding("scope:a"),
+            resources=(_resource(scope_id="scope:a"),),
+        )
+
+
+class FakeKnowledge:
+    def __init__(self) -> None:
+        self.documents: dict[str, str] = {}
+        self.hidden: set[str] = set()
+        self.purge_jobs: list[str] = []
+        self._idempotency: dict[str, Any] = {}
+
+    async def create_document(
+        self,
+        kb_id: str,
+        command: CreateKnowledgeDocumentCommand,
+        idempotency_key: str,
+    ) -> Any:
+        if idempotency_key in self._idempotency:
+            return self._idempotency[idempotency_key]
+        document_id = f"document-{len(self.documents) + 1}"
+        self.documents[document_id] = command.content
+        result = SimpleNamespace(document=SimpleNamespace(id=document_id))
+        self._idempotency[idempotency_key] = result
+        return result
+
+    async def update_document(
+        self,
+        kb_id: str,
+        document_id: str,
+        command: UpdateKnowledgeDocumentCommand,
+        idempotency_key: str,
+    ) -> Any:
+        if idempotency_key not in self._idempotency:
+            self.documents[document_id] = command.content
+            self._idempotency[idempotency_key] = object()
+        return self._idempotency[idempotency_key]
+
+    async def delete_document(
+        self,
+        kb_id: str,
+        document_id: str,
+        command: DeleteKnowledgeCommand,
+        idempotency_key: str,
+    ) -> Any:
+        if idempotency_key not in self._idempotency:
+            self.hidden.add(document_id)
+            self.purge_jobs.append(document_id)
+            self._idempotency[idempotency_key] = object()
+        return self._idempotency[idempotency_key]
+
+
+async def _knowledge_service(
+    fake: FakeDriveClient,
+    knowledge: FakeKnowledge,
+    revoked: list[str],
+) -> tuple[ConnectorService, InMemoryConnectorRepository, str]:
+    provider = EnabledGoogleDriveProvider(
+        lambda credential: fake,
+        lambda credential: revoked.append(str(credential.values.get("refresh_token"))),
+    )
+    repository = InMemoryConnectorRepository("scope:a")
+    binding = await repository.upsert_binding(
+        GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        ConnectorBindingDraft(),
+        ConnectorBindingStatus.connected,
+    )
+    await repository.upsert_resources(
+        GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        binding.id,
+        (ConnectorResourceDraft("root", "folder", "Root", selected=True),),
+    )
+    await repository.replace_targets(
+        GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        binding.id,
+        {ConnectorTargetKind.knowledge: "kb-1"},
+    )
+    credentials = ConnectorCredentialStore(
+        InMemoryTokenStore("scope:a", EnvelopeCipher("drive-test-key"))
+    )
+    await credentials.put(
+        GOOGLE_DRIVE_DOCS_CONNECTOR_ID,
+        CredentialEnvelope("oauth", {"refresh_token": "drive-refresh"}),
+    )
+    sink = DurableConnectorChangeSink(repository, knowledge=knowledge)
+    service = ConnectorService(
+        ConnectorRegistry(
+            (
+                ConnectorRegistration(
+                    google_drive_docs.manifest,
+                    lambda: provider,
+                    "tests.google_drive_docs",
+                ),
+            )
+        ),
+        repository,
+        credentials=credentials,
+        change_sink=sink,
+        purge_sink=sink,
+    )
+    return service, repository, binding.id
+
+
+async def test_external_delete_hides_and_queues_durable_knowledge_purge() -> None:
+    fake = FakeDriveClient(_load_fixture("initial.json"))
+    knowledge = FakeKnowledge()
+    service, repository, binding_id = await _knowledge_service(fake, knowledge, [])
+    assert await service.sync(GOOGLE_DRIVE_DOCS_CONNECTOR_ID, binding_id) == 3
+    mapped = {
+        item.external_id: item
+        for item in await repository.list_items(GOOGLE_DRIVE_DOCS_CONNECTOR_ID)
+    }
+    document_id = str(mapped["doc-1"].destination_id)
+
+    fake.files.pop("doc-1")
+    fake.change_pages["cursor-1"] = DriveChangePage(
+        (DriveChange("doc-1", True),),
+        new_start_page_token="cursor-2",
+    )
+    assert await service.sync(GOOGLE_DRIVE_DOCS_CONNECTOR_ID, binding_id) == 1
+    assert document_id in knowledge.hidden
+    assert document_id in knowledge.purge_jobs
+    assert "doc-1" not in {
+        item.external_id for item in await repository.list_items(GOOGLE_DRIVE_DOCS_CONNECTOR_ID)
+    }
+
+
+@pytest.mark.parametrize("purge", [False, True])
+async def test_revoke_retain_or_purge_and_never_resurrects(purge: bool) -> None:
+    fake = FakeDriveClient(_load_fixture("initial.json"))
+    knowledge = FakeKnowledge()
+    revoked: list[str] = []
+    service, repository, binding_id = await _knowledge_service(fake, knowledge, revoked)
+    assert await service.sync(GOOGLE_DRIVE_DOCS_CONNECTOR_ID, binding_id) == 3
+    imported_ids = {
+        str(item.destination_id)
+        for item in await repository.list_items(GOOGLE_DRIVE_DOCS_CONNECTOR_ID)
+    }
+
+    assert await service.revoke(GOOGLE_DRIVE_DOCS_CONNECTOR_ID, purge=purge) is True
+    assert revoked == ["drive-refresh"]
+    if purge:
+        assert knowledge.hidden == imported_ids
+        assert set(knowledge.purge_jobs) == imported_ids
+    else:
+        assert knowledge.hidden == set()
+        assert set(knowledge.documents) == imported_ids
+    with pytest.raises(LookupError, match="not configured"):
+        await service.sync(GOOGLE_DRIVE_DOCS_CONNECTOR_ID, binding_id)

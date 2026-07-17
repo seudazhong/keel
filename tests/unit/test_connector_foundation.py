@@ -69,12 +69,13 @@ from keel_core.tokens import InMemoryTokenStore
 from keel_core.types import ContentTaint
 
 
-def test_builtin_registry_discovers_gmail_deterministically() -> None:
+def test_builtin_registry_discovers_providers_deterministically() -> None:
     first = discover_connector_registry()
     second = discover_connector_registry()
-    assert [item.id for item in first.manifests()] == ["gmail"]
+    assert [item.id for item in first.manifests()] == ["gmail", "google_drive_docs"]
     assert first.manifests() == second.manifests()
     assert first.create("gmail").manifest.id == "gmail"
+    assert first.create("google_drive_docs").manifest.id == "google_drive_docs"
 
 
 def test_registry_rejects_duplicate_ids() -> None:
