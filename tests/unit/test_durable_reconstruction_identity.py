@@ -6,8 +6,12 @@ rows. That repair is **exact**: a durable row is adopted for a suspended call on
 ``run_id``, ``session_id``, ``call_id``, recomputed ``action_hash`` and — when the run's
 suspension checkpoint recorded them — its source ``run_attempt`` + ``batch_id`` all match. A
 foreign/older/newer attempt or batch, or a mismatched session/call/hash, fails closed (the call
-is denied, never executed on a stale/injected row). A legitimate older-build row (the checkpoint
-never persisted a batch id) is still repaired on the remaining exact fields.
+is denied, never executed on a stale/injected row). A legitimate older-build *checkpoint* (it
+never persisted a batch id, so ``reconstruct_batch_id`` is ``None``) is still repaired on the
+remaining exact fields — but only against an equally batch-less row (a true old-build approval
+row). A batch-less checkpoint never wildcards the batch constraint: a row that carries a real,
+non-empty batch id is always foreign to it and is rejected, fail closed — an empty legacy
+checkpoint can never be tricked into adopting some other (possibly unrelated) batch's approval.
 
 These drive ``loop.resume`` directly against the in-memory doubles, passing the checkpoint's
 ``reconstruct_attempt`` / ``reconstruct_batch_id`` expectations explicitly.
@@ -146,15 +150,30 @@ async def test_exact_attempt_and_batch_reconstructs_and_executes() -> None:
     assert sent == [{"to": "z@x"}]  # honoured the grant, exactly once
 
 
-# ---- legitimate older-build repair: checkpoint never stored a batch id (None relaxes batch) ---
+# ---- legitimate older-build repair: checkpoint AND row never stored a batch id (both empty,
+# a true old-build row) -> still reconstructs on the remaining exact fields -----------------
 async def test_older_build_repair_without_batch_id_still_reconstructs() -> None:
-    store, approvals, _record = await _suspend_granted()
+    store, approvals, record = await _suspend_granted()
+    approvals._rows[record.id] = replace(record, batch_id="")
     sent: list[dict[str, object]] = []
     reason = await _resume(
         store, approvals, sent, reconstruct_attempt=_ATTEMPT, reconstruct_batch_id=None
     )
     assert reason is StopReason.completed
     assert sent == [{"to": "z@x"}]  # attempt + hash + call + session sufficed
+
+
+# ---- adversarial: legacy/batch-less checkpoint (reconstruct_batch_id=None) must NEVER
+# wildcard-match a row that carries a real, non-empty (foreign) batch id -> fail closed --------
+async def test_empty_legacy_checkpoint_never_wildcards_foreign_batch_row() -> None:
+    store, approvals, record = await _suspend_granted()
+    assert record.batch_id  # the row genuinely carries a real batch id from this suspension
+    sent: list[dict[str, object]] = []
+    reason = await _resume(
+        store, approvals, sent, reconstruct_attempt=_ATTEMPT, reconstruct_batch_id=None
+    )
+    assert reason is StopReason.completed
+    assert sent == []  # foreign non-empty batch on a batch-less checkpoint -> never adopted
 
 
 # ---- foreign source attempt: an older/newer attempt is refused (fail closed) ------------------

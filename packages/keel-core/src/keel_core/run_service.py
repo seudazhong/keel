@@ -943,8 +943,11 @@ async def execute_run(
     # source attempt + exact batch id. A lost ``approval.requested`` event is repaired from the
     # durable rows only when their run/session/call/action-hash AND these match exactly — a
     # foreign/older/newer attempt or batch fails closed (blocker 1). ``checkpoint_batch_id``
-    # empty (a legitimate older-build row that never persisted it) relaxes only the batch
-    # constraint; the source attempt is still enforced.
+    # empty (a legitimate older-build checkpoint that never persisted one) does NOT wildcard the
+    # batch constraint: only an approval row whose own batch id is equally empty (a true
+    # old-build row) may be adopted — a row carrying a real, non-empty batch id is always
+    # foreign to a batch-less checkpoint and is rejected, fail closed. The source attempt is
+    # still enforced exactly regardless.
     reconstruct_attempt = record.checkpoint_attempt or lease.attempt
     reconstruct_batch_id = record.checkpoint_batch_id or None
 

@@ -1134,9 +1134,13 @@ async def _reconstruct_missing_approvals(
     ``batch_id`` (``expected_batch_id``). A foreign/older/newer attempt or batch, a mismatched
     session/call/hash, or an ambiguous (>1) candidate is rejected — never adopted — so a
     stale/duplicate/injected row cannot hijack a call (fail closed). When the checkpoint did
-    not persist a batch id (``expected_batch_id`` is ``None`` — a legitimate older-build row)
-    the batch constraint is relaxed, but every other field (including source attempt when
-    known) is still enforced exactly."""
+    not persist a batch id (``expected_batch_id`` is ``None`` — a legitimate older-build
+    checkpoint) the batch constraint is **not** relaxed to a wildcard: only a row whose own
+    ``batch_id`` is equally empty (a true old-build row, from before batch ids existed) may be
+    adopted. A row that carries a real (non-empty) batch id is always a *foreign* batch to a
+    batch-less checkpoint — never adopted, fail closed — so an empty legacy checkpoint can never
+    be tricked into adopting another (possibly unrelated) batch's approval. Every other field
+    (including source attempt when known) is still enforced exactly."""
     missing = [call for call in suspended_calls if call.id not in approval_of]
     if not missing:
         return []
@@ -1147,8 +1151,13 @@ async def _reconstruct_missing_approvals(
             continue  # run/session guard (never adopt a foreign run's or session's row)
         if expected_attempt is not None and row.run_attempt != expected_attempt:
             continue  # foreign/older/newer source attempt -> fail closed
-        if expected_batch_id is not None and row.batch_id != expected_batch_id:
-            continue  # foreign batch -> fail closed
+        if expected_batch_id is None:
+            if row.batch_id:
+                continue  # legacy/batch-less checkpoint: a row with a real batch is foreign
+                # to it -> never wildcard-adopted, fail closed (only an equally batch-less
+                # true old-build row may be adopted below)
+        elif row.batch_id != expected_batch_id:
+            continue  # foreign/older/newer batch -> fail closed
         by_call.setdefault(row.call_id, []).append(row)
     reconstructed: list[tuple[ToolCall, str]] = []
     for call in missing:

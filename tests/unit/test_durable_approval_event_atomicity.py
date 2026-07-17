@@ -127,7 +127,8 @@ async def test_missing_event_granted_approval_is_reconstructed_and_executes() ->
     store, approvals = InMemoryEventStore(), InMemoryApprovalStore()
     sent: list[dict[str, object]] = []
     run_id = await _suspend(store, approvals, sent, _send("c1", "z@x"))
-    aid = (await approvals.list_pending(_SCOPE))[0].id
+    record = (await approvals.list_pending(_SCOPE))[0]
+    aid = record.id
     await approvals.resolve(aid, "granted", "reviewer")
 
     # The approval.requested event never committed (crash boundary); only the row survived.
@@ -142,6 +143,8 @@ async def test_missing_event_granted_approval_is_reconstructed_and_executes() ->
         registry=_mail_tools(sent),
         permissions=_ask(),
         approvals=approvals,
+        reconstruct_attempt=record.run_attempt,
+        reconstruct_batch_id=record.batch_id,
     )
     assert result.reason is StopReason.completed
     assert sent == [{"to": "z@x"}]  # honoured the granted approval — no silent denial
@@ -159,7 +162,8 @@ async def test_missing_event_pending_approval_re_suspends_not_denied() -> None:
     store, approvals = InMemoryEventStore(), InMemoryApprovalStore()
     sent: list[dict[str, object]] = []
     run_id = await _suspend(store, approvals, sent, _send("c1", "z@x"))
-    aid = (await approvals.list_pending(_SCOPE))[0].id
+    record = (await approvals.list_pending(_SCOPE))[0]
+    aid = record.id
     assert _drop_approval_events(store, "s1") == 1  # event lost while still pending
 
     result = await resume(
@@ -171,6 +175,8 @@ async def test_missing_event_pending_approval_re_suspends_not_denied() -> None:
         registry=_mail_tools(sent),
         permissions=_ask(),
         approvals=approvals,
+        reconstruct_attempt=record.run_attempt,
+        reconstruct_batch_id=record.batch_id,
     )
     assert result.reason is StopReason.suspended  # re-suspended, not denied
     assert sent == []
@@ -182,7 +188,8 @@ async def test_missing_event_denied_approval_is_not_executed() -> None:
     store, approvals = InMemoryEventStore(), InMemoryApprovalStore()
     sent: list[dict[str, object]] = []
     run_id = await _suspend(store, approvals, sent, _send("c1", "z@x"))
-    aid = (await approvals.list_pending(_SCOPE))[0].id
+    record = (await approvals.list_pending(_SCOPE))[0]
+    aid = record.id
     await approvals.resolve(aid, "denied", "reviewer")
     assert _drop_approval_events(store, "s1") == 1
 
@@ -195,6 +202,8 @@ async def test_missing_event_denied_approval_is_not_executed() -> None:
         registry=_mail_tools(sent),
         permissions=_ask(),
         approvals=approvals,
+        reconstruct_attempt=record.run_attempt,
+        reconstruct_batch_id=record.batch_id,
     )
     assert result.reason is StopReason.completed
     assert sent == []
@@ -233,6 +242,8 @@ async def test_partial_batch_missing_one_event_reconstructs_both() -> None:
         registry=_mail_tools(sent),
         permissions=_ask(),
         approvals=approvals,
+        reconstruct_attempt=pending[0].run_attempt,
+        reconstruct_batch_id=pending[0].batch_id,
     )
     assert result.reason is StopReason.completed
     assert sorted(str(a["to"]) for a in sent) == ["a@x", "b@x"]  # both approved sends fired once

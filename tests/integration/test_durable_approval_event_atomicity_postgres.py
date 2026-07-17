@@ -292,6 +292,8 @@ async def test_resume_reconstructs_row_when_event_lost(migrated_db: AsyncEngine)
         permissions=_ask(),
         approvals=approvals,
         binding=ApprovalBinding(org_id="org-1", actor="user-1", run_attempt=1),
+        reconstruct_attempt=pending[0].run_attempt,
+        reconstruct_batch_id=pending[0].batch_id,
     )
     assert result.reason is StopReason.completed
     assert sent == [{"to": "z@x"}]  # honoured the grant — no silent denial
