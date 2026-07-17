@@ -18,13 +18,19 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from keel_core.connector_contracts import (
     ConnectorBindingDraft,
     ConnectorBindingStatus,
+    ConnectorHealth,
+    ConnectorHealthStatus,
+    ConnectorIngressFailure,
     ConnectorItemDraft,
     ConnectorRenewalPolicy,
     ConnectorResourceDraft,
     ConnectorTargetKind,
 )
 from keel_core.connector_credentials import ConnectorCredentialStore, CredentialEnvelope
-from keel_core.connector_repository import PostgresConnectorRepository
+from keel_core.connector_repository import (
+    ConnectorDeliveryClaimLostError,
+    PostgresConnectorRepository,
+)
 from keel_core.secrets import EnvelopeCipher
 from keel_core.tokens import PostgresTokenStore
 
@@ -82,6 +88,29 @@ async def test_connector_foundation_schema_and_rls(migrated_db: AsyncEngine) -> 
             "schedule_lease_token",
             "schedule_lease_expires_at",
         }
+        delivery_columns = (
+            await conn.execute(
+                text(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'connector_deliveries' "
+                    "AND column_name = ANY(:columns)"
+                ),
+                {
+                    "columns": [
+                        "claim_token",
+                        "error_code",
+                        "error_summary",
+                        "error_retryable",
+                    ]
+                },
+            )
+        ).scalars()
+        assert set(delivery_columns) == {
+            "claim_token",
+            "error_code",
+            "error_summary",
+            "error_retryable",
+        }
         head = await conn.scalar(text("SELECT version_num FROM alembic_version"))
         assert head == "0015_connector_foundation"
 
@@ -98,7 +127,7 @@ async def test_repository_scope_isolation_cursor_and_delivery_replay(
         ConnectorBindingDraft(display_name="Fixture"),
         ConnectorBindingStatus.connected,
     )
-    await repo_b.upsert_binding(
+    binding_b = await repo_b.upsert_binding(
         "fixture",
         ConnectorBindingDraft(display_name="Other scope"),
         ConnectorBindingStatus.connected,
@@ -139,15 +168,102 @@ async def test_repository_scope_isolation_cursor_and_delivery_replay(
     assert len(await repo_a.list_cursors("fixture", binding.id)) == 2
     assert (await repo_a.list_bindings())[0].display_name == "Fixture"
     assert (await repo_b.get_binding("fixture")).display_name == "Other scope"  # type: ignore[union-attr]
-    assert await repo_a.claim_delivery("fixture", binding.id, "delivery-1", "a" * 64)
-    assert not await repo_a.claim_delivery("fixture", binding.id, "delivery-1", "a" * 64)
+    first = await repo_a.claim_delivery("fixture", binding.id, "delivery-1", "a" * 64)
+    assert first is not None
+    assert await repo_a.claim_delivery("fixture", binding.id, "delivery-1", "a" * 64) is None
     with pytest.raises(ValueError, match="different payload"):
         await repo_a.claim_delivery("fixture", binding.id, "delivery-1", "b" * 64)
     await repo_a.finish_delivery(
-        "fixture", "delivery-1", error_code="temporary", error_summary="retry"
+        first,
+        failure=ConnectorIngressFailure("temporary", "retry", retryable=True),
     )
-    assert await repo_a.claim_delivery("fixture", binding.id, "delivery-1", "a" * 64)
-    await repo_a.finish_delivery("fixture", "delivery-1")
+    async with migrated_db.begin() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.scope_id', :scope, true)"),
+            {"scope": scope_a},
+        )
+        persisted_failure = (
+            await conn.execute(
+                text(
+                    "SELECT status, claim_token, error_code, error_summary, error_retryable "
+                    "FROM connector_deliveries WHERE scope_id = :scope "
+                    "AND connector_id = 'fixture' AND delivery_id = 'delivery-1'"
+                ),
+                {"scope": scope_a},
+            )
+        ).one()
+    assert (
+        persisted_failure.status,
+        persisted_failure.claim_token,
+        persisted_failure.error_code,
+        persisted_failure.error_summary,
+        persisted_failure.error_retryable,
+    ) == ("failed", first.token, "temporary", "retry", True)
+    failed_health = await repo_a.get_delivery_health("fixture", binding.id)
+    assert failed_health is not None
+    assert (failed_health.unresolved_count, failed_health.summary) == (1, "retry")
+    retry = await repo_a.claim_delivery("fixture", binding.id, "delivery-1", "a" * 64)
+    assert retry is not None and retry.token != first.token
+    with pytest.raises(ConnectorDeliveryClaimLostError, match="claim was lost"):
+        await repo_a.finish_delivery(first)
+    preserved_health = await repo_a.get_delivery_health("fixture", binding.id)
+    assert preserved_health is not None and preserved_health.summary == "retry"
+    await repo_a.finish_delivery(retry)
+    assert await repo_a.get_delivery_health("fixture", binding.id) is None
+    async with migrated_db.begin() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.scope_id', :scope, true)"),
+            {"scope": scope_a},
+        )
+        persisted_success = (
+            await conn.execute(
+                text(
+                    "SELECT status, claim_token, error_code, error_summary, error_retryable "
+                    "FROM connector_deliveries WHERE scope_id = :scope "
+                    "AND connector_id = 'fixture' AND delivery_id = 'delivery-1'"
+                ),
+                {"scope": scope_a},
+            )
+        ).one()
+    assert (
+        persisted_success.status,
+        persisted_success.claim_token,
+        persisted_success.error_code,
+        persisted_success.error_summary,
+        persisted_success.error_retryable,
+    ) == ("processed", retry.token, None, None, None)
+
+    stale = await repo_a.claim_delivery("fixture", binding.id, "delivery-stale", "c" * 64)
+    assert stale is not None
+    async with migrated_db.begin() as conn:
+        await conn.execute(
+            text("SELECT set_config('app.scope_id', :scope, true)"),
+            {"scope": scope_a},
+        )
+        await conn.execute(
+            text(
+                "UPDATE connector_deliveries SET updated_at = now() - interval '6 minutes' "
+                "WHERE scope_id = :scope AND connector_id = 'fixture' "
+                "AND delivery_id = 'delivery-stale'"
+            ),
+            {"scope": scope_a},
+        )
+    stale_retry = await repo_a.claim_delivery(
+        "fixture", binding.id, "delivery-stale", "c" * 64
+    )
+    assert stale_retry is not None and stale_retry.token != stale.token
+    await repo_a.finish_delivery(stale_retry)
+
+    other_scope_claim = await repo_b.claim_delivery(
+        "fixture",
+        binding_b.id,
+        "delivery-1",
+        "d" * 64,
+    )
+    assert other_scope_claim is not None
+    with pytest.raises(ConnectorDeliveryClaimLostError, match="claim was lost"):
+        await repo_a.finish_delivery(other_scope_claim)
+    await repo_b.finish_delivery(other_scope_claim)
 
     async with migrated_db.connect() as conn:
         await conn.execute(text("SET ROLE keel_runtime"))
@@ -157,9 +273,53 @@ async def test_repository_scope_isolation_cursor_and_delivery_replay(
         )
         rows = (await conn.execute(text("SELECT scope_id FROM connector_bindings"))).all()
         assert {row.scope_id for row in rows} == {scope_a}
+        delivery_rows = (
+            await conn.execute(text("SELECT scope_id FROM connector_deliveries"))
+        ).all()
+        assert {row.scope_id for row in delivery_rows} == {scope_a}
         await conn.execute(text("RESET app.scope_id"))
         assert (await conn.execute(text("SELECT scope_id FROM connector_bindings"))).all() == []
+        assert (await conn.execute(text("SELECT scope_id FROM connector_deliveries"))).all() == []
         await conn.execute(text("RESET ROLE"))
+
+
+async def test_delivery_binding_fence_survives_replacement(
+    migrated_db: AsyncEngine,
+) -> None:
+    scope = f"connector:replacement:{uuid.uuid4().hex}"
+    repository = PostgresConnectorRepository(migrated_db, scope)
+    original = await repository.upsert_binding(
+        "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    claim = await repository.claim_delivery(
+        "fixture", original.id, "delivery", "a" * 64
+    )
+    assert claim is not None
+    await repository.delete_connector("fixture")
+    replacement = await repository.upsert_binding(
+        "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    assert replacement.id != original.id
+    with pytest.raises(ConnectorDeliveryClaimLostError, match="claim was lost"):
+        await repository.finish_delivery(
+            claim,
+            failure=ConnectorIngressFailure("late", "Late worker failure", True),
+        )
+    assert await repository.get_delivery_health("fixture", replacement.id) is None
+    assert (
+        await repository.record_health(
+            "fixture",
+            original.id,
+            ConnectorHealth(
+                ConnectorHealthStatus.error,
+                datetime.now(UTC),
+                "old binding health",
+            ),
+        )
+        is None
+    )
+    current = await repository.get_binding("fixture")
+    assert current is not None and current.status is ConnectorBindingStatus.connected
 
 
 async def test_database_rejects_top_level_plaintext_secret_metadata(

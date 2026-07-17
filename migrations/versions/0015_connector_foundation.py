@@ -239,21 +239,37 @@ def upgrade() -> None:
             payload_hash text NOT NULL,
             status text NOT NULL DEFAULT 'received'
                 CHECK (status IN ('received', 'processing', 'processed', 'failed')),
+            claim_token text NOT NULL
+                CHECK (claim_token ~ '^[0-9a-f]{32}$'),
             event_id text,
-            error_code text,
-            error_summary text,
+            error_code text
+                CHECK (error_code ~ '^[a-z0-9._-]{1,64}$'),
+            error_summary text
+                CHECK (octet_length(error_summary) BETWEEN 1 AND 512),
+            error_retryable boolean,
             received_at timestamptz NOT NULL DEFAULT now(),
             processed_at timestamptz,
             updated_at timestamptz NOT NULL DEFAULT now(),
             UNIQUE (scope_id, connector_id, delivery_id),
             FOREIGN KEY (scope_id, binding_id)
-                REFERENCES connector_bindings (scope_id, id) ON DELETE CASCADE
+                REFERENCES connector_bindings (scope_id, id) ON DELETE CASCADE,
+            CHECK (
+                (error_code IS NULL
+                    AND error_summary IS NULL
+                    AND error_retryable IS NULL)
+                OR
+                (error_code IS NOT NULL
+                    AND error_summary IS NOT NULL
+                    AND error_retryable IS NOT NULL
+                    AND status IN ('processing', 'failed'))
+            ),
+            CHECK (status <> 'failed' OR error_code IS NOT NULL)
         )
         """
     )
     op.execute(
         "CREATE INDEX ix_connector_deliveries_status "
-        "ON connector_deliveries (scope_id, connector_id, status, received_at)"
+        "ON connector_deliveries (scope_id, connector_id, binding_id, status, updated_at)"
     )
     op.execute(
         "CREATE INDEX ix_connector_deliveries_payload_hash "
