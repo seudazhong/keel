@@ -15,6 +15,7 @@ from keel_core.connector_contracts import (
     ConnectorChange,
     ConnectorChangeKind,
     ConnectorEvent,
+    ConnectorIngressFailure,
     ConnectorIngressRequest,
     ConnectorIngressResponse,
     ConnectorIngressResult,
@@ -29,6 +30,11 @@ from ._client import FeishuClient
 from ._crypto import decrypt_event, verify_event_signature
 
 FEISHU_EVENT_TOLERANCE_SECONDS = 300
+_NORMALIZATION_FAILURE_RESPONSE = b'{"code":1,"msg":"temporary processing failure"}'
+
+
+class _VerifiedNormalizationError(ValueError):
+    pass
 
 
 @runtime_checkable
@@ -83,38 +89,50 @@ def _decode_request(
     *,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    outer = _json_object(request.body)
-    encrypted = outer.get("encrypt")
     timestamp = _header(request.headers, "x-lark-request-timestamp")
     nonce = _header(request.headers, "x-lark-request-nonce")
     signature = _header(request.headers, "x-lark-signature")
+    try:
+        outer = _json_object(request.body)
+    except ValueError as exc:
+        _verify_signed_request(request, credential, timestamp, nonce, signature, now=now)
+        raise _VerifiedNormalizationError("Feishu signed event JSON is invalid") from exc
+    encrypted = outer.get("encrypt")
     if isinstance(encrypted, str):
-        if not timestamp or not _timestamp_is_current(timestamp, now):
-            raise ConnectorAuthenticationError("Feishu webhook timestamp is missing or stale")
-        if not nonce or not verify_event_signature(
-            timestamp,
-            nonce,
-            credential.encrypt_key,
-            request.body,
-            signature,
-        ):
-            raise ConnectorAuthenticationError("Feishu webhook signature mismatch")
-        return _json_object(decrypt_event(credential.encrypt_key, encrypted))
+        _verify_signed_request(request, credential, timestamp, nonce, signature, now=now)
+        try:
+            return _json_object(decrypt_event(credential.encrypt_key, encrypted))
+        except ValueError as exc:
+            raise _VerifiedNormalizationError(
+                "Feishu encrypted event could not be normalized"
+            ) from exc
 
     event_type = outer.get("type")
     is_challenge = event_type == "url_verification" or "challenge" in outer
     if not is_challenge:
-        if not timestamp or not _timestamp_is_current(timestamp, now):
-            raise ConnectorAuthenticationError("Feishu webhook timestamp is missing or stale")
-        if not nonce or not verify_event_signature(
-            timestamp,
-            nonce,
-            credential.encrypt_key,
-            request.body,
-            signature,
-        ):
-            raise ConnectorAuthenticationError("Feishu webhook signature mismatch")
+        _verify_signed_request(request, credential, timestamp, nonce, signature, now=now)
     return outer
+
+
+def _verify_signed_request(
+    request: ConnectorIngressRequest,
+    credential: FeishuCredential,
+    timestamp: str,
+    nonce: str,
+    signature: str,
+    *,
+    now: datetime | None,
+) -> None:
+    if not timestamp or not _timestamp_is_current(timestamp, now):
+        raise ConnectorAuthenticationError("Feishu webhook timestamp is missing or stale")
+    if not nonce or not verify_event_signature(
+        timestamp,
+        nonce,
+        credential.encrypt_key,
+        request.body,
+        signature,
+    ):
+        raise ConnectorAuthenticationError("Feishu webhook signature mismatch")
 
 
 def _challenge(
@@ -136,18 +154,18 @@ def _challenge(
 def _message_text(message: dict[str, Any]) -> str:
     content = message.get("content")
     if not isinstance(content, str):
-        return ""
+        raise _VerifiedNormalizationError("Feishu message content is missing")
     try:
         parsed = json.loads(content)
-    except ValueError:
-        return ""
+    except ValueError as exc:
+        raise _VerifiedNormalizationError("Feishu message content JSON is invalid") from exc
     if not isinstance(parsed, dict):
-        return ""
+        raise _VerifiedNormalizationError("Feishu message content must be an object")
     text = parsed.get("text")
     if isinstance(text, str):
         return text
     if message.get("message_type") != "post":
-        return ""
+        raise _VerifiedNormalizationError("Feishu text message content is missing text")
     pieces: list[str] = []
 
     def walk(value: Any) -> None:
@@ -207,19 +225,21 @@ def _message_change(
     if context.binding is None:
         raise ValueError("Feishu ingress requires a binding")
     header = payload.get("header")
-    event = payload.get("event")
-    if not isinstance(header, dict) or not isinstance(event, dict):
-        return None
-    if header.get("event_type") != "im.message.receive_v1":
-        return None
+    if not isinstance(header, dict):
+        raise ConnectorAuthenticationError("Feishu event header is missing")
     _verify_token(payload, credential.verification_token)
     tenant_key = header.get("tenant_key")
     if not isinstance(tenant_key, str) or tenant_key != credential.tenant_key:
         raise ConnectorAuthenticationError("Feishu event tenant does not match the binding")
+    if header.get("event_type") != "im.message.receive_v1":
+        return None
+    event = payload.get("event")
+    if not isinstance(event, dict):
+        raise _VerifiedNormalizationError("Feishu message event payload is missing")
     message = event.get("message")
     sender = event.get("sender")
     if not isinstance(message, dict) or not isinstance(sender, dict):
-        return None
+        raise _VerifiedNormalizationError("Feishu message or sender payload is missing")
     message_type = message.get("message_type")
     if message_type not in {"text", "post"}:
         return None
@@ -227,7 +247,7 @@ def _message_change(
     chat_type = message.get("chat_type")
     message_id = message.get("message_id")
     if not all(isinstance(value, str) and value for value in (chat_id, chat_type, message_id)):
-        return None
+        raise _VerifiedNormalizationError("Feishu message identifiers are missing")
     assert isinstance(chat_id, str)
     assert isinstance(chat_type, str)
     assert isinstance(message_id, str)
@@ -298,12 +318,39 @@ def handle_ingress(
     *,
     now: datetime | None = None,
 ) -> ConnectorIngressResult:
-    payload = _decode_request(request, credential, now=now)
+    payload_hash = hashlib.sha256(request.body).hexdigest()
+    try:
+        payload = _decode_request(request, credential, now=now)
+    except _VerifiedNormalizationError:
+        return _normalization_failure(request, payload_hash)
     challenge = _challenge(payload, credential)
     if challenge is not None:
         return challenge
-    change = _message_change(context, payload, credential)
+    try:
+        change = _message_change(context, payload, credential)
+    except _VerifiedNormalizationError:
+        return _normalization_failure(request, payload_hash, payload)
     header = payload.get("header")
+    event_id = header.get("event_id") if isinstance(header, dict) else None
+    delivery_id = (
+        event_id
+        if isinstance(event_id, str) and event_id
+        else payload_hash
+    )
+    return ConnectorIngressResult(
+        ConnectorIngressResponse(status_code=200, body=b'{"code":0}'),
+        delivery_id=delivery_id,
+        payload_hash=payload_hash,
+        changes=(change,) if change is not None else (),
+    )
+
+
+def _normalization_failure(
+    request: ConnectorIngressRequest,
+    payload_hash: str,
+    payload: dict[str, Any] | None = None,
+) -> ConnectorIngressResult:
+    header = payload.get("header") if isinstance(payload, dict) else None
     event_id = header.get("event_id") if isinstance(header, dict) else None
     delivery_id = (
         event_id
@@ -311,10 +358,17 @@ def handle_ingress(
         else hashlib.sha256(request.body).hexdigest()
     )
     return ConnectorIngressResult(
-        ConnectorIngressResponse(status_code=200, body=b'{"code":0}'),
+        ConnectorIngressResponse(
+            status_code=503,
+            body=_NORMALIZATION_FAILURE_RESPONSE,
+        ),
         delivery_id=delivery_id,
-        payload_hash=hashlib.sha256(request.body).hexdigest(),
-        changes=(change,) if change is not None else (),
+        payload_hash=payload_hash,
+        failure=ConnectorIngressFailure(
+            "feishu_normalization_failed",
+            "Feishu verified event normalization failed.",
+            retryable=True,
+        ),
     )
 
 

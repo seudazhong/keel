@@ -56,13 +56,10 @@ sender, message, event, and creation identifiers; all admitted content remains t
 ## Health and disconnect
 
 Health reports missing or invalid encrypted credentials, tenant mismatch, permission shrink,
-expired tokens awaiting CAS rotation, uninstall/revoked authorization, and API failures.
-
-Foundation `129920d` does not expose failed delivery state to `ConnectorOperationContext`, and
-`ConnectorIngressResult` has no provider state update. Durable webhook-failure status therefore
-cannot yet be reflected by the provider health endpoint without a central contract change. Webhook
-requests still fail explicitly, and accepted delivery-processing failures remain recorded in the
-shared delivery ledger.
+expired tokens awaiting CAS rotation, uninstall/revoked authorization, API failures, and unresolved
+current-binding webhook delivery failures. Verified normalization failures return a safe retry
+response and are finalized through the binding-fenced delivery claim. Authentication and challenge
+failures remain outside the delivery ledger.
 
 A self-built app cannot uninstall or revoke its own tenant installation. Normal remote disconnect
 therefore fails closed. Uninstall the app in Feishu, then choose one generic local path:

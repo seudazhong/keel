@@ -78,9 +78,11 @@ from keel_core.types import ContentTaint
 def test_builtin_registry_discovers_providers_deterministically() -> None:
     first = discover_connector_registry()
     second = discover_connector_registry()
-    assert [item.id for item in first.manifests()] == ["feishu", "gmail"]
+    ids = [item.id for item in first.manifests()]
+    assert ids == sorted(ids)
+    assert len(ids) == len(set(ids))
+    assert "gmail" in ids
     assert first.manifests() == second.manifests()
-    assert first.create("feishu").manifest.id == "feishu"
     assert first.create("gmail").manifest.id == "gmail"
 
 

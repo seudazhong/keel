@@ -351,6 +351,21 @@ class FeishuProvider(BaseConnectorProvider):
                 datetime.now(UTC),
                 f"Feishu app permissions shrank; missing: {', '.join(sorted(missing))}.",
             )
+        if context.delivery_health is not None:
+            delivery = context.delivery_health
+            return ConnectorHealth(
+                (
+                    ConnectorHealthStatus.degraded
+                    if delivery.retryable
+                    else ConnectorHealthStatus.error
+                ),
+                datetime.now(UTC),
+                (
+                    f"Feishu webhook has {delivery.unresolved_count} unresolved delivery "
+                    f"failure(s): {delivery.summary}"
+                ),
+                retryable=delivery.retryable,
+            )
         if context.binding.status is ConnectorBindingStatus.authorizing:
             return ConnectorHealth(
                 ConnectorHealthStatus.degraded,

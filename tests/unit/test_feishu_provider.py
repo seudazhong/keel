@@ -10,11 +10,13 @@ import pytest
 
 from keel_core.connector_contracts import (
     ConnectorActionContext,
+    ConnectorAuthenticationError,
     ConnectorBinding,
     ConnectorBindingDraft,
     ConnectorBindingStatus,
     ConnectorChange,
     ConnectorChangeKind,
+    ConnectorDeliveryHealth,
     ConnectorHealthStatus,
     ConnectorIngressRequest,
     ConnectorItem,
@@ -38,7 +40,11 @@ from keel_core.connector_providers.feishu._provider import (
     manifest,
 )
 from keel_core.connector_providers.feishu._workspace import discover_resources, sync_workspace
-from keel_core.connector_registry import ConnectorRegistration, ConnectorRegistry
+from keel_core.connector_registry import (
+    ConnectorRegistration,
+    ConnectorRegistry,
+    discover_connector_registry,
+)
 from keel_core.connector_repository import InMemoryConnectorRepository
 from keel_core.connector_service import CallbackConnectorChangeSink, ConnectorService
 from keel_core.connectors import ConnectorTool
@@ -52,6 +58,15 @@ Handler = Callable[
     [str, str, str | None, Mapping[str, str | int], Mapping[str, Any] | None],
     dict[str, Any],
 ]
+
+
+def test_builtin_registry_discovers_only_feishu_facade() -> None:
+    registry = discover_connector_registry()
+    ids = [item.id for item in registry.manifests()]
+    assert ids.count("feishu") == 1
+    registration = registry.get("feishu")
+    assert registration is not None
+    assert registration.module_name == "keel_core.connector_providers.feishu"
 
 
 class FakeFeishuClient:
@@ -162,6 +177,55 @@ def _encrypted_request(payload: dict[str, Any], *, now: datetime) -> ConnectorIn
         body=body,
         public_url="https://keel.example/v1/connectors/feishu/webhook",
     )
+
+
+def _healthy_feishu_handler(
+    method: str,
+    path: str,
+    token: str | None,
+    params: Mapping[str, str | int],
+    body: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    if path.endswith("tenant/query"):
+        return {"code": 0, "data": {"tenant": {"tenant_key": "tenant-a", "name": "Acme"}}}
+    if path.endswith("/scopes"):
+        return {"code": 0, "data": {"scopes": list(FEISHU_REQUIRED_SCOPES)}}
+    raise AssertionError(path)
+
+
+async def _ingress_service(
+    change_sink: CallbackConnectorChangeSink | None = None,
+) -> tuple[ConnectorService, InMemoryConnectorRepository, FeishuProvider]:
+    repository = InMemoryConnectorRepository("scope-a")
+    binding = await repository.upsert_binding(
+        "feishu",
+        ConnectorBindingDraft(external_tenant_id="tenant-a"),
+        ConnectorBindingStatus.connected,
+    )
+    await repository.upsert_resources(
+        "feishu",
+        binding.id,
+        (
+            ConnectorResourceDraft(
+                external_id="chat:oc_chat",
+                kind="chat",
+                display_name="Project chat",
+                selected=True,
+            ),
+        ),
+    )
+    credentials = ConnectorCredentialStore(
+        InMemoryTokenStore("scope-a", EnvelopeCipher("test-key"))
+    )
+    await credentials.put("feishu", _credential().envelope())
+    provider = FeishuProvider(lambda: FakeFeishuClient(_healthy_feishu_handler))
+    service = ConnectorService(
+        ConnectorRegistry((ConnectorRegistration(manifest, lambda: provider, "test.feishu"),)),
+        repository,
+        credentials=credentials,
+        change_sink=change_sink,
+    )
+    return service, repository, provider
 
 
 @pytest.mark.asyncio
@@ -365,6 +429,112 @@ async def test_challenge_decryption_signature_thread_mapping_and_replay() -> Non
     stale = _encrypted_request(_message_event(), now=now - timedelta(minutes=10))
     with pytest.raises(Exception, match="timestamp"):
         await provider.ingress(context, stale)
+
+
+@pytest.mark.asyncio
+async def test_verified_normalization_failure_is_durable_and_health_visible() -> None:
+    service, repository, _ = await _ingress_service()
+    payload = _message_event()
+    message = payload["event"]["message"]
+    assert isinstance(message, dict)
+    message["content"] = "{invalid"
+    outcome = await service.ingress(
+        "feishu",
+        _encrypted_request(payload, now=datetime.now(UTC)),
+    )
+    assert outcome.response.status_code == 503
+    assert outcome.response.body == b'{"code":1,"msg":"temporary processing failure"}'
+    assert outcome.accepted is False
+    binding = await repository.get_binding("feishu")
+    assert binding is not None
+    delivery = await repository.get_delivery_health("feishu", binding.id)
+    assert delivery is not None
+    assert delivery.summary == "Feishu verified event normalization failed."
+    assert delivery.retryable is True
+
+    health = await service.health("feishu")
+    assert health.status is ConnectorHealthStatus.degraded
+    assert health.retryable is True
+    assert health.message is not None
+    assert "1 unresolved delivery failure" in health.message
+    assert "{invalid" not in health.message
+
+
+@pytest.mark.asyncio
+async def test_challenge_and_authentication_failures_do_not_claim_deliveries() -> None:
+    service, repository, _ = await _ingress_service()
+    challenge = await service.ingress(
+        "feishu",
+        ConnectorIngressRequest(
+            method="POST",
+            query={},
+            headers={},
+            body=json.dumps(
+                {
+                    "type": "url_verification",
+                    "token": "verify-token",
+                    "challenge": "challenge-1",
+                }
+            ).encode(),
+            public_url="https://keel.example/v1/connectors/feishu/webhook",
+        ),
+    )
+    assert challenge.accepted is False
+    binding = await repository.get_binding("feishu")
+    assert binding is not None
+    assert await repository.get_delivery_health("feishu", binding.id) is None
+
+    request = _encrypted_request(_message_event(), now=datetime.now(UTC))
+    invalid = ConnectorIngressRequest(
+        method=request.method,
+        query=request.query,
+        headers={**request.headers, "X-Lark-Signature": "0" * 64},
+        body=request.body,
+        public_url=request.public_url,
+    )
+    with pytest.raises(ConnectorAuthenticationError, match="signature"):
+        await service.ingress("feishu", invalid)
+    assert await repository.get_delivery_health("feishu", binding.id) is None
+
+
+@pytest.mark.asyncio
+async def test_sink_failure_health_and_retry_success_use_current_binding_delivery_state() -> None:
+    async def fail(change: ConnectorChange) -> None:
+        raise RuntimeError("sensitive sink details")
+
+    failing_service, repository, provider = await _ingress_service(
+        CallbackConnectorChangeSink(event=fail)
+    )
+    request = _encrypted_request(_message_event(), now=datetime.now(UTC))
+    with pytest.raises(RuntimeError, match="sensitive sink details"):
+        await failing_service.ingress("feishu", request)
+
+    failed_health = await failing_service.health("feishu")
+    assert failed_health.status is ConnectorHealthStatus.degraded
+    assert failed_health.message is not None
+    assert "connector delivery processing failed" in failed_health.message
+    assert "sensitive sink details" not in failed_health.message
+
+    changes: list[ConnectorChange] = []
+
+    async def capture(change: ConnectorChange) -> None:
+        changes.append(change)
+
+    credentials = failing_service.credentials
+    retry_service = ConnectorService(
+        ConnectorRegistry((ConnectorRegistration(manifest, lambda: provider, "test.feishu"),)),
+        repository,
+        credentials=credentials,
+        change_sink=CallbackConnectorChangeSink(event=capture),
+    )
+    outcome = await retry_service.ingress("feishu", request)
+    assert outcome.accepted is True
+    assert len(changes) == 1
+    binding = await repository.get_binding("feishu")
+    assert binding is not None
+    assert await repository.get_delivery_health("feishu", binding.id) is None
+    healthy = await retry_service.health("feishu")
+    assert healthy.status is ConnectorHealthStatus.healthy
 
 
 @pytest.mark.asyncio
@@ -697,6 +867,26 @@ async def test_health_reports_permission_shrink_tenant_mismatch_and_uninstall() 
     )
     assert mismatch.status is ConnectorHealthStatus.error
     assert mismatch.message is not None and "does not match" in mismatch.message
+
+    delivery_failure = await provider.health(
+        ConnectorOperationContext(
+            scope_id="scope-a",
+            connector_id="feishu",
+            binding=_binding(),
+            credential=_credential().envelope(),
+            credential_version=1,
+            delivery_health=ConnectorDeliveryHealth(
+                2,
+                datetime.now(UTC),
+                "Permanent webhook processing failure.",
+                retryable=False,
+            ),
+        )
+    )
+    assert delivery_failure.status is ConnectorHealthStatus.error
+    assert delivery_failure.retryable is False
+    assert delivery_failure.message is not None
+    assert "2 unresolved delivery failure" in delivery_failure.message
 
     def uninstalled_handler(
         method: str,
