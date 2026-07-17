@@ -416,65 +416,196 @@ async def test_iterations_accrue_cumulatively_across_release_and_terminalize(
     assert final.iterations == 3 and final.cost_usd == 0.03  # cumulative across both attempts
 
 
-async def test_simultaneous_expiry_ticks_consume_each_approval_once(
-    migrated_db: AsyncEngine,
-) -> None:
-    from keel_core.approvals import ApprovalRecord, PostgresApprovalStore
+async def _suspend_pg(
+    runs: PostgresRunStore,
+    approvals: PostgresApprovalStore,
+    *,
+    run_id: str,
+    key: str,
+    org_id: str = "org-1",
+    actor: str = "user-1",
+    args: dict[str, object] | None = None,
+    call_id: str = "c1",
+    batch_id: str = "",
+) -> str:
+    """Admit + suspend a run and create one bound pending approval; return its id."""
+    args = args if args is not None else {"to": "z@x"}
+    await runs.admit(
+        run_id=run_id,
+        scope_id="web:local",
+        org_id=org_id,
+        actor=actor,
+        agent_id="agent-1",
+        session_id="sess-1",
+        surface=RunSurface.web.value,
+        idempotency_key=key,
+        budget=RunBudgetSpec(),
+        expires_at=_now() + timedelta(hours=1),
+    )
+    await runs.mark_queued(run_id)
+    lease = await runs.claim(run_id, worker_id="w1", now=_now(), lease_seconds=30)
+    assert lease is not None
+    await runs.release(lease, to_status=RunStatus.waiting_approval)
+    return await approvals.create_pending(
+        scope_id="web:local",
+        run_id=run_id,
+        session_id="sess-1",
+        tool="email.send",
+        args=args,
+        call_id=call_id,
+        idempotency_key=f"i-{run_id}-{call_id}",
+        reason="first_use",
+        expires_at=_now() + timedelta(hours=1),
+        org_id=org_id,
+        actor=actor,
+        action_hash=action_hash("email.send", args),
+        run_attempt=1,
+        batch_id=batch_id,
+    )
+
+
+def _pg_service(
+    runs: PostgresRunStore, approvals: PostgresApprovalStore, sink: list[str]
+) -> object:
     from keel_core.loop import admit as loop_admit
     from keel_core.run_service import DurableRunService
     from keel_core.state import PostgresEventStore
 
+    async def enqueue(run_id: str) -> None:
+        sink.append(run_id)
+
+    return DurableRunService(
+        run_store=runs,
+        event_store=PostgresEventStore(runs._engine, "web:local"),  # type: ignore[attr-defined]
+        approvals=approvals,
+        scope_id="web:local",
+        enqueue=enqueue,
+        admit_fn=loop_admit,
+    )
+
+
+async def test_resolve_and_requeue_commit_atomically(migrated_db: AsyncEngine) -> None:
     runs = PostgresRunStore(migrated_db, "web:local")
-    events = PostgresEventStore(migrated_db, "web:local")
     approvals = PostgresApprovalStore(migrated_db, "web:local")
-    # A durable interactive run suspended on an approval that has already expired.
-    await _admit(runs, run_id="run-1", key="k1")
-    await runs.mark_queued("run-1")
-    lease = await runs.claim("run-1", worker_id="w1", now=_now(), lease_seconds=30)
-    assert lease is not None
-    await runs.release(lease, to_status=RunStatus.waiting_approval)
-    await approvals.create_pending(
+    approval_id = await _suspend_pg(runs, approvals, run_id="run-1", key="k1")
+    enq: list[str] = []
+    service = _pg_service(runs, approvals, enq)
+    ok = await service.resolve_approval(  # type: ignore[attr-defined]
+        approval_id, approved=True, resolved_by="user-1", actor="user-1", org_id="org-1"
+    )
+    assert ok is True and enq == ["run-1"]
+    # Both writes are visible together: approval granted AND run requeued (one transaction).
+    rec = await runs.get("run-1")
+    assert rec is not None and rec.status is RunStatus.queued and rec.resume_requested
+    approval = await approvals.get(approval_id)
+    assert approval is not None and approval.status == "granted"
+
+
+async def test_admission_fingerprint_conflict_and_tenant_namespace(
+    migrated_db: AsyncEngine,
+) -> None:
+    from keel_core.loop import admit as loop_admit
+    from keel_core.run_service import DurableRunService
+    from keel_core.runs import RunAdmissionConflict
+    from keel_core.state import PostgresEventStore
+
+    runs = PostgresRunStore(migrated_db, "web:local")
+    approvals = PostgresApprovalStore(migrated_db, "web:local")
+    enq: list[str] = []
+
+    async def enqueue(run_id: str) -> None:
+        enq.append(run_id)
+
+    service = DurableRunService(
+        run_store=runs,
+        event_store=PostgresEventStore(migrated_db, "web:local"),
+        approvals=approvals,
+        scope_id="web:local",
+        enqueue=enqueue,
+        admit_fn=loop_admit,
+    )
+
+    async def _admit_via(*, org_id: str, content: str, key: str = "shared") -> str:
+        result = await service.admit(
+            org_id=org_id,
+            actor="user-1",
+            agent_id="agent-1",
+            session_id="sess-1",
+            surface=RunSurface.web.value,
+            content=content,
+            idempotency_key=key,
+        )
+        return result.run_id
+
+    a = await _admit_via(org_id="org-A", content="do X")
+    b = await _admit_via(org_id="org-B", content="do X")
+    assert a != b  # a shared key does not collide across tenants (org namespace)
+    # Same identity + same content -> idempotent no-op (same run).
+    assert await _admit_via(org_id="org-A", content="do X") == a
+    # Same identity + different content -> conflict (never repaired with attacker values).
+    with pytest.raises(RunAdmissionConflict):
+        await _admit_via(org_id="org-A", content="do EVIL")
+
+
+async def test_multi_approval_batch_requeues_only_when_all_terminal(
+    migrated_db: AsyncEngine,
+) -> None:
+    runs = PostgresRunStore(migrated_db, "web:local")
+    approvals = PostgresApprovalStore(migrated_db, "web:local")
+    # A run suspended on a two-approval batch (shared batch id).
+    a1 = await _suspend_pg(
+        runs, approvals, run_id="run-1", key="k1", args={"to": "a@x"}, call_id="c1", batch_id="B"
+    )
+    a2 = await approvals.create_pending(
         scope_id="web:local",
         run_id="run-1",
         session_id="sess-1",
         tool="email.send",
-        args={},
-        call_id="c",
-        idempotency_key="i",
-        reason="tainted",
-        expires_at=_now() - timedelta(seconds=1),
+        args={"to": "b@x"},
+        call_id="c2",
+        idempotency_key="i-run-1-c2",
+        reason="first_use",
+        expires_at=_now() + timedelta(hours=1),
         org_id="org-1",
         actor="user-1",
-        action_hash=action_hash("email.send", {}),
+        action_hash=action_hash("email.send", {"to": "b@x"}),
         run_attempt=1,
+        batch_id="B",
     )
-    enq_a: list[str] = []
-    enq_b: list[str] = []
-    legacy: list[str] = []
+    enq: list[str] = []
+    service = _pg_service(runs, approvals, enq)
 
-    def _service(sink: list[str]) -> DurableRunService:
-        async def enqueue(run_id: str) -> None:
-            sink.append(run_id)
-
-        return DurableRunService(
-            run_store=runs,
-            event_store=events,
-            approvals=approvals,
-            scope_id="web:local",
-            enqueue=enqueue,
-            admit_fn=loop_admit,
-        )
-
-    async def legacy_resume(record: ApprovalRecord) -> None:
-        legacy.append(record.run_id)
-
-    # Two reconciler ticks fire simultaneously — the single owner of approval expiry.
-    res = await asyncio.gather(
-        _service(enq_a).expire_approvals(legacy_resume=legacy_resume),
-        _service(enq_b).expire_approvals(legacy_resume=legacy_resume),
+    # Resolving the first decision does NOT requeue (batch not terminal).
+    assert await service.resolve_approval(  # type: ignore[attr-defined]
+        a1, approved=True, resolved_by="user-1", actor="user-1"
     )
-    assert sorted(res) == [0, 1]  # exactly one tick consumed + resumed the approval
-    assert enq_a.count("run-1") + enq_b.count("run-1") == 1  # never a double resume
-    assert legacy == []  # a durable interactive approval is never routed to the legacy path
+    assert enq == []
+    rec = await runs.get("run-1")
+    assert rec is not None and rec.status is RunStatus.waiting_approval
+
+    # Resolving the last decision requeues exactly once.
+    assert await service.resolve_approval(  # type: ignore[attr-defined]
+        a2, approved=False, resolved_by="user-1", actor="user-1"
+    )
+    assert enq == ["run-1"]
+    rec = await runs.get("run-1")
+    assert rec is not None and rec.status is RunStatus.queued and rec.resume_requested
+    # Each exact decision is preserved on the durable rows.
+    assert (await approvals.get(a1)).status == "granted"  # type: ignore[union-attr]
+    assert (await approvals.get(a2)).status == "denied"  # type: ignore[union-attr]
+
+
+async def test_repair_stuck_resumes_backstops_missed_requeue_pg(migrated_db: AsyncEngine) -> None:
+    runs = PostgresRunStore(migrated_db, "web:local")
+    approvals = PostgresApprovalStore(migrated_db, "web:local")
+    approval_id = await _suspend_pg(runs, approvals, run_id="run-1", key="k1")
+    # Simulate a crash after the approval resolve committed but before the run requeued.
+    assert await approvals.resolve(approval_id, "granted", "user-1") is True
+    stuck = await runs.get("run-1")
+    assert stuck is not None and stuck.status is RunStatus.waiting_approval
+    enq: list[str] = []
+    service = _pg_service(runs, approvals, enq)
+    repaired = await service.repair_stuck_resumes()  # type: ignore[attr-defined]
+    assert repaired == 1 and enq == ["run-1"]
     rec = await runs.get("run-1")
     assert rec is not None and rec.status is RunStatus.queued and rec.resume_requested

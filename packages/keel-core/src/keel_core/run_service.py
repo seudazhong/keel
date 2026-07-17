@@ -28,6 +28,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine
+
 from keel_core.agents import AgentSpec
 from keel_core.approvals import ApprovalRecord, ApprovalStore
 from keel_core.errors import DuplicateEventError
@@ -52,10 +55,13 @@ from keel_core.runs import (
     RunStatus,
     RunStore,
     action_hash,
+    admission_fingerprint,
 )
 from keel_core.types import RunId, ScopeId, SessionId, StopReason
 
 logger = logging.getLogger("keel.run_service")
+
+_SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 
 # admit(...) persists a user/system turn before the first model call (loop invariant I2).
 AdmitFn = Callable[[EventStore, SessionId, ScopeId, str], Awaitable[None]]
@@ -66,8 +72,140 @@ PromptPersistedCheck = Callable[[RunRecord], Awaitable[bool]]
 # Routes an expired *legacy* (non-durable-run) approval to its own resume path — the durable
 # reconciler is the single owner of approval expiry, so it must also dispatch legacy resumes.
 LegacyResumeFn = Callable[[ApprovalRecord], Awaitable[None]]
+# An intentional, documented delegation policy: whether ``actor`` may resolve an approval it
+# does not own. Returns True to authorize a delegate (e.g. an org admin). Default: no
+# delegation — only the bound run/approval actor resolves (cross-user resolution denied).
+DelegatePolicy = Callable[[str, RunRecord, ApprovalRecord], Awaitable[bool]]
 
 _ADMISSION_MARKER = "admission_run"
+
+
+@dataclass(frozen=True)
+class _ResolveTx:
+    """Outcome of the atomic approval-resolve + (batch-gated) run-requeue transaction."""
+
+    applied: bool  # this call moved the approval pending -> terminal
+    current_status: str | None  # the approval's status after the transaction
+    batch_terminal: bool  # no approvals in the run's batch remain pending
+    requeued: bool  # the run transitioned waiting_approval -> queued in this transaction
+
+
+def _shared_engine(run_store: RunStore, approvals: ApprovalStore) -> AsyncEngine | None:
+    """The Postgres engine shared by both stores, or ``None`` (in-memory / mixed).
+
+    When both stores are Postgres-backed by the *same* engine, the approval resolution and
+    the run requeue can commit in a single transaction (blocker 1 atomicity). Otherwise the
+    in-memory single-process path applies each step sequentially (no crash boundary)."""
+    engine = getattr(run_store, "_engine", None)
+    ap_engine = getattr(approvals, "_engine", None)
+    if isinstance(engine, AsyncEngine) and engine is ap_engine:
+        return engine
+    return None
+
+
+async def _pg_resolve_and_requeue(
+    engine: AsyncEngine,
+    scope_id: ScopeId,
+    *,
+    approval_id: str,
+    run_id: RunId,
+    batch_id: str,
+    status: str,
+    resolved_by: str,
+    expected_action_hash: str,
+    expected_run_attempt: int,
+) -> _ResolveTx:
+    """Resolve the approval, check batch terminality, and requeue the run — one transaction.
+
+    All three writes commit atomically: a crash cannot leave a resolved approval with a run
+    stuck in ``waiting_approval``. The run's ``queued`` + ``resume_requested`` is the durable
+    dispatch-outbox marker; the reconciler re-enqueues it if the post-commit dispatch dies.
+    """
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        applied = (
+            await conn.execute(
+                text(
+                    "UPDATE approvals SET status = :status, resolved_at = now(), "
+                    "resolved_by = :by WHERE scope_id = :scope AND id = :id "
+                    "AND status = 'pending' AND action_hash = :hash AND run_attempt = :attempt "
+                    "RETURNING id"
+                ),
+                {
+                    "status": status,
+                    "by": resolved_by,
+                    "scope": scope_id,
+                    "id": approval_id,
+                    "hash": expected_action_hash,
+                    "attempt": expected_run_attempt,
+                },
+            )
+        ).rowcount == 1
+        current = (
+            await conn.execute(
+                text("SELECT status FROM approvals WHERE scope_id = :scope AND id = :id"),
+                {"scope": scope_id, "id": approval_id},
+            )
+        ).scalar_one_or_none()
+        if batch_id:
+            pending = (
+                await conn.execute(
+                    text(
+                        "SELECT count(*) FROM approvals WHERE scope_id = :scope AND run_id = :run "
+                        "AND batch_id = :batch AND status = 'pending'"
+                    ),
+                    {"scope": scope_id, "run": run_id, "batch": batch_id},
+                )
+            ).scalar_one()
+            batch_terminal = int(pending) == 0
+        else:
+            # Legacy single-approval suspension (no batch): terminal once this one resolves.
+            batch_terminal = current is not None and current != "pending"
+        requeued = False
+        if batch_terminal:
+            requeued = (
+                await conn.execute(
+                    text(
+                        "UPDATE runs SET status = 'queued', resume_requested = true, "
+                        "version = version + 1, updated_at = now() WHERE scope_id = :scope "
+                        "AND id = :run AND status = 'waiting_approval' RETURNING id"
+                    ),
+                    {"scope": scope_id, "run": run_id},
+                )
+            ).rowcount == 1
+    return _ResolveTx(applied, current, batch_terminal, requeued)
+
+
+async def _mem_resolve_and_requeue(
+    run_store: RunStore,
+    approvals: ApprovalStore,
+    *,
+    approval_id: str,
+    run_id: RunId,
+    batch_id: str,
+    status: str,
+    resolved_by: str,
+    expected_action_hash: str,
+    expected_run_attempt: int,
+) -> _ResolveTx:
+    """Sequential (single-process) equivalent of :func:`_pg_resolve_and_requeue`."""
+    applied = await approvals.resolve(
+        approval_id,
+        status,
+        resolved_by,
+        expected_action_hash=expected_action_hash,
+        expected_run_attempt=expected_run_attempt,
+    )
+    record = await approvals.get(approval_id)
+    current = record.status if record is not None else None
+    if batch_id:
+        batch_terminal = await approvals.batch_pending_count(run_id, batch_id) == 0
+    else:
+        # Legacy single-approval suspension (no batch): terminal once this one resolves.
+        batch_terminal = current is not None and current != "pending"
+    requeued = await run_store.requeue(run_id) if batch_terminal else False
+    return _ResolveTx(applied, current, batch_terminal, requeued)
+
 
 # StopReason -> terminal RunStatus. ``suspended`` is handled separately (release, not
 # terminalize); ``interrupted`` maps to interrupted unless a cancel control was consumed.
@@ -117,6 +255,7 @@ class DurableRunService:
         enqueue: EnqueueFn,
         admit_fn: AdmitFn,
         default_ttl_seconds: int = 24 * 3600,
+        delegate_policy: DelegatePolicy | None = None,
     ) -> None:
         self._runs = run_store
         self._events = event_store
@@ -125,6 +264,7 @@ class DurableRunService:
         self._enqueue = enqueue
         self._admit = admit_fn
         self._default_ttl_seconds = default_ttl_seconds
+        self._delegate_policy = delegate_policy
 
     @property
     def scope_id(self) -> ScopeId:
@@ -150,14 +290,25 @@ class DurableRunService:
         Admission has four durable steps — create the run row, persist the user turn,
         transition ``admitted -> queued``, and enqueue a worker job. Each is applied
         idempotently here so a crash (or a retried request with the same
-        ``(scope, idempotency_key)``) **repairs** a half-admitted row and completes exactly
-        the missing steps — it never creates a duplicate run/message and never leaves a
-        prompt-less run behind. The prompt is always persisted *before* the queued/dispatch
-        transition (invariant I2).
-        """
+        ``(scope, org, actor, idempotency_key)`` identity) **repairs** a half-admitted row and
+        completes exactly the missing steps — it never creates a duplicate run/message and
+        never leaves a prompt-less run behind. The prompt is always persisted *before* the
+        queued/dispatch transition (invariant I2). A retry whose immutable fingerprint
+        mismatches the persisted admission raises :class:`~keel_core.runs.RunAdmissionConflict`
+        rather than repairing with the caller-supplied binding/content."""
         now = now or datetime.now(UTC)
         run_id = run_id or uuid.uuid4().hex
         expires_at = now + timedelta(seconds=ttl_seconds or self._default_ttl_seconds)
+        # Immutable admission fingerprint: a retry that reuses the identity but mismatches the
+        # tenant/actor/agent/session/surface/content is rejected as a conflict by the store.
+        fingerprint = admission_fingerprint(
+            org_id=org_id,
+            actor=actor,
+            agent_id=agent_id,
+            session_id=session_id,
+            surface=surface,
+            content=content,
+        )
         record, created = await self._runs.create(
             run_id=run_id,
             scope_id=self._scope_id,
@@ -168,6 +319,7 @@ class DurableRunService:
             surface=surface,
             idempotency_key=idempotency_key,
             budget=budget or RunBudgetSpec(),
+            fingerprint=fingerprint,
             expires_at=expires_at,
             now=now,
         )
@@ -238,14 +390,29 @@ class DurableRunService:
             payload={"text": text},
         )
 
+    async def _actor_authorized(self, actor: str, run: RunRecord, record: ApprovalRecord) -> bool:
+        """Whether ``actor`` may resolve ``record`` for ``run`` (blocker 4).
+
+        A stable, non-blank authenticated actor is mandatory. The default policy authorizes
+        only the bound run/approval owner — a different user in the *same* org is denied
+        (no ambient cross-user resolution). An intentional, documented delegation is opt-in
+        via ``delegate_policy`` (e.g. an org-admin override), tested explicitly."""
+        if not actor:
+            return False  # never a blank/absent actor (local preview supplies a stable one)
+        if actor == run.actor:
+            return True
+        if self._delegate_policy is not None:
+            return await self._delegate_policy(actor, run, record)
+        return False
+
     async def resolve_approval(
         self,
         approval_id: str,
         *,
         approved: bool,
         resolved_by: str,
+        actor: str,
         org_id: str | None = None,
-        actor: str | None = None,
     ) -> bool:
         """Resolve a durable interactive approval, fully bound to the **current** run.
 
@@ -253,19 +420,23 @@ class DurableRunService:
         defaulted from the approval's own copies (which an attacker/stale replay controls):
 
         * the approval's ``run_id`` must resolve to a durable run (else it is not ours);
-        * the run must currently be ``waiting_approval`` (state gate);
+        * the run must not be terminal; resolution + requeue are gated on the current state;
         * the resolver's authenticated ``org_id`` (when supplied) must equal the run's org
           (cross-org denial), and the approval's stored ``org_id`` must equal the run's org;
-        * the approval's ``actor`` must match the run's owner, and when the resolver's
-          ``actor`` is supplied it must match too (no impersonation);
+        * the approval's ``actor`` must match the run's owner, and the resolver's ``actor``
+          (**mandatory**, non-blank) must be the bound owner or a documented delegate — a
+          same-org different user is denied unless a delegation policy authorizes it;
         * the approval's ``run_attempt`` must equal the run's **current** ``attempt`` — an
           attempt-0 approval can never resume an attempt-1 (reclaimed/advanced) run;
         * the ``action_hash`` is **recomputed** from the approval's stored exact tool + args
           and must equal the stored hash (tamper/replay defense).
 
-        Only if all bindings hold does the transactional ``resolve`` fire (with the verified
-        hash + current attempt as CAS guards), the run transition ``waiting_approval ->
-        queued`` with a resume marker, and a ``run_interactive`` resume job enqueue.
+        The approval-resolve, the batch-terminality check, and the run
+        ``waiting_approval -> queued`` (resume marker) commit in **one transaction** (blocker
+        1); the run is requeued only once *every* approval in its batch is terminal (blocker
+        5). Dispatch of the resume job happens after commit; the reconciler re-enqueues a
+        committed-but-undispatched run. A duplicate identical decision is idempotent
+        (returns True); a conflicting decision on a terminal approval is rejected (False).
         """
         record = await self._approvals.get(approval_id)
         if record is None:
@@ -274,8 +445,6 @@ class DurableRunService:
         if run is None:
             # Not a durable interactive run (e.g. a legacy scheduled approval): not ours.
             return False
-        if run.status is not RunStatus.waiting_approval:
-            return False  # only resolve a genuinely suspended run
         # Bind to the CURRENT run, not the approval's own (possibly stale) copies.
         if record.org_id != run.org_id:
             return False  # approval was bound to a different org than the run now has
@@ -283,36 +452,80 @@ class DurableRunService:
             return False  # cross-org resolution denied (fail closed)
         if record.actor != run.actor:
             return False  # approval was bound to a different actor than the run owner
-        if actor is not None and record.actor != actor:
-            return False  # resolver identity does not match the bound actor
+        if not await self._actor_authorized(actor, run, record):
+            return False  # resolver is not the bound owner nor an authorized delegate
         if record.run_attempt != run.attempt:
             return False  # attempt-0 approval cannot resume an attempt-1 run (fail closed)
         # Recompute the action hash from the stored exact action payload (never trust the
         # stored hash blindly): a mismatch means the row was tampered with -> fail closed.
         if record.action_hash != action_hash(record.tool, record.args):
             return False
+        if run.is_terminal:
+            return False  # the run already finished; a late decision is moot
         status = "granted" if approved else "denied"
-        resolved = await self._approvals.resolve(
-            approval_id,
-            status,
-            resolved_by,
+        tx = await self._resolve_and_requeue(
+            approval_id=approval_id,
+            run_id=record.run_id,
+            batch_id=record.batch_id,
+            status=status,
+            resolved_by=resolved_by,
             expected_action_hash=record.action_hash,
             expected_run_attempt=run.attempt,
         )
-        if not resolved:
-            return False
-        # Requeue (waiting_approval -> queued, resume marked) then dispatch a resume job.
-        if await self._runs.requeue(record.run_id):
-            await self._enqueue(record.run_id)
-        logger.info(
-            "approval resolved scope=%s run=%s approval=%s decision=%s by=%s",
-            self._scope_id,
-            record.run_id,
-            approval_id,
-            status,
-            resolved_by,
+        if tx.requeued:
+            await self._enqueue(record.run_id)  # dispatch after commit (reconciler backs up)
+        if tx.applied:
+            logger.info(
+                "approval resolved scope=%s run=%s approval=%s decision=%s by=%s batch_done=%s",
+                self._scope_id,
+                record.run_id,
+                approval_id,
+                status,
+                resolved_by,
+                tx.batch_terminal,
+            )
+            return True
+        # Not applied: either an idempotent duplicate of the same decision, or a conflict.
+        if tx.current_status == status:
+            return True  # duplicate identical decision is idempotent
+        return False  # conflicting decision on an already-terminal approval is rejected
+
+    async def _resolve_and_requeue(
+        self,
+        *,
+        approval_id: str,
+        run_id: RunId,
+        batch_id: str,
+        status: str,
+        resolved_by: str,
+        expected_action_hash: str,
+        expected_run_attempt: int,
+    ) -> _ResolveTx:
+        """Atomic (Postgres) or sequential (in-memory) resolve + batch-gated requeue."""
+        engine = _shared_engine(self._runs, self._approvals)
+        if engine is not None:
+            return await _pg_resolve_and_requeue(
+                engine,
+                self._scope_id,
+                approval_id=approval_id,
+                run_id=run_id,
+                batch_id=batch_id,
+                status=status,
+                resolved_by=resolved_by,
+                expected_action_hash=expected_action_hash,
+                expected_run_attempt=expected_run_attempt,
+            )
+        return await _mem_resolve_and_requeue(
+            self._runs,
+            self._approvals,
+            approval_id=approval_id,
+            run_id=run_id,
+            batch_id=batch_id,
+            status=status,
+            resolved_by=resolved_by,
+            expected_action_hash=expected_action_hash,
+            expected_run_attempt=expected_run_attempt,
         )
-        return True
 
     async def expire_approvals(
         self, *, now: datetime | None = None, legacy_resume: LegacyResumeFn | None = None
@@ -324,13 +537,14 @@ class DurableRunService:
         classified + routed here transactionally. ``expire_due`` mutates each pending row to
         ``expired`` exactly once (RETURNING), so even under simultaneous reconciler ticks no
         approval is consumed twice. A durable **interactive** approval (its ``run_id`` is a
-        durable run currently ``waiting_approval``) requeues the run and enqueues a
-        ``run_interactive`` resume; a **legacy** approval (no durable run row) is dispatched
-        via ``legacy_resume`` — never through the durable run state machine, and never left
-        hanging. Returns the number of runs resumed."""
+        durable run currently ``waiting_approval``) requeues the run **only once every
+        approval in its batch is terminal** (blocker 5); a **legacy** approval (no durable
+        run row) is dispatched via ``legacy_resume`` — never through the durable run state
+        machine, and never left hanging. Returns the number of runs resumed."""
         now = now or datetime.now(UTC)
         expired = await self._approvals.expire_due(now)
         resumed = 0
+        requeued_runs: set[RunId] = set()
         for approval_id in expired:
             record = await self._approvals.get(approval_id)
             if record is None:
@@ -342,12 +556,38 @@ class DurableRunService:
                     await legacy_resume(record)
                     resumed += 1
                 continue
-            if run.status is not RunStatus.waiting_approval:
+            if run.status is not RunStatus.waiting_approval or record.run_id in requeued_runs:
+                continue
+            # Resume only when the whole suspended batch is terminal (all expired/resolved). A
+            # legacy single approval (no batch id) is terminal the moment it expires.
+            if record.batch_id and (
+                await self._approvals.batch_pending_count(record.run_id, record.batch_id) != 0
+            ):
                 continue
             if await self._runs.requeue(record.run_id):
+                requeued_runs.add(record.run_id)
                 await self._enqueue(record.run_id)
                 resumed += 1
         return resumed
+
+    async def repair_stuck_resumes(self, *, limit: int = 100) -> int:
+        """Requeue any run stuck in ``waiting_approval`` whose approvals are all terminal.
+
+        The single, crash-tolerant backstop for blocker 1: whether a crash happened between
+        the atomic approval-resolve/expiry commit and the run requeue, or between the requeue
+        and the post-commit dispatch, this reconciliation observes a durable run whose batch
+        is fully resolved/expired and drives ``waiting_approval -> queued`` (resume marked) +
+        re-enqueues. Idempotent — a run already requeued is skipped, a duplicate enqueue is
+        deduped by the claim. Returns the number of runs repaired."""
+        repaired = 0
+        for run_id in await self._runs.waiting_approval_ids(limit):
+            # No pending approvals for the run == its suspended batch is terminal.
+            if await self._approvals.pending_for_run(run_id):
+                continue
+            if await self._runs.requeue(run_id):
+                await self._enqueue(run_id)
+                repaired += 1
+        return repaired
 
 
 @dataclass

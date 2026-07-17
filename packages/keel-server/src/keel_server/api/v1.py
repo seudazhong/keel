@@ -42,7 +42,7 @@ from keel_core.state import InMemoryEventStore, PostgresEventStore, list_session
 from keel_core.tokens import delete_token, list_connected
 from keel_core.types import PermissionDecision
 from keel_server.auth import Role, require_role
-from keel_server.identity_context import resolve_actor
+from keel_server.identity_context import Actor, resolve_actor
 from keel_server.runtime import AgentRuntime
 
 # Baseline authorization: every /v1 route needs at least `viewer`. In open mode (no
@@ -104,6 +104,20 @@ async def _authorize_run(request: Request, record: RunRecord) -> None:
     except NotFoundError:
         # Not a member of the run's org: same response as a nonexistent run (no info leak).
         raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found") from None
+
+
+def durable_actor_id(actor: Actor) -> str:
+    """A stable, non-blank actor identity for durable run admission/resolution (blocker 4).
+
+    A real user resolves to their durable ``user_id`` — the same value durable admission
+    binds as the run's ``actor`` — so a *different* same-org user is rejected by the service
+    (no ambient cross-user resolution). The open-mode local operator and API-key machines map
+    to a stable ``"<kind>:<name>"`` id: an explicit, never-blank local actor rather than a
+    blank/ambient one, matching their single scope-bound tenant."""
+    if actor.is_user:
+        assert actor.user_id is not None
+        return actor.user_id
+    return f"{actor.kind.value}:{actor.display_name}"
 
 
 def _durable_run_service(request: Request) -> DurableRunService:
@@ -528,6 +542,7 @@ async def _resolve_durable(request: Request, approval_id: str, decision: str) ->
             approval_id,
             approved=decision == "granted",
             resolved_by=actor.display_name,
+            actor=durable_actor_id(actor),
             org_id=durable_run.org_id if actor.is_user else None,
         )
         return {"ok": ok}

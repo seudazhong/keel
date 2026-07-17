@@ -52,6 +52,15 @@ class ApprovalRecord:
     actor: str = ""
     action_hash: str = ""
     run_attempt: int = 0
+    # Every approval raised by one suspended tool batch shares this id, so a run resumes only
+    # once *all* decisions in the batch are terminal (M3.6 blocker 5). Empty for legacy rows.
+    batch_id: str = ""
+
+    TERMINAL_STATUSES = ("granted", "denied", "expired")
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in ApprovalRecord.TERMINAL_STATUSES
 
 
 @runtime_checkable
@@ -74,6 +83,7 @@ class ApprovalStore(Protocol):
         actor: str = "",
         action_hash: str = "",
         run_attempt: int = 0,
+        batch_id: str = "",
     ) -> str: ...
 
     async def get(self, approval_id: str) -> ApprovalRecord | None: ...
@@ -81,6 +91,8 @@ class ApprovalStore(Protocol):
     async def list_pending(self, scope_id: str) -> list[ApprovalRecord]: ...
 
     async def pending_for_run(self, run_id: str) -> list[ApprovalRecord]: ...
+
+    async def batch_pending_count(self, run_id: str, batch_id: str) -> int: ...
 
     async def resolve(
         self,
@@ -117,6 +129,7 @@ class InMemoryApprovalStore:
         actor: str = "",
         action_hash: str = "",
         run_attempt: int = 0,
+        batch_id: str = "",
     ) -> str:
         approval_id = uuid.uuid4().hex
         self._rows[approval_id] = ApprovalRecord(
@@ -136,6 +149,7 @@ class InMemoryApprovalStore:
             actor=actor,
             action_hash=action_hash,
             run_attempt=run_attempt,
+            batch_id=batch_id,
         )
         return approval_id
 
@@ -147,6 +161,14 @@ class InMemoryApprovalStore:
 
     async def pending_for_run(self, run_id: str) -> list[ApprovalRecord]:
         return [r for r in self._rows.values() if r.run_id == run_id and r.status == "pending"]
+
+    async def batch_pending_count(self, run_id: str, batch_id: str) -> int:
+        """How many approvals in this run's batch are still pending (0 == batch terminal)."""
+        return sum(
+            1
+            for r in self._rows.values()
+            if r.run_id == run_id and r.batch_id == batch_id and r.status == "pending"
+        )
 
     async def resolve(
         self,
@@ -200,6 +222,7 @@ def _to_record(row: Any) -> ApprovalRecord:
         actor=row["actor"],
         action_hash=row["action_hash"],
         run_attempt=row["run_attempt"],
+        batch_id=row["batch_id"],
     )
 
 
@@ -226,6 +249,7 @@ class PostgresApprovalStore:
         actor: str = "",
         action_hash: str = "",
         run_attempt: int = 0,
+        batch_id: str = "",
     ) -> str:
         approval_id = uuid.uuid4().hex
         async with self._engine.begin() as conn:
@@ -234,10 +258,10 @@ class PostgresApprovalStore:
                 text(
                     "INSERT INTO approvals (id, scope_id, run_id, session_id, tool, args, "
                     "call_id, idempotency_key, reason, status, created_at, expires_at, "
-                    "org_id, actor, action_hash, run_attempt) VALUES "
+                    "org_id, actor, action_hash, run_attempt, batch_id) VALUES "
                     "(:id, :scope, :run_id, :session_id, :tool, CAST(:args AS jsonb), :call_id, "
                     ":key, :reason, 'pending', now(), :expires_at, :org_id, :actor, "
-                    ":action_hash, :run_attempt)"
+                    ":action_hash, :run_attempt, :batch_id)"
                 ),
                 {
                     "id": approval_id,
@@ -254,6 +278,7 @@ class PostgresApprovalStore:
                     "actor": actor,
                     "action_hash": action_hash,
                     "run_attempt": run_attempt,
+                    "batch_id": batch_id,
                 },
             )
         return approval_id
@@ -308,6 +333,20 @@ class PostgresApprovalStore:
                 .all()
             )
         return [_to_record(r) for r in rows]
+
+    async def batch_pending_count(self, run_id: str, batch_id: str) -> int:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            count = (
+                await conn.execute(
+                    text(
+                        "SELECT count(*) FROM approvals WHERE scope_id = :scope "
+                        "AND run_id = :run_id AND batch_id = :batch AND status = 'pending'"
+                    ),
+                    {"scope": self._scope_id, "run_id": run_id, "batch": batch_id},
+                )
+            ).scalar_one()
+        return int(count)
 
     async def resolve(
         self,

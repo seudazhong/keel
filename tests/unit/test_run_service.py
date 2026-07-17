@@ -270,6 +270,7 @@ async def test_durable_approval_suspends_then_resolve_resumes() -> None:
         pending[0].id,
         approved=True,
         resolved_by="user-1",
+        actor="user-1",
         org_id="org-1",
     )
     assert ok and enqueued == [admitted.run_id]
@@ -760,7 +761,7 @@ async def test_resolve_approval_marks_resume_and_binds_org_state() -> None:
     # Cross-org resolution is denied (fail closed), leaving the run suspended.
     assert (
         await service.resolve_approval(
-            pending[0].id, approved=True, resolved_by="attacker", org_id="org-OTHER"
+            pending[0].id, approved=True, resolved_by="attacker", actor="user-1", org_id="org-OTHER"
         )
         is False
     )
@@ -770,7 +771,7 @@ async def test_resolve_approval_marks_resume_and_binds_org_state() -> None:
     enqueued.clear()
     assert (
         await service.resolve_approval(
-            pending[0].id, approved=True, resolved_by="user-1", org_id="org-1"
+            pending[0].id, approved=True, resolved_by="user-1", actor="user-1", org_id="org-1"
         )
         is True
     )
@@ -802,7 +803,10 @@ async def test_resolve_approval_denies_when_run_not_waiting() -> None:
         reason="first_use",
         expires_at=datetime.now(UTC) + timedelta(hours=1),
     )
-    assert await service.resolve_approval(approval_id, approved=True, resolved_by="u") is False
+    assert (
+        await service.resolve_approval(approval_id, approved=True, resolved_by="u", actor="u")
+        is False
+    )
 
 
 async def test_expire_approvals_resumes_suspended_run() -> None:
@@ -1163,7 +1167,9 @@ async def test_approval_binding_rejects_wrong_attempt_and_tampered_hash() -> Non
     # (a) A stale attempt-0 approval cannot resume this attempt-1 run.
     stale = await _pending(run_attempt=0, hash_=good_hash)
     assert (
-        await service.resolve_approval(stale, approved=True, resolved_by="user-1", org_id="org-1")
+        await service.resolve_approval(
+            stale, approved=True, resolved_by="user-1", actor="user-1", org_id="org-1"
+        )
         is False
     )
     assert (await run_store.get(run_id)).status is RunStatus.waiting_approval  # type: ignore[union-attr]
@@ -1171,7 +1177,7 @@ async def test_approval_binding_rejects_wrong_attempt_and_tampered_hash() -> Non
     tampered = await _pending(run_attempt=1, hash_="deadbeef")
     assert (
         await service.resolve_approval(
-            tampered, approved=True, resolved_by="user-1", org_id="org-1"
+            tampered, approved=True, resolved_by="user-1", actor="user-1", org_id="org-1"
         )
         is False
     )
@@ -1179,7 +1185,9 @@ async def test_approval_binding_rejects_wrong_attempt_and_tampered_hash() -> Non
     # (c) The correctly-bound decision (attempt 1, valid recomputed hash) is accepted.
     good = await _pending(run_attempt=1, hash_=good_hash)
     assert (
-        await service.resolve_approval(good, approved=True, resolved_by="user-1", org_id="org-1")
+        await service.resolve_approval(
+            good, approved=True, resolved_by="user-1", actor="user-1", org_id="org-1"
+        )
         is True
     )
     record = await run_store.get(run_id)
@@ -1283,7 +1291,7 @@ async def test_max_iterations_one_blocks_a_second_iteration_after_resume() -> No
 
     pending = await approvals.pending_for_run(admitted.run_id)
     assert await service.resolve_approval(
-        pending[0].id, approved=True, resolved_by="user-1", org_id="org-1"
+        pending[0].id, approved=True, resolved_by="user-1", actor="user-1", org_id="org-1"
     )
     resume_lease = await run_store.claim(admitted.run_id, worker_id="w2", lease_seconds=30)
     assert resume_lease is not None and resume_lease.iterations_used == 1

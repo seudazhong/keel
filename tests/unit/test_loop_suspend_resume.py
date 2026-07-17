@@ -283,3 +283,134 @@ async def test_double_resume_sends_once() -> None:
             approvals=approvals,
         )
     assert sent == [{"to": "z@x", "idempotency_key": "k1"}]  # idempotent: one send
+
+
+def _send_only(call_id: str, to: str) -> ScriptedProviderGateway:
+    """One turn that directly asks to send (suspends immediately on the ask gate)."""
+    return ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(
+                    tool_call=ToolCall(id=call_id, name="email.send", arguments={"to": to}),
+                    finish_reason=FinishReason.tool_use,
+                )
+            ]
+        ]
+    )
+
+
+async def test_two_suspended_runs_in_one_session_isolate_by_run_id() -> None:
+    """Two runs share a session and both suspend on the SAME call id ``c2`` (blocker 2).
+
+    Resuming run A must resolve only A's suspended call — never inspect, execute, or deny
+    run B's identically-numbered call, even though the event log is shared."""
+    from keel_core.loop import resume
+
+    store, approvals, sent = InMemoryEventStore(), InMemoryApprovalStore(), []
+    perms = RuleBasedPermissionEngine(
+        [Rule("email.send", PermissionDecision.ask)], default=PermissionDecision.ask
+    )
+    await admit_system(store, "s1", "u:1", "seed the shared session")
+
+    run_a = await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=_send_only("c2", "a@x"),
+        registry=_mail_tools(sent),
+        permissions=perms,
+        approvals=approvals,
+        run_id="run-A",
+        expires_at=_EXPIRES,
+    )
+    run_b = await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=_send_only("c2", "b@x"),  # overlapping call id c2 in the same session
+        registry=_mail_tools(sent),
+        permissions=perms,
+        approvals=approvals,
+        run_id="run-B",
+        expires_at=_EXPIRES,
+    )
+    assert run_a.reason is StopReason.suspended and run_b.reason is StopReason.suspended
+
+    approvals_a = [a for a in await approvals.list_pending("u:1") if a.run_id == "run-A"]
+    approvals_b = [a for a in await approvals.list_pending("u:1") if a.run_id == "run-B"]
+    assert len(approvals_a) == 1 and len(approvals_b) == 1
+
+    # Grant ONLY run A's approval, then resume run A.
+    await approvals.resolve(approvals_a[0].id, "granted", "reviewer")
+    result = await resume(
+        agent=_agent(),
+        session_id="s1",
+        run_id="run-A",
+        store=store,
+        provider=_done(),
+        registry=_mail_tools(sent),
+        permissions=perms,
+        approvals=approvals,
+    )
+    assert result.reason is StopReason.completed
+    # Exactly A's send fired (to a@x); B's identically-numbered c2 was never executed.
+    assert sent == [{"to": "a@x"}]
+    b_results = [
+        e for e in store.snapshot("s1") if e.type is EventType.tool_result and e.run_id == "run-B"
+    ]
+    assert b_results == []  # run B's suspended call is untouched
+    assert (await approvals.get(approvals_b[0].id)).status == "pending"  # type: ignore[union-attr]
+
+
+async def test_resume_refuses_to_deny_a_still_pending_batch_member() -> None:
+    """A run must never implicitly deny a still-pending approval on resume (blocker 5)."""
+    from keel_core.loop import resume
+
+    store, approvals, sent = InMemoryEventStore(), InMemoryApprovalStore(), []
+    perms = RuleBasedPermissionEngine(
+        [Rule("email.send", PermissionDecision.ask)], default=PermissionDecision.ask
+    )
+    await admit_system(store, "s1", "u:1", "seed")
+    two = ScriptedProviderGateway(
+        [
+            [
+                ProviderChunk(
+                    tool_call=ToolCall(id="c1", name="email.send", arguments={"to": "a@x"}),
+                    finish_reason=FinishReason.tool_use,
+                ),
+                ProviderChunk(
+                    tool_call=ToolCall(id="c2", name="email.send", arguments={"to": "b@x"}),
+                    finish_reason=FinishReason.tool_use,
+                ),
+            ]
+        ]
+    )
+    suspended = await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=two,
+        registry=_mail_tools(sent),
+        permissions=perms,
+        approvals=approvals,
+        run_id="run-1",
+        expires_at=_EXPIRES,
+    )
+    assert suspended.reason is StopReason.suspended
+    pending = sorted(await approvals.list_pending("u:1"), key=lambda r: r.call_id)
+    assert len(pending) == 2
+    # Grant only c1; c2 stays pending. A resume must re-suspend rather than deny c2.
+    await approvals.resolve(pending[0].id, "granted", "reviewer")
+    result = await resume(
+        agent=_agent(),
+        session_id="s1",
+        run_id="run-1",
+        store=store,
+        provider=_done(),
+        registry=_mail_tools(sent),
+        permissions=perms,
+        approvals=approvals,
+    )
+    assert result.reason is StopReason.suspended  # not completed, not denied
+    assert sent == []  # nothing executed while a decision is still pending
+    assert (await approvals.get(pending[1].id)).status == "pending"  # type: ignore[union-attr]

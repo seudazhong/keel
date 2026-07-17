@@ -154,7 +154,10 @@ async def reconcile_runs_tick(ctx: dict[str, Any]) -> int:
     # Single owner of approval expiry: routes durable interactive approvals through the run
     # state machine and legacy approvals through resume_run (item 6).
     resumed = await service.expire_approvals(now=now, legacy_resume=_legacy_resume)
-    return result.redispatched + result.reclaimed + result.expired + resumed
+    # Crash-tolerant backstop (blocker 1): requeue any run left in waiting_approval whose
+    # approval batch is fully terminal but whose atomic requeue/dispatch did not complete.
+    repaired = await service.repair_stuck_resumes()
+    return result.redispatched + result.reclaimed + result.expired + resumed + repaired
 
 
 __all__ = ["reconcile_runs_tick", "run_interactive"]

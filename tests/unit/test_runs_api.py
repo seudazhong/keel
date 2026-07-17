@@ -59,7 +59,7 @@ async def _admit_run(runs: InMemoryRunStore, run_id: str, *, org_id: str = "org-
         run_id=run_id,
         scope_id=_SCOPE,
         org_id=org_id,
-        actor="user-1",
+        actor="local:local",
         agent_id="agent-1",
         session_id="sess-1",
         surface=RunSurface.web.value,
@@ -138,7 +138,7 @@ def test_durable_interactive_approval_routes_to_run_interactive() -> None:
             reason="first_use",
             expires_at=datetime.now(UTC) + timedelta(hours=1),
             org_id="org-1",
-            actor="user-1",
+            actor="local:local",
             action_hash=action_hash("email.send", {"to": "z@x"}),
             run_attempt=1,
         )
@@ -172,6 +172,120 @@ def test_legacy_approval_routes_to_resume_run() -> None:
     resp = client.post(f"/v1/approvals/{approval_id}/approve")
     assert resp.status_code == 200 and resp.json() == {"ok": True}
     # The legacy scheduled/digest path keeps the existing resume_run behavior.
+    assert enqueued == [("resume_run", ("sched-sess", "legacy-run", _SCOPE))]
+
+
+async def _suspend_run_for_user(
+    runs: InMemoryRunStore,
+    approvals: InMemoryApprovalStore,
+    run_id: str,
+    *,
+    org_id: str,
+    actor: str,
+) -> str:
+    """Admit + suspend a run owned by ``actor`` with a bound pending approval (attempt 1)."""
+    await runs.admit(
+        run_id=run_id,
+        scope_id=_SCOPE,
+        org_id=org_id,
+        actor=actor,
+        agent_id="agent-1",
+        session_id="sess-1",
+        surface=RunSurface.web.value,
+        idempotency_key=run_id,
+        budget=RunBudgetSpec(),
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    await runs.mark_queued(run_id)
+    lease = await runs.claim(run_id, worker_id="w1", lease_seconds=30)
+    assert lease is not None
+    await runs.release(lease, to_status=RunStatus.waiting_approval)
+    return await approvals.create_pending(
+        scope_id=_SCOPE,
+        run_id=run_id,
+        session_id="sess-1",
+        tool="email.send",
+        args={"to": "z@x"},
+        call_id="c1",
+        idempotency_key=f"i-{run_id}",
+        reason="first_use",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        org_id=org_id,
+        actor=actor,
+        action_hash=action_hash("email.send", {"to": "z@x"}),
+        run_attempt=1,
+    )
+
+
+def test_cross_user_same_org_resolution_denied_via_api(monkeypatch: Any) -> None:
+    # A run owned by user-alice (org-1); a DIFFERENT user (bob), also an org-1 member, must
+    # not resolve alice's approval — the API passes bob's stable actor and the service denies.
+    runs = InMemoryRunStore()
+    approvals = InMemoryApprovalStore()
+    client = _app_with_state(runs, approvals, [])
+    approval_id = _run(
+        _suspend_run_for_user(runs, approvals, "run-1", org_id="org-1", actor="user-alice")
+    )
+
+    async def _bob(_request: object) -> Actor:
+        return Actor(
+            kind=ActorKind.user,
+            api_role=Role.operator,
+            display_name="bob",
+            user_id="user-bob",
+        )
+
+    class _Org1Member:
+        async def select_org(self, user_id: str, org_ref: str) -> Any:
+            if org_ref == "org-1":
+                return object()
+            raise NotFoundError("organization not found")
+
+    monkeypatch.setattr(v1, "resolve_actor", _bob)
+    cast(FastAPI, client.app).state.identity = _Org1Member()
+    # bob is an org member (authorize passes) but not the owner: the service denies.
+    resp = client.post(f"/v1/approvals/{approval_id}/approve")
+    assert resp.status_code == 200 and resp.json() == {"ok": False}
+    record = _run(runs.get("run-1"))
+    assert record is not None and record.status is RunStatus.waiting_approval  # still suspended
+
+
+def test_conflicting_decision_via_api_is_rejected() -> None:
+    # Local-preview operator approves, then a conflicting reject must be rejected (ok: False).
+    runs = InMemoryRunStore()
+    approvals = InMemoryApprovalStore()
+    enqueued: list[tuple[str, tuple[object, ...]]] = []
+    client = _app_with_state(runs, approvals, enqueued)
+    approval_id = _run(
+        _suspend_run_for_user(runs, approvals, "run-1", org_id="org-1", actor="local:local")
+    )
+    assert client.post(f"/v1/approvals/{approval_id}/approve").json() == {"ok": True}
+    # A duplicate approve is idempotent; a conflicting reject is rejected.
+    assert client.post(f"/v1/approvals/{approval_id}/approve").json() == {"ok": True}
+    assert client.post(f"/v1/approvals/{approval_id}/reject").json() == {"ok": False}
+    assert _run(approvals.get(approval_id)).status == "granted"  # type: ignore[union-attr]
+
+
+def test_legacy_approval_routes_to_resume_run_after_new_helpers() -> None:
+    # (Kept minimal: re-verifies the legacy path is untouched by the new binding checks.)
+    runs = InMemoryRunStore()
+    approvals = InMemoryApprovalStore()
+    enqueued: list[tuple[str, tuple[object, ...]]] = []
+    client = _app_with_state(runs, approvals, enqueued)
+    approval_id = _run(
+        approvals.create_pending(
+            scope_id=_SCOPE,
+            run_id="legacy-run",
+            session_id="sched-sess",
+            tool="email.send",
+            args={},
+            call_id="c1",
+            idempotency_key="i1",
+            reason="first_use",
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    assert client.post(f"/v1/approvals/{approval_id}/approve").json() == {"ok": True}
     assert enqueued == [("resume_run", ("sched-sess", "legacy-run", _SCOPE))]
 
 

@@ -20,9 +20,13 @@ survive a server **and** worker restart and are safe under N racing workers.
 * ``run_control`` — durable interrupt / cancel / steering requests consumed by the owning
   worker (restart- and N-worker-safe: a request outlives the process that issued it).
 * ``approvals`` gains binding columns (``org_id``, ``actor``, ``action_hash``,
-  ``run_attempt``) so a cross-surface decision is bound to the exact run attempt + tool +
-  argument set — a stale/replayed approval for different args (or an earlier attempt) is
-  rejected.
+  ``run_attempt``, ``batch_id``) so a cross-surface decision is bound to the exact run
+  attempt + tool + argument set — a stale/replayed approval for different args (or an
+  earlier attempt) is rejected — and every approval raised by one suspended tool batch
+  shares a ``batch_id`` so the run resumes only once *all* its decisions are terminal.
+* ``runs`` additionally persists an immutable admission ``fingerprint`` and namespaces its
+  admission-identity uniqueness by ``(scope_id, org_id, actor, idempotency_key)`` so one
+  tenant/actor cannot collide with or hijack another's run via a shared idempotency key.
 
 Row-Level Security (ADR-0009 / DESIGN-REVIEW G16): ``runs`` and ``run_control`` carry the
 ``app.scope_id`` policy (mirroring ``jobs`` / ``approvals``) plus ``FORCE ROW LEVEL
@@ -75,6 +79,12 @@ def upgrade() -> None:
             result_ref text,
             error_kind text,
             error_message text,
+            -- Immutable admission fingerprint: a stable hash over the tenant/actor/agent/
+            -- session/surface binding + the normalized admission content. A retried admission
+            -- that presents the same idempotency identity but a *different* binding/content is
+            -- rejected as a conflict rather than silently repaired with attacker-supplied
+            -- values (M3.6 blocker 3). Defaults empty so pre-existing rows upgrade safely.
+            fingerprint text NOT NULL DEFAULT '',
             -- Explicit durable resume marker: set when an approval resolves and the run is
             -- requeued so the claiming worker calls loop.resume() (never inferred from a
             -- pre-claim status that requeue overwrote).
@@ -92,7 +102,10 @@ def upgrade() -> None:
             expires_at timestamptz NOT NULL,
             -- A leased row must always name its owner (fencing sanity).
             CHECK ((lease_token IS NULL) = (worker_id IS NULL)),
-            UNIQUE (scope_id, idempotency_key)
+            -- Admission identity is namespaced by tenant (org) AND admitting actor, not by a
+            -- shared (scope, idempotency_key) alone: one tenant/actor cannot collide with — or
+            -- hijack — another's run by reusing an idempotency key (M3.6 blocker 3).
+            UNIQUE (scope_id, org_id, actor, idempotency_key)
         )
         """
     )
@@ -148,6 +161,14 @@ def upgrade() -> None:
     op.execute("ALTER TABLE approvals ADD COLUMN actor text NOT NULL DEFAULT ''")
     op.execute("ALTER TABLE approvals ADD COLUMN action_hash text NOT NULL DEFAULT ''")
     op.execute("ALTER TABLE approvals ADD COLUMN run_attempt integer NOT NULL DEFAULT 0")
+    # Batch identity: every approval raised by one suspended tool batch shares a batch_id so a
+    # run resumes only once *every* decision in the batch is terminal (M3.6 blocker 5). A
+    # single-approval suspension is just a batch of one. Defaults empty for legacy rows.
+    op.execute("ALTER TABLE approvals ADD COLUMN batch_id text NOT NULL DEFAULT ''")
+    op.execute(
+        "CREATE INDEX ix_approvals_batch ON approvals (scope_id, run_id, batch_id) "
+        "WHERE status = 'pending'"
+    )
 
     # --- Row-Level Security on the scope-bound run tables -----------------------------
     for table in _SCOPED_TABLES:
@@ -179,6 +200,8 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute("DROP INDEX IF EXISTS ux_events_dedup")
+    op.execute("DROP INDEX IF EXISTS ix_approvals_batch")
+    op.execute("ALTER TABLE approvals DROP COLUMN IF EXISTS batch_id")
     op.execute("ALTER TABLE approvals DROP COLUMN IF EXISTS run_attempt")
     op.execute("ALTER TABLE approvals DROP COLUMN IF EXISTS action_hash")
     op.execute("ALTER TABLE approvals DROP COLUMN IF EXISTS actor")

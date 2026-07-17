@@ -425,6 +425,9 @@ async def _run_tools(
         ]
         if asks:
             reason = "tainted" if ctx.content_taint is ContentTaint.tainted else "first_use"
+            # Every approval raised by this one suspended batch shares a batch_id, so the run
+            # resumes only once *all* of them are terminal (M3.6 blocker 5).
+            batch_id = uuid.uuid4().hex
             created: list[str] = []
             for call in asks:
                 key = str(call.arguments.get("idempotency_key") or uuid.uuid4().hex)
@@ -442,6 +445,7 @@ async def _run_tools(
                     actor=binding.actor if binding else "",
                     action_hash=_action_hash(call.name, call.arguments),
                     run_attempt=binding.run_attempt if binding else 0,
+                    batch_id=batch_id,
                 )
                 await _emit(
                     store,
@@ -710,12 +714,20 @@ async def run(
     )
 
 
-async def _suspended_calls(store: EventStore, session_id: SessionId) -> list[ToolCall]:
-    """The tool.call events in the log that have no matching tool.result (the batch a
-    suspended run stopped at)."""
+async def _suspended_calls(
+    store: EventStore, session_id: SessionId, run_id: RunId
+) -> list[ToolCall]:
+    """The tool.call events for **this run** that have no matching tool.result (the batch a
+    suspended run stopped at).
+
+    Filtered by ``event.run_id`` so a run never inspects, executes, or denies another run's
+    suspended calls when a session is shared (M3.6 blocker 2). Only events belonging to
+    ``run_id`` are considered, even if two runs in the session raised overlapping call ids."""
     calls: dict[str, ToolCall] = {}
     resulted: set[str] = set()
     async for event in store.read(session_id):
+        if event.run_id != run_id:
+            continue
         if event.type is EventType.tool_call:
             cid = str(event.payload["call_id"])
             calls[cid] = ToolCall(
@@ -777,13 +789,39 @@ async def resume(
         trust=trust,
         content_taint=taint_from_events(prior),
     )
+    # Approval id per call, restricted to THIS run's approval.requested events — never adopt
+    # another run's approval decision when a session is shared (M3.6 blocker 2).
     approval_of: dict[str, str] = {
         str(event.payload["call_id"]): str(event.payload["approval_id"])
         for event in prior
-        if event.type is EventType.approval_requested
+        if event.type is EventType.approval_requested and event.run_id == run_id
     }
 
-    for call in await _suspended_calls(store, session_id):
+    suspended_calls = await _suspended_calls(store, session_id, run_id)
+    # A run must not resume while any approval in its suspended batch is still pending — a
+    # pending decision may never be *implicitly denied* (M3.6 blocker 5). Re-suspend cleanly
+    # so the still-pending approvals are preserved for a later, complete resolution.
+    still_pending = [
+        approval_of[call.id]
+        for call in suspended_calls
+        if call.id in approval_of
+        and (rec := await approvals.get(approval_of[call.id])) is not None
+        and rec.status == "pending"
+    ]
+    if still_pending:
+        await _emit(
+            store,
+            EventType.run_suspended,
+            session_id,
+            scope_id,
+            run_id,
+            {"approval_ids": still_pending},
+        )
+        return RunResult(
+            run_id=run_id, reason=StopReason.suspended, pending_approvals=still_pending
+        )
+
+    for call in suspended_calls:
         # Fail closed under a lost lease / durable cancel: never run an external effect and
         # never write a result the fresh owner would double-apply. Leave the batch pending.
         if interrupt is not None and interrupt():
@@ -791,6 +829,8 @@ async def resume(
         decision = permissions.evaluate(call.name, call.arguments, ctx)
         granted = decision is PermissionDecision.allow
         if decision is PermissionDecision.ask and call.id in approval_of:
+            # Preserve the *exact* durable decision: only an explicitly granted approval runs;
+            # a denied/expired one is refused (never executed).
             record = await approvals.get(approval_of[call.id])
             granted = record is not None and record.status == "granted"
         if granted:

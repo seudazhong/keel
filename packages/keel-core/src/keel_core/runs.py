@@ -14,8 +14,12 @@ Load-bearing invariants proven here:
   a superseded owner (lease expired, another worker reclaimed) can never write.
 * **Reclaim after expiry** — a run whose lease lapsed is reclaimable by any worker; the
   attempt counter advances so replay is bounded.
-* **Idempotent admission** — ``(scope_id, idempotency_key)`` is unique, so retrying a user
-  request returns the same run instead of creating a duplicate message/run.
+* **Idempotent admission** — ``(scope_id, org_id, actor, idempotency_key)`` is unique, so
+  retrying a user request returns the same run instead of creating a duplicate message/run;
+  and admission identity is namespaced by tenant + actor so one caller cannot collide with
+  (or hijack) another's run via a shared idempotency key. An immutable ``fingerprint`` binds
+  the admission to its exact org/actor/agent/session/surface/content — a retry that reuses
+  the identity but mismatches the binding is a **conflict**, never a silent repair.
 * **Idempotent terminalization** — terminalizing an already-terminal run is a no-op that
   returns the authoritative row (fail-safe under retries/races).
 * **Fail-closed transitions** — an illegal or stale-version transition raises rather than
@@ -131,6 +135,20 @@ class RunLeaseLostError(RuntimeError):
         self.run_id = run_id
 
 
+class RunAdmissionConflict(RuntimeError):
+    """Raised when a retried admission reuses an identity but mismatches its binding.
+
+    The unique admission identity is ``(scope_id, org_id, actor, idempotency_key)``. A retry
+    that presents the same identity but a *different* immutable fingerprint (a different
+    agent / session / surface / content) is an attacker or client bug — fail closed with a
+    conflict rather than repair the half-admitted row using the caller-supplied values.
+    """
+
+    def __init__(self, run_id: RunId) -> None:
+        super().__init__(f"run admission conflict: {run_id}")
+        self.run_id = run_id
+
+
 class RunControlKind(StrEnum):
     """A durable, worker-consumed control signal against a run."""
 
@@ -147,6 +165,36 @@ def action_hash(tool: str, args: Mapping[str, Any]) -> str:
     """
     canonical = json.dumps(
         {"tool": tool, "args": args}, sort_keys=True, separators=(",", ":"), default=str
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def admission_fingerprint(
+    *,
+    org_id: str,
+    actor: str,
+    agent_id: str,
+    session_id: str,
+    surface: str,
+    content: str,
+) -> str:
+    """Immutable fingerprint of an admission request (M3.6 blocker 3).
+
+    Covers the full tenant/actor binding, the selected agent, the target session, the
+    surface, and a hash of the normalized admission content. Two admissions that share an
+    idempotency identity must present an identical fingerprint; a mismatch is a conflict.
+    Canonical JSON with sorted keys makes the hash stable across equivalent inputs."""
+    canonical = json.dumps(
+        {
+            "org_id": org_id,
+            "actor": actor,
+            "agent_id": agent_id,
+            "session_id": session_id,
+            "surface": surface,
+            "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
@@ -206,6 +254,9 @@ class RunRecord:
     # Persisted so ``max_iterations`` bounds the *whole* run: a resumed run resumes the
     # counter rather than minting a fresh iteration budget (M3.6 cumulative-budget invariant).
     iterations: int = 0
+    # Immutable admission fingerprint (org/actor/agent/session/surface/content hash). A
+    # retried admission that reuses the identity but mismatches this is a conflict.
+    fingerprint: str = ""
 
     @property
     def is_terminal(self) -> bool:
@@ -290,6 +341,7 @@ class RunStore(Protocol):
         idempotency_key: str,
         budget: RunBudgetSpec,
         expires_at: datetime,
+        fingerprint: str = "",
         now: datetime | None = None,
     ) -> tuple[RunRecord, bool]: ...
 
@@ -306,6 +358,7 @@ class RunStore(Protocol):
         idempotency_key: str,
         budget: RunBudgetSpec,
         expires_at: datetime,
+        fingerprint: str = "",
         now: datetime | None = None,
     ) -> RunRecord: ...
 
@@ -382,6 +435,8 @@ class RunStore(Protocol):
 
     async def reclaimable(self, now: datetime, limit: int) -> list[str]: ...
 
+    async def waiting_approval_ids(self, limit: int) -> list[str]: ...
+
     async def expire_due(self, now: datetime, limit: int) -> list[str]: ...
 
 
@@ -400,7 +455,7 @@ class InMemoryRunStore:
     """Deterministic in-memory RunStore (tests + single-process dev)."""
 
     _rows: dict[RunId, RunRecord] = field(default_factory=dict)
-    _by_key: dict[tuple[str, str], RunId] = field(default_factory=dict)
+    _by_key: dict[tuple[str, str, str, str], RunId] = field(default_factory=dict)
     _control: dict[str, RunControl] = field(default_factory=dict)
     _consumed: set[str] = field(default_factory=set)
 
@@ -417,13 +472,21 @@ class InMemoryRunStore:
         idempotency_key: str,
         budget: RunBudgetSpec,
         expires_at: datetime,
+        fingerprint: str = "",
         now: datetime | None = None,
     ) -> tuple[RunRecord, bool]:
         now = now or _now()
-        key = (scope_id, idempotency_key)
+        # Admission identity is namespaced by tenant (org) + admitting actor, not a shared
+        # (scope, key) — so two tenants/actors cannot collide on one idempotency key.
+        key = (scope_id, org_id, actor, idempotency_key)
         existing_id = self._by_key.get(key)
         if existing_id is not None:
-            return self._rows[existing_id], False
+            existing = self._rows[existing_id]
+            # A retry that reuses the identity but presents a different immutable fingerprint
+            # is a conflict (never repaired with the caller-supplied binding/content).
+            if fingerprint and existing.fingerprint and existing.fingerprint != fingerprint:
+                raise RunAdmissionConflict(existing_id)
+            return existing, False
         record = RunRecord(
             id=run_id,
             scope_id=scope_id,
@@ -444,6 +507,7 @@ class InMemoryRunStore:
             created_at=now,
             updated_at=now,
             expires_at=expires_at,
+            fingerprint=fingerprint,
         )
         self._rows[run_id] = record
         self._by_key[key] = run_id
@@ -462,6 +526,7 @@ class InMemoryRunStore:
         idempotency_key: str,
         budget: RunBudgetSpec,
         expires_at: datetime,
+        fingerprint: str = "",
         now: datetime | None = None,
     ) -> RunRecord:
         record, _ = await self.create(
@@ -475,6 +540,7 @@ class InMemoryRunStore:
             idempotency_key=idempotency_key,
             budget=budget,
             expires_at=expires_at,
+            fingerprint=fingerprint,
             now=now,
         )
         return record
@@ -743,6 +809,11 @@ class InMemoryRunStore:
         rows.sort(key=lambda r: r.lease_expires_at or now)
         return [r.id for r in rows[:limit]]
 
+    async def waiting_approval_ids(self, limit: int) -> list[str]:
+        rows = [r for r in self._rows.values() if r.status is RunStatus.waiting_approval]
+        rows.sort(key=lambda r: r.updated_at)
+        return [r.id for r in rows[:limit]]
+
     async def expire_due(self, now: datetime, limit: int) -> list[str]:
         expired: list[str] = []
         rows = [r for r in self._rows.values() if not r.is_terminal and r.expires_at <= now]
@@ -767,8 +838,8 @@ _RUN_COLUMNS = (
     "id, scope_id, org_id, actor, agent_id, session_id, surface, idempotency_key, status, "
     "stop_reason, attempt, version, worker_id, lease_token, lease_expires_at, heartbeat_at, "
     "max_iterations, token_budget, prompt_tokens, completion_tokens, cost_usd, result_ref, "
-    "error_kind, error_message, resume_requested, prompt_persisted, iterations, created_at, "
-    "updated_at, started_at, finished_at, expires_at"
+    "error_kind, error_message, resume_requested, prompt_persisted, iterations, fingerprint, "
+    "created_at, updated_at, started_at, finished_at, expires_at"
 )
 
 
@@ -801,6 +872,7 @@ def _to_record(row: Mapping[Any, Any]) -> RunRecord:
         resume_requested=bool(row["resume_requested"]),
         prompt_persisted=bool(row["prompt_persisted"]),
         iterations=row["iterations"],
+        fingerprint=row["fingerprint"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         started_at=row["started_at"],
@@ -846,6 +918,7 @@ class PostgresRunStore:
         idempotency_key: str,
         budget: RunBudgetSpec,
         expires_at: datetime,
+        fingerprint: str = "",
         now: datetime | None = None,
     ) -> tuple[RunRecord, bool]:
         if scope_id != self._scope_id:
@@ -853,17 +926,19 @@ class PostgresRunStore:
         now = now or _now()
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": scope_id})
-            # Idempotent admission: an INSERT that no-ops on the unique (scope, key) pair.
+            # Idempotent admission namespaced by tenant + actor: an INSERT that no-ops on the
+            # unique (scope, org, actor, key) tuple so two tenants/actors cannot collide.
             inserted = (
                 await conn.execute(
                     text(
                         "INSERT INTO runs (id, scope_id, org_id, actor, agent_id, session_id, "
                         "surface, idempotency_key, status, attempt, version, max_iterations, "
-                        "token_budget, prompt_tokens, completion_tokens, cost_usd, created_at, "
-                        "updated_at, expires_at) VALUES (:id, :scope, :org, :actor, :agent, "
-                        ":session, :surface, :key, 'admitted', 0, 1, :max_it, :tok_budget, "
-                        ":ptok, :ctok, :cost, :now, :now, :expires) "
-                        "ON CONFLICT (scope_id, idempotency_key) DO NOTHING RETURNING id"
+                        "token_budget, prompt_tokens, completion_tokens, cost_usd, fingerprint, "
+                        "created_at, updated_at, expires_at) VALUES (:id, :scope, :org, :actor, "
+                        ":agent, :session, :surface, :key, 'admitted', 0, 1, :max_it, "
+                        ":tok_budget, :ptok, :ctok, :cost, :fingerprint, :now, :now, :expires) "
+                        "ON CONFLICT (scope_id, org_id, actor, idempotency_key) DO NOTHING "
+                        "RETURNING id"
                     ),
                     {
                         "id": run_id,
@@ -879,6 +954,7 @@ class PostgresRunStore:
                         "ptok": budget.prompt_tokens,
                         "ctok": budget.completion_tokens,
                         "cost": budget.cost_usd,
+                        "fingerprint": fingerprint,
                         "now": now,
                         "expires": expires_at,
                     },
@@ -890,15 +966,26 @@ class PostgresRunStore:
                     await conn.execute(
                         text(
                             f"SELECT {_RUN_COLUMNS} FROM runs "
-                            "WHERE scope_id = :scope AND idempotency_key = :key"
+                            "WHERE scope_id = :scope AND org_id = :org AND actor = :actor "
+                            "AND idempotency_key = :key"
                         ),
-                        {"scope": scope_id, "key": idempotency_key},
+                        {
+                            "scope": scope_id,
+                            "org": org_id,
+                            "actor": actor,
+                            "key": idempotency_key,
+                        },
                     )
                 )
                 .mappings()
                 .one()
             )
-        return _to_record(row), created
+        record = _to_record(row)
+        # A retry that reuses the identity but mismatches the immutable fingerprint is a
+        # conflict — never repaired using the caller-supplied binding/content.
+        if not created and fingerprint and record.fingerprint and record.fingerprint != fingerprint:
+            raise RunAdmissionConflict(record.id)
+        return record, created
 
     async def admit(
         self,
@@ -913,6 +1000,7 @@ class PostgresRunStore:
         idempotency_key: str,
         budget: RunBudgetSpec,
         expires_at: datetime,
+        fingerprint: str = "",
         now: datetime | None = None,
     ) -> RunRecord:
         record, _ = await self.create(
@@ -926,6 +1014,7 @@ class PostgresRunStore:
             idempotency_key=idempotency_key,
             budget=budget,
             expires_at=expires_at,
+            fingerprint=fingerprint,
             now=now,
         )
         return record
@@ -1338,6 +1427,13 @@ class PostgresRunStore:
             "AND status IN ('running', 'waiting_approval') AND lease_expires_at <= :now "
             "ORDER BY lease_expires_at LIMIT :limit",
             {"scope": self._scope_id, "now": now, "limit": limit},
+        )
+
+    async def waiting_approval_ids(self, limit: int) -> list[str]:
+        return await self._select_ids(
+            "SELECT id FROM runs WHERE scope_id = :scope AND status = 'waiting_approval' "
+            "ORDER BY updated_at LIMIT :limit",
+            {"scope": self._scope_id, "limit": limit},
         )
 
     async def expire_due(self, now: datetime, limit: int) -> list[str]:
