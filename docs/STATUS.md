@@ -207,8 +207,12 @@ Review-finding hardening (this increment):
   `tests/integration/test_run_routing_postgres.py::test_two_orgs_identical_session_ids_are_isolated`.
 - **Per-scope workspace isolation.** A scoped execution-environment factory
   (`build_scoped_execution_environment`) gives each scope its own workspace (validated opaque
-  `ws_<hash>` namespace, no traversal); the sandbox RPC carries the namespace and fails file/
-  shell closed when it cannot provision a scoped workspace (never a shared one).
+  `ws_<hash>` namespace, no traversal); the sandbox RPC carries the namespace and fails file
+  operations closed when it cannot provision a scoped workspace (never a shared one). A
+  namespace directory under a shared parent confines *file* operations only (path policy); a
+  *shell* subprocess is not confined by a directory, so namespaced `command` execution is
+  denied by default and permitted only when the backend asserts `shell_isolated` (a proven
+  OS/container/microVM mount boundary exposing only that namespace root).
 - **Dispatch failure semantics.** Once durable admission commits, a failed enqueue returns the
   accepted run (202 + `dispatch_pending`, idempotency key echoed) and relies on the reconciler
   — never an opaque 500 that risks duplicate retries.
@@ -227,9 +231,16 @@ Second-pass review findings (this increment, migration `0016_web_routing_isolati
   `X-Keel-Org`/`X-Keel-Agent`. Evidence: `tests/unit/test_machine_credentials.py`.
 - **Composite session tenant identity.** `sessions` is re-keyed on `(scope_id, id)` and `events`
   on `(scope_id, session_id, seq)`, so identical external session ids in two orgs coexist as
-  isolated sessions (no cross-scope denial); existing rows upgrade safely and downgrade restores
-  the global namespace when no cross-scope id collision exists. Evidence:
-  `test_state_postgres.py`, `test_run_routing_postgres.py::test_two_orgs_identical_session_ids_are_isolated`.
+  isolated sessions (no cross-scope denial); existing rows upgrade safely. Downgrade restores the
+  global namespace losslessly even with cross-scope id collisions: it keeps the canonical
+  (lexicographically-smallest) scope's id, deterministically renames every other colliding
+  scope's session, repoints all referencing rows in lock-step, and — because a run's immutable
+  admission fingerprint binds the session id — recomputes each remapped run's fingerprint to the
+  exact pre-0016 (legacy, pre-model) form for its new id (content recovered from the run's unique
+  admission event; a fingerprint that cannot be reconstructed safely fails the downgrade rather
+  than being cleared). Evidence: `test_state_postgres.py`,
+  `test_run_routing_postgres.py::test_two_orgs_identical_session_ids_are_isolated`,
+  `test_web_routing_isolation_migration.py::test_downgrade_remaps_run_fingerprints_for_new_session_id`.
 - **Scoped Gmail OAuth.** `/connect` resolves through the unified `require_privilege` and binds
   the one-time state to the caller's canonical `agent:<org>/<agent>` scope (never the app-global
   `web:local`); the unauthenticated callback consumes that state and writes the token to that
@@ -247,8 +258,13 @@ Second-pass review findings (this increment, migration `0016_web_routing_isolati
   `tests/unit/test_sse_tail.py`.
 - **Real sandbox namespace confinement.** The sandbox service resolves each validated
   `ws_<hash>` namespace to its own confined workspace via a `WorkspaceProvider`/factory and fails
-  closed when a scoped workspace cannot be provisioned — it never ignores the namespace. Evidence:
-  `test_sandbox_rpc.py::test_rpc_namespaces_are_confined_to_distinct_workspaces`.
+  closed when a scoped workspace cannot be provisioned — it never ignores the namespace. Directory
+  confinement bounds *file* operations only; a namespaced `command` is not a shell sandbox (a
+  subprocess can reach absolute/sibling/expanded paths), so namespaced shell is denied before it
+  reaches an environment unless the provider asserts `shell_isolated` (a proven OS/container/
+  microVM boundary). Evidence:
+  `test_sandbox_rpc.py::test_rpc_namespaces_are_confined_to_distinct_workspaces`,
+  `test_sandbox_rpc.py::test_rpc_namespaced_shell_is_denied_without_os_isolation`.
 - **Readiness + OpenAPI compatibility.** Readiness is degraded (503) when default durable message
   admission cannot execute (no shared substrate / no run queue) instead of reporting 200 while
   every message 503s. `check_openapi_compat.py` validates against the **main** baseline (the

@@ -37,14 +37,165 @@ stays behind RLS; the outbox is only a dispatch pointer.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Sequence
 
+import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0016_web_routing_isolation"
 down_revision: str | None = "0015_projects_github"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
+
+
+# The exact list of session-referencing repoints applied when a colliding scoped session is
+# renamed on downgrade (children before the ``sessions`` row itself). ``runs`` is remapped
+# separately because its immutable admission fingerprint must be recomputed for the new id.
+_SESSION_REPOINTS: tuple[str, ...] = (
+    "UPDATE events SET session_id = :new WHERE scope_id = :scope AND session_id = :old",
+    "UPDATE approvals SET session_id = :new WHERE scope_id = :scope AND session_id = :old",
+    "UPDATE schedules SET session_id = :new WHERE scope_id = :scope AND session_id = :old",
+    "UPDATE message_embeddings SET session_id = :new WHERE scope_id = :scope AND session_id = :old",
+    "UPDATE jobs SET target_session_id = :new WHERE scope_id = :scope AND target_session_id = :old",
+    "UPDATE event_tombstones SET session_id = :new WHERE scope_id = :scope AND session_id = :old",
+    "UPDATE erasure_requests SET target_id = :new "
+    "WHERE scope_id = :scope AND target_kind = 'session' AND target_id = :old",
+    "UPDATE sessions SET id = :new WHERE scope_id = :scope AND id = :old",
+)
+
+
+def _legacy_admission_fingerprint(
+    *,
+    org_id: str,
+    actor: str,
+    agent_id: str,
+    session_id: str,
+    surface: str,
+    content: str,
+) -> str:
+    """Recompute the *pre-0016* (pre-model) admission fingerprint in pure Python.
+
+    Byte-for-byte identical to :func:`keel_core.runs.legacy_admission_fingerprint`: canonical
+    JSON (sorted keys, compact separators) over the tenant/actor/agent/session/surface binding
+    plus a SHA-256 of the immutable admission content, hashed with SHA-256. No ``model`` key —
+    the form the code running *after* a rollback below 0016 computes — and no optional DB
+    extension (pgcrypto is not required). Downgrade rewrites every remapped run's fingerprint to
+    exactly this value for its NEW session id so a retry after rollback is recognized as the same
+    admission instead of being falsely rejected as a conflict, while a changed
+    content/actor/agent/surface still produces a different hash (a real conflict).
+    """
+    payload = {
+        "org_id": org_id,
+        "actor": actor,
+        "agent_id": agent_id,
+        "session_id": session_id,
+        "surface": surface,
+        "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _derive_remapped_session_id(
+    bind: sa.engine.Connection, scope_id: str, old_id: str, taken: set[str]
+) -> str:
+    """Deterministic, collision-free rename derived from the original id + owning scope.
+
+    Mirrors the id derivation this migration used before fingerprint recomputation moved to
+    Python: ``left(old_id, 180) || '.scope-' || md5(scope || '|' || old_id)`` with a
+    deterministic ``-N`` bump extending it until free (guarding the astronomically unlikely
+    digest collision against an existing id or one already assigned in this pass).
+    """
+    base = old_id[:180]
+    digest = hashlib.md5(f"{scope_id}|{old_id}".encode()).hexdigest()  # noqa: S324
+    new_id = f"{base}.scope-{digest}"
+    bump = 0
+    while (
+        new_id in taken
+        or bind.execute(sa.text("SELECT 1 FROM sessions WHERE id = :nid"), {"nid": new_id}).first()
+        is not None
+    ):
+        bump += 1
+        new_id = f"{base}.scope-{digest}-{bump}"
+    return new_id
+
+
+def _admission_content(bind: sa.engine.Connection, scope_id: str, run_id: str) -> str:
+    """Recover a run's immutable admission content from its unique admission user event.
+
+    The admission user turn (see :func:`keel_core.loop.admit_run`) carries an ``admission_run``
+    payload marker equal to the run id and a ``dedup_key`` of ``admit:<run_id>`` guarded by a
+    per-scope partial-unique index, so there is at most one matching event per run. We require
+    **exactly one** unambiguous match with a string ``text`` field; anything else (a half-admitted
+    run with no prompt, a truncated payload) means the fingerprint cannot be reconstructed safely,
+    so we raise and fail the downgrade *before* any constraint changes — never clearing/wildcarding
+    the fingerprint.
+    """
+    rows = bind.execute(
+        sa.text(
+            "SELECT payload FROM events "
+            "WHERE scope_id = :scope AND payload->>'admission_run' = :run_id"
+        ),
+        {"scope": scope_id, "run_id": run_id},
+    ).all()
+    if len(rows) != 1:
+        raise RuntimeError(
+            "0016 downgrade: refusing to remap run fingerprint for run "
+            f"{run_id!r} in scope {scope_id!r}: expected exactly one admission event, "
+            f"found {len(rows)}"
+        )
+    raw = rows[0][0]
+    payload = json.loads(raw) if isinstance(raw, str) else raw
+    text_value = payload.get("text") if isinstance(payload, dict) else None
+    if not isinstance(text_value, str):
+        raise RuntimeError(
+            "0016 downgrade: refusing to remap run fingerprint for run "
+            f"{run_id!r} in scope {scope_id!r}: admission event has no immutable 'text' content"
+        )
+    return text_value
+
+
+def _remap_run_fingerprints(
+    bind: sa.engine.Connection, scope_id: str, old_id: str, new_id: str
+) -> None:
+    """Repoint a scoped session's runs to ``new_id`` and rebind each immutable fingerprint.
+
+    The admission fingerprint binds the session id, so a bare ``session_id`` repoint would leave
+    every remapped run carrying a hash that no longer matches its own row — a retry after rollback
+    would be falsely rejected as a conflict. For each affected run we recompute the exact pre-0016
+    fingerprint for ``new_id`` (org/actor/agent/surface/content preserved; only the session id
+    moves), recovering the content from the run's unique admission event. A run that never carried
+    a fingerprint (``''``) stays unverifiable/empty (no reconstruction, safe to leave). We update
+    ``session_id`` and ``fingerprint`` together so the row is never observed in a bound-mismatched
+    state.
+    """
+    runs = bind.execute(
+        sa.text(
+            "SELECT id, org_id, actor, agent_id, surface, fingerprint "
+            "FROM runs WHERE scope_id = :scope AND session_id = :old"
+        ),
+        {"scope": scope_id, "old": old_id},
+    ).all()
+    for run in runs:
+        new_fingerprint = run.fingerprint
+        if run.fingerprint:
+            new_fingerprint = _legacy_admission_fingerprint(
+                org_id=run.org_id,
+                actor=run.actor,
+                agent_id=run.agent_id,
+                session_id=new_id,
+                surface=run.surface,
+                content=_admission_content(bind, scope_id, run.id),
+            )
+        bind.execute(
+            sa.text(
+                "UPDATE runs SET session_id = :new, fingerprint = :fp "
+                "WHERE scope_id = :scope AND id = :run_id"
+            ),
+            {"new": new_id, "fp": new_fingerprint, "scope": scope_id, "run_id": run.id},
+        )
 
 
 def upgrade() -> None:
@@ -205,27 +356,29 @@ def downgrade() -> None:
     # reference is left dangling. There are no session FKs, so ON UPDATE CASCADE is unavailable
     # — we repoint each referencing table explicitly, children before the ``sessions`` row.
     #
+    # A run additionally carries an immutable admission ``fingerprint`` that binds the session
+    # id, so a remapped run cannot be repointed by session id alone: we recompute the exact
+    # pre-0016 fingerprint for the NEW id (:func:`_remap_run_fingerprints`), recovering the
+    # immutable content from the run's unique admission event and failing the downgrade if it
+    # cannot be reconstructed safely — never wildcarding/clearing it. The remap + fingerprint
+    # recomputation run in Python (this migration's bind) rather than plpgsql so the SHA-256
+    # fingerprint matches the application algorithm byte-for-byte without an optional DB
+    # extension (pgcrypto).
+    #
     # ``runs`` (and only ``runs`` among the session-referencing tables) is under FORCE ROW LEVEL
     # SECURITY, so even the table owner is filtered by ``app.scope_id`` — which is unset during
     # a migration. We drop FORCE for the duration of the cross-scope remap so the repoint reaches
     # every scope's runs, then restore it. The derivation is deterministic and only touches rows
     # that still collide, so a repeated/partial downgrade converges (idempotent) and the
     # no-collision case is a pure no-op.
+    bind = op.get_bind()
     op.execute("ALTER TABLE runs NO FORCE ROW LEVEL SECURITY")
-    op.execute(
-        """
-        DO $$
-        DECLARE
-            collision RECORD;
-            new_id text;
-            base text;
-            digest text;
-            bump int;
-        BEGIN
-            -- Materialize the collision set up front (every non-canonical scoped session for a
-            -- globally-duplicated id) so repointing ``sessions`` mid-loop cannot disturb the
-            -- iteration.
-            CREATE TEMP TABLE _session_id_collisions ON COMMIT DROP AS
+
+    # Materialize the collision set up front (every non-canonical scoped session for a
+    # globally-duplicated id) so repointing ``sessions`` mid-loop cannot disturb the iteration.
+    collisions = bind.execute(
+        sa.text(
+            """
             SELECT s.scope_id AS scope_id, s.id AS old_id
             FROM sessions s
             JOIN (
@@ -234,48 +387,26 @@ def downgrade() -> None:
                 GROUP BY id
                 HAVING count(*) > 1
             ) dup ON dup.id = s.id
-            WHERE s.scope_id <> dup.canonical_scope;
+            WHERE s.scope_id <> dup.canonical_scope
+            ORDER BY s.id, s.scope_id
+            """
+        )
+    ).all()
 
-            FOR collision IN SELECT scope_id, old_id FROM _session_id_collisions LOOP
-                -- Deterministic, stable rename derived from the original id + owning scope.
-                -- ``(scope_id, id)`` is the composite PK, so md5(scope||id) is unique per row;
-                -- the base is truncated to keep the derived id bounded in length/format.
-                base := left(collision.old_id, 180);
-                digest := md5(collision.scope_id || '|' || collision.old_id);
-                new_id := base || '.scope-' || digest;
-                -- Guard the (astronomically unlikely) digest collision with an existing id or
-                -- one already assigned in this pass: extend deterministically until free.
-                bump := 0;
-                WHILE EXISTS (SELECT 1 FROM sessions WHERE id = new_id) LOOP
-                    bump := bump + 1;
-                    new_id := base || '.scope-' || digest || '-' || bump;
-                END LOOP;
+    taken: set[str] = set()
+    for collision in collisions:
+        scope_id = collision.scope_id
+        old_id = collision.old_id
+        new_id = _derive_remapped_session_id(bind, scope_id, old_id, taken)
+        taken.add(new_id)
 
-                -- Repoint every referencing row for this scoped session, then the row itself.
-                UPDATE events SET session_id = new_id
-                    WHERE scope_id = collision.scope_id AND session_id = collision.old_id;
-                UPDATE runs SET session_id = new_id
-                    WHERE scope_id = collision.scope_id AND session_id = collision.old_id;
-                UPDATE approvals SET session_id = new_id
-                    WHERE scope_id = collision.scope_id AND session_id = collision.old_id;
-                UPDATE schedules SET session_id = new_id
-                    WHERE scope_id = collision.scope_id AND session_id = collision.old_id;
-                UPDATE message_embeddings SET session_id = new_id
-                    WHERE scope_id = collision.scope_id AND session_id = collision.old_id;
-                UPDATE jobs SET target_session_id = new_id
-                    WHERE scope_id = collision.scope_id AND target_session_id = collision.old_id;
-                UPDATE event_tombstones SET session_id = new_id
-                    WHERE scope_id = collision.scope_id AND session_id = collision.old_id;
-                UPDATE erasure_requests SET target_id = new_id
-                    WHERE scope_id = collision.scope_id
-                        AND target_kind = 'session'
-                        AND target_id = collision.old_id;
-                UPDATE sessions SET id = new_id
-                    WHERE scope_id = collision.scope_id AND id = collision.old_id;
-            END LOOP;
-        END $$;
-        """
-    )
+        # Repoint the runs (with their recomputed fingerprints) before the generic repoints so a
+        # failed/unsafe fingerprint reconstruction aborts the downgrade before any constraint or
+        # id changes for this collision.
+        _remap_run_fingerprints(bind, scope_id, old_id, new_id)
+        for statement in _SESSION_REPOINTS:
+            bind.execute(sa.text(statement), {"new": new_id, "old": old_id, "scope": scope_id})
+
     op.execute("ALTER TABLE runs FORCE ROW LEVEL SECURITY")
 
     # Every cross-scope collision is now collapsed, so the global constraints are representable.

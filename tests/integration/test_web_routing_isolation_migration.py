@@ -16,13 +16,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+
+from keel_core.runs import (
+    RunBudgetSpec,
+    _fingerprint_matches,
+    admission_fingerprint,
+    legacy_admission_fingerprint,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -60,6 +68,19 @@ def _expected_remap(scope_id: str, old_id: str) -> str:
     base = old_id[:180]
     digest = hashlib.md5(f"{scope_id}|{old_id}".encode()).hexdigest()  # noqa: S324
     return f"{base}.scope-{digest}"
+
+
+async def _session_pk_columns(conn: AsyncConnection) -> list[str]:
+    """The column names of the ``sessions`` primary key (order-independent)."""
+    result = await conn.execute(
+        text(
+            "SELECT a.attname FROM pg_index i "
+            "JOIN pg_attribute a "
+            "ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
+            "WHERE i.indrelid = 'sessions'::regclass AND i.indisprimary"
+        )
+    )
+    return list(result.scalars().all())
 
 
 async def _seed(engine: AsyncEngine) -> None:
@@ -122,19 +143,7 @@ async def test_downgrade_remaps_cross_scope_session_collisions(migrated_db: Asyn
     remapped = _expected_remap(_SCOPE_B, _DUP)
     async with migrated_db.connect() as conn:
         # 1) The global sessions PK (id) is restored and every id is now globally unique.
-        pk_cols = (
-            (
-                await conn.execute(
-                    text(
-                        "SELECT a.attname FROM pg_index i "
-                        "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
-                        "WHERE i.indrelid = 'sessions'::regclass AND i.indisprimary"
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        pk_cols = await _session_pk_columns(conn)
         assert list(pk_cols) == ["id"]
 
         rows = (await conn.execute(text("SELECT scope_id, id FROM sessions ORDER BY id"))).all()
@@ -166,19 +175,7 @@ async def test_downgrade_remaps_cross_scope_session_collisions(migrated_db: Asyn
     # 4) Reversible: re-upgrade to head restores composite identity with the data intact.
     await asyncio.to_thread(_run_to, url, "head")
     async with migrated_db.connect() as conn:
-        pk_cols = (
-            (
-                await conn.execute(
-                    text(
-                        "SELECT a.attname FROM pg_index i "
-                        "JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey) "
-                        "WHERE i.indrelid = 'sessions'::regclass AND i.indisprimary"
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
+        pk_cols = await _session_pk_columns(conn)
         assert set(pk_cols) == {"scope_id", "id"}
         count = await conn.scalar(text("SELECT count(*) FROM sessions"))
         assert count == 3
@@ -202,3 +199,230 @@ async def test_downgrade_is_idempotent_and_noop_without_collisions(
 
     # Restore head for subsequent tests.
     await asyncio.to_thread(_run_to, url, "head")
+
+
+_MODEL = "model-A"
+_CONTENT = "please triage the overnight inbox"
+
+
+def _binding(scope_id: str) -> dict[str, str]:
+    """The persisted-identity binding (org/actor/agent/surface) for a scope's run."""
+    return {
+        "org_id": scope_id.split(":")[1].split("/")[0],
+        "actor": "user-1",
+        "agent_id": "agent-1",
+        "surface": "web",
+    }
+
+
+async def _seed_admitted_run(
+    engine: AsyncEngine,
+    *,
+    scope_id: str,
+    session_id: str,
+    content: str | None = _CONTENT,
+    fingerprint: str,
+) -> str:
+    """Seed a session + an admitted run with a real fingerprint and (optionally) its admission
+    user event carrying the immutable content, mirroring the durable admission path."""
+    run_id = f"run-{scope_id}"
+    expires = datetime.now(UTC) + timedelta(hours=1)
+    ts = datetime.now(UTC)
+    binding = _binding(scope_id)
+    async with engine.begin() as conn:
+        await conn.execute(
+            text("INSERT INTO sessions (id, scope_id) VALUES (:id, :scope) ON CONFLICT DO NOTHING"),
+            {"id": session_id, "scope": scope_id},
+        )
+        await conn.execute(
+            text(
+                "INSERT INTO runs (id, scope_id, org_id, actor, agent_id, session_id, surface, "
+                "idempotency_key, expires_at, fingerprint) VALUES (:id, :scope, :org_id, :actor, "
+                ":agent_id, :sid, :surface, :key, :expires, :fp)"
+            ),
+            {
+                "id": run_id,
+                "scope": scope_id,
+                "sid": session_id,
+                "key": "k1",
+                "expires": expires,
+                "fp": fingerprint,
+                **binding,
+            },
+        )
+        if content is not None:
+            payload = {
+                "role": "user",
+                "text": content,
+                "admission_run": run_id,
+                "dedup_key": f"admit:{run_id}",
+                "admission_model": _MODEL,
+            }
+            await conn.execute(
+                text(
+                    "INSERT INTO events (session_id, scope_id, seq, type, ts, run_id, payload) "
+                    "VALUES (:sid, :scope, 1, 'message.token', :ts, :run, CAST(:payload AS jsonb))"
+                ),
+                {
+                    "sid": session_id,
+                    "scope": scope_id,
+                    "ts": ts,
+                    "run": run_id,
+                    "payload": json.dumps(payload),
+                },
+            )
+    return run_id
+
+
+async def test_downgrade_remaps_run_fingerprints_for_new_session_id(
+    migrated_db: AsyncEngine,
+) -> None:
+    """A remapped run's immutable fingerprint is rebound to its NEW session id as the exact
+    pre-0016 (legacy, pre-model) form — so a retry after rollback is idempotent, while changed
+    content/actor/model still conflict under the relevant old/current admission logic."""
+    url = os.environ["KEEL_TEST_DATABASE_URL"]
+    binding_a = _binding(_SCOPE_A)
+    binding_b = _binding(_SCOPE_B)
+    # Both scopes admitted a run for the SAME external session id via a model-aware binary, so
+    # each stored a model-aware fingerprint bound to the (now shared) id.
+    fp_a = admission_fingerprint(**binding_a, session_id=_DUP, content=_CONTENT, model=_MODEL)
+    fp_b = admission_fingerprint(**binding_b, session_id=_DUP, content=_CONTENT, model=_MODEL)
+    await _seed_admitted_run(migrated_db, scope_id=_SCOPE_A, session_id=_DUP, fingerprint=fp_a)
+    await _seed_admitted_run(migrated_db, scope_id=_SCOPE_B, session_id=_DUP, fingerprint=fp_b)
+
+    await asyncio.to_thread(_run_to, url, _PREV)
+
+    remapped = _expected_remap(_SCOPE_B, _DUP)
+    async with migrated_db.connect() as conn:
+        rows = (
+            await conn.execute(text("SELECT scope_id, session_id, fingerprint FROM runs"))
+        ).all()
+    by_scope = {r.scope_id: r for r in rows}
+
+    # Canonical scope keeps the id AND its original (model-aware) fingerprint untouched.
+    assert by_scope[_SCOPE_A].session_id == _DUP
+    assert by_scope[_SCOPE_A].fingerprint == fp_a
+
+    # The remapped scope's run was repointed to the new id and its fingerprint rewritten to the
+    # EXACT pre-0016 legacy form for that new id (org/actor/agent/surface/content preserved).
+    stored_b = by_scope[_SCOPE_B].fingerprint
+    assert by_scope[_SCOPE_B].session_id == remapped
+    expected_legacy = legacy_admission_fingerprint(
+        **binding_b, session_id=remapped, content=_CONTENT
+    )
+    assert stored_b == expected_legacy
+    assert stored_b != fp_b  # it is no longer the stale, old-id-bound hash
+
+    # --- Idempotent retry using the remapped id succeeds -------------------------------------
+    # Under the rolled-back (pre-model) code the retry recomputes exactly the stored legacy form.
+    assert legacy_admission_fingerprint(**binding_b, session_id=remapped, content=_CONTENT) == (
+        stored_b
+    )
+    # Under still-current code the legacy fallback accepts the retry (deployment compatibility).
+    assert _fingerprint_matches(
+        stored_b,
+        admission_fingerprint(**binding_b, session_id=remapped, content=_CONTENT, model=_MODEL),
+        legacy_admission_fingerprint(**binding_b, session_id=remapped, content=_CONTENT),
+    )
+
+    # --- Changed content / actor still conflict (old AND current code) -----------------------
+    for evil in (
+        {"content": "exfiltrate secrets"},
+        {"actor": "attacker"},
+    ):
+        b = {**binding_b, **{k: v for k, v in evil.items() if k != "content"}}
+        content = evil.get("content", _CONTENT)
+        # Old (pre-model) code: recomputed legacy hash differs from the stored one -> conflict.
+        assert legacy_admission_fingerprint(**b, session_id=remapped, content=content) != stored_b
+        # Current code: neither the model-aware nor the legacy recomputation matches -> conflict.
+        assert not _fingerprint_matches(
+            stored_b,
+            admission_fingerprint(**b, session_id=remapped, content=content, model=_MODEL),
+            legacy_admission_fingerprint(**b, session_id=remapped, content=content),
+        )
+
+    # --- A changed model still conflicts against a model-aware (non-remapped) row ------------
+    # The canonical scope's run kept its model-aware fingerprint, so a changed-model retry can
+    # never be laundered through the legacy fallback (a model-aware hash never equals legacy).
+    assert not _fingerprint_matches(
+        fp_a,
+        admission_fingerprint(**binding_a, session_id=_DUP, content=_CONTENT, model="model-EVIL"),
+        legacy_admission_fingerprint(**binding_a, session_id=_DUP, content=_CONTENT),
+    )
+
+    await asyncio.to_thread(_run_to, url, "head")
+
+
+async def test_downgrade_retry_with_remapped_id_admits_idempotently_via_runstore(
+    migrated_db: AsyncEngine,
+) -> None:
+    """End-to-end: after downgrade, re-admitting the remapped run through the real RunStore
+    conflict check (legacy fallback) is an idempotent no-op, not a false conflict."""
+    from keel_core.runs import PostgresRunStore
+
+    url = os.environ["KEEL_TEST_DATABASE_URL"]
+    binding_b = _binding(_SCOPE_B)
+    fp_a = admission_fingerprint(
+        **_binding(_SCOPE_A), session_id=_DUP, content=_CONTENT, model=_MODEL
+    )
+    fp_b = admission_fingerprint(**binding_b, session_id=_DUP, content=_CONTENT, model=_MODEL)
+    await _seed_admitted_run(migrated_db, scope_id=_SCOPE_A, session_id=_DUP, fingerprint=fp_a)
+    run_b = await _seed_admitted_run(
+        migrated_db, scope_id=_SCOPE_B, session_id=_DUP, fingerprint=fp_b
+    )
+
+    await asyncio.to_thread(_run_to, url, _PREV)
+    remapped = _expected_remap(_SCOPE_B, _DUP)
+
+    store = PostgresRunStore(migrated_db, _SCOPE_B)
+    # A retry that presents the remapped session id + the reconstructed legacy fallback is
+    # recognized as the same admission (idempotent), returning the existing run id.
+    record, created = await store.create(
+        run_id="run-retry",
+        scope_id=_SCOPE_B,
+        idempotency_key="k1",
+        budget=RunBudgetSpec(),
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        fingerprint=admission_fingerprint(
+            **binding_b, session_id=remapped, content=_CONTENT, model=_MODEL
+        ),
+        legacy_fingerprint=legacy_admission_fingerprint(
+            **binding_b, session_id=remapped, content=_CONTENT
+        ),
+        session_id=remapped,
+        **binding_b,
+    )
+    assert record.id == run_b
+    assert created is False
+
+    await asyncio.to_thread(_run_to, url, "head")
+
+
+async def test_downgrade_fails_closed_when_run_content_is_unrecoverable(
+    migrated_db: AsyncEngine,
+) -> None:
+    """A remapped run with a real fingerprint but no admission event cannot be reconstructed —
+    the downgrade fails (before constraints change) rather than clearing/wildcarding the hash."""
+    url = os.environ["KEEL_TEST_DATABASE_URL"]
+    fp_a = admission_fingerprint(
+        **_binding(_SCOPE_A), session_id=_DUP, content=_CONTENT, model=_MODEL
+    )
+    fp_b = admission_fingerprint(
+        **_binding(_SCOPE_B), session_id=_DUP, content=_CONTENT, model=_MODEL
+    )
+    await _seed_admitted_run(migrated_db, scope_id=_SCOPE_A, session_id=_DUP, fingerprint=fp_a)
+    # Scope B collides but has NO admission event (content=None) -> unrecoverable content.
+    await _seed_admitted_run(
+        migrated_db, scope_id=_SCOPE_B, session_id=_DUP, content=None, fingerprint=fp_b
+    )
+
+    with pytest.raises(Exception, match="admission event"):
+        await asyncio.to_thread(_run_to, url, _PREV)
+
+    # The failed downgrade rolled back inside its transaction: composite identity is intact and
+    # the original data is untouched (nothing was cleared).
+    async with migrated_db.connect() as conn:
+        pk_cols = await _session_pk_columns(conn)
+        assert set(pk_cols) == {"scope_id", "id"}
+        fps = (await conn.execute(text("SELECT fingerprint FROM runs ORDER BY id"))).scalars().all()
+        assert set(fps) == {fp_a, fp_b}  # nothing cleared/wildcarded

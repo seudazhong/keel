@@ -63,10 +63,12 @@ class ExecutionRpcRequest(BaseModel):
     requested_egress_hosts: list[str] = Field(default_factory=list)
     limits: RpcLimits = Field(default_factory=RpcLimits)
     # Opaque per-scope workspace namespace (``ws_<hex>``) requested by the caller so the
-    # executor confines file/shell operations to that scope's isolated workspace under the
-    # sandbox's configured root — never a shared writable workspace across scopes (M3.6 item
-    # 3). ``None`` means the caller did not request scoped isolation (single-workspace/local
-    # preview). A malformed value, or a scoped request a sandbox cannot provision, fails closed.
+    # executor confines *file* operations to that scope's isolated workspace under the sandbox's
+    # configured root — never a shared writable workspace across scopes (M3.6 item 3). Directory
+    # confinement does not sandbox a *shell* subprocess, so namespaced ``command`` execution is
+    # denied unless the executor asserts a proven OS isolation boundary. ``None`` means the caller
+    # did not request scoped isolation (single-workspace/local preview). A malformed value, or a
+    # scoped request a sandbox cannot provision, fails closed.
     workspace: str | None = Field(default=None, max_length=64)
 
 

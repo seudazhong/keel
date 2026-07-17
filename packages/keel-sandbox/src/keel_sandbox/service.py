@@ -68,6 +68,20 @@ class WorkspaceProvider(Protocol):
 
     def resolve(self, namespace: str | None) -> ExecutionEnvironment | None: ...
 
+    def namespaced_shell_isolated(self) -> bool:
+        """Whether ``command``/shell execution against a *namespaced* workspace is confined by a
+        real OS/container/microVM boundary that exposes **only** that namespace root.
+
+        Path policy confines *file* operations, but it cannot confine a shell subprocess: a
+        command can reference absolute paths, expand globs, or derive a sibling namespace path
+        and read/write outside its namespace root. A namespaced workspace that is merely a child
+        directory under a shared parent is therefore **not** a shell sandbox. This capability
+        must default to ``False`` and may be asserted ``True`` only by a backend that proves an
+        OS-level mount boundary; when it is ``False`` the service denies every namespaced
+        ``command`` before it can reach the environment.
+        """
+        ...
+
     async def aclose(self) -> None: ...
 
 
@@ -90,6 +104,15 @@ class DirectoryWorkspaceProvider:
     target stays inside the base** (a same-base alias would otherwise silently share another
     namespace's tree). Re-validating on every request (rather than trusting a cached mapping)
     defeats a swap between validation and use.
+
+    Directory confinement bounds *file* operations only. A namespace root that is just a child
+    directory under a shared parent is **not** a shell sandbox: a ``command`` subprocess can
+    reference an absolute path, expand a glob, or derive a sibling ``ws_<hex>`` path and reach
+    outside its own root. ``shell_isolated`` (default ``False``) therefore gates namespaced
+    ``command`` execution: it must be asserted ``True`` only by a deployment that wraps each
+    namespace root in a real OS/container/microVM mount boundary exposing only that root.
+    While it is ``False`` the service denies every namespaced ``command`` before it reaches an
+    environment; file operations remain available (confined by path policy).
     """
 
     def __init__(
@@ -98,12 +121,17 @@ class DirectoryWorkspaceProvider:
         factory: Callable[[Path], ExecutionEnvironment],
         *,
         default_environment: ExecutionEnvironment | None = None,
+        shell_isolated: bool = False,
     ) -> None:
         self._base = Path(base_root).resolve()
         self._base_real = Path(os.path.realpath(self._base))
         self._factory = factory
         self._default = default_environment
+        self._shell_isolated = shell_isolated
         self._cache: dict[str, ExecutionEnvironment] = {}
+
+    def namespaced_shell_isolated(self) -> bool:
+        return self._shell_isolated
 
     def _is_own_directory(self, child: Path) -> bool:
         """Whether ``child`` is a real, non-aliased directory owned by this base (no-follow).
@@ -334,6 +362,23 @@ def create_app(
             return _failure(
                 ExecutionErrorCode.unavailable,
                 "scoped workspace could not be provisioned",
+            )
+        if (
+            request.operation is ExecutionOperation.command
+            and request.workspace is not None
+            and workspace_provider is not None
+            and not workspace_provider.namespaced_shell_isolated()
+        ):
+            # A namespaced workspace is confined for *file* operations by path policy, but a
+            # shell subprocess is not: it can reference an absolute path, expand a glob, or
+            # derive a sibling namespace path and escape its root. Unless the provider proves a
+            # real OS/container/microVM mount boundary exposing only this namespace root, deny
+            # the command here — before it can reach the environment. (The unscoped/default
+            # workspace path, ``request.workspace is None``, is unaffected.)
+            return _failure(
+                ExecutionErrorCode.denied,
+                "shell/command execution is disabled for a namespaced workspace without a "
+                "proven OS isolation boundary",
             )
         try:
             return ExecutionRpcResponse.from_result(await _dispatch(scoped_environment, request))

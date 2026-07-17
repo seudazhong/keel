@@ -4,7 +4,11 @@
 mounts only the sanitized workspace (never its host parent, ``.git``, or ``.env``)
 and enforces the admitted egress policy. ``KEEL_SANDBOX_WORKSPACE_SANITIZED=true``
 separately enables shell only after the executor revalidates denied names are absent.
-Neither assertion defaults on.
+``KEEL_SANDBOX_NAMESPACE_SHELL_ISOLATED=true`` separately asserts that every per-scope
+``ws_<hash>`` namespace root is wrapped in a real OS/container/microVM mount boundary
+exposing only that root, which is required before a *namespaced* shell command is
+allowed (a namespace directory alone confines file operations, not shell subprocesses).
+None of these assertions default on.
 """
 
 from __future__ import annotations
@@ -45,6 +49,11 @@ def main() -> None:
             namespaces_root,
             _build,
             default_environment=default_environment,
+            # A namespace root is a child directory under a shared parent: file operations are
+            # confined by path policy, but a shell subprocess is not. Only assert namespaced
+            # shell isolation when the deployment wraps each namespace root in a real
+            # OS/container/microVM mount boundary exposing only that root. Defaults off.
+            shell_isolated=_enabled("KEEL_SANDBOX_NAMESPACE_SHELL_ISOLATED"),
         )
     app = create_app(
         default_environment,
