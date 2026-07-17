@@ -1,0 +1,36 @@
+# NOT DEPLOYABLE YET — dormant example, excluded from ../../kustomization.yaml on purpose.
+#
+# Standard `networking.k8s.io/v1` NetworkPolicy cannot select traffic by Service name/DNS for
+# out-of-cluster endpoints (ExternalName Services such as
+# ../datastores/postgres-external-service.example.yaml have no pod IP to select) — only by
+# `ipBlock` CIDR, `podSelector`, or `namespaceSelector`. This file is the template for that
+# CIDR-based allow; it ships with a placeholder because the real CIDR is cluster/VPC-specific
+# and cannot be known here. Copy it into your own overlay, replace the placeholder with your
+# managed Postgres/Redis/object-storage CIDR, and add it to your overlay's `resources:`.
+#
+# If your CNI supports FQDN-based egress policies (e.g. Cilium `CiliumNetworkPolicy`), prefer
+# that for tighter, name-based control instead of a CIDR allow — see
+# ../../../docs/security-model.md "NetworkPolicy caveats".
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-control-plane-egress-managed-data
+  labels:
+    app.kubernetes.io/part-of: keel
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: control-plane
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: REPLACE_WITH_MANAGED_DATA_SERVICES_CIDR/32 # Postgres/Redis/object storage
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 6379
+        - protocol: TCP
+          port: 443

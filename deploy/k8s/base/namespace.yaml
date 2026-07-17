@@ -1,0 +1,22 @@
+# Namespace for a single Keel deployment (one organization / trust boundary per namespace).
+#
+# Multi-tenant clusters MUST use one namespace per org/tenant (namespace-per-org, see
+# ../docs/security-model.md and the managed-code-projects design doc §8.4). This manifest
+# does not itself enforce that — it is guidance encoded as a label, applied by whoever
+# instantiates a tenant's namespace (e.g. `kubectl apply -f namespace.yaml -n <name>` after
+# copying/renaming, or a platform controller in a future milestone).
+#
+# `pod-security.kubernetes.io/*` labels select the Pod Security Admission (PSA) profile.
+# The production overlay pins `enforce=restricted`; this base defaults to `warn`+`audit` only
+# so `dev`/`staging` overlays can surface violations without blocking apply. Do not weaken the
+# production overlay's `enforce` level.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: keel
+  labels:
+    app.kubernetes.io/part-of: keel
+    keel.dev/tenant-boundary: "namespace-per-org"
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/enforce: baseline

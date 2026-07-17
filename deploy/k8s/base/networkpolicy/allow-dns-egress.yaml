@@ -1,0 +1,49 @@
+# DNS is otherwise blocked by default-deny-all.yaml. Applies to every Pod in the namespace,
+# including sandbox Jobs, since even the sandbox's constrained egress-proxy path needs to
+# resolve the proxy's in-cluster Service name.
+#
+# Restricted to the `kube-system` namespace (matched by the automatically-applied
+# `kubernetes.io/metadata.name` label present on every namespace since Kubernetes 1.21) rather
+# than `namespaceSelector: {}` (any namespace) — the earlier, broader form would let every Pod
+# in this namespace reach a same-named DNS-labeled Pod in ANY namespace, not just the
+# cluster's real DNS. Two documented Pod-label conventions are covered: `k8s-app: kube-dns`
+# (kube-dns and CoreDNS on kubeadm/EKS/GKE/AKS's default manifests — this is the standard,
+# near-universal label) and `app.kubernetes.io/name: coredns` (the `coredns/coredns` Helm
+# chart's default label, used when CoreDNS is installed independently of a managed offering's
+# built-in manifests). If your cluster's DNS Pods carry a different label, add a third `to:`
+# entry rather than widening the `namespaceSelector`.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns-egress
+  labels:
+    app.kubernetes.io/part-of: keel
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns # kubeadm/EKS/GKE/AKS default kube-dns and CoreDNS label
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: coredns # coredns/coredns Helm chart default label
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

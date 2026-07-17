@@ -1,0 +1,136 @@
+# Per-run sandbox Job template — NOT applied directly with `kubectl apply`/kustomize.
+#
+# This is the canonical shape a FUTURE, narrowly-scoped sandbox-controller renders and
+# submits once per agent run that needs shell/code execution, substituting the
+# RUN_ID_PLACEHOLDER / *_PLACEHOLDER tokens below with real per-run values, injecting the
+# run's resource quota (`project_quotas`, see the managed-code-projects design doc §2/§8.4),
+# and deleting the Job when the run's worktree is reclaimed.
+#
+# THIS DOES NOT EXIST YET. keel-server holds no RBAC grant to create Jobs/Pods anywhere in
+# this scaffold (see ../../docs/security-model.md "Pending gates") — a prior version of this
+# scaffold granted `create`/`delete` on `jobs` directly to keel-server's own ServiceAccount,
+# which was removed because that permission is equivalent to broad node/Secret/PVC
+# exfiltration risk in most clusters (a Job can mount arbitrary Secrets/PVCs and run as
+# arbitrary images/service accounts unless constrained by an admission policy). Standing this
+# up safely requires either (a) a dedicated sandbox-controller Deployment, in its own
+# namespace, with an admission policy (e.g. Kyverno/OPA Gatekeeper, or Kubernetes' built-in
+# ValidatingAdmissionPolicy) that restricts exactly which Job shapes it may submit — not
+# keel-server itself calling the Kubernetes API — or (b) an equivalently constrained indirect
+# submission contract. Neither is implemented here.
+#
+# This template is excluded from ../kustomization.yaml's resources so `kubectl kustomize
+# build` never needs to fill it in — ../../scripts/validate_manifests.py still statically
+# checks it for the required hardening properties below.
+#
+# Hardening applied to every rendered Job:
+# - no ServiceAccount token (keel-sandbox-run, automountServiceAccountToken: false)
+# - restricted securityContext: non-root, all Linux capabilities dropped, no privilege
+#   escalation, seccomp RuntimeDefault, read-only root filesystem
+# - resource `limits` sourced from the project's quota row, never unbounded
+# - `backoffLimit: 0` — this is a single bounded attempt; retry policy is an
+#   application-level decision (durable jobs), not a Kubernetes-level retry loop
+# - `activeDeadlineSeconds` enforces a hard wall-clock ceiling independent of the in-process
+#   agent loop's own budgets/timeouts (defense in depth)
+# - ephemeral-only scratch (`emptyDir`); the sandbox is never mounted onto the durable Git PVC
+#   (../datastores/git-pvc.example.yaml, itself dormant/unconsumed today) — only a per-run
+#   worktree materialized into this Pod by the `keel-worktree-init` init container from an
+#   immutable object-storage snapshot
+# - `runtimeClassName` is deliberately OMITTED here. Stronger-isolation runtimes (gVisor/
+#   Kata/a microVM backend) are opt-in: install the matching node-level runtime, apply the
+#   single matching object from ../sandbox/runtimeclass.example.yaml, and set the
+#   `KEEL_SANDBOX_RUNTIME_CLASS` config key (see ../configmap-app.yaml) so the future
+#   sandbox-controller sets `spec.template.spec.runtimeClassName` when rendering this
+#   template. Wiring that config key through to Job creation is pending real sandbox
+#   integration — see ../../docs/security-model.md "Pending gates". Do not treat the default
+#   runc runtime as sufficient for hostile multi-tenant workloads in the meantime.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: keel-sandbox-run-RUN_ID_PLACEHOLDER
+  labels:
+    app.kubernetes.io/part-of: keel
+    app.kubernetes.io/component: sandbox
+    keel.dev/run-id: RUN_ID_PLACEHOLDER
+    keel.dev/project-id: PROJECT_ID_PLACEHOLDER
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: 1800 # ceiling; the control plane may render a smaller per-run value
+  ttlSecondsAfterFinished: 3600 # GC finished Jobs even if the control plane's own delete fails
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/part-of: keel
+        app.kubernetes.io/component: sandbox
+        keel.dev/run-id: RUN_ID_PLACEHOLDER
+        keel.dev/project-id: PROJECT_ID_PLACEHOLDER
+    spec:
+      serviceAccountName: keel-sandbox-run
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      # runtimeClassName: gvisor   # opt-in only; see ../../docs/security-model.md
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10100
+        runAsGroup: 10100
+        fsGroup: 10100
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # Materializes an ephemeral worktree from the project's immutable object-storage
+        # snapshot into /workspace. Never mounts the durable Git PVC — the authoritative
+        # active repository is not writable/reachable from the sandbox (design doc §2.3/§3.4).
+        - name: keel-worktree-init
+          image: ghcr.io/OWNER/keel-worktree-init:REPLACE_WITH_PINNED_DIGEST
+          args: ["--snapshot-ref", "SNAPSHOT_REF_PLACEHOLDER", "--dest", "/workspace"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "500m"
+              memory: "512Mi"
+      containers:
+        - name: keel-sandbox-agent
+          image: ghcr.io/OWNER/keel-sandbox:REPLACE_WITH_PINNED_DIGEST
+          # Control-plane<->sandbox RPC is internal, mTLS, capability-token-bound (never
+          # public); the token is injected per-run, not a long-lived Secret mount.
+          env:
+            - name: KEEL_RUN_ID
+              value: RUN_ID_PLACEHOLDER
+            - name: KEEL_EGRESS_PROXY_URL
+              value: "http://keel-egress-proxy.keel.svc.cluster.local:3128"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            # Placeholder values; the control plane MUST overwrite these from the caller's
+            # project_quotas row before submission — never fall back to unbounded.
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+              ephemeral-storage: "4Gi"
+      volumes:
+        - name: workspace
+          emptyDir:
+            sizeLimit: 4Gi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 512Mi

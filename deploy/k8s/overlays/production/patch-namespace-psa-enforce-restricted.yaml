@@ -1,0 +1,3 @@
+- op: replace
+  path: /metadata/labels/pod-security.kubernetes.io~1enforce
+  value: restricted

@@ -1,0 +1,23 @@
+# Production overlay: stricter Pod Security Admission enforcement, a higher `keel-worker`
+# replica floor, and `keel-server` deliberately held at a single replica — see
+# ./patch-server-single-replica.yaml for why. This still does NOT make the deployment safe
+# for hostile multi-tenant workloads by itself — see ../../docs/security-model.md
+# "Pending gates" for what remains (real sandbox isolation runtime, identity/tenancy
+# enforcement, vertical integration).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - path: patch-namespace-psa-enforce-restricted.yaml
+    target:
+      kind: Namespace
+      name: keel
+  - path: patch-worker-replicas.yaml
+    target:
+      kind: Deployment
+      labelSelector: app.kubernetes.io/name=keel-worker
+  - path: patch-server-single-replica.yaml
+    target:
+      kind: Deployment
+      labelSelector: app.kubernetes.io/name=keel-server

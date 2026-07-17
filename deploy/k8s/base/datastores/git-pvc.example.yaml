@@ -1,0 +1,39 @@
+# NOT DEPLOYABLE YET — dormant example, excluded from ../kustomization.yaml on purpose.
+#
+# No shipped Deployment in this scaffold mounts this PVC, and no current application code
+# (`packages/keel-core/src/keel_core/config.py`) has any Git-storage or object-storage
+# setting — the "managed code projects" Git-storage design
+# (`docs/designs/2026-07-16-managed-code-projects-and-coding-agents-design.md` §2.3) is not
+# implemented yet. Shipping this as an active, applied resource would create a volume nothing
+# ever reads or writes: a nonfunctional claim of capability that does not exist. Promote it
+# back into ../kustomization.yaml (and wire an actual `volumeMounts` entry on the service that
+# will own it) once that feature lands.
+#
+# Durable, authoritative Git storage (mutable bare repositories: objects, refs, packfiles).
+# This is NOT the ephemeral per-run worktree (that lives in the sandbox Job's `emptyDir`,
+# ../sandbox/job-template.yaml) and it is NEVER mounted into a sandbox Pod — only trusted
+# control-plane workloads (keel-server/keel-worker) that materialize worktrees and perform
+# ref updates may access it. See ../../docs/storage-topology.md.
+#
+# `ReadWriteMany` assumes a CSI driver that supports it (e.g. a NAS/NFS-backed class, EFS,
+# Filestore, Azure Files) so multiple keel-server/keel-worker replicas can serve concurrent
+# repository operations; if your storage only supports `ReadWriteOnce`, either run a single
+# writer with proper repository locking or front the volume with a Git-smart service
+# (design doc §2.3) instead of mounting it directly from every replica.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: keel-git-storage
+  labels:
+    app.kubernetes.io/part-of: keel
+spec:
+  accessModes:
+    - ReadWriteMany
+  # storageClassName intentionally omitted — set it to a StorageClass in your cluster that
+  # provides durable, replicated, RWX-capable (or single-writer) block/file storage. Do not
+  # rely on the cluster default StorageClass for this without checking its durability and
+  # backup story (see ../../docs/backup-restore-dr.md).
+  storageClassName: REPLACE_WITH_DURABLE_STORAGE_CLASS
+  resources:
+    requests:
+      storage: 50Gi

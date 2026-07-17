@@ -1,0 +1,42 @@
+# Control-plane workloads (keel-server, keel-worker; selected by the
+# `app.kubernetes.io/component: control-plane` label) may reach outbound HTTPS (LLM
+# providers, GitHub App API, managed data services once you fill in
+# ./allow-control-plane-egress-managed-data.example.yaml, etc.).
+#
+# This file intentionally ships with NO placeholder values so it is safe to apply as-is —
+# `scripts/validate_manifests.py` fails the build if any actively-applied resource contains
+# an unresolved placeholder. The Postgres/Redis/object-storage-specific rule (which needs a
+# real CIDR you can only know for your own cluster/VPC) lives in the separate, dormant
+# ./allow-control-plane-egress-managed-data.example.yaml — copy it into your own overlay,
+# fill in the CIDR, and add it there instead of editing this file.
+#
+# No rule here grants access to the Kubernetes API server: this scaffold does not bind any
+# RBAC Role to keel-server/keel-worker (see ../../docs/security-model.md "Pending gates" —
+# per-run sandbox Job creation needs a narrowly separated controller, not broad RBAC on the
+# app's own ServiceAccount), so there is nothing for it to call the API server for. Do not
+# add a Kubernetes-API-server egress rule here unless a real, narrowly-scoped RBAC grant is
+# added alongside it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-control-plane-egress
+  labels:
+    app.kubernetes.io/part-of: keel
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: control-plane
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443 # LLM provider / GitHub App API egress; narrow with an allow-list proxy
+                    # (design doc §9 "Egress") before treating this as hostile-tenant-safe.

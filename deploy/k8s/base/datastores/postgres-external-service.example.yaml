@@ -1,0 +1,21 @@
+# Reference-only Service pointing at Postgres. This scaffold does not ship an in-cluster
+# Postgres StatefulSet (see ../../docs/storage-topology.md for why): production installs
+# should use a managed Postgres (RDS/Cloud SQL/Azure Database for PostgreSQL, or a supported
+# operator such as CloudNativePG) with pgvector available, automated backups, and PITR.
+#
+# Two ways to use this:
+#   - Managed database reachable at a stable DNS name: keep this as an ExternalName Service so
+#     in-cluster code can keep using `keel-postgres.keel.svc.cluster.local` (matches
+#     base/configmap-app.yaml's KEEL_DATABASE_HOST) without hardcoding the real hostname.
+#   - Self-operated in-cluster Postgres (e.g. via CloudNativePG): delete/replace this
+#     ExternalName Service with the operator-provided Service instead, keeping the same name
+#     so KEEL_DATABASE_HOST does not need to change.
+apiVersion: v1
+kind: Service
+metadata:
+  name: keel-postgres
+  labels:
+    app.kubernetes.io/part-of: keel
+spec:
+  type: ExternalName
+  externalName: REPLACE_WITH_MANAGED_POSTGRES_HOSTNAME

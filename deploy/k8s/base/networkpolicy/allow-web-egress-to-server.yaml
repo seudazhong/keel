@@ -1,0 +1,26 @@
+# keel-web (nginx) proxies /v1, /health, /readiness to keel-server (deploy/docker/web.nginx.conf)
+# — that requires an EGRESS allow on keel-web's side, not just the INGRESS allow on
+# keel-server's side (../networkpolicy/allow-ingress-to-web-and-server.yaml). NetworkPolicy is
+# directional: both the source Pod's egress and the destination Pod's ingress must permit the
+# traffic, or default-deny-all.yaml blocks it even though the other side allows it. Without
+# this file, keel-web could not reach keel-server at all despite the ingress rule existing.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-web-egress-to-server
+  labels:
+    app.kubernetes.io/part-of: keel
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: keel-web
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: keel-server
+      ports:
+        - protocol: TCP
+          port: 8000

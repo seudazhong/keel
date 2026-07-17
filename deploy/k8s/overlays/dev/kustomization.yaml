@@ -1,0 +1,13 @@
+# Development/staging overlay: same manifests as base, smaller footprint, PSA left at
+# warn/audit only (namespace.yaml's default) so contributors get feedback without being
+# blocked. Do not point this overlay at real user data or expose it publicly — it inherits
+# every pending gate in ../../docs/security-model.md, plus relaxed replica counts.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - path: patch-single-replica.yaml
+    target:
+      kind: Deployment
+      labelSelector: app.kubernetes.io/name in (keel-server,keel-worker,keel-web)

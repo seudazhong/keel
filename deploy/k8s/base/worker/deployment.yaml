@@ -1,0 +1,64 @@
+# keel-worker: arq worker running agent turns and durable jobs (ARCHITECTURE §15). Scale with
+# `replicas`; arq gives each job to exactly one worker and the scheduler_tick cron coordinates
+# across replicas via a Redis lock, so scale-out is CAS-safe (see docker-compose.yml comments).
+# keel-worker builds its own execution environment the same way keel-server does
+# (`keel_core.tools.wiring.build_service_execution_environment`, default
+# `execution_backend=sandbox`): shell/file tool calls are routed to the authenticated
+# `keel-sandbox` RPC service, not dispatched as dynamically-created per-run Kubernetes Jobs —
+# `../sandbox/job-template.yaml` is a separate, still-dormant template, not the execution path
+# in code today. See ../../docs/security-model.md "Isolation levels".
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keel-worker
+  labels:
+    app.kubernetes.io/name: keel-worker
+    app.kubernetes.io/part-of: keel
+    app.kubernetes.io/component: control-plane
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: keel-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keel-worker
+        app.kubernetes.io/part-of: keel
+        app.kubernetes.io/component: control-plane
+    spec:
+      automountServiceAccountToken: false # no Kubernetes API access needed
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keel-worker
+          image: ghcr.io/OWNER/keel-app:REPLACE_WITH_PINNED_DIGEST
+          command: ["arq", "keel_worker.main.WorkerSettings"]
+          envFrom:
+            - configMapRef:
+                name: keel-app-config
+            - secretRef:
+                name: keel-app-secret
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "1"
+              memory: "1Gi"
+      volumes:
+        - name: tmp
+          emptyDir: {}
