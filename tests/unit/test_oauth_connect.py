@@ -134,6 +134,8 @@ async def test_scoped_machine_credential_binds_state_to_canonical_scope(
     The Gmail connect flow must store the one-time state under the caller's derived
     ``agent:<org>/<agent>`` scope (never the app-global ``web:local`` singleton), so the
     callback writes the token into exactly the org/Agent that initiated the connect (finding 3).
+    In cloud mode the browser-safe entry point is the authenticated JSON ``POST /connect-url``
+    (finding 2): a GET redirect cannot carry the auth headers that select the scope.
     """
     from keel_core.identity import IdentityService, InMemoryIdentityStore, LoggingAuditSink
     from keel_core.identity.models import AgentKind
@@ -163,16 +165,37 @@ async def test_scoped_machine_credential_binds_state_to_canonical_scope(
     transport = ASGITransport(app=app)
     try:
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            resp = await client.get(
-                "/v1/connectors/gmail/connect",
+            # Cloud mode: the browser-safe JSON endpoint returns only the consent URL.
+            resp = await client.post(
+                "/v1/connectors/gmail/connect-url",
                 headers={"X-API-Key": "opkey"},
-                follow_redirects=False,
             )
-            assert resp.status_code in (302, 307)
-            state = parse_qs(urlparse(resp.headers["location"]).query)["state"][0]
+            assert resp.status_code == 200
+            url = resp.json()["url"]
+            assert "accounts.google.com" in url
+            state = parse_qs(urlparse(url).query)["state"][0]
             consumed = await app.state.oauth_state_store.consume(state)
             assert consumed is not None
             assert consumed.scope_id == derive_agent_scope(org.org_id, agent.id)
             assert consumed.scope_id != "web:local"
+
+            # The legacy GET redirect fails closed in cloud mode (it cannot carry scope headers).
+            get_resp = await client.get(
+                "/v1/connectors/gmail/connect",
+                headers={"X-API-Key": "opkey"},
+                follow_redirects=False,
+            )
+            assert get_resp.status_code == 403
     finally:
         get_settings.cache_clear()
+
+
+async def test_connect_url_requires_operator(
+    keyed_oauth_app: tuple[httpx.AsyncClient, FastAPI],
+) -> None:
+    """The JSON connect-url endpoint gates on operator privilege like the redirect does."""
+    client, _ = keyed_oauth_app
+    missing = await client.post("/v1/connectors/gmail/connect-url")
+    assert missing.status_code == 401
+    viewer = await client.post("/v1/connectors/gmail/connect-url", headers={"X-API-Key": "vw-key"})
+    assert viewer.status_code == 403

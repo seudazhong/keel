@@ -291,22 +291,95 @@ async def test_dispatch_outbox_leases_across_scopes_and_blocks_duplicate_worker(
 
     outbox = PostgresRunDispatchOutbox(migrated_db)
     now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
-    await outbox.record("run-a", "agent:orga/agta", now=now)
-    await outbox.record("run-b", "agent:orgb/agtb", now=now)
+    # The outbox FKs run_dispatch_outbox.run_id -> runs(id): an intent can only exist for a real
+    # run, so create the runs (in their own scopes) before recording their dispatch intents.
+    run_a = await _make_run(migrated_db, "agent:orga/agta", "orga", "agta", "sess-oa", "k-oa")
+    run_b = await _make_run(migrated_db, "agent:orgb/agtb", "orgb", "agtb", "sess-ob", "k-ob")
+    await outbox.record(run_a, "agent:orga/agta", now=now)
+    await outbox.record(run_b, "agent:orgb/agtb", now=now)
     assert await outbox.active_scopes() == {"agent:orga/agta", "agent:orgb/agtb"}
 
     first = await outbox.claim_due(worker_id="w1", now=now, lease_seconds=60)
-    assert {i.run_id for i in first} == {"run-a", "run-b"}
+    assert {i.run_id for i in first} == {run_a, run_b}
     # A second worker sees nothing while the lease is live (SKIP LOCKED + lease window).
     second = await outbox.claim_due(worker_id="w2", now=now + timedelta(seconds=1))
     assert second == []
     # After the lease expires the intents are claimable again.
     third = await outbox.claim_due(worker_id="w2", now=now + timedelta(seconds=120))
-    assert {i.run_id for i in third} == {"run-a", "run-b"}
+    assert {i.run_id for i in third} == {run_a, run_b}
 
     # A terminal run's intent is removed; a still-active one is deferred.
-    await outbox.remove("run-a")
-    await outbox.reschedule("run-b", delay_seconds=300, now=now + timedelta(seconds=120))
+    await outbox.remove(run_a)
+    await outbox.reschedule(run_b, delay_seconds=300, now=now + timedelta(seconds=120))
     assert await outbox.active_scopes() == {"agent:orgb/agtb"}
     # run-b is deferred past its next attempt, so an immediate claim skips it.
     assert await outbox.claim_due(worker_id="w3", now=now + timedelta(seconds=121)) == []
+
+
+async def _make_run(
+    engine: AsyncEngine, scope: str, org: str, agent: str, session: str, key: str
+) -> str:
+    """Admit a bare durable run in ``scope`` (no dispatch) and return its id."""
+    import uuid
+    from datetime import UTC, datetime, timedelta
+
+    from keel_core.runs import RunBudgetSpec
+
+    store = PostgresRunStore(engine, scope)
+    run_id = uuid.uuid4().hex
+    record, _ = await store.create(
+        run_id=run_id,
+        scope_id=scope,
+        org_id=org,
+        actor="svc",
+        agent_id=agent,
+        session_id=session,
+        surface=RunSurface.web.value,
+        idempotency_key=key,
+        budget=RunBudgetSpec(),
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+    )
+    return record.id
+
+
+async def test_mark_queued_with_intent_is_atomic_on_postgres(migrated_db: AsyncEngine) -> None:
+    """The queued transition + dispatch intent commit in ONE transaction (M3.6 finding 4).
+
+    A committed ``queued`` run always has a discoverable outbox intent, and a failed intent
+    write rolls the transition back — the run never becomes queued-but-undiscoverable.
+    """
+    from keel_core.run_dispatch import PostgresRunDispatchOutbox
+
+    scope = "agent:orgq/agq"
+    run_id = await _make_run(migrated_db, scope, "orgq", "agq", "sess-q", "k-q")
+    store = PostgresRunStore(migrated_db, scope)
+    outbox = PostgresRunDispatchOutbox(migrated_db)
+
+    queued = await store.mark_queued_with_dispatch_intent(run_id, scope, outbox)
+    assert queued is True
+    record = await store.get(run_id)
+    assert record is not None and record.status is RunStatus.queued
+    assert await outbox.active_scopes() == {scope}
+    # Idempotent: re-running does not double-transition (already queued) and keeps one intent.
+    assert await store.mark_queued_with_dispatch_intent(run_id, scope, outbox) is False
+
+
+async def test_outbox_intent_cascade_deleted_with_run(migrated_db: AsyncEngine) -> None:
+    """Deleting a run (lifecycle purge / scope erasure) cascades its dispatch intent away.
+
+    ``run_dispatch_outbox.run_id`` FKs ``runs(id) ON DELETE CASCADE``, so purge leaves no
+    orphaned dispatch metadata behind (M3.6 finding 4).
+    """
+    from keel_core.run_dispatch import PostgresRunDispatchOutbox
+    from keel_core.runs import purge_scope
+
+    scope = "agent:orgc/agc"
+    run_id = await _make_run(migrated_db, scope, "orgc", "agc", "sess-c", "k-c")
+    outbox = PostgresRunDispatchOutbox(migrated_db)
+    await outbox.record(run_id, scope)
+    assert await outbox.active_scopes() == {scope}
+
+    # Lifecycle purge deletes the run rows; the FK cascade removes the intent metadata.
+    removed = await purge_scope(migrated_db, scope)
+    assert removed >= 1
+    assert await outbox.active_scopes() == set()

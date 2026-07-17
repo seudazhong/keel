@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -77,9 +79,17 @@ class DirectoryWorkspaceProvider:
     namespace can never resolve into another's tree (the environment's workspace path policy
     resolves symlinks/junctions and rejects anything outside its own root). Because the
     namespace is an opaque, validated ``ws_<hex>`` token it can never contain a separator or
-    ``..``; we still re-check containment defensively. Environments are cached per namespace so
-    repeated operations reuse one confined root, and the directory is created on first use
-    (explicit provisioning). A namespace that cannot be provisioned resolves to ``None``.
+    ``..``.
+
+    The namespace **root itself** is the isolation boundary, so it is provisioned and validated
+    with no-follow / exclusive semantics (M3.6 finding 5): the child is created with an exclusive
+    ``mkdir`` (which never follows a final-component symlink and fails closed if the name already
+    exists), and every ``resolve`` — cache hit or miss — re-validates the root via a *no-follow*
+    ``lstat`` and a real-path **identity** check. This rejects a namespace root that is a symlink,
+    a Windows junction / reparse point, or an alias to a different directory **even when its
+    target stays inside the base** (a same-base alias would otherwise silently share another
+    namespace's tree). Re-validating on every request (rather than trusting a cached mapping)
+    defeats a swap between validation and use.
     """
 
     def __init__(
@@ -90,27 +100,64 @@ class DirectoryWorkspaceProvider:
         default_environment: ExecutionEnvironment | None = None,
     ) -> None:
         self._base = Path(base_root).resolve()
+        self._base_real = Path(os.path.realpath(self._base))
         self._factory = factory
         self._default = default_environment
         self._cache: dict[str, ExecutionEnvironment] = {}
+
+    def _is_own_directory(self, child: Path) -> bool:
+        """Whether ``child`` is a real, non-aliased directory owned by this base (no-follow).
+
+        Rejects a missing path, a symlink, a Windows junction / reparse point, a non-directory,
+        or any path whose real target is not exactly ``<base>/<name>`` — i.e. an alias to a
+        different directory, even one that still lives inside the base.
+        """
+        try:
+            info = child.lstat()  # no-follow: describe the link itself, never its target
+        except OSError:
+            return False
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return False
+        # Windows junctions / reparse points are not S_ISLNK; reject them explicitly.
+        reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        if os.name == "nt" and bool(getattr(info, "st_file_attributes", 0) & reparse):
+            return False
+        # Identity + containment: the resolved target must be exactly base_real/<name> — no
+        # alias to another name, and never outside the base tree.
+        real = Path(os.path.realpath(child))
+        expected = self._base_real / child.name
+        if real != expected:
+            return False
+        return real == self._base_real or real.is_relative_to(self._base_real)
 
     def resolve(self, namespace: str | None) -> ExecutionEnvironment | None:
         if namespace is None:
             return self._default
         if not _WORKSPACE_NAMESPACE.match(namespace):
             return None
-        root = (self._base / namespace).resolve()
-        if root != self._base and not root.is_relative_to(self._base):
-            # Defense in depth: an opaque validated namespace can never escape, but never
-            # serve a root outside the provider's base even if that invariant regresses.
+        # The direct, un-followed child path (the namespace is a flat ``ws_<hex>`` token, so it
+        # can never contain a separator or ``..``).
+        child = self._base / namespace
+        # Ensure the (trusted) base tree exists, then provision the namespace root exclusively
+        # when absent: ``mkdir`` fails closed if the name already exists and never follows a
+        # planted final-component symlink.
+        try:
+            self._base.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        try:
+            os.mkdir(child)
+        except FileExistsError:
+            pass  # already present — validate below (it could be a planted alias/reparse point)
+        except OSError:
+            return None
+        # Re-validate on EVERY resolve (cache hit or miss) so a swap between validation and use
+        # is caught: the root must be our own real directory, not a symlink/junction/alias.
+        if not self._is_own_directory(child):
             return None
         environment = self._cache.get(namespace)
         if environment is None:
-            try:
-                root.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                return None
-            environment = self._factory(root)
+            environment = self._factory(child)
             self._cache[namespace] = environment
         return environment
 

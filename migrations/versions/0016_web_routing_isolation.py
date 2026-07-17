@@ -46,7 +46,11 @@ def upgrade() -> None:
     op.execute(
         """
         CREATE TABLE run_dispatch_outbox (
-            run_id text PRIMARY KEY,
+            -- The dispatch pointer is owned by its run: deleting a run (lifecycle purge,
+            -- scope erasure) cascades the intent away, so purge leaves no orphaned metadata
+            -- and no intent can outlive (or dangle past) the run it points at (finding 4).
+            run_id text PRIMARY KEY
+                REFERENCES runs (id) ON DELETE CASCADE,
             scope_id text NOT NULL,
             -- Coarse dispatch state, NOT the run's authoritative status (which lives, RLS-
             -- protected, on ``runs``). 'pending' means "a worker should look at this run in

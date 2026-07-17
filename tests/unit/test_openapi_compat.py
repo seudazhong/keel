@@ -117,6 +117,37 @@ def test_parameter_reorder_is_compatible() -> None:
     check(baseline, current)
 
 
+def test_duplicate_parameter_in_current_fails() -> None:
+    # Two descriptions of the same (name, in) is ambiguous and must be rejected.
+    baseline = _op_with_params([_ID_QUERY])
+    current = _op_with_params([_ID_QUERY, dict(_ID_QUERY)])
+    with pytest.raises(CompatibilityError):
+        check(baseline, current)
+
+
+def test_duplicate_parameter_in_baseline_fails() -> None:
+    baseline = _op_with_params([_ID_QUERY, dict(_ID_QUERY)])
+    current = _op_with_params([_ID_QUERY])
+    with pytest.raises(CompatibilityError):
+        check(baseline, current)
+
+
+def test_parameter_schema_format_change_fails() -> None:
+    # A schema change deeper than ``type`` (e.g. a format/constraint change) is still breaking.
+    dated = {"name": "since", "in": "query", "required": False, "schema": {"type": "string"}}
+    baseline = _op_with_params([{**dated, "schema": {"type": "string", "format": "date-time"}}])
+    current = _op_with_params([{**dated, "schema": {"type": "string", "format": "date"}}])
+    with pytest.raises(CompatibilityError):
+        check(baseline, current)
+
+
+def test_parameter_schema_additive_constraint_allowed() -> None:
+    # Adding an optional schema constraint (a new key) is backward compatible.
+    baseline = _op_with_params([{**_ID_QUERY, "schema": {"type": "string"}}])
+    current = _op_with_params([{**_ID_QUERY, "schema": {"type": "string", "maxLength": 64}}])
+    check(baseline, current)
+
+
 def test_new_path_is_additive() -> None:
     baseline = {"paths": {"/v1/items": {"get": {"responses": {"200": {}}}}}}
     current = {

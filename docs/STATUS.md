@@ -277,6 +277,41 @@ Still to do (not yet done):
   assistant turns) appear via the server's durable-polling SSE tail, but sub-100ms
   token-by-token deltas are not fanned out from the worker to Redis yet.
 
+### Second-pass review response (this increment)
+
+Hardened the durable Web-routing review findings with tests:
+
+- **Atomic run dispatch (finding 4).** The `admitted → queued` transition and the global
+  `run_dispatch_outbox` intent now commit in one transaction on the same engine
+  (`RunStore.mark_queued_with_dispatch_intent`); the intent write is no longer swallowed, so a
+  committed `queued` run always has a discoverable dispatch pointer (a failed intent rolls the
+  transition back). Added `run_dispatch_outbox.run_id → runs(id) ON DELETE CASCADE` so lifecycle
+  purge/erasure removes the metadata with the run. Fault-injection + live-PG cascade/atomicity
+  tests.
+- **Gmail OAuth launch (finding 2).** Added authenticated `POST /v1/connectors/gmail/connect-url`
+  returning only the consent URL (browser opens it with headers via `fetch`); the legacy `GET`
+  redirect now fails closed in cloud mode. Callback stays state-bound/unauthenticated.
+- **Workspace no-follow isolation (finding 5).** `DirectoryWorkspaceProvider` now provisions the
+  namespace root with an exclusive `mkdir` and re-validates it on every request via a no-follow
+  `lstat` + real-path identity check, rejecting a symlink/junction/reparse-point/alias root even
+  when its target stays inside the base, and defeating a validate/use swap.
+- **SSE cursor (finding 6).** `_resume_cursor()` (Last-Event-ID wins over `after`) now applies to
+  the local-preview live path too, not only the scoped durable path.
+- **OpenAPI checker (finding 7).** Restored the `main` published baseline as the regression guard
+  and hardened the additive checker to reject duplicate parameter identities and deeper
+  `schema` changes (not just top-level `type`).
+- **Browser auth/workspace context (finding 1).** Added a React Auth/Workspace context (API key
+  or OIDC bearer, org + Agent) that keeps secrets in memory / tab-scoped `sessionStorage` (never
+  `localStorage`) and clears them on sign-out; a centralized `api` fetch wrapper attaches
+  `Authorization`/`X-API-Key`/`X-Keel-Org`/`X-Keel-Agent` + idempotency; a `fetch`/`ReadableStream`
+  SSE client replaces the header-less `EventSource` (reconnect with `Last-Event-ID`, de-dupe,
+  abort-on-unmount); and a truthful sign-in/context screen appears when the server rejects a
+  request for auth (it does not fake an OIDC authorization-code flow).
+- **Per-scope Knowledge + worker jobs (finding 3) remains deferred** — see the Knowledge
+  limitation above; it requires driving the worker's Knowledge indexing jobs across scopes (a
+  cross-scope job-dispatch outbox mirroring the run-dispatch one) so the server-side per-scope
+  service does not orphan documents, and was not attempted here to avoid a broken half-migration.
+
 ## Next work
 
 Follow [Roadmap](./ROADMAP.md), in order:

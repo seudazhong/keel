@@ -61,9 +61,13 @@ def _require_additive_parameters(baseline: list[Any], current: list[Any], path: 
 
     * a baseline parameter that is **removed** (its identity is gone) fails;
     * a matched parameter whose ``required`` flag is **tightened** (optional -> required) or
-      whose ``schema.type`` **changes** fails;
+      whose ``schema`` **changes non-additively** (its ``type`` changes, or any schema value is
+      removed/altered) fails;
     * a **newly added** parameter is allowed only when it is optional (``required`` falsy) — a
-      new required parameter would break an existing caller that never sent it.
+      new required parameter would break an existing caller that never sent it;
+    * a **duplicate** ``(name, in)`` identity — in either the baseline or the current list — is
+      rejected: a parameters array with two descriptions of the same parameter is ambiguous and
+      cannot be reasoned about additively.
 
     Parameters without a resolvable identity (no ``name``/``in``) fall back to the strict,
     order-sensitive list comparison so nothing is silently skipped.
@@ -71,17 +75,21 @@ def _require_additive_parameters(baseline: list[Any], current: list[Any], path: 
     if not isinstance(current, list):
         raise CompatibilityError(f"{path} changed from a parameter list")
     base_ids = {_param_identity(p) for p in baseline}
-    cur_by_id: dict[tuple[str, str], dict[str, Any]] = {}
-    for param in current:
-        pid = _param_identity(param)
-        if pid is not None and isinstance(param, dict):
-            cur_by_id[pid] = param
     if None in base_ids or any(_param_identity(p) is None for p in current):
         # An unidentifiable parameter (no name/in) — fall back to exact comparison so we never
         # under-report a change we cannot reason about by identity.
         if baseline != current:
             raise CompatibilityError(f"{path} changed")
         return
+    # Reject duplicate identities on either side: an ambiguous parameters array (the same
+    # (name, in) described twice) is not additively comparable.
+    _reject_duplicate_parameters(baseline, path, "baseline")
+    _reject_duplicate_parameters(current, path, "current")
+    cur_by_id: dict[tuple[str, str], dict[str, Any]] = {}
+    for param in current:
+        pid = _param_identity(param)
+        if pid is not None and isinstance(param, dict):
+            cur_by_id[pid] = param
     for param in baseline:
         pid = _param_identity(param)
         assert pid is not None and isinstance(param, dict)  # narrowed above
@@ -95,9 +103,28 @@ def _require_additive_parameters(baseline: list[Any], current: list[Any], path: 
             raise CompatibilityError(
                 f"{path}[{pid[1]}:{pid[0]}] type changed from {old_type!r} to {new_type!r}"
             )
+        # A parameter's ``schema`` must evolve additively too (format/enum/$ref/nested changes,
+        # or a removed constraint, are breaking); new schema keys remain additive.
+        old_schema, new_schema = param.get("schema"), current_param.get("schema")
+        if isinstance(old_schema, dict):
+            _require_additive(old_schema, new_schema, f"{path}[{pid[1]}:{pid[0]}].schema")
     for pid, param in cur_by_id.items():
         if pid not in base_ids and bool(param.get("required", False)):
             raise CompatibilityError(f"{path}[{pid[1]}:{pid[0]}] added as a required parameter")
+
+
+def _reject_duplicate_parameters(params: list[Any], path: str, side: str) -> None:
+    """Raise if any ``(name, in)`` identity appears more than once in ``params``."""
+    seen: set[tuple[str, str]] = set()
+    for param in params:
+        pid = _param_identity(param)
+        if pid is None:
+            continue
+        if pid in seen:
+            raise CompatibilityError(
+                f"{path}[{pid[1]}:{pid[0]}] is duplicated in the {side} parameter list"
+            )
+        seen.add(pid)
 
 
 def _require_additive(baseline: Any, current: Any, path: str = "$", key: str | None = None) -> None:

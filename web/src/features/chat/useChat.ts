@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useReducer, useRef } from "react";
 import { interruptRun, openEvents, postMessage, resolveApproval } from "./chatApi";
+import type { SseHandle } from "./sseClient";
 import { applyEvent, initialChatState, userSent } from "./chatReducer";
 import type { ChatItem, ChatState, SseEvent } from "./types";
 
@@ -44,7 +45,7 @@ export function useChat(): {
 
   const sessionRef = useRef<string>("");
   if (!sessionRef.current) sessionRef.current = crypto.randomUUID();
-  const esRef = useRef<EventSource | null>(null);
+  const esRef = useRef<SseHandle | null>(null);
   const runIdRef = useRef<string | null>(null);
   const lastSeqRef = useRef(0);
   useEffect(() => {

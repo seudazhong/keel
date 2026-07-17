@@ -40,6 +40,11 @@ from typing import Any, Protocol, runtime_checkable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from keel_core.run_dispatch import (
+    PostgresRunDispatchOutbox,
+    RunDispatchOutbox,
+    record_intent_in_connection,
+)
 from keel_core.types import RunId, ScopeId, SessionId
 
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
@@ -387,6 +392,25 @@ class RunStore(Protocol):
 
     async def mark_queued(self, run_id: RunId, *, now: datetime | None = None) -> bool: ...
 
+    async def mark_queued_with_dispatch_intent(
+        self,
+        run_id: RunId,
+        scope_id: ScopeId,
+        outbox: RunDispatchOutbox,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Transition ``admitted -> queued`` and record the dispatch intent **atomically**.
+
+        The queued transition and the global dispatch intent commit in one unit (one Postgres
+        transaction on the same engine), so a committed ``queued`` run is always accompanied by
+        a discoverable cross-scope dispatch pointer. If recording the intent fails the whole
+        unit rolls back — the run stays ``admitted`` (recovered by admission retry / reconcile)
+        rather than becoming an undiscoverable queued run. Returns whether *this* caller won the
+        transition (``mark_queued`` semantics).
+        """
+        ...
+
     async def mark_prompt_persisted(
         self, run_id: RunId, *, now: datetime | None = None
     ) -> bool: ...
@@ -580,6 +604,37 @@ class InMemoryRunStore:
         record.status = RunStatus.queued
         record.version += 1
         record.updated_at = now or _now()
+        return True
+
+    async def mark_queued_with_dispatch_intent(
+        self,
+        run_id: RunId,
+        scope_id: ScopeId,
+        outbox: RunDispatchOutbox,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        now = now or _now()
+        record = self._rows.get(run_id)
+        if record is None or record.status is not RunStatus.admitted:
+            return False
+        # Atomic parity with Postgres: if recording the intent fails, roll the transition back
+        # so the run is never left ``queued`` without a discoverable dispatch intent.
+        prior_status, prior_version, prior_updated = (
+            record.status,
+            record.version,
+            record.updated_at,
+        )
+        record.status = RunStatus.queued
+        record.version += 1
+        record.updated_at = now
+        try:
+            await outbox.record(run_id, scope_id, now=now)
+        except Exception:
+            record.status = prior_status
+            record.version = prior_version
+            record.updated_at = prior_updated
+            raise
         return True
 
     async def mark_prompt_persisted(self, run_id: RunId, *, now: datetime | None = None) -> bool:
@@ -1195,6 +1250,42 @@ class PostgresRunStore:
                 {"scope": self._scope_id, "id": run_id, "now": now},
             )
         return result.rowcount == 1
+
+    async def mark_queued_with_dispatch_intent(
+        self,
+        run_id: RunId,
+        scope_id: ScopeId,
+        outbox: RunDispatchOutbox,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """Commit the queued transition + the dispatch intent in ONE transaction.
+
+        Both statements run on this store's engine inside a single ``begin()`` block: if the
+        intent INSERT fails the ``UPDATE runs`` is rolled back with it, so the run never reaches
+        ``queued`` in the durable store without a discoverable ``run_dispatch_outbox`` pointer.
+        The ``outbox`` argument is accepted for interface symmetry with the in-memory store; the
+        Postgres path writes the intent directly on its own connection (same database), so the
+        outbox must be backed by the same engine — asserted below.
+        """
+        if isinstance(outbox, PostgresRunDispatchOutbox) and outbox._engine is not self._engine:
+            raise RunStateError("dispatch outbox must share the run store engine for atomicity")
+        now = now or _now()
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    "UPDATE runs SET status = 'queued', version = version + 1, "
+                    "updated_at = :now WHERE scope_id = :scope AND id = :id "
+                    "AND status = 'admitted'"
+                ),
+                {"scope": self._scope_id, "id": run_id, "now": now},
+            )
+            if result.rowcount != 1:
+                return False
+            # Same transaction as the transition — commits or rolls back as one unit.
+            await record_intent_in_connection(conn, run_id, scope_id, now=now)
+        return True
 
     async def mark_prompt_persisted(self, run_id: RunId, *, now: datetime | None = None) -> bool:
         now = now or _now()

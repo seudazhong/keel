@@ -1,8 +1,11 @@
 import { http, HttpResponse } from "msw";
-import { expect, test } from "vitest";
+import { afterEach, expect, test } from "vitest";
 import type { Approval } from "../features/approvals/types";
+import { emptyAuth, setAuthSnapshot } from "../features/auth/authState";
 import { server } from "../test/setup";
 import { api } from "./api";
+
+afterEach(() => setAuthSnapshot(emptyAuth));
 
 test("api.get returns the approvals list", async () => {
   const rows = await api.get<Approval[]>("/v1/approvals?status=pending");
@@ -17,4 +20,41 @@ test("api.get throws on a non-2xx response", async () => {
     ),
   );
   await expect(api.get("/v1/approvals")).rejects.toThrow("datastore unavailable");
+});
+
+test("api attaches the credential + workspace headers from the auth snapshot", async () => {
+  setAuthSnapshot({ credential: { kind: "bearer", secret: "tok-123" }, org: "acme", agent: "a1" });
+  let seen: Record<string, string | null> = {};
+  server.use(
+    http.get("/v1/approvals", ({ request }) => {
+      seen = {
+        auth: request.headers.get("authorization"),
+        apiKey: request.headers.get("x-api-key"),
+        org: request.headers.get("x-keel-org"),
+        agent: request.headers.get("x-keel-agent"),
+      };
+      return HttpResponse.json([]);
+    }),
+  );
+  await api.get("/v1/approvals");
+  expect(seen.auth).toBe("Bearer tok-123");
+  expect(seen.apiKey).toBeNull();
+  expect(seen.org).toBe("acme");
+  expect(seen.agent).toBe("a1");
+});
+
+test("api sends X-API-Key for an api-key credential and an idempotency key on mutations", async () => {
+  setAuthSnapshot({ credential: { kind: "api-key", secret: "vkey" }, org: null, agent: null });
+  let apiKey: string | null = null;
+  let idem: string | null = null;
+  server.use(
+    http.post("/v1/things", ({ request }) => {
+      apiKey = request.headers.get("x-api-key");
+      idem = request.headers.get("idempotency-key");
+      return HttpResponse.json({ ok: true });
+    }),
+  );
+  await api.post("/v1/things", { a: 1 });
+  expect(apiKey).toBe("vkey");
+  expect(idem).toBeTruthy();
 });

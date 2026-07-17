@@ -137,6 +137,24 @@ export const en = {
   "runs.approvals.approve": "Approve",
   "runs.approvals.reject": "Reject",
   "runs.approvals.decided": "Decision recorded for this preview session.",
+
+  "auth.title": "Sign in to your workspace",
+  "auth.subtitle": "This deployment requires a credential. Provide an API key or a bearer token and select your organization and Agent.",
+  "auth.credentialType": "Credential type",
+  "auth.apiKey": "API key",
+  "auth.bearer": "OIDC bearer token",
+  "auth.secret": "Secret",
+  "auth.secretPlaceholder": "Paste your key or token",
+  "auth.org": "Organization",
+  "auth.orgPlaceholder": "org id or slug",
+  "auth.agent": "Agent",
+  "auth.agentPlaceholder": "Agent id or name",
+  "auth.submit": "Continue",
+  "auth.signOut": "Sign out",
+  "auth.localPreview": "Continue in local preview",
+  "auth.secretWarning": "Secrets are kept only in this browser tab and cleared when you sign out or close the tab. They are never written to persistent storage.",
+  "auth.tokenNote": "A bearer token is supplied by your external login or reverse proxy; this screen does not run an OIDC login flow.",
+  "auth.rejected": "Your credential or workspace was rejected. Check the values and try again.",
 } satisfies Record<string, string>;
 
 export type MessageKey = keyof typeof en;

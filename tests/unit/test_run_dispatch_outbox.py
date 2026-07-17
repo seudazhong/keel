@@ -11,6 +11,8 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
+
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.loop import admit
 from keel_core.run_dispatch import InMemoryRunDispatchOutbox
@@ -147,3 +149,37 @@ async def test_reconcile_dispatch_removes_terminal_intent() -> None:
     ctx, _enqueued = _ctx(runs, events, outbox)
     await reconcile_dispatch_tick(ctx)
     assert await outbox.active_scopes() == set()  # terminal intent retired
+
+
+class _FailingOutbox(InMemoryRunDispatchOutbox):
+    """A dispatch outbox whose ``record`` always fails (intent-store fault injection)."""
+
+    async def record(self, run_id: str, scope_id: str, *, now: Any = None) -> None:  # type: ignore[override]
+        raise RuntimeError("outbox unavailable")
+
+
+async def test_intent_write_failure_rolls_back_queued_transition() -> None:
+    # Fault at the intent-store boundary: the queued transition + intent are atomic, so a
+    # failed intent write must NOT leave a queued run without a discoverable dispatch pointer.
+    # The transition rolls back (run stays admitted) and the error is NOT swallowed — the caller
+    # can retry idempotently (or the reconciler recovers the admitted run).
+    runs, events, outbox = InMemoryRunStore(), InMemoryEventStore(), _FailingOutbox()
+    with pytest.raises(RuntimeError, match="outbox unavailable"):
+        await _admit(runs, events, outbox, scope_id=_SCOPE_A, session_id="s1")
+    # The run exists and is still admitted (never a queued-but-undiscoverable run), the prompt
+    # is durably persisted, and no intent was recorded.
+    (run_id,) = list(runs._rows)
+    record = await runs.get(run_id)
+    assert record is not None and record.status is RunStatus.admitted
+    assert await outbox.active_scopes() == set()
+
+
+async def test_mark_queued_with_intent_is_atomic_and_single_winner() -> None:
+    # The atomic transition is single-winner: two admitters of the same idempotency key produce
+    # exactly one queued run with exactly one intent.
+    runs, events, outbox = InMemoryRunStore(), InMemoryEventStore(), InMemoryRunDispatchOutbox()
+    run_a = await _admit(runs, events, outbox, scope_id=_SCOPE_A, session_id="s1")
+    run_b = await _admit(runs, events, outbox, scope_id=_SCOPE_A, session_id="s1")
+    assert run_a == run_b  # idempotent
+    intents = await outbox.claim_due(worker_id="w1")
+    assert [i.run_id for i in intents] == [run_a]  # exactly one intent

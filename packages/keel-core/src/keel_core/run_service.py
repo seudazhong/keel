@@ -360,29 +360,24 @@ class DurableRunService:
         # 2) admitted -> queued is an atomic, single-winner transition; only the caller that
         #    wins it dispatches, so N concurrent admitters enqueue the worker job exactly once
         #    (a lost enqueue after this point is repaired by the reconciler, not re-sent here).
-        queued = await self._runs.mark_queued(record.id, now=now)
+        #    When a global dispatch outbox is wired the queued transition AND the cross-scope
+        #    dispatch intent commit in ONE transaction (finding 4): a committed ``queued`` run is
+        #    always accompanied by a discoverable intent, and a failed intent write rolls the
+        #    transition back (the run stays ``admitted``, recovered by retry/reconcile) rather
+        #    than becoming an undiscoverable queued run. We therefore do NOT swallow that error.
+        if self._dispatch_outbox is not None:
+            queued = await self._runs.mark_queued_with_dispatch_intent(
+                record.id, self._scope_id, self._dispatch_outbox, now=now
+            )
+        else:
+            queued = await self._runs.mark_queued(record.id, now=now)
         dispatch_pending = False
         if queued:
-            # Record the global dispatch intent as part of completing the queued transition,
-            # BEFORE the best-effort enqueue. This is the durable, cross-scope pointer the
-            # worker reconciler scans: even if the enqueue below is lost, the intent survives
-            # so the reconciler redispatches this run in its own scope (M3.6 finding 4). The
-            # intent is recorded exactly once (idempotent on run_id).
-            if self._dispatch_outbox is not None:
-                try:
-                    await self._dispatch_outbox.record(record.id, self._scope_id, now=now)
-                except Exception:  # noqa: BLE001 - outbox is best-effort; per-scope reconcile backs up
-                    logger.warning(
-                        "run dispatch intent not recorded scope=%s run=%s",
-                        self._scope_id,
-                        record.id,
-                        exc_info=True,
-                    )
             # 3) Dispatch a worker job (a duplicate enqueue is deduped by the claim). The
-            #    durable admission (run row + prompt + queued) has ALREADY committed, so a
-            #    failed enqueue must NOT propagate as an error: that would make the caller
-            #    retry and risk a duplicate run. We swallow the enqueue failure, mark the
-            #    admission as dispatch-pending, and rely on the durable reconciler to
+            #    durable admission (run row + prompt + queued + dispatch intent) has ALREADY
+            #    committed, so a failed enqueue must NOT propagate as an error: that would make
+            #    the caller retry and risk a duplicate run. We swallow the enqueue failure, mark
+            #    the admission as dispatch-pending, and rely on the durable reconciler to
             #    redispatch queued-but-undispatched runs (durable-outbox reconciliation).
             try:
                 await self._enqueue(record.id)

@@ -666,11 +666,16 @@ async def stream_events(
     if not await _session_in_scope(request, session_id, auth.scope_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
 
+    # The resume cursor (SSE ``Last-Event-ID`` reconnect header, else ``after``) is honored on
+    # BOTH the local-preview live path and the scoped durable path (finding 6), so a reconnect
+    # resumes exactly where it dropped — no missed or duplicated events — on either surface.
+    cursor = _resume_cursor(request, after)
+
     if auth.scope_id == LOCAL_PREVIEW_SCOPE:
         runtime = _runtime(request)
 
         async def _live() -> AsyncIterator[str]:
-            async for event in runtime.tail(session_id, after):
+            async for event in runtime.tail(session_id, cursor):
                 if await request.is_disconnected():
                     break
                 data = f"data: {event.model_dump_json()}\n\n"
@@ -684,7 +689,6 @@ async def stream_events(
         )
 
     store = _scoped_events(request, auth.scope_id)
-    cursor = _resume_cursor(request, after)
 
     async def _replay_and_tail() -> AsyncIterator[str]:
         nonlocal cursor

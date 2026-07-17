@@ -20,13 +20,41 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from keel_core.types import RunId, ScopeId
 
 
 def _now() -> datetime:
     return datetime.now(UTC)
+
+
+# The single INSERT that records (idempotently, on ``run_id``) an open dispatch intent. Shared
+# between the standalone outbox (:meth:`PostgresRunDispatchOutbox.record`) and the atomic
+# queued-transition path (:meth:`keel_core.runs.PostgresRunStore.mark_queued`), so the intent
+# can be written **in the same transaction** as the run's ``admitted -> queued`` transition —
+# the run never reaches ``queued`` in the durable store without a discoverable dispatch intent
+# (M3.6 finding 4). ON CONFLICT keeps a repair/retry idempotent.
+_INSERT_INTENT = text(
+    "INSERT INTO run_dispatch_outbox "
+    "(run_id, scope_id, state, attempts, next_attempt_at, created_at, updated_at) "
+    "VALUES (:run_id, :scope_id, 'pending', 0, :now, :now, :now) "
+    "ON CONFLICT (run_id) DO NOTHING"
+)
+
+
+async def record_intent_in_connection(
+    conn: AsyncConnection, run_id: RunId, scope_id: ScopeId, *, now: datetime | None = None
+) -> None:
+    """Record a dispatch intent inside the caller's transaction (no commit here).
+
+    Lets the run store persist the intent atomically with the ``queued`` transition so a
+    committed ``queued`` run is always accompanied by its cross-scope dispatch pointer: if the
+    surrounding transaction rolls back, neither the transition nor the intent survives, so there
+    is never a queued-but-undiscoverable run.
+    """
+    now = now or _now()
+    await conn.execute(_INSERT_INTENT, {"run_id": run_id, "scope_id": scope_id, "now": now})
 
 
 @dataclass(frozen=True)
@@ -148,15 +176,7 @@ class PostgresRunDispatchOutbox:
     ) -> None:
         now = now or _now()
         async with self._engine.begin() as conn:
-            await conn.execute(
-                text(
-                    "INSERT INTO run_dispatch_outbox "
-                    "(run_id, scope_id, state, attempts, next_attempt_at, created_at, updated_at) "
-                    "VALUES (:run_id, :scope_id, 'pending', 0, :now, :now, :now) "
-                    "ON CONFLICT (run_id) DO NOTHING"
-                ),
-                {"run_id": run_id, "scope_id": scope_id, "now": now},
-            )
+            await record_intent_in_connection(conn, run_id, scope_id, now=now)
 
     async def claim_due(
         self,
@@ -237,4 +257,5 @@ __all__ = [
     "InMemoryRunDispatchOutbox",
     "PostgresRunDispatchOutbox",
     "RunDispatchOutbox",
+    "record_intent_in_connection",
 ]

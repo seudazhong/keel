@@ -114,3 +114,43 @@ def test_resume_cursor_prefers_last_event_id() -> None:
     assert v1._resume_cursor(_req({"last-event-id": "7"}), 3) == 7  # header wins over after
     assert v1._resume_cursor(_req({}), 3) == 3  # no header -> after
     assert v1._resume_cursor(_req({"last-event-id": "nope"}), 3) == 3  # invalid -> after
+
+
+class _RecordingRuntime:
+    """A local-preview runtime double that records the resume cursor its tail was given."""
+
+    def __init__(self) -> None:
+        self.tail_after: list[int | None] = []
+
+    def tail(self, session_id: str, after: int | None) -> AsyncIterator[Event]:
+        self.tail_after.append(after)
+
+        async def _gen() -> AsyncIterator[Event]:
+            yield _event(9, EventType.run_ended, "web:local")
+
+        return _gen()
+
+
+def test_local_preview_stream_honors_last_event_id() -> None:
+    # Finding 6: the local-preview live path must apply the resume cursor too, so a reconnect
+    # with Last-Event-ID resumes exactly where it dropped rather than replaying from the start.
+    from keel_server.app import create_app
+
+    runtime = _RecordingRuntime()
+    app = create_app()
+    app.state.engine = None
+    app.state.runtime = runtime
+    app.state.runs = InMemoryRunStore()
+    app.state.durable_approvals = InMemoryApprovalStore()
+    app.state.durable_scope = "web:local"
+    app.state.auth_required = False  # non-cloud local preview -> web:local scope
+    app.state.api_keys = parse_api_keys("vkey:viewer")
+    client = TestClient(app)
+
+    resp = client.get(
+        "/v1/sessions/s1/events",
+        headers={"X-API-Key": "vkey", "Last-Event-ID": "5"},
+    )
+    assert resp.status_code == 200
+    # The Last-Event-ID header (5) is the cursor handed to the live tail, not the default None.
+    assert runtime.tail_after == [5]
