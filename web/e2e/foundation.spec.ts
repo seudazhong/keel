@@ -136,6 +136,43 @@ test.describe("responsive shell", () => {
     // Focus lands on the main landmark, never falls back to <body>.
     await expect(main).toBeFocused();
   });
+
+  test("dismissing the drawer via the backdrop returns focus to the button that opened it, not <body> or a hidden element", async ({
+    page,
+  }) => {
+    await freshVisit(page, "/chat");
+
+    const openButton = page.getByRole("button", { name: "Open navigation menu" });
+    await openButton.click();
+    await expect(page.getByRole("dialog", { name: "Navigation menu" })).toBeVisible();
+
+    await page.locator("div.bg-black\\/40").click();
+
+    const main = page.locator("#main-content");
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(main).toHaveJSProperty("inert", false);
+    // Real Chromium enforces `inert`: focusing an element while it's still
+    // inert (the opener button lives inside main's subtree) is a no-op, so
+    // this only passes once the close/inert-removal is sequenced correctly.
+    await expect(openButton).toBeFocused();
+  });
+
+  test("dismissing the drawer via the close button returns focus to the button that opened it, not <body> or a hidden element", async ({
+    page,
+  }) => {
+    await freshVisit(page, "/chat");
+
+    const openButton = page.getByRole("button", { name: "Open navigation menu" });
+    await openButton.click();
+    await expect(page.getByRole("dialog", { name: "Navigation menu" })).toBeVisible();
+
+    await page.getByRole("button", { name: "Close navigation menu" }).click();
+
+    const main = page.locator("#main-content");
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(main).toHaveJSProperty("inert", false);
+    await expect(openButton).toBeFocused();
+  });
 });
 
 test.describe("desktop shell", () => {

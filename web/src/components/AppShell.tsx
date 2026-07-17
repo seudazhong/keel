@@ -28,7 +28,11 @@ export function AppShell() {
   const mainRef = useRef<HTMLElement>(null);
   const menuButtonRef = useRef<HTMLElement | null>(null);
   const firstRender = useRef(true);
-  const pendingNavFocus = useRef(false);
+  // What to focus once `sidebarOpen` next settles to `false` and the DOM
+  // commit that removes `inert`/`aria-hidden` from main has landed: "main"
+  // after a route change, "opener" after a drawer dismissal (Escape,
+  // backdrop click, close button). `null` means nothing is owed.
+  const pendingFocus = useRef<"main" | "opener" | null>(null);
 
   // Close the mobile drawer whenever the route changes (link click, back/forward, etc.),
   // and re-check onboarding completion (it's set from the /onboarding route via a plain
@@ -67,33 +71,47 @@ export function AppShell() {
   }, []);
 
   // Mark that a route change happened (skipping the initial mount) so the
-  // effect below knows a focus restoration is owed.
+  // effect below knows a focus restoration to main is owed.
   useEffect(() => {
     if (firstRender.current) {
       firstRender.current = false;
       return;
     }
-    pendingNavFocus.current = true;
+    pendingFocus.current = "main";
   }, [location.pathname]);
 
   // Move focus to the main landmark on navigation so keyboard/screen-reader
   // users land in new content instead of staying on a now-stale sidebar
-  // link. This only fires once `sidebarOpen` has actually settled to
-  // `false`: while the mobile drawer is still open/closing, main is
-  // `inert`, and calling `.focus()` on an inert element is a no-op that
-  // drops focus to <body> instead of #main-content. Depending on both
-  // `sidebarOpen` and the pathname means desktop navigations (drawer never
-  // opens) focus immediately, while mobile navigations wait for the
-  // drawer-close commit to land first.
+  // link, and restore focus to the button that opened the drawer after it's
+  // dismissed via Escape/backdrop/close button (see `closeSidebar`). Both
+  // cases only fire once `sidebarOpen` has actually settled to `false`:
+  // while the mobile drawer is still open/closing, main (and everything
+  // inside it, including the opener button rendered by the page's Topbar)
+  // is `inert`, and calling `.focus()` on an inert element/descendant is a
+  // no-op in real browsers — it silently drops focus to <body> or leaves it
+  // on an element that's about to become non-interactive, instead of
+  // landing on the intended target. Depending on both `sidebarOpen` and the
+  // pathname means desktop navigations (drawer never opens) focus
+  // immediately, while mobile navigations/dismissals wait for the
+  // drawer-close commit (and the inert removal it carries) to land first.
   useEffect(() => {
-    if (!pendingNavFocus.current || sidebarOpen) return;
-    pendingNavFocus.current = false;
-    mainRef.current?.focus();
+    const target = pendingFocus.current;
+    if (!target || sidebarOpen) return;
+    pendingFocus.current = null;
+    if (target === "opener") {
+      menuButtonRef.current?.focus();
+    } else {
+      mainRef.current?.focus();
+    }
   }, [location.pathname, sidebarOpen]);
 
+  // Closing via Escape, the backdrop, or the close button never navigates,
+  // so it only needs to record the intended focus target and flip the
+  // state; the effect above performs the actual `.focus()` call once the
+  // close has committed and inert is removed.
   function closeSidebar() {
+    pendingFocus.current = "opener";
     setSidebarOpen(false);
-    menuButtonRef.current?.focus();
   }
 
   return (

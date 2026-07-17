@@ -139,6 +139,30 @@ test("clicking the backdrop closes the mobile sidebar drawer", () => {
   expect(container.querySelector(".bg-black\\/40")).toBeNull();
 });
 
+test("dismissing the drawer via the backdrop returns focus to the button that opened it", () => {
+  const { container } = renderWithClient(<RouterProvider router={shellAt("/chat")} />);
+  const openButton = screen.getByRole("button", { name: "Open navigation menu" });
+  openButton.focus();
+  fireEvent.click(openButton);
+
+  fireEvent.click(container.querySelector(".bg-black\\/40")!);
+
+  expect(document.getElementById("main-content")!.hasAttribute("inert")).toBe(false);
+  expect(document.activeElement).toBe(openButton);
+});
+
+test("dismissing the drawer via the close button returns focus to the button that opened it", () => {
+  renderWithClient(<RouterProvider router={shellAt("/chat")} />);
+  const openButton = screen.getByRole("button", { name: "Open navigation menu" });
+  openButton.focus();
+  fireEvent.click(openButton);
+
+  fireEvent.click(screen.getByRole("button", { name: "Close navigation menu" }));
+
+  expect(document.getElementById("main-content")!.hasAttribute("inert")).toBe(false);
+  expect(document.activeElement).toBe(openButton);
+});
+
 test("resizing from mobile to desktop clears an open drawer: sidebar is no longer modal and main is no longer inert", () => {
   setViewportWidth(MOBILE_WIDTH);
   renderWithClient(<RouterProvider router={shellAt("/chat")} />);
