@@ -125,8 +125,14 @@ def _children(element: ElementTree.Element, name: str) -> list[ElementTree.Eleme
 
 
 def _first_child(element: ElementTree.Element, *names: str) -> ElementTree.Element | None:
-    wanted = set(names)
-    return next((child for child in element if _local_name(child.tag) in wanted), None)
+    for name in names:
+        child = next(
+            (candidate for candidate in element if _local_name(candidate.tag) == name),
+            None,
+        )
+        if child is not None:
+            return child
+    return None
 
 
 def _element_text(element: ElementTree.Element | None, *, limit: int) -> str:

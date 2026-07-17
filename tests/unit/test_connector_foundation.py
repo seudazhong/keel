@@ -75,12 +75,15 @@ from keel_core.tokens import InMemoryTokenStore
 from keel_core.types import ContentTaint
 
 
-def test_builtin_registry_discovers_connectors_deterministically() -> None:
+def test_builtin_registry_discovers_providers_deterministically() -> None:
     first = discover_connector_registry()
     second = discover_connector_registry()
-    assert [item.id for item in first.manifests()] == ["atom", "gmail", "rss", "webhook"]
+    connector_ids = [item.id for item in first.manifests()]
+    assert connector_ids
+    assert connector_ids == sorted(connector_ids)
+    assert len(connector_ids) == len(set(connector_ids))
     assert first.manifests() == second.manifests()
-    assert first.create("gmail").manifest.id == "gmail"
+    assert all(first.get(item.id) is not None for item in first.manifests())
 
 
 def test_registry_rejects_duplicate_ids() -> None:

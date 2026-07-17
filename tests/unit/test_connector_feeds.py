@@ -22,11 +22,16 @@ from keel_core.connector_network import (
     PinnedHttpResponse,
     PinnedHttpTarget,
 )
+from keel_core.connector_providers._feeds import parse_atom, parse_rss
 from keel_core.connector_providers.atom import AtomProvider
 from keel_core.connector_providers.atom import manifest as atom_manifest
 from keel_core.connector_providers.rss import RssProvider
 from keel_core.connector_providers.rss import manifest as rss_manifest
-from keel_core.connector_registry import ConnectorRegistration, ConnectorRegistry
+from keel_core.connector_registry import (
+    ConnectorRegistration,
+    ConnectorRegistry,
+    discover_connector_registry,
+)
 from keel_core.connector_repository import InMemoryConnectorRepository
 from keel_core.connector_service import ConnectorService
 from keel_core.types import ContentTaint
@@ -337,6 +342,48 @@ def test_feed_manifests_are_separate_recurring_provider_local_connectors() -> No
     assert rss_manifest.default_sync_cadence_seconds == 900
     assert atom_manifest.default_sync_cadence_seconds == 900
     assert rss_manifest.actions == atom_manifest.actions == ()
+
+
+def test_feed_providers_are_discovered_separately() -> None:
+    registry = discover_connector_registry()
+    rss_registration = registry.get("rss")
+    atom_registration = registry.get("atom")
+    assert rss_registration is not None
+    assert atom_registration is not None
+    assert rss_registration.manifest == rss_manifest
+    assert atom_registration.manifest == atom_manifest
+
+
+def test_rss_fallbacks_prefer_full_content_and_pubdate_by_semantics() -> None:
+    body = b"""<rss version="2.0"
+        xmlns:content="http://purl.org/rss/1.0/modules/content/"
+        xmlns:dc="http://purl.org/dc/elements/1.1/">
+      <channel><title>Preference RSS</title><item>
+        <guid>preference-rss</guid>
+        <description>Summary first</description>
+        <content:encoded><![CDATA[<p>Full RSS content</p>]]></content:encoded>
+        <dc:date>2026-07-18T02:00:00Z</dc:date>
+        <pubDate>Sat, 18 Jul 2026 01:00:00 GMT</pubDate>
+      </item></channel>
+    </rss>"""
+    item = parse_rss(body, "https://example.com/feed").items[0]
+    assert item.content == "Full RSS content"
+    assert item.published == "Sat, 18 Jul 2026 01:00:00 GMT"
+
+
+def test_atom_fallbacks_prefer_full_content_and_published_by_semantics() -> None:
+    body = b"""<feed xmlns="http://www.w3.org/2005/Atom">
+      <title>Preference Atom</title><entry>
+        <id>preference-atom</id>
+        <summary>Summary first</summary>
+        <content type="html">&lt;p&gt;Full Atom content&lt;/p&gt;</content>
+        <updated>2026-07-18T02:00:00Z</updated>
+        <published>2026-07-18T01:00:00Z</published>
+      </entry>
+    </feed>"""
+    item = parse_atom(body, "https://example.com/feed").items[0]
+    assert item.content == "Full Atom content"
+    assert item.published == "2026-07-18T01:00:00Z"
 
 
 def test_feed_context_rejects_cross_provider_resource() -> None:
