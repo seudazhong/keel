@@ -454,8 +454,14 @@ class DurableRunService:
             return False  # approval was bound to a different actor than the run owner
         if not await self._actor_authorized(actor, run, record):
             return False  # resolver is not the bound owner nor an authorized delegate
-        if record.run_attempt != run.attempt:
-            return False  # attempt-0 approval cannot resume an attempt-1 run (fail closed)
+        # Bind the decision to the suspended *source* attempt, not the raw lease attempt. A
+        # crash-reclaimed run advances ``attempt`` for lease fencing while ``checkpoint_attempt``
+        # preserves the attempt whose approval batch is outstanding; an approval for that source
+        # attempt stays applicable, while a stale approval from a different/older checkpoint is
+        # rejected. Legacy rows (no checkpoint) fall back to the current attempt.
+        expected_attempt = run.checkpoint_attempt or run.attempt
+        if record.run_attempt != expected_attempt:
+            return False  # approval bound to a superseded/foreign attempt (fail closed)
         # Recompute the action hash from the stored exact action payload (never trust the
         # stored hash blindly): a mismatch means the row was tampered with -> fail closed.
         if record.action_hash != action_hash(record.tool, record.args):
@@ -470,7 +476,7 @@ class DurableRunService:
             status=status,
             resolved_by=resolved_by,
             expected_action_hash=record.action_hash,
-            expected_run_attempt=run.attempt,
+            expected_run_attempt=expected_attempt,
         )
         if tx.requeued:
             await self._enqueue(record.run_id)  # dispatch after commit (reconciler backs up)
@@ -802,8 +808,17 @@ async def execute_run(
         return watcher.interrupted or keeper.lost
 
     budget = _budget_for(lease)
+
+    async def _checkpoint() -> None:
+        # Durable suspension checkpoint, written just before the loop persists an approval
+        # batch and fenced by this lease. If the worker dies before releasing to
+        # waiting_approval, the still-``running`` row carries the marker so the lease-expiry
+        # reclaim resumes (honouring the durable approval) instead of restarting fresh.
+        await run_store.mark_checkpoint(lease)
+
     keeper.start()
     watcher.start()
+    lease_lost = False
     try:
         if resume:
             result = await loop_resume(
@@ -822,6 +837,7 @@ async def execute_run(
                 system_context=system_context,
                 binding=binding,
                 start_iteration=lease.iterations_used,
+                on_suspend=_checkpoint,
             )
         else:
             result = await loop_run(
@@ -840,14 +856,21 @@ async def execute_run(
                 system_context=system_context,
                 binding=binding,
                 start_iteration=lease.iterations_used,
+                on_suspend=_checkpoint,
             )
+    except RunLeaseLostError:
+        # A fenced checkpoint write found the lease lost mid-batch (another worker reclaimed):
+        # fail closed. No approval batch was persisted under the stale lease and no terminal
+        # state is written here — the reclaiming owner drives the run.
+        lease_lost = True
+        result = None
     finally:
         await watcher.stop()
         await keeper.stop()
 
     # Fenced out mid-run: the lease is stale, so we must NOT write a terminal state (the
     # reclaiming owner drives it). Leave control signals pending for the fresh owner.
-    if keeper.lost:
+    if keeper.lost or lease_lost or result is None:
         current = await run_store.get(lease.run_id)
         return current if current is not None else record
 

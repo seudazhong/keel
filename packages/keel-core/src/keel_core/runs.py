@@ -257,6 +257,18 @@ class RunRecord:
     # Immutable admission fingerprint (org/actor/agent/session/surface/content hash). A
     # retried admission that reuses the identity but mismatches this is a conflict.
     fingerprint: str = ""
+    # Durable suspension/checkpoint intent (M3.6 crash boundary). Set — fenced by the active
+    # lease — the instant a worker begins persisting an approval batch, BEFORE the
+    # ``running -> waiting_approval`` release. If the worker crashes in that window the row is
+    # still ``running`` with a durable approval bound to its attempt; without this marker the
+    # lease-expiry reclaim advances the attempt with ``resume=False`` and silently discards
+    # the (later approved) action. The marker makes the reclaiming worker *resume* instead.
+    suspend_checkpoint: bool = False
+    # The source attempt whose approval batch the current checkpoint owns. Preserved across a
+    # crash reclaim (the lease attempt advances for fencing, this does not) so an approval
+    # decision bound to the suspended source attempt stays applicable exactly once on resume,
+    # while stale approvals from a different/older checkpoint attempt remain rejected.
+    checkpoint_attempt: int = 0
 
     @property
     def is_terminal(self) -> bool:
@@ -371,6 +383,8 @@ class RunStore(Protocol):
     ) -> bool: ...
 
     async def requeue(self, run_id: RunId, *, now: datetime | None = None) -> bool: ...
+
+    async def mark_checkpoint(self, lease: RunLease, *, now: datetime | None = None) -> bool: ...
 
     async def claim(
         self,
@@ -576,6 +590,28 @@ class InMemoryRunStore:
         record.updated_at = now or _now()
         return True
 
+    async def mark_checkpoint(self, lease: RunLease, *, now: datetime | None = None) -> bool:
+        """Durably record a suspension checkpoint intent, fenced by the active lease.
+
+        Called (before the approval batch is persisted) so that a crash before the
+        ``running -> waiting_approval`` release still leaves a marker on the ``running`` row.
+        Records the current attempt as the checkpoint's source attempt for approval binding.
+        Idempotent within an attempt; raises if the lease is lost (never writes unfenced)."""
+        record = self._rows.get(lease.run_id)
+        if (
+            record is None
+            or record.lease_token != lease.token
+            or record.status is not RunStatus.running
+        ):
+            raise RunLeaseLostError(lease.run_id)
+        if record.suspend_checkpoint and record.checkpoint_attempt == record.attempt:
+            return True  # idempotent no-op for the current attempt
+        record.suspend_checkpoint = True
+        record.checkpoint_attempt = record.attempt
+        record.version += 1
+        record.updated_at = now or _now()
+        return True
+
     async def claim(
         self,
         run_id: RunId,
@@ -597,7 +633,16 @@ class InMemoryRunStore:
         )
         if not claimable:
             return None
-        resume = record.status is RunStatus.waiting_approval or record.resume_requested
+        # Resume (vs fresh start) when: the run is explicitly waiting_approval, an approval
+        # resolution requeued it (resume_requested), OR it crashed mid-suspension — a
+        # ``running`` row with a durable checkpoint marker whose lease has now expired. The
+        # last case is the crash boundary: without it the reclaim would restart fresh and
+        # silently discard the durable (later approved) approval bound to the source attempt.
+        resume = (
+            record.status is RunStatus.waiting_approval
+            or record.resume_requested
+            or (record.status is RunStatus.running and record.suspend_checkpoint)
+        )
         token = uuid.uuid4().hex
         record.status = RunStatus.running
         record.attempt += 1
@@ -688,6 +733,10 @@ class InMemoryRunStore:
         record.worker_id = None
         record.lease_token = None
         record.lease_expires_at = None
+        # The suspension intent is now durably reflected in the run status (waiting_approval)
+        # or handed back to the queue; clear the crash-window marker. ``checkpoint_attempt`` is
+        # preserved so the pending approval bound to the source attempt still resolves.
+        record.suspend_checkpoint = False
         record.updated_at = now
         return record
 
@@ -721,6 +770,7 @@ class InMemoryRunStore:
         record.worker_id = None
         record.lease_token = None
         record.lease_expires_at = None
+        record.suspend_checkpoint = False
         record.finished_at = now
         record.updated_at = now
         record.result_ref = result_ref
@@ -825,6 +875,7 @@ class InMemoryRunStore:
             record.worker_id = None
             record.lease_token = None
             record.lease_expires_at = None
+            record.suspend_checkpoint = False
             record.finished_at = now
             record.updated_at = now
             expired.append(record.id)
@@ -839,6 +890,7 @@ _RUN_COLUMNS = (
     "stop_reason, attempt, version, worker_id, lease_token, lease_expires_at, heartbeat_at, "
     "max_iterations, token_budget, prompt_tokens, completion_tokens, cost_usd, result_ref, "
     "error_kind, error_message, resume_requested, prompt_persisted, iterations, fingerprint, "
+    "suspend_checkpoint, checkpoint_attempt, "
     "created_at, updated_at, started_at, finished_at, expires_at"
 )
 
@@ -873,6 +925,8 @@ def _to_record(row: Mapping[Any, Any]) -> RunRecord:
         prompt_persisted=bool(row["prompt_persisted"]),
         iterations=row["iterations"],
         fingerprint=row["fingerprint"],
+        suspend_checkpoint=bool(row["suspend_checkpoint"]),
+        checkpoint_attempt=row["checkpoint_attempt"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         started_at=row["started_at"],
@@ -1077,6 +1131,57 @@ class PostgresRunStore:
             )
         return result.rowcount == 1
 
+    async def mark_checkpoint(self, lease: RunLease, *, now: datetime | None = None) -> bool:
+        """Durably mark a suspension checkpoint on the ``running`` row, fenced by the lease.
+
+        Written (before the approval batch is persisted) so a crash before the
+        ``running -> waiting_approval`` release still leaves a marker; ``checkpoint_attempt``
+        captures the current attempt as the batch's source attempt for approval binding. The
+        write is fenced on ``lease_token`` + ``status = 'running'``; a lost lease raises
+        rather than writing unfenced. Re-marking the current attempt is an idempotent no-op."""
+        now = now or _now()
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            row = (
+                await conn.execute(
+                    text(
+                        "UPDATE runs SET suspend_checkpoint = true, "
+                        "checkpoint_attempt = attempt, version = version + 1, updated_at = :now "
+                        "WHERE scope_id = :scope AND id = :id AND lease_token = :token "
+                        "AND status = 'running' "
+                        "AND NOT (suspend_checkpoint AND checkpoint_attempt = attempt) "
+                        "RETURNING id"
+                    ),
+                    {"scope": self._scope_id, "id": lease.run_id, "token": lease.token, "now": now},
+                )
+            ).scalar_one_or_none()
+            if row is not None:
+                return True
+            # No row updated: either the marker already reflects this attempt (idempotent), or
+            # the lease is lost. Distinguish so a lost lease never silently succeeds.
+            current = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT lease_token, status, suspend_checkpoint, checkpoint_attempt, "
+                            "attempt FROM runs WHERE scope_id = :scope AND id = :id"
+                        ),
+                        {"scope": self._scope_id, "id": lease.run_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if (
+            current is not None
+            and current["lease_token"] == lease.token
+            and current["status"] == "running"
+            and current["suspend_checkpoint"]
+            and current["checkpoint_attempt"] == current["attempt"]
+        ):
+            return True  # idempotent: the current attempt is already checkpointed
+        raise RunLeaseLostError(lease.run_id)
+
     async def claim(
         self,
         run_id: RunId,
@@ -1098,7 +1203,7 @@ class PostgresRunStore:
                     await conn.execute(
                         text(
                             "WITH claimable AS ("
-                            "  SELECT id, status, resume_requested FROM runs "
+                            "  SELECT id, status, resume_requested, suspend_checkpoint FROM runs "
                             "  WHERE scope_id = :scope AND id = :id AND expires_at > :now AND ("
                             "    status IN ('admitted', 'queued') OR "
                             "    (status IN ('running', 'waiting_approval') "
@@ -1112,7 +1217,8 @@ class PostgresRunStore:
                             "resume_requested = false "
                             "FROM claimable c WHERE r.id = c.id "
                             f"RETURNING {run_cols_r}, "
-                            "(c.status = 'waiting_approval' OR c.resume_requested) AS resume"
+                            "(c.status = 'waiting_approval' OR c.resume_requested OR "
+                            " (c.status = 'running' AND c.suspend_checkpoint)) AS resume"
                         ),
                         {
                             "scope": self._scope_id,
@@ -1235,7 +1341,8 @@ class PostgresRunStore:
             lease,
             assignments=(
                 "status = :to_status, worker_id = NULL, lease_token = NULL, "
-                "lease_expires_at = NULL, prompt_tokens = prompt_tokens + :ptok, "
+                "lease_expires_at = NULL, suspend_checkpoint = false, "
+                "prompt_tokens = prompt_tokens + :ptok, "
                 "completion_tokens = completion_tokens + :ctok, cost_usd = cost_usd + :cost, "
                 "iterations = iterations + :iters, updated_at = :now"
             ),
@@ -1270,7 +1377,8 @@ class PostgresRunStore:
                 lease,
                 assignments=(
                     "status = :status, stop_reason = :stop_reason, worker_id = NULL, "
-                    "lease_token = NULL, lease_expires_at = NULL, finished_at = :now, "
+                    "lease_token = NULL, lease_expires_at = NULL, suspend_checkpoint = false, "
+                    "finished_at = :now, "
                     "prompt_tokens = prompt_tokens + :ptok, "
                     "completion_tokens = completion_tokens + :ctok, cost_usd = cost_usd + :cost, "
                     "iterations = iterations + :iters, "
@@ -1445,6 +1553,7 @@ class PostgresRunStore:
                         text(
                             "UPDATE runs SET status = 'expired', stop_reason = 'expired', "
                             "worker_id = NULL, lease_token = NULL, lease_expires_at = NULL, "
+                            "suspend_checkpoint = false, "
                             "finished_at = :now, version = version + 1, updated_at = :now "
                             "WHERE scope_id = :scope AND id IN ("
                             "  SELECT id FROM runs WHERE scope_id = :scope "

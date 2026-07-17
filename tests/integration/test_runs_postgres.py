@@ -8,7 +8,11 @@ Proves the load-bearing concurrency + isolation guarantees against a live Postgr
 * idempotent terminalization,
 * durable interrupt consumed exactly once (survives a "restart" = a new store instance),
 * RLS: a scope-bound store cannot see or claim another scope's run,
-* approval binding: a stale action-hash / wrong-attempt decision is rejected (fail closed).
+* approval binding: a stale action-hash / wrong-attempt decision is rejected (fail closed),
+* suspension checkpoint: a ``running`` row that crashed mid-suspension (durable approval,
+  no ``waiting_approval`` transition) is reclaimed with ``resume=True`` and its source
+  attempt preserved, so the (later approved) action is honoured exactly once — never
+  silently discarded by an attempt-advancing reclaim.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from keel_core.runs import (
     RunBudgetSpec,
     RunControlKind,
     RunCost,
+    RunLease,
     RunLeaseLostError,
     RunStatus,
     RunSurface,
@@ -609,3 +614,115 @@ async def test_repair_stuck_resumes_backstops_missed_requeue_pg(migrated_db: Asy
     assert repaired == 1 and enq == ["run-1"]
     rec = await runs.get("run-1")
     assert rec is not None and rec.status is RunStatus.queued and rec.resume_requested
+
+
+async def test_mark_checkpoint_is_fenced_and_idempotent(migrated_db: AsyncEngine) -> None:
+    store = PostgresRunStore(migrated_db, "web:local")
+    await _admit(store)
+    await store.mark_queued("run-1")
+    t0 = _now()
+    lease = await store.claim("run-1", worker_id="w1", now=t0, lease_seconds=30)
+    assert lease is not None and lease.attempt == 1
+    # The active owner marks the checkpoint, fenced by its lease; re-marking is idempotent.
+    assert await store.mark_checkpoint(lease, now=t0) is True
+    assert await store.mark_checkpoint(lease, now=t0) is True
+    rec = await store.get("run-1")
+    assert rec is not None and rec.suspend_checkpoint is True and rec.checkpoint_attempt == 1
+    # A superseded owner (wrong lease token) cannot write the marker (fail closed).
+    stale = RunLease(
+        run_id="run-1",
+        scope_id="web:local",
+        org_id="org-1",
+        token="not-the-token",
+        worker_id="w9",
+        attempt=1,
+        agent_id="agent-1",
+        session_id="sess-1",
+        lease_seconds=30,
+    )
+    with pytest.raises(RunLeaseLostError):
+        await store.mark_checkpoint(stale, now=t0)
+
+
+async def test_crash_mid_suspension_reclaims_as_resume_and_keeps_source_attempt(
+    migrated_db: AsyncEngine,
+) -> None:
+    runs = PostgresRunStore(migrated_db, "web:local")
+    approvals = PostgresApprovalStore(migrated_db, "web:local")
+    await _admit(runs)
+    await runs.mark_queued("run-1")
+    t0 = _now()
+    lease = await runs.claim("run-1", worker_id="w1", now=t0, lease_seconds=30)
+    assert lease is not None and lease.attempt == 1
+
+    # The worker begins to suspend: checkpoint marker persists (fenced), the approval is
+    # durable and bound to attempt 1 — but the worker crashes BEFORE the run releases to
+    # waiting_approval. The row is therefore still ``running`` with the marker set.
+    assert await runs.mark_checkpoint(lease, now=t0) is True
+    args = {"to": "z@x"}
+    bound = action_hash("email.send", args)
+    approval_id = await approvals.create_pending(
+        scope_id="web:local",
+        run_id="run-1",
+        session_id="sess-1",
+        tool="email.send",
+        args=args,
+        call_id="c1",
+        idempotency_key="i1",
+        reason="first_use",
+        expires_at=t0 + timedelta(hours=1),
+        org_id="org-1",
+        actor="user-1",
+        action_hash=bound,
+        run_attempt=1,
+        batch_id="b1",
+    )
+    crashed = await runs.get("run-1")
+    assert crashed is not None and crashed.status is RunStatus.running
+    assert crashed.suspend_checkpoint is True and crashed.checkpoint_attempt == 1
+
+    # Lease expiry -> reclaim: the marker makes the reclaim RESUME (not restart-fresh). The
+    # lease attempt advances to 2 for fencing, but the checkpoint (source) attempt stays 1.
+    t1 = t0 + timedelta(seconds=60)
+    assert await runs.reclaimable(t1, 10) == ["run-1"]
+    reclaimed = await runs.claim("run-1", worker_id="w2", now=t1, lease_seconds=30)
+    assert reclaimed is not None and reclaimed.attempt == 2 and reclaimed.resume is True
+    record = await runs.get("run-1")
+    assert record is not None and record.suspend_checkpoint is True
+    assert record.checkpoint_attempt == 1  # source attempt preserved across the reclaim
+
+    # The reclaimed worker resumes, finds the approval still pending, and safely restores
+    # waiting_approval (release). The marker clears but the source attempt stays 1.
+    await runs.release(reclaimed, to_status=RunStatus.waiting_approval, now=t1)
+    restored = await runs.get("run-1")
+    assert restored is not None and restored.status is RunStatus.waiting_approval
+    assert restored.suspend_checkpoint is False and restored.checkpoint_attempt == 1
+
+    # The operator's decision, bound to the SOURCE attempt (1), still binds and requeues even
+    # though the lease attempt is now 2 — the approved action is NOT silently discarded.
+    enq: list[str] = []
+    service = _pg_service(runs, approvals, enq)
+    ok = await service.resolve_approval(  # type: ignore[attr-defined]
+        approval_id, approved=True, resolved_by="user-1", actor="user-1", org_id="org-1"
+    )
+    assert ok is True and enq == ["run-1"]
+    requeued = await runs.get("run-1")
+    assert requeued is not None and requeued.status is RunStatus.queued
+    assert requeued.resume_requested
+    assert (await approvals.get(approval_id)).status == "granted"  # type: ignore[union-attr]
+
+
+async def test_release_to_waiting_clears_checkpoint_marker(migrated_db: AsyncEngine) -> None:
+    store = PostgresRunStore(migrated_db, "web:local")
+    await _admit(store)
+    await store.mark_queued("run-1")
+    t0 = _now()
+    lease = await store.claim("run-1", worker_id="w1", now=t0, lease_seconds=30)
+    assert lease is not None
+    assert await store.mark_checkpoint(lease, now=t0) is True
+    # Releasing to waiting_approval durably reflects the suspension; the crash-window marker
+    # is cleared, while the source (checkpoint) attempt is preserved for approval binding.
+    await store.release(lease, to_status=RunStatus.waiting_approval, now=t0)
+    rec = await store.get("run-1")
+    assert rec is not None and rec.status is RunStatus.waiting_approval
+    assert rec.suspend_checkpoint is False and rec.checkpoint_attempt == 1

@@ -27,6 +27,11 @@ survive a server **and** worker restart and are safe under N racing workers.
 * ``runs`` additionally persists an immutable admission ``fingerprint`` and namespaces its
   admission-identity uniqueness by ``(scope_id, org_id, actor, idempotency_key)`` so one
   tenant/actor cannot collide with or hijack another's run via a shared idempotency key.
+* ``runs`` carries a durable suspension checkpoint (``suspend_checkpoint`` +
+  ``checkpoint_attempt``): set — fenced by the active lease — before an approval batch is
+  persisted, so a worker crash before the ``running -> waiting_approval`` release still lets
+  the lease-expiry reclaim *resume* (honouring the durable approval) instead of restarting
+  fresh and silently discarding the (later approved) action.
 
 Row-Level Security (ADR-0009 / DESIGN-REVIEW G16): ``runs`` and ``run_control`` carry the
 ``app.scope_id`` policy (mirroring ``jobs`` / ``approvals``) plus ``FORCE ROW LEVEL
@@ -95,6 +100,16 @@ def upgrade() -> None:
             -- Cumulative agent-loop iterations consumed across claim/suspend/resume attempts,
             -- so max_iterations bounds the whole run (a resume cannot reset the budget).
             iterations integer NOT NULL DEFAULT 0 CHECK (iterations >= 0),
+            -- Durable suspension checkpoint (M3.6 crash boundary): set — fenced by the active
+            -- lease — the instant a worker begins persisting an approval batch, BEFORE the
+            -- running -> waiting_approval release. If the worker crashes in that window the row
+            -- is still 'running' with a durable approval bound to its attempt; the marker makes
+            -- the lease-expiry reclaim *resume* (honouring the approval) instead of restarting
+            -- fresh and silently discarding it. checkpoint_attempt records the batch's source
+            -- attempt for approval binding, preserved across a reclaim (the lease attempt
+            -- advances for fencing, this does not). Defaults so pre-existing rows upgrade safely.
+            suspend_checkpoint boolean NOT NULL DEFAULT false,
+            checkpoint_attempt integer NOT NULL DEFAULT 0 CHECK (checkpoint_attempt >= 0),
             created_at timestamptz NOT NULL DEFAULT now(),
             updated_at timestamptz NOT NULL DEFAULT now(),
             started_at timestamptz,

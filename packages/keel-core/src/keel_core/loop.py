@@ -389,6 +389,7 @@ async def _run_tools(
     approvals: ApprovalStore | None = None,
     expires_at: datetime | None = None,
     binding: ApprovalBinding | None = None,
+    on_suspend: Callable[[], Awaitable[None]] | None = None,
 ) -> list[str]:
     """Emit tool.call events, run the calls through the parallel-safe permission-gated
     executor, then emit tool.result events — all in source order. A failing tool yields
@@ -425,6 +426,13 @@ async def _run_tools(
         ]
         if asks:
             reason = "tainted" if ctx.content_taint is ContentTaint.tainted else "first_use"
+            # Durable suspension checkpoint (M3.6 crash boundary): record the intent *before*
+            # any approval row/event is persisted, fenced by the active lease/attempt. If the
+            # worker crashes after this but before the run releases to waiting_approval, the
+            # still-``running`` row carries a marker so the lease-expiry reclaim resumes
+            # (honouring the durable approval) instead of restarting fresh and discarding it.
+            if on_suspend is not None:
+                await on_suspend()
             # Every approval raised by this one suspended batch shares a batch_id, so the run
             # resumes only once *all* of them are terminal (M3.6 blocker 5).
             batch_id = uuid.uuid4().hex
@@ -508,6 +516,7 @@ async def _agent_loop(
     start_iteration: int = 0,
     system_context: SystemContextFn | None = None,
     binding: ApprovalBinding | None = None,
+    on_suspend: Callable[[], Awaitable[None]] | None = None,
 ) -> _LoopOutcome:
     """The turn loop: build request -> call provider -> (gate) run tools -> repeat.
 
@@ -582,6 +591,7 @@ async def _agent_loop(
                 approvals,
                 expires_at,
                 binding,
+                on_suspend,
             )
             if suspended:
                 pending = suspended
@@ -626,6 +636,7 @@ async def run(
     system_context: SystemContextFn | None = None,
     binding: ApprovalBinding | None = None,
     start_iteration: int = 0,
+    on_suspend: Callable[[], Awaitable[None]] | None = None,
 ) -> RunResult:
     """Execute the agent loop until a named termination and return the result.
 
@@ -683,6 +694,7 @@ async def run(
         system_context=system_context,
         binding=binding,
         start_iteration=start_iteration,
+        on_suspend=on_suspend,
     )
 
     if outcome.reason is StopReason.suspended:
@@ -759,6 +771,7 @@ async def resume(
     system_context: SystemContextFn | None = None,
     binding: ApprovalBinding | None = None,
     start_iteration: int = 0,
+    on_suspend: Callable[[], Awaitable[None]] | None = None,
 ) -> RunResult:
     """Resume a suspended run: resolve its pending tool batch, then continue the loop.
 
@@ -881,6 +894,7 @@ async def resume(
         system_context=system_context,
         binding=binding,
         start_iteration=start_iteration,
+        on_suspend=on_suspend,
     )
 
     if outcome.reason is StopReason.suspended:
