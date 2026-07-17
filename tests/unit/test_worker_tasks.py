@@ -95,7 +95,10 @@ async def test_run_agent_missing_schedule_is_a_noop() -> None:
     assert await run_agent(ctx, "nope") == "missing"
 
 
-async def test_scheduler_tick_enqueues_due_and_expires_stale() -> None:
+async def test_scheduler_tick_enqueues_due_and_does_not_own_approval_expiry() -> None:
+    # Approval expiry moved to the durable reconciler (M3.6, item 6): the legacy scheduler
+    # must never consume/route approvals, so a durable interactive approval can't be sent to
+    # the wrong resume_run job. scheduler_tick now only advances the schedule due-loop.
     approvals = InMemoryApprovalStore()
     await approvals.create_pending(
         scope_id="u:1",
@@ -106,7 +109,7 @@ async def test_scheduler_tick_enqueues_due_and_expires_stale() -> None:
         call_id="c",
         idempotency_key="k",
         reason="tainted",
-        expires_at=_NOW - timedelta(minutes=1),  # already stale -> fail-closed
+        expires_at=_NOW - timedelta(minutes=1),  # already stale
     )
     enqueued: list[tuple[Any, ...]] = []
 
@@ -122,7 +125,10 @@ async def test_scheduler_tick_enqueues_due_and_expires_stale() -> None:
     count = await scheduler_tick(ctx)
     assert count == 1
     assert ("run_agent", "daily") in enqueued
-    assert any(e[0] == "resume_run" for e in enqueued)  # the expired approval is resumed to deny
+    # No approval routing here anymore — the reconciler owns expiry.
+    assert not any(e[0] == "resume_run" for e in enqueued)
+    # The approval stays pending (untouched) for the reconciler to expire + route.
+    assert len(await approvals.list_pending("u:1")) == 1
 
 
 async def test_resume_run_completes_after_grant() -> None:
@@ -189,6 +195,82 @@ async def test_run_agent_rejects_unknown_agent_id() -> None:
     )
     ctx: dict[str, Any] = {"schedules": InMemoryScheduleStore([row])}
     assert await run_agent(ctx, "weird") == "unsupported"
+
+
+async def test_reconcile_runs_tick_owns_approval_expiry_routing() -> None:
+    # The reconciler is the single owner of approval expiry (item 6): it resumes a durable
+    # interactive approval through run_interactive and a legacy approval through resume_run.
+    from keel_core.runs import (
+        InMemoryRunStore,
+        RunBudgetSpec,
+        RunStatus,
+        RunSurface,
+        action_hash,
+    )
+    from keel_worker.runs import reconcile_runs_tick
+
+    scope = "web:local"
+    runs, events, approvals = InMemoryRunStore(), InMemoryEventStore(), InMemoryApprovalStore()
+    now = datetime.now(UTC)
+    await runs.admit(
+        run_id="run-1",
+        scope_id=scope,
+        org_id="org-1",
+        actor="user-1",
+        agent_id="agent-1",
+        session_id="s1",
+        surface=RunSurface.web.value,
+        idempotency_key="k1",
+        budget=RunBudgetSpec(),
+        expires_at=now + timedelta(hours=1),
+    )
+    await runs.mark_queued("run-1")
+    lease = await runs.claim("run-1", worker_id="w1", lease_seconds=30)
+    assert lease is not None
+    await runs.release(lease, to_status=RunStatus.waiting_approval)
+    await approvals.create_pending(
+        scope_id=scope,
+        run_id="run-1",
+        session_id="s1",
+        tool="email.send",
+        args={},
+        call_id="c1",
+        idempotency_key="i1",
+        reason="tainted",
+        expires_at=now - timedelta(seconds=1),
+        org_id="org-1",
+        actor="user-1",
+        action_hash=action_hash("email.send", {}),
+        run_attempt=1,
+    )
+    await approvals.create_pending(
+        scope_id=scope,
+        run_id="legacy-run",
+        session_id="sched-sess",
+        tool="email.send",
+        args={},
+        call_id="c2",
+        idempotency_key="i2",
+        reason="tainted",
+        expires_at=now - timedelta(seconds=1),
+    )
+    enqueued: list[tuple[Any, ...]] = []
+
+    async def enqueue(name: str, *args: object) -> None:
+        enqueued.append((name, *args))
+
+    ctx: dict[str, Any] = {
+        "runs": runs,
+        "store": events,
+        "approvals": approvals,
+        "enqueue": enqueue,
+        "durable_scope": scope,
+    }
+    await reconcile_runs_tick(ctx)
+    assert ("run_interactive", "run-1", scope) in enqueued  # durable interactive routing
+    assert ("resume_run", "sched-sess", "legacy-run", scope) in enqueued  # legacy routing
+    record = await runs.get("run-1")
+    assert record is not None and record.status is RunStatus.queued
 
 
 def test_worker_registers_job_functions_and_dispatch_cron() -> None:

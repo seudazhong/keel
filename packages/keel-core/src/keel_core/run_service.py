@@ -29,8 +29,16 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from keel_core.agents import AgentSpec
-from keel_core.approvals import ApprovalStore
-from keel_core.loop import ApprovalBinding, RunBudget, ToolRegistry, admit_run
+from keel_core.approvals import ApprovalRecord, ApprovalStore
+from keel_core.errors import DuplicateEventError
+from keel_core.loop import (
+    ApprovalBinding,
+    RunBudget,
+    ToolRegistry,
+    admit_run,
+    steer_persisted_in_log,
+)
+from keel_core.loop import admit_steer as loop_admit_steer
 from keel_core.loop import resume as loop_resume
 from keel_core.loop import run as loop_run
 from keel_core.protocols import EventStore, PermissionEngine, ProviderGateway
@@ -43,6 +51,7 @@ from keel_core.runs import (
     RunRecord,
     RunStatus,
     RunStore,
+    action_hash,
 )
 from keel_core.types import RunId, ScopeId, SessionId, StopReason
 
@@ -54,6 +63,9 @@ EnqueueFn = Callable[[RunId], Awaitable[None]]
 VisibilityCheck = Callable[[RunRecord], Awaitable[bool]]
 SystemContextFn = Callable[[], Awaitable[str]]
 PromptPersistedCheck = Callable[[RunRecord], Awaitable[bool]]
+# Routes an expired *legacy* (non-durable-run) approval to its own resume path — the durable
+# reconciler is the single owner of approval expiry, so it must also dispatch legacy resumes.
+LegacyResumeFn = Callable[[ApprovalRecord], Awaitable[None]]
 
 _ADMISSION_MARKER = "admission_run"
 
@@ -167,12 +179,17 @@ class DurableRunService:
 
         # Fresh admission, or crash-repair of a half-admitted row: complete the missing steps
         # idempotently, always persisting the prompt *before* the queued/dispatch transition.
-        # 1) Persist the user turn *before* any dispatch (invariant I2), exactly once.
+        # 1) Persist the user turn *before* any dispatch (invariant I2), exactly once — a
+        #    concurrent/duplicate admitter loses the durable-append race (DuplicateEventError)
+        #    and observes the winner's turn rather than appending a second prompt.
         await self._ensure_prompt(record.id, session_id, content)
-        # 2) admitted -> queued (idempotent no-op once queued).
-        await self._runs.mark_queued(record.id, now=now)
-        # 3) Dispatch a worker job (a duplicate enqueue is deduped by the claim).
-        await self._enqueue(record.id)
+        # 2) admitted -> queued is an atomic, single-winner transition; only the caller that
+        #    wins it dispatches, so N concurrent admitters enqueue the worker job exactly once
+        #    (a lost enqueue after this point is repaired by the reconciler, not re-sent here).
+        queued = await self._runs.mark_queued(record.id, now=now)
+        if queued:
+            # 3) Dispatch a worker job (a duplicate enqueue is deduped by the claim).
+            await self._enqueue(record.id)
         if created:
             logger.info(
                 "run admitted scope=%s run=%s org=%s actor=%s agent=%s session=%s surface=%s",
@@ -187,11 +204,20 @@ class DurableRunService:
         return AdmitResult(run_id=record.id, created=created)
 
     async def _ensure_prompt(self, run_id: RunId, session_id: SessionId, content: str) -> None:
-        """Append the admission user turn exactly once (crash-safe via the log marker)."""
+        """Append the admission user turn exactly once (crash- and concurrency-safe).
+
+        The ``dedup_key`` partial-unique index makes the append atomic across processes: two
+        concurrent admitters cannot both persist the prompt — the loser raises
+        :class:`~keel_core.errors.DuplicateEventError` and simply observes the winner's turn.
+        A crash between run creation and this append is repaired by a later retry (the marker
+        is absent, so the retry appends and wins)."""
         if await prompt_persisted_in_log(self._events, session_id, run_id):
             await self._runs.mark_prompt_persisted(run_id)
             return
-        await admit_run(self._events, session_id, self._scope_id, content, run_id)
+        try:
+            await admit_run(self._events, session_id, self._scope_id, content, run_id)
+        except DuplicateEventError:
+            pass  # a concurrent admitter won the durable append; observe, never duplicate
         await self._runs.mark_prompt_persisted(run_id)
 
     async def interrupt(self, run_id: RunId, *, requested_by: str) -> bool:
@@ -219,18 +245,27 @@ class DurableRunService:
         approved: bool,
         resolved_by: str,
         org_id: str | None = None,
-        expected_action_hash: str | None = None,
-        expected_run_attempt: int | None = None,
+        actor: str | None = None,
     ) -> bool:
-        """Resolve a durable interactive approval, fully bound, and resume its run.
+        """Resolve a durable interactive approval, fully bound to the **current** run.
 
-        Binding is **never optional** on the durable path: the decision is checked against
-        the run's org (cross-org denial), the run must currently be ``waiting_approval``
-        (state check), and the approval row's ``action_hash`` + ``run_attempt`` must match
-        (defaulting to the record's own values so a caller that omits them still gets the
-        binding). An expired approval fails closed (``resolve`` no-ops on a non-pending row).
-        On success the suspended run transitions ``waiting_approval -> queued`` with an
-        explicit resume marker and a ``run_interactive`` job is enqueued.
+        Every binding field is verified against the run row as it exists *now* — never
+        defaulted from the approval's own copies (which an attacker/stale replay controls):
+
+        * the approval's ``run_id`` must resolve to a durable run (else it is not ours);
+        * the run must currently be ``waiting_approval`` (state gate);
+        * the resolver's authenticated ``org_id`` (when supplied) must equal the run's org
+          (cross-org denial), and the approval's stored ``org_id`` must equal the run's org;
+        * the approval's ``actor`` must match the run's owner, and when the resolver's
+          ``actor`` is supplied it must match too (no impersonation);
+        * the approval's ``run_attempt`` must equal the run's **current** ``attempt`` — an
+          attempt-0 approval can never resume an attempt-1 (reclaimed/advanced) run;
+        * the ``action_hash`` is **recomputed** from the approval's stored exact tool + args
+          and must equal the stored hash (tamper/replay defense).
+
+        Only if all bindings hold does the transactional ``resolve`` fire (with the verified
+        hash + current attempt as CAS guards), the run transition ``waiting_approval ->
+        queued`` with a resume marker, and a ``run_interactive`` resume job enqueue.
         """
         record = await self._approvals.get(approval_id)
         if record is None:
@@ -239,21 +274,30 @@ class DurableRunService:
         if run is None:
             # Not a durable interactive run (e.g. a legacy scheduled approval): not ours.
             return False
-        if org_id is not None and run.org_id != org_id:
-            return False  # cross-org resolution denied (fail closed)
         if run.status is not RunStatus.waiting_approval:
             return False  # only resolve a genuinely suspended run
+        # Bind to the CURRENT run, not the approval's own (possibly stale) copies.
+        if record.org_id != run.org_id:
+            return False  # approval was bound to a different org than the run now has
+        if org_id is not None and run.org_id != org_id:
+            return False  # cross-org resolution denied (fail closed)
+        if record.actor != run.actor:
+            return False  # approval was bound to a different actor than the run owner
+        if actor is not None and record.actor != actor:
+            return False  # resolver identity does not match the bound actor
+        if record.run_attempt != run.attempt:
+            return False  # attempt-0 approval cannot resume an attempt-1 run (fail closed)
+        # Recompute the action hash from the stored exact action payload (never trust the
+        # stored hash blindly): a mismatch means the row was tampered with -> fail closed.
+        if record.action_hash != action_hash(record.tool, record.args):
+            return False
         status = "granted" if approved else "denied"
         resolved = await self._approvals.resolve(
             approval_id,
             status,
             resolved_by,
-            expected_action_hash=(
-                expected_action_hash if expected_action_hash is not None else record.action_hash
-            ),
-            expected_run_attempt=(
-                expected_run_attempt if expected_run_attempt is not None else record.run_attempt
-            ),
+            expected_action_hash=record.action_hash,
+            expected_run_attempt=run.attempt,
         )
         if not resolved:
             return False
@@ -270,12 +314,20 @@ class DurableRunService:
         )
         return True
 
-    async def expire_approvals(self, *, now: datetime | None = None) -> int:
-        """Expire past-deadline approvals and resume their suspended runs (fail closed).
+    async def expire_approvals(
+        self, *, now: datetime | None = None, legacy_resume: LegacyResumeFn | None = None
+    ) -> int:
+        """Expire past-deadline approvals and route each to the correct resume path.
 
-        A timed-out approval is a denial: the run must resume so the loop records the
-        denied tool result and drives to a named terminal state, rather than hanging in
-        ``waiting_approval`` forever. Returns the number of runs requeued for resume."""
+        This is the **single owner** of durable-approval expiry (M3.6, item 6): the legacy
+        scheduler no longer expires approvals, so both interactive and legacy approvals are
+        classified + routed here transactionally. ``expire_due`` mutates each pending row to
+        ``expired`` exactly once (RETURNING), so even under simultaneous reconciler ticks no
+        approval is consumed twice. A durable **interactive** approval (its ``run_id`` is a
+        durable run currently ``waiting_approval``) requeues the run and enqueues a
+        ``run_interactive`` resume; a **legacy** approval (no durable run row) is dispatched
+        via ``legacy_resume`` — never through the durable run state machine, and never left
+        hanging. Returns the number of runs resumed."""
         now = now or datetime.now(UTC)
         expired = await self._approvals.expire_due(now)
         resumed = 0
@@ -284,7 +336,13 @@ class DurableRunService:
             if record is None:
                 continue
             run = await self._runs.get(record.run_id)
-            if run is None or run.status is not RunStatus.waiting_approval:
+            if run is None:
+                # Legacy scheduled/digest approval: route to its own (non-durable) resume.
+                if legacy_resume is not None:
+                    await legacy_resume(record)
+                    resumed += 1
+                continue
+            if run.status is not RunStatus.waiting_approval:
                 continue
             if await self._runs.requeue(record.run_id):
                 await self._enqueue(record.run_id)
@@ -330,7 +388,23 @@ class _ControlWatcher:
             elif control.kind is RunControlKind.steer:
                 text = str(control.payload.get("text", "")).strip()
                 if text:
-                    await self.admit_fn(self.event_store, self.session_id, self.scope_id, text)
+                    # Persist the steering turn keyed by the control id. If a prior owner
+                    # already appended it (crash after append, before ack), the durable
+                    # marker makes this a no-op instead of a duplicate steering message.
+                    if not await steer_persisted_in_log(
+                        self.event_store, self.session_id, control.id
+                    ):
+                        try:
+                            await loop_admit_steer(
+                                self.event_store,
+                                self.session_id,
+                                self.scope_id,
+                                text,
+                                self.run_id,
+                                control.id,
+                            )
+                        except DuplicateEventError:
+                            pass  # a racing watcher won the append; the turn is durable
                 # Ack steer only AFTER the durable user turn is appended (never before).
                 await self.run_store.ack_controls([control.id])
 
@@ -362,9 +436,11 @@ class _ControlWatcher:
 class _LeaseKeeper:
     """Renews a fenced lease well before expiry; flags the lease **lost** on failure.
 
-    A lost renewal (another worker reclaimed, or the row moved out from under us) means the
-    lease is stale: ``lost`` trips the loop's interrupt predicate so no further model call,
-    tool batch, event, or terminal write proceeds under the superseded lease (fail closed).
+    A lost renewal — a ``False`` return (another worker reclaimed, or the row moved out from
+    under us) **or any exception** from ``renew`` — means the lease is stale: ``lost`` trips
+    the loop's interrupt predicate so no further model call, tool batch, event, or terminal
+    write proceeds under the superseded lease (fail closed). The keeper is supervised for the
+    whole run; a failure inside it is never allowed to mask the run's primary outcome/error.
     """
 
     run_store: RunStore
@@ -380,9 +456,20 @@ class _LeaseKeeper:
         try:
             while True:
                 await asyncio.sleep(self.interval_seconds)
-                renewed = await self.run_store.renew(
-                    self.lease, lease_seconds=self.lease.lease_seconds
-                )
+                try:
+                    renewed = await self.run_store.renew(
+                        self.lease, lease_seconds=self.lease.lease_seconds
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 - any renew failure is a lost lease (fail closed)
+                    logger.warning(
+                        "lease renewal raised; marking lease lost run=%s",
+                        self.lease.run_id,
+                        exc_info=True,
+                    )
+                    self.lost = True
+                    return
                 if not renewed:
                     self.lost = True
                     return
@@ -396,6 +483,8 @@ class _LeaseKeeper:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            except Exception:  # noqa: BLE001 - keeper cleanup must not mask the primary error
+                logger.warning("lease keeper task error suppressed on stop", exc_info=True)
 
 
 def _budget_for(lease: RunLease) -> RunBudget:
@@ -492,6 +581,7 @@ async def execute_run(
                 expires_at=expires_at,
                 system_context=system_context,
                 binding=binding,
+                start_iteration=lease.iterations_used,
             )
         else:
             result = await loop_run(
@@ -509,6 +599,7 @@ async def execute_run(
                 on_event=on_event,
                 system_context=system_context,
                 binding=binding,
+                start_iteration=lease.iterations_used,
             )
     finally:
         await watcher.stop()
@@ -520,18 +611,30 @@ async def execute_run(
         current = await run_store.get(lease.run_id)
         return current if current is not None else record
 
-    cost = RunCost(
-        prompt_tokens=result.usage.prompt_tokens,
-        completion_tokens=result.usage.completion_tokens,
-    )
     terminal_now = datetime.now(UTC)
 
     if result.reason is StopReason.suspended:
-        # A durable approval is pending: release the lease and wait to be resumed.
+        # A durable approval is pending: release the lease and wait to be resumed. The
+        # suspended tool batch executes on resume, so it consumes an iteration — persist
+        # ``+1`` here so ``max_iterations`` bounds the run across the suspend/resume boundary
+        # (a resumed run cannot mint a fresh iteration budget). Provider-reported cost is
+        # propagated so cumulative cost_usd survives the suspension.
+        suspend_cost = RunCost(
+            prompt_tokens=result.usage.prompt_tokens,
+            completion_tokens=result.usage.completion_tokens,
+            cost_usd=result.usage.cost_usd,
+            iterations=max(0, (result.iterations + 1) - lease.iterations_used),
+        )
         return await run_store.release(
-            lease, to_status=RunStatus.waiting_approval, now=terminal_now, cost=cost
+            lease, to_status=RunStatus.waiting_approval, now=terminal_now, cost=suspend_cost
         )
 
+    cost = RunCost(
+        prompt_tokens=result.usage.prompt_tokens,
+        completion_tokens=result.usage.completion_tokens,
+        cost_usd=result.usage.cost_usd,
+        iterations=max(0, result.iterations - lease.iterations_used),
+    )
     status = _TERMINAL_FOR.get(result.reason, RunStatus.completed)
     if watcher.cancelled:
         status = RunStatus.cancelled

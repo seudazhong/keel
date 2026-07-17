@@ -82,6 +82,9 @@ def upgrade() -> None:
             -- Durable admission progress: true once the user turn is persisted. Reconciliation
             -- must never dispatch a run whose prompt was not durably admitted.
             prompt_persisted boolean NOT NULL DEFAULT false,
+            -- Cumulative agent-loop iterations consumed across claim/suspend/resume attempts,
+            -- so max_iterations bounds the whole run (a resume cannot reset the budget).
+            iterations integer NOT NULL DEFAULT 0 CHECK (iterations >= 0),
             created_at timestamptz NOT NULL DEFAULT now(),
             updated_at timestamptz NOT NULL DEFAULT now(),
             started_at timestamptz,
@@ -129,6 +132,16 @@ def upgrade() -> None:
         "WHERE consumed_at IS NULL"
     )
 
+    # --- Durably-unique admission / steering turns ------------------------------------
+    # A partial-unique index on the ``dedup_key`` marker makes the admission user turn and
+    # each steering user turn append **exactly once** even under N racing admitters/workers:
+    # a concurrent or replayed append loses the race here (surfaced as DuplicateEventError)
+    # instead of duplicating the prompt/steer message. Only the winner appends + dispatches.
+    op.execute(
+        "CREATE UNIQUE INDEX ux_events_dedup ON events (scope_id, (payload->>'dedup_key')) "
+        "WHERE payload ? 'dedup_key'"
+    )
+
     # --- Cross-surface approval binding (bind a decision to run attempt + action) ------
     # Additive columns; existing rows default so the migration is safe on populated DBs.
     op.execute("ALTER TABLE approvals ADD COLUMN org_id text NOT NULL DEFAULT ''")
@@ -165,6 +178,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute("DROP INDEX IF EXISTS ux_events_dedup")
     op.execute("ALTER TABLE approvals DROP COLUMN IF EXISTS run_attempt")
     op.execute("ALTER TABLE approvals DROP COLUMN IF EXISTS action_hash")
     op.execute("ALTER TABLE approvals DROP COLUMN IF EXISTS actor")

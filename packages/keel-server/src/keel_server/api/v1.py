@@ -432,24 +432,75 @@ async def resolve_approval(
 async def list_approvals(
     request: Request, status_filter: str = Query("pending", alias="status")
 ) -> list[dict[str, object]]:
-    """Durable approvals raised by unattended runs (pending queue by default)."""
+    """Durable approvals visible to the requesting actor (pending queue by default).
+
+    The durable interactive runtime shares a single data-plane scope across orgs, so a raw
+    ``list_pending`` would leak one org's tool/args to another (M3.6, item 8). Each approval
+    is therefore filtered by ownership: a **durable interactive** approval (its ``run_id`` is
+    a durable run) is exposed only to an actor authorized for that run's org — a cloud user
+    must be an active member; the local/machine single-tenant operator sees its own scope.
+    A **legacy local-preview** approval (no durable run row) is explicitly isolated to the
+    local/machine operator and labeled ``origin=local-preview`` — never surfaced to a cloud
+    user's org view.
+    """
     store, scope = _durable_approvals(request)
-    rows = await store.list_pending(scope) if status_filter == "pending" else []
-    return [
-        {
-            "id": r.id,
-            "run_id": r.run_id,
-            "session_id": r.session_id,
-            "tool": r.tool,
-            "args": r.args,
-            "call_id": r.call_id,
-            "reason": r.reason,
-            "status": r.status,
-            "created_at": r.created_at.isoformat(),
-            "expires_at": r.expires_at.isoformat(),
-        }
-        for r in rows
-    ]
+    if status_filter != "pending":
+        return []
+    actor = await resolve_actor(request)
+    run_store: RunStore | None = getattr(request.app.state, "runs", None)
+    rows = await store.list_pending(scope)
+    org_access: dict[str, bool] = {}
+    result: list[dict[str, object]] = []
+    for r in rows:
+        run = await run_store.get(r.run_id) if run_store is not None else None
+        if run is not None:
+            org_id = run.org_id
+            if org_id not in org_access:
+                org_access[org_id] = await _may_access_org(request, actor, org_id)
+            if not org_access[org_id]:
+                continue  # cross-org durable interactive approval — never exposed
+            origin: str = "interactive"
+        else:
+            # Legacy local-preview approval: isolated to the local/machine operator.
+            if actor.is_user:
+                continue
+            origin = "local-preview"
+        result.append(
+            {
+                "id": r.id,
+                "run_id": r.run_id,
+                "session_id": r.session_id,
+                "tool": r.tool,
+                "args": r.args,
+                "call_id": r.call_id,
+                "reason": r.reason,
+                "status": r.status,
+                "origin": origin,
+                "org_id": run.org_id if run is not None else None,
+                "created_at": r.created_at.isoformat(),
+                "expires_at": r.expires_at.isoformat(),
+            }
+        )
+    return result
+
+
+async def _may_access_org(request: Request, actor: Any, org_id: str) -> bool:
+    """Whether ``actor`` may see approvals bound to ``org_id`` (fail closed for users).
+
+    A non-user (local operator / API-key machine) stays within its single scope-bound tenant
+    (local-preview compatibility). A cloud user must be an *active member* of the run's org —
+    resolved through the identity service exactly like :func:`_authorize_run`, so a non-member
+    is treated identically to an unknown org (no exposure, no existence leak)."""
+    if not actor.is_user:
+        return True
+    service = getattr(request.app.state, "identity", None)
+    if service is None or actor.user_id is None:
+        return False
+    try:
+        await service.select_org(actor.user_id, org_id)
+    except NotFoundError:
+        return False
+    return True
 
 
 async def _resolve_durable(request: Request, approval_id: str, decision: str) -> dict[str, bool]:

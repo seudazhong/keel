@@ -202,6 +202,10 @@ class RunRecord:
     # Durable admission progress: the user turn is persisted before the run is dispatched.
     # Reconciliation must never dispatch a run whose prompt was not durably admitted.
     prompt_persisted: bool = False
+    # Cumulative agent-loop iterations consumed across every claim/suspend/resume attempt.
+    # Persisted so ``max_iterations`` bounds the *whole* run: a resumed run resumes the
+    # counter rather than minting a fresh iteration budget (M3.6 cumulative-budget invariant).
+    iterations: int = 0
 
     @property
     def is_terminal(self) -> bool:
@@ -239,6 +243,9 @@ class RunLease:
     token_budget: int | None = None
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    # Cumulative iterations already consumed by prior attempts — the resume loop seeds its
+    # counter here so ``max_iterations`` bounds the run across suspend/resume (never reset).
+    iterations_used: int = 0
 
 
 @dataclass(frozen=True)
@@ -261,6 +268,9 @@ class RunCost:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost_usd: float = 0.0
+    # Iteration delta consumed this attempt; accrued onto the run's cumulative counter so a
+    # suspend/resume cannot reset the iteration budget (M3.6).
+    iterations: int = 0
 
 
 @runtime_checkable
@@ -548,6 +558,7 @@ class InMemoryRunStore:
             token_budget=record.token_budget,
             prompt_tokens=record.prompt_tokens,
             completion_tokens=record.completion_tokens,
+            iterations_used=record.iterations,
         )
 
     def _owned(self, lease: RunLease) -> RunRecord:
@@ -590,6 +601,7 @@ class InMemoryRunStore:
         record.prompt_tokens += cost.prompt_tokens
         record.completion_tokens += cost.completion_tokens
         record.cost_usd += cost.cost_usd
+        record.iterations += cost.iterations
 
     async def release(
         self,
@@ -755,8 +767,8 @@ _RUN_COLUMNS = (
     "id, scope_id, org_id, actor, agent_id, session_id, surface, idempotency_key, status, "
     "stop_reason, attempt, version, worker_id, lease_token, lease_expires_at, heartbeat_at, "
     "max_iterations, token_budget, prompt_tokens, completion_tokens, cost_usd, result_ref, "
-    "error_kind, error_message, resume_requested, prompt_persisted, created_at, updated_at, "
-    "started_at, finished_at, expires_at"
+    "error_kind, error_message, resume_requested, prompt_persisted, iterations, created_at, "
+    "updated_at, started_at, finished_at, expires_at"
 )
 
 
@@ -788,6 +800,7 @@ def _to_record(row: Mapping[Any, Any]) -> RunRecord:
         error_message=row["error_message"],
         resume_requested=bool(row["resume_requested"]),
         prompt_persisted=bool(row["prompt_persisted"]),
+        iterations=row["iterations"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         started_at=row["started_at"],
@@ -1043,6 +1056,7 @@ class PostgresRunStore:
             token_budget=record.token_budget,
             prompt_tokens=record.prompt_tokens,
             completion_tokens=record.completion_tokens,
+            iterations_used=record.iterations,
         )
 
     async def heartbeat(self, lease: RunLease, now: datetime | None = None) -> bool:
@@ -1134,13 +1148,14 @@ class PostgresRunStore:
                 "status = :to_status, worker_id = NULL, lease_token = NULL, "
                 "lease_expires_at = NULL, prompt_tokens = prompt_tokens + :ptok, "
                 "completion_tokens = completion_tokens + :ctok, cost_usd = cost_usd + :cost, "
-                "updated_at = :now"
+                "iterations = iterations + :iters, updated_at = :now"
             ),
             params={
                 "to_status": to_status.value,
                 "ptok": cost.prompt_tokens,
                 "ctok": cost.completion_tokens,
                 "cost": cost.cost_usd,
+                "iters": cost.iterations,
                 "now": now,
             },
         )
@@ -1169,6 +1184,7 @@ class PostgresRunStore:
                     "lease_token = NULL, lease_expires_at = NULL, finished_at = :now, "
                     "prompt_tokens = prompt_tokens + :ptok, "
                     "completion_tokens = completion_tokens + :ctok, cost_usd = cost_usd + :cost, "
+                    "iterations = iterations + :iters, "
                     "result_ref = :result_ref, error_kind = :error_kind, "
                     "error_message = :error_message, updated_at = :now"
                 ),
@@ -1179,6 +1195,7 @@ class PostgresRunStore:
                     "ptok": cost.prompt_tokens,
                     "ctok": cost.completion_tokens,
                     "cost": cost.cost_usd,
+                    "iters": cost.iterations,
                     "result_ref": result_ref,
                     "error_kind": error_kind,
                     "error_message": error_message,

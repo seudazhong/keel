@@ -317,3 +317,164 @@ async def test_mark_prompt_persisted_is_idempotent(migrated_db: AsyncEngine) -> 
     assert await store.mark_prompt_persisted("run-1") is True
     assert await store.mark_prompt_persisted("run-1") is False  # already set
     assert (await store.get("run-1")).prompt_persisted is True  # type: ignore[union-attr]
+
+
+async def test_duplicate_admission_event_is_rejected_by_unique_index(
+    migrated_db: AsyncEngine,
+) -> None:
+    from keel_core.errors import DuplicateEventError
+    from keel_core.loop import admit_run, admit_steer
+    from keel_core.state import PostgresEventStore
+
+    events = PostgresEventStore(migrated_db, "web:local")
+    await admit_run(events, "sess-1", "web:local", "hello", "run-1")
+    with pytest.raises(DuplicateEventError):
+        await admit_run(events, "sess-1", "web:local", "hello again", "run-1")
+    # The steering marker is enforced by the same partial-unique index.
+    await admit_steer(events, "sess-1", "web:local", "use staging", "run-1", "ctrl-1")
+    with pytest.raises(DuplicateEventError):
+        await admit_steer(events, "sess-1", "web:local", "use staging", "run-1", "ctrl-1")
+    # Exactly one admission turn + one steer turn survive.
+    rows = [e async for e in events.read("sess-1")]
+    assert sum(1 for e in rows if e.payload.get("admission_run") == "run-1") == 1
+    assert sum(1 for e in rows if e.payload.get("steer_control") == "ctrl-1") == 1
+
+
+async def test_concurrent_admission_persists_one_prompt_and_enqueues_once(
+    migrated_db: AsyncEngine,
+) -> None:
+    from keel_core.approvals import PostgresApprovalStore
+    from keel_core.loop import admit as loop_admit
+    from keel_core.run_service import DurableRunService
+    from keel_core.state import PostgresEventStore
+
+    events = PostgresEventStore(migrated_db, "web:local")
+    runs = PostgresRunStore(migrated_db, "web:local")
+    approvals = PostgresApprovalStore(migrated_db, "web:local")
+    enqueued: list[str] = []
+
+    async def enqueue(run_id: str) -> None:
+        enqueued.append(run_id)
+
+    service = DurableRunService(
+        run_store=runs,
+        event_store=events,
+        approvals=approvals,
+        scope_id="web:local",
+        enqueue=enqueue,
+        admit_fn=loop_admit,
+    )
+
+    async def one() -> object:
+        return await service.admit(
+            org_id="org-1",
+            actor="user-1",
+            agent_id="agent-1",
+            session_id="sess-1",
+            surface=RunSurface.web.value,
+            content="hello",
+            idempotency_key="k1",
+        )
+
+    results = await asyncio.gather(*[one() for _ in range(6)], return_exceptions=True)
+    ok = [r for r in results if not isinstance(r, BaseException)]
+    assert len(ok) == 6  # every admitter completes (loser observes, never errors)
+    run_ids = {r.run_id for r in ok}  # type: ignore[attr-defined]
+    assert len(run_ids) == 1
+    (run_id,) = run_ids
+    rows = [e async for e in events.read("sess-1")]
+    assert sum(1 for e in rows if e.payload.get("admission_run") == run_id) == 1  # one prompt
+    assert enqueued == [run_id]  # dispatched exactly once
+
+
+async def test_iterations_accrue_cumulatively_across_release_and_terminalize(
+    migrated_db: AsyncEngine,
+) -> None:
+    store = PostgresRunStore(migrated_db, "web:local")
+    await _admit(store)
+    await store.mark_queued("run-1")
+    lease = await store.claim("run-1", worker_id="w1", now=_now(), lease_seconds=30)
+    assert lease is not None and lease.iterations_used == 0
+    # Suspend on an approval, consuming one iteration (persisted cumulatively).
+    await store.release(
+        lease,
+        to_status=RunStatus.waiting_approval,
+        cost=RunCost(prompt_tokens=4, completion_tokens=2, cost_usd=0.01, iterations=1),
+    )
+    rec = await store.get("run-1")
+    assert rec is not None and rec.iterations == 1 and rec.cost_usd == 0.01
+    # Resume: the claim carries the cumulative iteration count so the budget is not reset.
+    assert await store.requeue("run-1") is True
+    resumed = await store.claim("run-1", worker_id="w2", now=_now(), lease_seconds=30)
+    assert resumed is not None and resumed.iterations_used == 1 and resumed.resume is True
+    final = await store.terminalize(
+        resumed,
+        status=RunStatus.completed,
+        stop_reason="completed",
+        cost=RunCost(iterations=2, cost_usd=0.02),
+    )
+    assert final.iterations == 3 and final.cost_usd == 0.03  # cumulative across both attempts
+
+
+async def test_simultaneous_expiry_ticks_consume_each_approval_once(
+    migrated_db: AsyncEngine,
+) -> None:
+    from keel_core.approvals import ApprovalRecord, PostgresApprovalStore
+    from keel_core.loop import admit as loop_admit
+    from keel_core.run_service import DurableRunService
+    from keel_core.state import PostgresEventStore
+
+    runs = PostgresRunStore(migrated_db, "web:local")
+    events = PostgresEventStore(migrated_db, "web:local")
+    approvals = PostgresApprovalStore(migrated_db, "web:local")
+    # A durable interactive run suspended on an approval that has already expired.
+    await _admit(runs, run_id="run-1", key="k1")
+    await runs.mark_queued("run-1")
+    lease = await runs.claim("run-1", worker_id="w1", now=_now(), lease_seconds=30)
+    assert lease is not None
+    await runs.release(lease, to_status=RunStatus.waiting_approval)
+    await approvals.create_pending(
+        scope_id="web:local",
+        run_id="run-1",
+        session_id="sess-1",
+        tool="email.send",
+        args={},
+        call_id="c",
+        idempotency_key="i",
+        reason="tainted",
+        expires_at=_now() - timedelta(seconds=1),
+        org_id="org-1",
+        actor="user-1",
+        action_hash=action_hash("email.send", {}),
+        run_attempt=1,
+    )
+    enq_a: list[str] = []
+    enq_b: list[str] = []
+    legacy: list[str] = []
+
+    def _service(sink: list[str]) -> DurableRunService:
+        async def enqueue(run_id: str) -> None:
+            sink.append(run_id)
+
+        return DurableRunService(
+            run_store=runs,
+            event_store=events,
+            approvals=approvals,
+            scope_id="web:local",
+            enqueue=enqueue,
+            admit_fn=loop_admit,
+        )
+
+    async def legacy_resume(record: ApprovalRecord) -> None:
+        legacy.append(record.run_id)
+
+    # Two reconciler ticks fire simultaneously — the single owner of approval expiry.
+    res = await asyncio.gather(
+        _service(enq_a).expire_approvals(legacy_resume=legacy_resume),
+        _service(enq_b).expire_approvals(legacy_resume=legacy_resume),
+    )
+    assert sorted(res) == [0, 1]  # exactly one tick consumed + resumed the approval
+    assert enq_a.count("run-1") + enq_b.count("run-1") == 1  # never a double resume
+    assert legacy == []  # a durable interactive approval is never routed to the legacy path
+    rec = await runs.get("run-1")
+    assert rec is not None and rec.status is RunStatus.queued and rec.resume_requested

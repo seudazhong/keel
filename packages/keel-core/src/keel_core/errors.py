@@ -27,6 +27,22 @@ class MaintenanceDatabaseNotConfigured(KeelError):
     """
 
 
+class DuplicateEventError(KeelError):
+    """A durably-unique event append lost the race to a concurrent/duplicate writer.
+
+    Raised when appending an event whose uniqueness marker (an admission or steering
+    ``dedup_key``) is already present — the DB partial-unique index (or the in-memory
+    double) rejects the second insert. The caller treats this as an idempotent no-op:
+    the winning writer already persisted the durable turn, so a retry/concurrent admitter
+    or a reclaiming steering watcher must **observe** rather than append a duplicate
+    message (M3.6 concurrent-admission + steering-idempotency invariants).
+    """
+
+    def __init__(self, dedup_key: str) -> None:
+        self.dedup_key = dedup_key
+        super().__init__(f"duplicate durable event for dedup_key={dedup_key!r}")
+
+
 class CrossScopeError(KeelError):
     """A cross-scope access was attempted and denied (ADR-0009 / DESIGN-REVIEW G16).
 

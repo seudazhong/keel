@@ -18,7 +18,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from keel_core.agents import AgentSpec, Scope
-from keel_core.approvals import ApprovalStore
+from keel_core.approvals import ApprovalRecord, ApprovalStore
 from keel_core.config import Settings, get_settings
 from keel_core.interactive import build_interactive_tools, interactive_permissions
 from keel_core.loop import ToolRegistry, admit
@@ -132,6 +132,10 @@ async def reconcile_runs_tick(ctx: dict[str, Any]) -> int:
     async def _prompt_persisted(record: RunRecord) -> bool:
         return await prompt_persisted_in_log(event_store, record.session_id, record.id)
 
+    async def _legacy_resume(record: ApprovalRecord) -> None:
+        # A legacy scheduled/digest approval resumes through its own (non-durable) job.
+        await enqueue("resume_run", record.session_id, record.run_id, record.scope_id)
+
     now = datetime.now(UTC)
     result = await reconcile_runs(
         run_store=run_store,
@@ -147,7 +151,9 @@ async def reconcile_runs_tick(ctx: dict[str, Any]) -> int:
         enqueue=_enqueue,
         admit_fn=admit,
     )
-    resumed = await service.expire_approvals(now=now)
+    # Single owner of approval expiry: routes durable interactive approvals through the run
+    # state machine and legacy approvals through resume_run (item 6).
+    resumed = await service.expire_approvals(now=now, legacy_resume=_legacy_resume)
     return result.redispatched + result.reclaimed + result.expired + resumed
 
 

@@ -173,3 +173,97 @@ def test_legacy_approval_routes_to_resume_run() -> None:
     assert resp.status_code == 200 and resp.json() == {"ok": True}
     # The legacy scheduled/digest path keeps the existing resume_run behavior.
     assert enqueued == [("resume_run", ("sched-sess", "legacy-run", _SCOPE))]
+
+
+async def _seed_interactive_approval(
+    approvals: InMemoryApprovalStore, run_id: str, *, org_id: str, to: str
+) -> str:
+    return await approvals.create_pending(
+        scope_id=_SCOPE,
+        run_id=run_id,
+        session_id="sess-1",
+        tool="email.send",
+        args={"to": to},
+        call_id=f"c-{run_id}",
+        idempotency_key=f"i-{run_id}",
+        reason="first_use",
+        expires_at=datetime.now(UTC) + timedelta(hours=1),
+        org_id=org_id,
+        actor="user-1",
+        action_hash=action_hash("email.send", {"to": to}),
+        run_attempt=1,
+    )
+
+
+def test_list_approvals_isolates_durable_interactive_across_orgs(monkeypatch: Any) -> None:
+    # Two orgs' durable interactive approvals share one data-plane scope; a user who is a
+    # member of only org-A must never see org-B's tool/args (item 8).
+    runs = InMemoryRunStore()
+    approvals = InMemoryApprovalStore()
+    client = _app_with_state(runs, approvals, [])
+    _run(_suspend_run(runs, "run-A", org_id="org-A"))
+    _run(_suspend_run(runs, "run-B", org_id="org-B"))
+    aid_a = _run(_seed_interactive_approval(approvals, "run-A", org_id="org-A", to="a@x"))
+    _run(_seed_interactive_approval(approvals, "run-B", org_id="org-B", to="b@x"))
+
+    async def _user_actor(_request: object) -> Actor:
+        return Actor(
+            kind=ActorKind.user,
+            api_role=Role.operator,
+            display_name="alice",
+            user_id="user-alice",
+        )
+
+    class _OrgAOnlyIdentity:
+        async def select_org(self, user_id: str, org_ref: str) -> Any:
+            if org_ref == "org-A":
+                return object()
+            raise NotFoundError("organization not found")
+
+    monkeypatch.setattr(v1, "resolve_actor", _user_actor)
+    cast(FastAPI, client.app).state.identity = _OrgAOnlyIdentity()
+    listed = client.get("/v1/approvals?status=pending").json()
+    assert [a["id"] for a in listed] == [aid_a]  # only org-A; org-B's args never exposed
+    assert listed[0]["origin"] == "interactive" and listed[0]["org_id"] == "org-A"
+
+
+def test_list_approvals_legacy_isolated_to_local_operator(monkeypatch: Any) -> None:
+    # A legacy local-preview approval (no durable run row) is visible to the local operator,
+    # labeled, and never surfaced to a cloud user's org view.
+    runs = InMemoryRunStore()
+    approvals = InMemoryApprovalStore()
+    client = _app_with_state(runs, approvals, [])
+    aid = _run(
+        approvals.create_pending(
+            scope_id=_SCOPE,
+            run_id="legacy-run",
+            session_id="sched-sess",
+            tool="email.send",
+            args={"to": "finance@external.example"},
+            call_id="c1",
+            idempotency_key="i1",
+            reason="tainted",
+            expires_at=datetime.now(UTC) + timedelta(hours=1),
+        )
+    )
+    # Default open-mode actor is the local operator: sees the legacy approval, labeled.
+    listed_local = client.get("/v1/approvals?status=pending").json()
+    assert [a["id"] for a in listed_local] == [aid]
+    assert listed_local[0]["origin"] == "local-preview"
+
+    # A cloud user never sees a legacy local-preview approval.
+    async def _user_actor(_request: object) -> Actor:
+        return Actor(
+            kind=ActorKind.user,
+            api_role=Role.operator,
+            display_name="alice",
+            user_id="user-alice",
+        )
+
+    class _DenyingIdentity:
+        async def select_org(self, user_id: str, org_ref: str) -> Any:
+            raise NotFoundError("organization not found")
+
+    monkeypatch.setattr(v1, "resolve_actor", _user_actor)
+    cast(FastAPI, client.app).state.identity = _DenyingIdentity()
+    assert client.get("/v1/approvals?status=pending").json() == []

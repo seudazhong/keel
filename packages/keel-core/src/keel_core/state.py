@@ -14,9 +14,10 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
-from keel_core.errors import CrossScopeError
+from keel_core.errors import CrossScopeError, DuplicateEventError
 from keel_core.events import Event
 from keel_core.evolution import EVENT_UPCASTERS, upcast_event
 from keel_core.types import ScopeId, SessionId
@@ -27,8 +28,18 @@ class InMemoryEventStore:
 
     def __init__(self) -> None:
         self._events: dict[str, list[Event]] = {}
+        # Mirrors the Postgres partial-unique index on ``payload->>'dedup_key'`` so
+        # deterministic in-memory concurrency tests reject a duplicate admission/steer
+        # append exactly like production (M3.6).
+        self._dedup: set[tuple[str, str]] = set()
 
     async def append(self, event: Event) -> None:
+        dedup_key = event.payload.get("dedup_key")
+        if dedup_key is not None:
+            marker = (event.scope_id, str(dedup_key))
+            if marker in self._dedup:
+                raise DuplicateEventError(str(dedup_key))
+            self._dedup.add(marker)
         bucket = self._events.setdefault(event.session_id, [])
         event.seq = len(bucket) + 1  # monotonic per session (replay cursor)
         bucket.append(event)
@@ -176,9 +187,18 @@ class PostgresEventStore:
     async def append(self, event: Event) -> None:
         if event.scope_id != self._scope_id:
             raise CrossScopeError(self._scope_id, event.scope_id)
-        async with self._engine.begin() as conn:
-            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            seq = await append_event_in_transaction(conn, event)
+        try:
+            async with self._engine.begin() as conn:
+                await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+                seq = await append_event_in_transaction(conn, event)
+        except IntegrityError as exc:
+            # A concurrent/duplicate admission or steering append lost the race on the
+            # ``ux_events_dedup`` partial-unique index — surface it as an idempotent signal
+            # so the caller observes the winner's durable turn instead of duplicating it.
+            dedup_key = event.payload.get("dedup_key")
+            if dedup_key is not None and "ux_events_dedup" in str(exc.orig):
+                raise DuplicateEventError(str(dedup_key)) from exc
+            raise
         event.seq = seq
 
     def read(self, session_id: SessionId, after: int | None = None) -> AsyncIterator[Event]:

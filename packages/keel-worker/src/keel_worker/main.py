@@ -226,11 +226,15 @@ async def resume_run(ctx: dict[str, Any], session_id: str, run_id: str, scope_id
 
 
 async def scheduler_tick(ctx: dict[str, Any]) -> int:
-    """One due-loop tick: enqueue due runs (at most once) + fail-closed expired approvals."""
-    schedules, claim, approvals, enqueue = (
+    """One due-loop tick: enqueue due scheduled runs (at most once).
+
+    Approval expiry is **not** owned here (M3.6, item 6): the durable run reconciler
+    (:func:`keel_worker.runs.reconcile_runs_tick`) is the single owner of approval expiry so
+    a durable interactive approval is never consumed by this legacy scheduler and routed to
+    the wrong (``resume_run``) job. This tick only advances the schedule due-loop."""
+    schedules, claim, enqueue = (
         ctx["schedules"],
         ctx["claim"],
-        ctx["approvals"],
         ctx["enqueue"],
     )
     now = datetime.now(UTC)
@@ -240,10 +244,6 @@ async def scheduler_tick(ctx: dict[str, Any]) -> int:
         now=now,
         enqueue=lambda sid: enqueue("run_agent", sid),
     )
-    for approval_id in await approvals.expire_due(now):
-        record = await approvals.get(approval_id)
-        if record is not None:
-            await enqueue("resume_run", record.session_id, record.run_id, record.scope_id)
     return len(enqueued)
 
 

@@ -231,15 +231,61 @@ async def admit_run(
 
     The ``admission_run`` payload marker makes admission **idempotent**: a repair/retry can
     detect an already-persisted prompt (see the durable run service) and never append a
-    duplicate user turn or dispatch a prompt-less run (invariant I2, M3.6)."""
+    duplicate user turn or dispatch a prompt-less run (invariant I2, M3.6). The ``dedup_key``
+    is enforced by a partial-unique index on ``events`` so two concurrent admitters (or a
+    retried request across processes) can never both append the prompt — the loser raises
+    :class:`~keel_core.errors.DuplicateEventError` and observes the winner's turn."""
     await _emit(
         store,
         EventType.message_token,
         session_id,
         scope_id,
         run_id,
-        {"role": "user", "text": content, "admission_run": run_id},
+        {
+            "role": "user",
+            "text": content,
+            "admission_run": run_id,
+            "dedup_key": f"admit:{run_id}",
+        },
     )
+
+
+async def admit_steer(
+    store: EventStore,
+    session_id: SessionId,
+    scope_id: ScopeId,
+    content: str,
+    run_id: RunId,
+    control_id: str,
+) -> None:
+    """Persist a steering user turn, uniquely keyed by its durable control id (M3.6).
+
+    Steering is admitted as a durable user turn before its control row is acked. A crash
+    after the append but before the ack leaves the control pending, so a reclaiming worker
+    re-drains it — the ``steer_control`` marker + ``dedup_key`` partial-unique index make
+    that replay a no-op (:class:`~keel_core.errors.DuplicateEventError`) instead of a
+    duplicate steering message."""
+    await _emit(
+        store,
+        EventType.message_token,
+        session_id,
+        scope_id,
+        run_id,
+        {
+            "role": "user",
+            "text": content,
+            "steer_control": control_id,
+            "dedup_key": f"steer:{control_id}",
+        },
+    )
+
+
+async def steer_persisted_in_log(store: EventStore, session_id: SessionId, control_id: str) -> bool:
+    """Whether the durable steering turn for ``control_id`` is already in the event log."""
+    async for event in store.read(session_id):
+        if event.payload.get("steer_control") == control_id:
+            return True
+    return False
 
 
 async def admit_system(
@@ -511,6 +557,14 @@ async def _agent_loop(
 
         # Stop-reason gate (I3): tools run ONLY on an explicit tool_use finish.
         if turn.finish_reason == FinishReason.tool_use and turn.tool_calls:
+            # Pre-effect fence (M3.6): re-check interrupt/cancel/lease-loss *after* the
+            # provider returned and *immediately before* dispatching the tool batch. A
+            # durable cancel or a lost lease that arrived during the (possibly long)
+            # provider call must prevent every subsequent external tool effect — otherwise
+            # a fenced-out/cancelled run could still act on the world for one more batch.
+            if interrupt is not None and interrupt():
+                reason = StopReason.interrupted
+                break
             suspended = await _run_tools(
                 store,
                 registry,
@@ -567,6 +621,7 @@ async def run(
     expires_at: datetime | None = None,
     system_context: SystemContextFn | None = None,
     binding: ApprovalBinding | None = None,
+    start_iteration: int = 0,
 ) -> RunResult:
     """Execute the agent loop until a named termination and return the result.
 
@@ -577,7 +632,10 @@ async def run(
     finished); otherwise one is generated. With ``stream_deltas`` the loop also emits
     partial ``message.token`` events per delta (``payload.partial``) so a store's
     fan-out can relay token-by-token; the whole message is still emitted at turn end.
-    """
+
+    ``start_iteration`` seeds the loop's iteration counter from the run's persisted
+    cumulative count so ``max_iterations`` bounds the *whole* run across suspend/resume
+    attempts (a resumed run cannot mint a fresh iteration budget)."""
     registry = registry or ToolRegistry()
     budget = budget or RunBudget(
         max_iterations=agent.max_iterations, token_budget=agent.token_budget
@@ -620,6 +678,7 @@ async def run(
         expires_at=expires_at,
         system_context=system_context,
         binding=binding,
+        start_iteration=start_iteration,
     )
 
     if outcome.reason is StopReason.suspended:
@@ -687,6 +746,7 @@ async def resume(
     expires_at: datetime | None = None,
     system_context: SystemContextFn | None = None,
     binding: ApprovalBinding | None = None,
+    start_iteration: int = 0,
 ) -> RunResult:
     """Resume a suspended run: resolve its pending tool batch, then continue the loop.
 
@@ -780,6 +840,7 @@ async def resume(
         expires_at=expires_at,
         system_context=system_context,
         binding=binding,
+        start_iteration=start_iteration,
     )
 
     if outcome.reason is StopReason.suspended:
