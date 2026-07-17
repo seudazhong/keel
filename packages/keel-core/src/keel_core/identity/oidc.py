@@ -169,13 +169,24 @@ class HTTPJWKSProvider:
     """Fetches + caches an issuer's JWKS over HTTPS with a TTL and rotation refresh.
 
     Anti-amplification (an attacker must not be able to convert a flood of tokens carrying
-    unknown ``kid``s into a matching flood of outbound JWKS requests):
+    unknown ``kid``s — or a flood of requests during a provider outage — into a matching flood
+    of outbound JWKS requests):
 
     * **Coalescing** — concurrent refreshes share a single in-flight fetch (an
-      ``asyncio.Lock``), so N simultaneous misses cause at most one network call.
+      ``asyncio.Lock``), so N simultaneous misses cause at most one network call. This holds
+      for *failures* too: the first caller records the failure and every caller queued behind
+      it fails fast from the negative provider cache instead of re-hitting the network.
     * **Minimum refresh interval** — a forced refresh (unknown ``kid``) is rate-limited: if
       a fetch happened within ``min_refresh_interval_seconds`` the cached set is reused
       instead of hitting the network again.
+    * **Failure cooldown (negative provider cache)** — after a failed/degenerate fetch,
+      further fetches are suppressed for ``failure_cooldown_seconds``: a still-valid cache is
+      served (non-forced reads) and otherwise the caller fails fast with a controlled
+      :class:`OIDCAvailabilityError`. The provider recovers automatically once the cooldown
+      elapses.
+    * **Keyset validation** — a fetched document is only cached if it contains at least one
+      structurally usable, supported asymmetric signing key. An empty / malformed / only-oct
+      / unsupported keyset is a provider-availability problem (503), not an invalid token.
 
     ``httpx`` is imported lazily so the pure verifier can be unit-tested (with a static
     provider) without a live network stack. All fetch/transport/parse failures are wrapped
@@ -190,6 +201,7 @@ class HTTPJWKSProvider:
         cache_ttl_seconds: int = 3600,
         request_timeout_seconds: float = 5.0,
         min_refresh_interval_seconds: float = 60.0,
+        failure_cooldown_seconds: float = 30.0,
         clock: Clock | None = None,
     ) -> None:
         if not jwks_uri.lower().startswith("https://"):
@@ -198,10 +210,12 @@ class HTTPJWKSProvider:
         self._cache_ttl = cache_ttl_seconds
         self._timeout = request_timeout_seconds
         self._min_refresh_interval = max(0.0, min_refresh_interval_seconds)
+        self._failure_cooldown = max(0.0, failure_cooldown_seconds)
         self._clock = clock or _system_clock
         self._cached: list[dict[str, Any]] = []
         self._fetched_at: float = 0.0
         self._last_fetch_attempt: float = 0.0
+        self._failed_at: float | None = None
         self._lock = asyncio.Lock()
 
     async def get_keys(self, *, force_refresh: bool = False) -> list[dict[str, Any]]:
@@ -212,7 +226,7 @@ class HTTPJWKSProvider:
         # A fetch is (maybe) needed. Serialize so concurrent misses coalesce into one call.
         async with self._lock:
             now = self._clock()
-            fresh = self._cached and (now - self._fetched_at) < self._cache_ttl
+            fresh = bool(self._cached) and (now - self._fetched_at) < self._cache_ttl
             if fresh and not force_refresh:
                 # Another coroutine refreshed while we waited for the lock.
                 return list(self._cached)
@@ -222,8 +236,24 @@ class HTTPJWKSProvider:
                 # regardless of how many unknown-kid tokens arrive.
                 if (now - self._last_fetch_attempt) < self._min_refresh_interval:
                     return list(self._cached)
+            # Negative provider cache: if a recent fetch failed, do not hammer the provider.
+            # Serve a still-usable cache for non-forced reads; otherwise fail fast. This is
+            # what coalesces *failures* — callers queued behind a failed fetch return here
+            # rather than each issuing their own outbound request.
+            if self._failed_at is not None and (now - self._failed_at) < self._failure_cooldown:
+                if self._cached and not force_refresh:
+                    return list(self._cached)
+                raise OIDCAvailabilityError("issuer JWKS temporarily unavailable (cooldown)")
             self._last_fetch_attempt = now
-            keys = await self._fetch()
+            try:
+                keys = await self._fetch()
+                _require_usable_signing_key(keys)
+            except OIDCAvailabilityError:
+                # Record the failure so the cooldown suppresses a retry storm; the in-flight
+                # lock already coalesced concurrent callers onto this single attempt.
+                self._failed_at = self._clock()
+                raise
+            self._failed_at = None
             self._cached = keys
             self._fetched_at = self._clock()
             return list(self._cached)
@@ -252,6 +282,47 @@ class HTTPJWKSProvider:
 
 def _system_clock() -> float:
     return time.monotonic()
+
+
+# JWK key types backing the supported asymmetric signature families (RS*/PS* -> RSA,
+# ES* -> EC). A ``kty`` outside this set (e.g. ``oct`` for HMAC, ``OKP`` for EdDSA which we
+# do not support) cannot verify any allowed algorithm and is treated as unusable.
+_ASYMMETRIC_KEY_TYPES: frozenset[str] = frozenset({"RSA", "EC"})
+
+
+def _is_usable_signing_key(raw: dict[str, Any]) -> bool:
+    """A single JWK is a usable, supported asymmetric signing key.
+
+    Requires a supported asymmetric ``kty``, a ``use`` that is signing (or unspecified), an
+    ``alg`` (if present) inside the hard-coded allowlist, and that PyJWT can structurally
+    build the key. This deliberately rejects ``oct`` (symmetric) and unsupported key types.
+    """
+    if not isinstance(raw, dict):
+        return False
+    if raw.get("use") not in (None, "sig"):
+        return False
+    if raw.get("kty") not in _ASYMMETRIC_KEY_TYPES:
+        return False
+    alg = raw.get("alg")
+    if alg is not None and alg not in _SUPPORTED_ALGORITHMS:
+        return False
+    try:
+        PyJWK.from_dict(raw)
+    except (jwt.PyJWTError, KeyError, ValueError, TypeError):
+        return False
+    return True
+
+
+def _require_usable_signing_key(keys: list[dict[str, Any]]) -> None:
+    """Validate a fetched JWKS before it is cached.
+
+    An empty / malformed / only-oct / unsupported keyset means we cannot verify *any* token
+    from this issuer right now — that is a provider-availability problem (mapped to 503), not
+    an invalid-token (401). Raising here (rather than silently caching a degenerate set) keeps
+    the two failure modes distinct and lets the negative provider cache back off.
+    """
+    if not any(_is_usable_signing_key(raw) for raw in keys):
+        raise OIDCAvailabilityError("issuer JWKS has no usable supported asymmetric signing key")
 
 
 class OIDCVerifier:

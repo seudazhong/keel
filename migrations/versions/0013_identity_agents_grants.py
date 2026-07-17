@@ -248,8 +248,247 @@ def upgrade() -> None:
         """
     )
 
+    # --- Maintenance-only erasure (works under keel_runtime without RLS bypass) -------
+    # User erasure is inherently CROSS-tenant (a user belongs to many orgs) and must delete
+    # the global ``users`` row (whose ON DELETE CASCADE would otherwise silently orphan an
+    # active org). Under production RLS (``keel_runtime`` is NOBYPASSRLS + FORCE RLS), a plain
+    # cross-org enumeration returns nothing, so the sole-owner block/archive guard would be
+    # bypassed and a live tenant left ownerless. We therefore centralize erasure in
+    # ``SECURITY DEFINER`` functions with a locked-down ``search_path`` and ownership, owned by
+    # a dedicated ``keel_maintenance`` role. Normal runtime principals cannot invoke arbitrary
+    # cross-tenant deletion: DELETE on the three global identity tables is revoked from
+    # ``keel_runtime`` and EXECUTE on these functions is revoked from PUBLIC (granted only to
+    # ``keel_maintenance``). The functions enumerate + FOR UPDATE-lock the affected orgs,
+    # enforce sole-owner block/archive semantics, and purge every identity row atomically.
+    #
+    # Column names deliberately avoid the identity table names so plpgsql does not shadow the
+    # tables the function DELETEs from.
+    op.execute(
+        """
+        CREATE OR REPLACE FUNCTION keel_erase_organization(p_org_id text)
+        RETURNS TABLE (
+            deleted_grants integer,
+            deleted_agents integer,
+            deleted_memberships integer,
+            deleted_org integer
+        )
+        LANGUAGE plpgsql
+        SECURITY DEFINER
+        SET search_path = pg_catalog, public
+        AS $fn$
+        DECLARE
+            v_grants integer := 0;
+            v_agents integer := 0;
+            v_members integer := 0;
+            v_org integer := 0;
+        BEGIN
+            IF p_org_id IS NULL OR length(p_org_id) = 0 THEN
+                RAISE EXCEPTION 'keel_erase_organization: org id is required';
+            END IF;
+            PERFORM 1 FROM organizations WHERE id = p_org_id FOR UPDATE;
+            DELETE FROM resource_grants WHERE org_id = p_org_id;
+            GET DIAGNOSTICS v_grants = ROW_COUNT;
+            DELETE FROM agents WHERE org_id = p_org_id;
+            GET DIAGNOSTICS v_agents = ROW_COUNT;
+            DELETE FROM memberships WHERE org_id = p_org_id;
+            GET DIAGNOSTICS v_members = ROW_COUNT;
+            DELETE FROM organizations WHERE id = p_org_id;
+            GET DIAGNOSTICS v_org = ROW_COUNT;
+            deleted_grants := v_grants;
+            deleted_agents := v_agents;
+            deleted_memberships := v_members;
+            deleted_org := v_org;
+            RETURN NEXT;
+            RETURN;
+        END;
+        $fn$;
+        """
+    )
+    op.execute(
+        """
+        CREATE OR REPLACE FUNCTION keel_erase_user(p_user_id text)
+        RETURNS TABLE (
+            blocked_org_ids text[],
+            deleted_oidc integer,
+            deleted_agents integer,
+            deleted_memberships integer,
+            deleted_grants integer,
+            deleted_users integer,
+            archived_orgs integer
+        )
+        LANGUAGE plpgsql
+        SECURITY DEFINER
+        SET search_path = pg_catalog, public
+        AS $fn$
+        DECLARE
+            v_blocked text[] := ARRAY[]::text[];
+            v_archivable text[] := ARRAY[]::text[];
+            v_oidc integer := 0;
+            v_agents integer := 0;
+            v_members integer := 0;
+            v_grants integer := 0;
+            v_user integer := 0;
+            v_archived integer := 0;
+            r record;
+        BEGIN
+            IF p_user_id IS NULL OR length(p_user_id) = 0 THEN
+                RAISE EXCEPTION 'keel_erase_user: user id is required';
+            END IF;
+            -- Enumerate + FOR UPDATE-lock the active orgs the user SOLELY owns (no other
+            -- active owner), split by whether any OTHER active member remains. Locking the
+            -- membership rows freezes the block/archive decision against a concurrent
+            -- ownership change.
+            FOR r IN
+                SELECT m.org_id AS org_id,
+                       (SELECT count(*) FROM memberships mm
+                          WHERE mm.org_id = m.org_id AND mm.status = 'active'
+                            AND mm.user_id <> p_user_id) AS other_members
+                FROM memberships m
+                JOIN organizations o ON o.id = m.org_id
+                WHERE m.user_id = p_user_id AND m.status = 'active' AND m.role = 'owner'
+                  AND o.status = 'active'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM memberships o2
+                      WHERE o2.org_id = m.org_id AND o2.status = 'active'
+                        AND o2.role = 'owner' AND o2.user_id <> p_user_id)
+                FOR UPDATE OF m
+            LOOP
+                IF r.other_members > 0 THEN
+                    v_blocked := array_append(v_blocked, r.org_id);
+                ELSE
+                    v_archivable := array_append(v_archivable, r.org_id);
+                END IF;
+            END LOOP;
+
+            IF array_length(v_blocked, 1) IS NOT NULL THEN
+                -- Blocked: delete nothing, surface the blocking org ids (atomic no-op).
+                blocked_org_ids := v_blocked;
+                deleted_oidc := 0;
+                deleted_agents := 0;
+                deleted_memberships := 0;
+                deleted_grants := 0;
+                deleted_users := 0;
+                archived_orgs := 0;
+                RETURN NEXT;
+                RETURN;
+            END IF;
+
+            IF array_length(v_archivable, 1) IS NOT NULL THEN
+                UPDATE organizations
+                   SET status = 'archived', archived_at = now(), updated_at = now()
+                 WHERE id = ANY(v_archivable) AND status = 'active';
+                GET DIAGNOSTICS v_archived = ROW_COUNT;
+            END IF;
+
+            DELETE FROM resource_grants g
+             WHERE g.grantor_user_id = p_user_id
+                OR g.agent_id IN (SELECT id FROM agents WHERE owner_user_id = p_user_id);
+            GET DIAGNOSTICS v_grants = ROW_COUNT;
+            DELETE FROM agents WHERE owner_user_id = p_user_id;
+            GET DIAGNOSTICS v_agents = ROW_COUNT;
+            DELETE FROM memberships WHERE user_id = p_user_id;
+            GET DIAGNOSTICS v_members = ROW_COUNT;
+            DELETE FROM oidc_identities WHERE user_id = p_user_id;
+            GET DIAGNOSTICS v_oidc = ROW_COUNT;
+            DELETE FROM users WHERE id = p_user_id;
+            GET DIAGNOSTICS v_user = ROW_COUNT;
+
+            blocked_org_ids := ARRAY[]::text[];
+            deleted_oidc := v_oidc;
+            deleted_agents := v_agents;
+            deleted_memberships := v_members;
+            deleted_grants := v_grants;
+            deleted_users := v_user;
+            archived_orgs := v_archived;
+            RETURN NEXT;
+            RETURN;
+        END;
+        $fn$;
+        """
+    )
+    # Never executable by PUBLIC (which would include keel_runtime). EXECUTE is granted only
+    # to the dedicated maintenance role below.
+    op.execute(
+        "REVOKE ALL ON FUNCTION keel_erase_organization(text) FROM PUBLIC"
+    )
+    op.execute("REVOKE ALL ON FUNCTION keel_erase_user(text) FROM PUBLIC")
+
+    # Dedicated maintenance role: NOLOGIN (a group role a maintenance/admin login is granted
+    # into) + BYPASSRLS so the SECURITY DEFINER body can enumerate + delete across every org
+    # even under FORCE RLS. Guarded so a managed Postgres that forbids CREATE ROLE / ALTER
+    # OWNER / GRANT does not fail the migration (operators provision it manually there).
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'keel_maintenance') THEN
+                BEGIN
+                    EXECUTE 'CREATE ROLE keel_maintenance NOLOGIN NOSUPERUSER BYPASSRLS';
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'keel_maintenance not created (insufficient privilege)';
+                END;
+            END IF;
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'keel_maintenance') THEN
+                BEGIN
+                    GRANT SELECT, INSERT, UPDATE, DELETE ON
+                        users, oidc_identities, organizations,
+                        memberships, agents, resource_grants
+                        TO keel_maintenance;
+                    ALTER FUNCTION keel_erase_organization(text) OWNER TO keel_maintenance;
+                    ALTER FUNCTION keel_erase_user(text) OWNER TO keel_maintenance;
+                    GRANT EXECUTE ON FUNCTION keel_erase_organization(text) TO keel_maintenance;
+                    GRANT EXECUTE ON FUNCTION keel_erase_user(text) TO keel_maintenance;
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'keel_maintenance erasure grants skipped (insufficient privilege)';
+                END;
+            END IF;
+        END $$;
+        """
+    )
+
+    # Normal runtime principals must not be able to perform cross-tenant deletion: revoke
+    # DELETE on the three GLOBAL identity tables (deleting them cascades across orgs) and
+    # EXECUTE on the erasure functions from keel_runtime. Single-tenant deletes on the
+    # RLS-scoped tables (memberships/agents/resource_grants, always bound to app.org_id) stay
+    # available for ordinary org-scoped operations.
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'keel_runtime') THEN
+                BEGIN
+                    REVOKE DELETE ON users, oidc_identities, organizations FROM keel_runtime;
+                    REVOKE EXECUTE ON FUNCTION keel_erase_organization(text) FROM keel_runtime;
+                    REVOKE EXECUTE ON FUNCTION keel_erase_user(text) FROM keel_runtime;
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'keel_runtime erasure revokes skipped (insufficient privilege)';
+                END;
+            END IF;
+        END $$;
+        """
+    )
+
 
 def downgrade() -> None:
+    # Restore the broad keel_runtime DELETE grant (0011/0013 baseline) and drop the erasure
+    # functions. The keel_maintenance role is intentionally left in place (like keel_runtime):
+    # dropping a role that may still own objects elsewhere would fail; operators drop it.
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'keel_runtime') THEN
+                BEGIN
+                    GRANT DELETE ON users, oidc_identities, organizations TO keel_runtime;
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'keel_runtime DELETE re-grant skipped (insufficient privilege)';
+                END;
+            END IF;
+        END $$;
+        """
+    )
+    op.execute("DROP FUNCTION IF EXISTS keel_erase_user(text)")
+    op.execute("DROP FUNCTION IF EXISTS keel_erase_organization(text)")
     for table in reversed(_ORG_TABLES):
         op.execute(f"ALTER TABLE {table} NO FORCE ROW LEVEL SECURITY")
     op.execute("DROP TABLE IF EXISTS resource_grants CASCADE")

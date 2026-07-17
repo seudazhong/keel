@@ -402,3 +402,114 @@ class _HTTPProviderStub(HTTPJWKSProvider):
         self.fetches += 1
         await asyncio.sleep(0.01)  # widen the window so concurrent callers coalesce
         return list(self.current)
+
+
+class _FailingHTTPProviderStub(HTTPJWKSProvider):
+    """An :class:`HTTPJWKSProvider` whose ``_fetch`` fails while ``down`` is set.
+
+    Exercises the real failure-cooldown / coalescing logic without a network stack.
+    """
+
+    def __init__(self, keys: list[dict], **kwargs) -> None:
+        super().__init__("https://issuer.example/jwks", **kwargs)
+        self.current = list(keys)
+        self.fetches = 0
+        self.down = True
+
+    async def _fetch(self) -> list[dict]:
+        self.fetches += 1
+        await asyncio.sleep(0.01)  # widen the window so concurrent callers coalesce
+        if self.down:
+            raise OIDCAvailabilityError("jwks endpoint down")
+        return list(self.current)
+
+
+async def test_concurrent_cold_cache_failure_coalesces_to_one_fetch() -> None:
+    # A cold cache under a failing provider: many concurrent callers must not each hit the
+    # network. The in-flight lock + negative provider cache collapse them onto ONE attempt,
+    # and every caller sees a provider-availability error (never a 401).
+    provider = _FailingHTTPProviderStub([make_rsa_key().jwk], failure_cooldown_seconds=1000)
+
+    async def attempt() -> None:
+        with pytest.raises(OIDCAvailabilityError):
+            await provider.get_keys()
+
+    await asyncio.gather(*(attempt() for _ in range(16)))
+    assert provider.fetches == 1
+
+
+async def test_failure_cooldown_suppresses_retries_then_recovers() -> None:
+    key = make_rsa_key(kid="recovers")
+    clock = _FakeClock()
+    provider = _FailingHTTPProviderStub(
+        [key.jwk], clock=clock, failure_cooldown_seconds=30, min_refresh_interval_seconds=0
+    )
+    # First fetch fails and arms the cooldown.
+    with pytest.raises(OIDCAvailabilityError):
+        await provider.get_keys()
+    assert provider.fetches == 1
+    # Within the cooldown window every further call fails fast without a network fetch.
+    for _ in range(5):
+        with pytest.raises(OIDCAvailabilityError):
+            await provider.get_keys()
+    assert provider.fetches == 1
+    # The provider recovers; once the cooldown elapses a single retry re-fetches and caches.
+    provider.down = False
+    clock.advance(31)
+    keys = await provider.get_keys()
+    assert provider.fetches == 2
+    assert [k["kid"] for k in keys] == ["recovers"]
+    # A subsequent read is served from the fresh cache (no additional fetch).
+    await provider.get_keys()
+    assert provider.fetches == 2
+
+
+async def test_empty_keyset_is_availability_error() -> None:
+    provider = _HTTPProviderStub([], min_refresh_interval_seconds=0)
+    with pytest.raises(OIDCAvailabilityError):
+        await provider.get_keys(force_refresh=True)
+
+
+async def test_only_oct_keyset_is_availability_error() -> None:
+    # A JWKS that only advertises symmetric (oct) keys cannot verify any allowed algorithm:
+    # provider-availability (503), not an invalid token (401).
+    provider = _HTTPProviderStub(
+        [{"kty": "oct", "k": "c2VjcmV0", "kid": "h1", "use": "sig"}],
+        min_refresh_interval_seconds=0,
+    )
+    with pytest.raises(OIDCAvailabilityError):
+        await provider.get_keys(force_refresh=True)
+
+
+async def test_unsupported_alg_only_keyset_is_availability_error() -> None:
+    # An RSA key pinned to an unsupported alg (e.g. an HS* smuggled onto an RSA kty, or a
+    # bogus alg) leaves no usable signing key.
+    bad = make_rsa_key(kid="bad")
+    bad.jwk["alg"] = "HS256"
+    provider = _HTTPProviderStub([bad.jwk], min_refresh_interval_seconds=0)
+    with pytest.raises(OIDCAvailabilityError):
+        await provider.get_keys(force_refresh=True)
+
+
+async def test_malformed_keyset_failure_is_negatively_cached() -> None:
+    # A malformed (only-oct) keyset fails, arms the cooldown, and is not re-fetched until the
+    # cooldown elapses — then a healthy keyset recovers.
+    good = make_rsa_key(kid="good")
+    clock = _FakeClock()
+    provider = _HTTPProviderStub(
+        [{"kty": "oct", "k": "c2VjcmV0"}],
+        clock=clock,
+        failure_cooldown_seconds=30,
+        min_refresh_interval_seconds=0,
+    )
+    with pytest.raises(OIDCAvailabilityError):
+        await provider.get_keys(force_refresh=True)
+    assert provider.fetches == 1
+    with pytest.raises(OIDCAvailabilityError):
+        await provider.get_keys(force_refresh=True)
+    assert provider.fetches == 1  # negative provider cache absorbed the retry
+    provider.current = [good.jwk]
+    clock.advance(31)
+    keys = await provider.get_keys(force_refresh=True)
+    assert [k["kid"] for k in keys] == ["good"]
+    assert provider.fetches == 2

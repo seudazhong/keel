@@ -95,7 +95,6 @@ class IdentityStore(Protocol):
         user_id: str,
         role: MembershipRole,
         revalidate_actor_user_id: str | None = None,
-        require_owner_actor: bool = False,
     ) -> Membership: ...
     async def get_membership(self, org_id: str, user_id: str) -> Membership | None: ...
     async def list_memberships(self, org_id: str) -> list[Membership]: ...
@@ -106,18 +105,14 @@ class IdentityStore(Protocol):
         user_id: str,
         role: MembershipRole,
         *,
-        guard_last_owner: bool = False,
         revalidate_actor_user_id: str | None = None,
-        require_owner_actor: bool = False,
     ) -> Membership | None: ...
     async def revoke_membership(
         self,
         org_id: str,
         user_id: str,
         *,
-        guard_last_owner: bool = False,
         revalidate_actor_user_id: str | None = None,
-        require_owner_actor: bool = False,
     ) -> Membership | None: ...
     async def count_active_owners(self, org_id: str) -> int: ...
 
@@ -323,10 +318,11 @@ class InMemoryIdentityStore:
         user_id: str,
         role: MembershipRole,
         revalidate_actor_user_id: str | None = None,
-        require_owner_actor: bool = False,
     ) -> Membership:
         if revalidate_actor_user_id is not None:
-            self._require_manager(org_id, revalidate_actor_user_id, require_owner_actor)
+            # Inviting an owner requires the actor to itself be an owner (derived from the
+            # requested role, not a stale service decision).
+            self._require_manager(org_id, revalidate_actor_user_id, role is MembershipRole.owner)
         if self._membership_key(org_id, user_id) is not None:
             raise ConflictError("membership already exists")
         now = _now()
@@ -357,18 +353,24 @@ class InMemoryIdentityStore:
         user_id: str,
         role: MembershipRole,
         *,
-        guard_last_owner: bool = False,
         revalidate_actor_user_id: str | None = None,
-        require_owner_actor: bool = False,
     ) -> Membership | None:
         key = self._membership_key(org_id, user_id)
         if key is None:
             return None
+        current = self._memberships[key]
+        if current.status is not MembershipStatus.active:
+            return None
+        # Owner-affecting transitions (this row is, or becomes, an owner) are derived from
+        # the *current* target row, never from a stale caller decision.
+        owner_change = MembershipRole.owner in (current.role, role)
         if revalidate_actor_user_id is not None:
-            self._require_manager(org_id, revalidate_actor_user_id, require_owner_actor)
-        if guard_last_owner and self._other_active_owners(org_id, user_id) == 0:
-            raise LastOwnerError("an organization must retain at least one active owner")
-        updated = replace(self._memberships[key], role=role, updated_at=_now())
+            self._require_manager(org_id, revalidate_actor_user_id, owner_change)
+        # Last-owner protection: demoting the final active owner is refused.
+        if current.role is MembershipRole.owner and role is not MembershipRole.owner:
+            if self._other_active_owners(org_id, user_id) == 0:
+                raise LastOwnerError("an organization must retain at least one active owner")
+        updated = replace(current, role=role, updated_at=_now())
         self._memberships[key] = updated
         return updated
 
@@ -377,22 +379,23 @@ class InMemoryIdentityStore:
         org_id: str,
         user_id: str,
         *,
-        guard_last_owner: bool = False,
         revalidate_actor_user_id: str | None = None,
-        require_owner_actor: bool = False,
     ) -> Membership | None:
         key = self._membership_key(org_id, user_id)
         if key is None:
             return None
-        if self._memberships[key].status is not MembershipStatus.active:
+        current = self._memberships[key]
+        if current.status is not MembershipStatus.active:
             return None
+        # Removing an owner is an owner-affecting transition, derived from the target row.
+        removes_owner = current.role is MembershipRole.owner
         if revalidate_actor_user_id is not None:
-            self._require_manager(org_id, revalidate_actor_user_id, require_owner_actor)
-        if guard_last_owner and self._other_active_owners(org_id, user_id) == 0:
+            self._require_manager(org_id, revalidate_actor_user_id, removes_owner)
+        if removes_owner and self._other_active_owners(org_id, user_id) == 0:
             raise LastOwnerError("an organization must retain at least one active owner")
         now = _now()
         updated = replace(
-            self._memberships[key],
+            current,
             status=MembershipStatus.revoked,
             revoked_at=now,
             updated_at=now,
@@ -984,14 +987,14 @@ class PostgresIdentityStore:
     async def _require_active_manager(
         self, conn: Any, org_id: str, user_id: str, *, require_owner: bool = False
     ) -> None:
-        """Re-check + row-lock the actor's admin/owner membership inside a mutation txn.
+        """Re-check + ``FOR SHARE`` row-lock the actor's admin/owner membership in a txn.
 
-        The ``FOR SHARE`` lock blocks a concurrent role demotion/revocation (which needs a
+        Used by the grant paths (which acquire a *single* membership lock and no org lock, so
+        they cannot participate in a lock cycle with the org-first membership mutations). The
+        ``FOR SHARE`` lock blocks a concurrent role demotion/revocation (which needs a
         ``FOR UPDATE`` write lock on the same row) until this transaction commits; if the
         demotion has already committed, the filtered row no longer matches and the operation
-        is refused. This makes grant + member management atomic with grantor/actor
-        revalidation so a demoted admin (or an owner demoted to admin, when ``require_owner``
-        is set) cannot commit the privileged mutation afterward.
+        is refused, so a demoted admin cannot commit a grant afterward.
         """
         roles = "('owner')" if require_owner else "('owner', 'admin')"
         row = (
@@ -1015,6 +1018,87 @@ class PostgresIdentityStore:
                 + " membership"
             )
 
+    async def _lock_org_row(self, conn: Any, org_id: str) -> None:
+        """Serialize every owner-affecting membership mutation on ``org_id``.
+
+        A stable ``FOR UPDATE`` lock on the (single) organization row is the FIRST lock a
+        membership mutation takes. Because all membership mutations acquire this lock before
+        any membership-row lock, two concurrent mutations on the same org cannot interleave
+        their per-row locks in opposite orders, so cross-owner demotions/removals can neither
+        deadlock nor both observe two owners and both proceed.
+        """
+        await conn.execute(
+            text("SELECT id FROM organizations WHERE id = :org FOR UPDATE"),
+            {"org": org_id},
+        )
+
+    async def _lock_membership_rows(self, conn: Any, org_id: str, user_ids: set[str]) -> None:
+        """``FOR UPDATE``-lock the given membership rows in a deterministic (sorted) order.
+
+        Locking actor + target rows in a stable order is defense-in-depth against deadlock on
+        top of the org lock (which already fully serializes these mutations). Missing rows
+        simply take no lock; the subsequent role/target reads then decide the outcome.
+        """
+        for uid in sorted(user_ids):
+            await conn.execute(
+                text(
+                    "SELECT id FROM memberships WHERE org_id = :org AND user_id = :user FOR UPDATE"
+                ),
+                {"org": org_id, "user": uid},
+            )
+
+    async def _assert_active_manager(
+        self, conn: Any, org_id: str, user_id: str, *, require_owner: bool
+    ) -> None:
+        """Authorize the actor from its (already locked) membership row — no extra lock."""
+        roles = "('owner')" if require_owner else "('owner', 'admin')"
+        row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT role FROM memberships "
+                        "WHERE org_id = :org AND user_id = :user AND status = 'active' "
+                        f"AND role IN {roles}"
+                    ),
+                    {"org": org_id, "user": user_id},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise PermissionDenied(
+                "this operation requires an active org "
+                + ("owner" if require_owner else "admin/owner")
+                + " membership"
+            )
+
+    async def _read_active_target_role(self, conn: Any, org_id: str, user_id: str) -> str | None:
+        """Return the target's current active role (from its locked row), else ``None``."""
+        role = await conn.scalar(
+            text(
+                "SELECT role FROM memberships "
+                "WHERE org_id = :org AND user_id = :user AND status = 'active'"
+            ),
+            {"org": org_id, "user": user_id},
+        )
+        return None if role is None else str(role)
+
+    async def _require_other_active_owner(
+        self, conn: Any, org_id: str, exclude_user_id: str
+    ) -> None:
+        """Refuse a mutation that would leave ``org_id`` with zero active owners."""
+        remaining = await conn.scalar(
+            text(
+                "SELECT count(*) FROM memberships "
+                "WHERE org_id = :org AND role = 'owner' AND status = 'active' "
+                "AND user_id <> :user"
+            ),
+            {"org": org_id, "user": exclude_user_id},
+        )
+        if int(remaining or 0) == 0:
+            raise LastOwnerError("an organization must retain at least one active owner")
+
     async def create_membership(
         self,
         *,
@@ -1022,7 +1106,6 @@ class PostgresIdentityStore:
         user_id: str,
         role: MembershipRole,
         revalidate_actor_user_id: str | None = None,
-        require_owner_actor: bool = False,
     ) -> Membership:
         membership_id = new_membership_id()
         try:
@@ -1030,8 +1113,16 @@ class PostgresIdentityStore:
                 await conn.execute(_SET_ORG, {"org": org_id})
                 await conn.execute(_SET_USER, {"user": user_id})
                 if revalidate_actor_user_id is not None:
-                    await self._require_active_manager(
-                        conn, org_id, revalidate_actor_user_id, require_owner=require_owner_actor
+                    # Lock the org first, then the actor row, before authorizing: an owner
+                    # invite requires an owner actor (derived from the requested role), and a
+                    # concurrently-demoted actor can no longer authorize the invite.
+                    await self._lock_org_row(conn, org_id)
+                    await self._lock_membership_rows(conn, org_id, {revalidate_actor_user_id})
+                    await self._assert_active_manager(
+                        conn,
+                        org_id,
+                        revalidate_actor_user_id,
+                        require_owner=role is MembershipRole.owner,
                     )
                 row = (
                     (
@@ -1111,50 +1202,38 @@ class PostgresIdentityStore:
             )
         return [_to_membership(row) for row in rows]
 
-    async def _lock_org_and_require_owner_retained(
-        self, conn: Any, org_id: str, exclude_user_id: str
-    ) -> None:
-        """Serialize owner-affecting mutations on an org, then assert an owner survives.
-
-        Takes a stable ``FOR UPDATE`` lock on the (global) organization row so two
-        concurrent owner demotions/removals cannot both observe two owners and both proceed.
-        Under that lock we recount the *other* active owners; if none remain the mutation
-        would leave the org ownerless and is rejected. This is the durable, race-free
-        backstop to the service-level precheck — never a substitute driven only by it.
-        """
-        await conn.execute(
-            text("SELECT id FROM organizations WHERE id = :org FOR UPDATE"),
-            {"org": org_id},
-        )
-        remaining = await conn.scalar(
-            text(
-                "SELECT count(*) FROM memberships "
-                "WHERE org_id = :org AND role = 'owner' AND status = 'active' "
-                "AND user_id <> :user"
-            ),
-            {"org": org_id, "user": exclude_user_id},
-        )
-        if int(remaining or 0) == 0:
-            raise LastOwnerError("an organization must retain at least one active owner")
-
     async def update_membership_role(
         self,
         org_id: str,
         user_id: str,
         role: MembershipRole,
         *,
-        guard_last_owner: bool = False,
         revalidate_actor_user_id: str | None = None,
-        require_owner_actor: bool = False,
     ) -> Membership | None:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_ORG, {"org": org_id})
+            # Lock ordering: organization row first, then the actor + target membership rows
+            # in a deterministic (sorted) order. The org lock serializes owner-affecting
+            # mutations on this org; the sorted membership locks are defense-in-depth.
+            await self._lock_org_row(conn, org_id)
+            lock_users = {user_id}
             if revalidate_actor_user_id is not None:
-                await self._require_active_manager(
-                    conn, org_id, revalidate_actor_user_id, require_owner=require_owner_actor
+                lock_users.add(revalidate_actor_user_id)
+            await self._lock_membership_rows(conn, org_id, lock_users)
+            # The target's CURRENT (locked) role is the sole source of truth for whether this
+            # is an owner-affecting transition — never a stale service-level read.
+            target_role = await self._read_active_target_role(conn, org_id, user_id)
+            if target_role is None:
+                return None
+            owner_change = "owner" in (target_role, role.value)
+            if revalidate_actor_user_id is not None:
+                await self._assert_active_manager(
+                    conn, org_id, revalidate_actor_user_id, require_owner=owner_change
                 )
-            if guard_last_owner:
-                await self._lock_org_and_require_owner_retained(conn, org_id, user_id)
+            # Last-owner protection: demoting the final active owner is refused, decided from
+            # the owner count read under the same lock.
+            if target_role == "owner" and role is not MembershipRole.owner:
+                await self._require_other_active_owner(conn, org_id, user_id)
             row = (
                 (
                     await conn.execute(
@@ -1176,18 +1255,25 @@ class PostgresIdentityStore:
         org_id: str,
         user_id: str,
         *,
-        guard_last_owner: bool = False,
         revalidate_actor_user_id: str | None = None,
-        require_owner_actor: bool = False,
     ) -> Membership | None:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_ORG, {"org": org_id})
+            await self._lock_org_row(conn, org_id)
+            lock_users = {user_id}
             if revalidate_actor_user_id is not None:
-                await self._require_active_manager(
-                    conn, org_id, revalidate_actor_user_id, require_owner=require_owner_actor
+                lock_users.add(revalidate_actor_user_id)
+            await self._lock_membership_rows(conn, org_id, lock_users)
+            target_role = await self._read_active_target_role(conn, org_id, user_id)
+            if target_role is None:
+                return None
+            removes_owner = target_role == "owner"
+            if revalidate_actor_user_id is not None:
+                await self._assert_active_manager(
+                    conn, org_id, revalidate_actor_user_id, require_owner=removes_owner
                 )
-            if guard_last_owner:
-                await self._lock_org_and_require_owner_retained(conn, org_id, user_id)
+            if removes_owner:
+                await self._require_other_active_owner(conn, org_id, user_id)
             row = (
                 (
                     await conn.execute(

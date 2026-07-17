@@ -37,7 +37,12 @@ Three actor kinds are derived per request (no global mutable state), in
   (alg-confusion defense). A multi-audience token must carry an `azp` equal to the
   configured client id, an unknown `kid` triggers at most one coalesced, rate-limited JWKS
   refresh (then a bounded negative cache), and a provider outage fails closed with `503`
-  (never an uncontrolled `500`) while an invalid token is `401`. The subject is resolved to
+  (never an uncontrolled `500`) while an invalid token is `401`. Concurrent cold-cache
+  fetches are coalesced onto a single in-flight request **including failures**, a bounded
+  failure cooldown (negative provider cache) suppresses retry amplification and recovers
+  automatically, and a fetched keyset is only cached once it contains a usable supported
+  asymmetric signing key — an empty / malformed / only-`oct` / unsupported keyset is a
+  provider-availability `503`, not an invalid-token `401`. The subject is resolved to
   a durable user by its `(issuer, subject)` link. A bearer credential that is not a valid
   JWT is retried as a configured API key, so a valid dotted API key still works, but an
   invalid JWT is never laundered into an API-key/open-mode bypass.
@@ -68,11 +73,17 @@ An Agent acting on a resource never exceeds **both** the acting user's org capab
 the Agent's granted capabilities — the effective set is their **intersection** (a
 confused-deputy / privilege-escalation defense). Membership administration enforces
 **last-owner protection** (an org must retain ≥1 active owner) and restricts owner
-assignment to owners. Owner-affecting membership changes, member management, and grant
-create/revoke are made **atomic with actor re-validation** in the durable store (a stable
-organization-row lock for last-owner, a `FOR SHARE` membership-row lock for actor role
-revalidation), so two concurrent demotions cannot leave an org ownerless and a demoted
-admin cannot commit a membership change or grant after losing authority. This is
+assignment to owners. Membership mutations take locks in a single deterministic order —
+the **organization row first** (`FOR UPDATE`, which serializes every owner-affecting change
+on that org), then the actor and target membership rows in sorted order — so concurrent
+cross-owner demotions/removals can neither deadlock nor both proceed. Crucially, whether
+last-owner protection and the owner-actor requirement apply is derived **exclusively from
+the target's current (locked) row and an owner recount inside the same transaction**, never
+from a possibly-stale service-level read: a stale admin operation can no longer remove a
+user who has since become the final owner. The grant create/revoke paths keep their single
+`FOR SHARE` membership-row revalidation (they take no org lock and only one membership lock,
+so they cannot form a cycle with the org-first membership mutations), so a demoted admin
+still cannot commit a grant after losing authority. This is
 deliberately distinct from the coarse `role >= minimum` endpoint tiers in
 `keel_server.auth`; `keel_core.scope.DefaultScopeGuard` is unchanged and still guards the
 event-core scope checks.
@@ -87,6 +98,20 @@ keyed by the `app.org_id` GUC, with `FORCE ROW LEVEL SECURITY` and grants to the
 applies to `UPDATE`/`DELETE`, so a caller holding only `app.user_id` cannot mutate a
 cross-org membership — mutations always require the correct operating `app.org_id`.
 Repositories set these GUCs on every access.
+
+**Erasure under production RLS.** User (data-subject) erasure is inherently *cross-tenant*
+(a user belongs to many orgs) and must delete the global `users` row, so it cannot run as a
+normal `keel_runtime` request: under `FORCE ROW LEVEL SECURITY` a cross-org enumeration
+returns nothing, which would silently skip the sole-owner block/archive guard and cascade an
+active org into an ownerless state. Erasure therefore runs through the `keel_erase_user` /
+`keel_erase_organization` **`SECURITY DEFINER`** functions installed by migration `0013`
+(locked-down `search_path`, owned by a dedicated `keel_maintenance` role with `BYPASSRLS`).
+The functions enumerate + `FOR UPDATE`-lock the affected orgs, enforce the block/archive
+semantics, and purge every identity row atomically. Normal runtime principals cannot invoke
+arbitrary cross-tenant deletion: `DELETE` on the three global identity tables (`users`,
+`oidc_identities`, `organizations`) is **revoked** from `keel_runtime`, and `EXECUTE` on the
+erasure functions is revoked from `PUBLIC` (granted only to `keel_maintenance`); the
+migration downgrade restores the prior grants.
 
 ## REST API (`/v1/identity`)
 
@@ -115,6 +140,7 @@ API key, or an Agent's persona/instruction text.
 | `KEEL_OIDC_LEEWAY_SECONDS` | `60` | Clock skew tolerance for `exp`/`nbf`/`iat`. |
 | `KEEL_OIDC_JWKS_CACHE_TTL_SECONDS` | `3600` | JWKS cache TTL (rotation refresh on unknown `kid`). |
 | `KEEL_OIDC_JWKS_MIN_REFRESH_INTERVAL_SECONDS` | `60` | Min interval between unknown-`kid` JWKS refreshes (anti-amplification). |
+| `KEEL_OIDC_JWKS_FAILURE_COOLDOWN_SECONDS` | `30` | Cooldown after a failed/degenerate JWKS fetch before a retry (negative provider cache). |
 | `KEEL_IDENTITY_ALLOW_JIT_PROVISIONING` | `false` | JIT-provision a first-seen verified subject. |
 
 With OIDC disabled, only the API-key and local-operator actor paths are available; outside

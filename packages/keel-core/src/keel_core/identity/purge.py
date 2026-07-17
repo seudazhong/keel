@@ -11,13 +11,20 @@ path rather than the scope ledger — see ``docs/DATA-LIFECYCLE.md``):
   and the user row. Erasure never orphans an active organization: it is **blocked** (with
   :class:`UserErasureBlockedError`, atomically, deleting nothing) when the user is the sole
   active owner of an active org that still has other active members, and it atomically
-  **archives** an active org the user solely owns and is the only active member of. All row
-  deletes cascade from ``users`` via ``ON DELETE CASCADE``; the explicit, ordered deletes
-  make the operation observable + idempotent.
+  **archives** an active org the user solely owns and is the only active member of.
 
-Every method sets ``app.org_id`` (org path) so Postgres RLS is engaged when erasure runs
-under the non-owner runtime role. Identity is not event-sourced, so no projection rebuild
-can resurrect an erased identity row (there is no event source to replay from).
+Both primitives execute the durable ``keel_erase_organization`` / ``keel_erase_user``
+``SECURITY DEFINER`` functions installed by migration 0013 rather than issuing the deletes
+directly. This is what makes erasure correct under production RLS: user erasure is inherently
+cross-tenant (a user belongs to many orgs) and must delete the global ``users`` row, but the
+non-bypass ``keel_runtime`` role under ``FORCE ROW LEVEL SECURITY`` cannot enumerate rows
+across orgs — so a direct enumeration would silently skip the sole-owner guard and cascade an
+active org into an ownerless state. The definer functions (owned by the ``keel_maintenance``
+role, EXECUTE revoked from ``keel_runtime``) enumerate + lock the affected orgs, enforce the
+block/archive semantics, and purge every identity row atomically, while normal runtime
+principals are denied both the functions and DELETE on the global identity tables.
+
+Identity is not event-sourced, so no projection rebuild can resurrect an erased identity row.
 """
 
 from __future__ import annotations
@@ -28,8 +35,6 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.errors import KeelError
-
-_SET_ORG = text("SELECT set_config('app.org_id', :org, true)")
 
 
 class UserErasureBlockedError(KeelError):
@@ -81,43 +86,22 @@ class UserErasureResult:
 async def purge_organization(engine: AsyncEngine, org_id: str) -> OrganizationErasureResult:
     """Erase all rows owned by an organization (idempotent). Returns per-store counts."""
     async with engine.begin() as conn:
-        await conn.execute(_SET_ORG, {"org": org_id})
-        grants = await conn.execute(
-            text("DELETE FROM resource_grants WHERE org_id = :org"), {"org": org_id}
+        row = (
+            (
+                await conn.execute(
+                    text("SELECT * FROM keel_erase_organization(:org)"),
+                    {"org": org_id},
+                )
+            )
+            .mappings()
+            .one()
         )
-        agents = await conn.execute(text("DELETE FROM agents WHERE org_id = :org"), {"org": org_id})
-        members = await conn.execute(
-            text("DELETE FROM memberships WHERE org_id = :org"), {"org": org_id}
-        )
-        org = await conn.execute(text("DELETE FROM organizations WHERE id = :org"), {"org": org_id})
     return OrganizationErasureResult(
-        resource_grants=int(grants.rowcount or 0),
-        agents=int(agents.rowcount or 0),
-        memberships=int(members.rowcount or 0),
-        organization=int(org.rowcount or 0),
+        resource_grants=int(row["deleted_grants"] or 0),
+        agents=int(row["deleted_agents"] or 0),
+        memberships=int(row["deleted_memberships"] or 0),
+        organization=int(row["deleted_org"] or 0),
     )
-
-
-# Active orgs the user solely owns (no OTHER active owner), split by whether any OTHER
-# active member remains. ``other_members`` > 0 -> a transfer target exists, so blocking is
-# the honest policy; ``other_members`` == 0 -> nobody else to own it, so the org is safely
-# archived (lifecycle-honest: retained as archived, never a live ownerless tenant).
-_SOLELY_OWNED_ACTIVE_ORGS = text(
-    "SELECT m.org_id AS org_id, "
-    "  (SELECT count(*) FROM memberships mm "
-    "     WHERE mm.org_id = m.org_id AND mm.status = 'active' AND mm.user_id <> :user) "
-    "     AS other_members "
-    "FROM memberships m "
-    "JOIN organizations o ON o.id = m.org_id "
-    "WHERE m.user_id = :user AND m.status = 'active' AND m.role = 'owner' "
-    "  AND o.status = 'active' "
-    "  AND NOT EXISTS ("
-    "    SELECT 1 FROM memberships o2 "
-    "    WHERE o2.org_id = m.org_id AND o2.status = 'active' AND o2.role = 'owner' "
-    "      AND o2.user_id <> :user"
-    "  ) "
-    "FOR UPDATE OF m"
-)
 
 
 async def purge_user(engine: AsyncEngine, user_id: str) -> UserErasureResult:
@@ -128,50 +112,30 @@ async def purge_user(engine: AsyncEngine, user_id: str) -> UserErasureResult:
     :class:`UserErasureBlockedError` (ownership must be transferred first). An active org the
     user solely owns *and* is the only active member of is atomically archived as part of the
     same transaction (nobody else can own it), so lifecycle stays honest and no live tenant
-    is left ownerless.
+    is left ownerless. The block/archive decision and the purge run inside the durable
+    ``keel_erase_user`` ``SECURITY DEFINER`` function so they are correct under production RLS.
     """
     async with engine.begin() as conn:
-        rows = (await conn.execute(_SOLELY_OWNED_ACTIVE_ORGS, {"user": user_id})).mappings().all()
-        blocking = tuple(r["org_id"] for r in rows if int(r["other_members"]) > 0)
-        if blocking:
-            raise UserErasureBlockedError(blocking)
-        archivable = [r["org_id"] for r in rows if int(r["other_members"]) == 0]
-        archived = 0
-        for org_id in archivable:
-            result = await conn.execute(
-                text(
-                    "UPDATE organizations SET status = 'archived', archived_at = now(), "
-                    "updated_at = now() WHERE id = :org AND status = 'active'"
-                ),
-                {"org": org_id},
+        row = (
+            (
+                await conn.execute(
+                    text("SELECT * FROM keel_erase_user(:user)"),
+                    {"user": user_id},
+                )
             )
-            archived += int(result.rowcount or 0)
-        # Grants issued by the user, and grants bound to Agents the user owns.
-        grants = await conn.execute(
-            text(
-                "DELETE FROM resource_grants g "
-                "WHERE g.grantor_user_id = :user "
-                "OR g.agent_id IN (SELECT id FROM agents WHERE owner_user_id = :user)"
-            ),
-            {"user": user_id},
+            .mappings()
+            .one()
         )
-        agents = await conn.execute(
-            text("DELETE FROM agents WHERE owner_user_id = :user"), {"user": user_id}
-        )
-        members = await conn.execute(
-            text("DELETE FROM memberships WHERE user_id = :user"), {"user": user_id}
-        )
-        oidc = await conn.execute(
-            text("DELETE FROM oidc_identities WHERE user_id = :user"), {"user": user_id}
-        )
-        user = await conn.execute(text("DELETE FROM users WHERE id = :user"), {"user": user_id})
+    blocked = tuple(row["blocked_org_ids"] or ())
+    if blocked:
+        raise UserErasureBlockedError(blocked)
     return UserErasureResult(
-        oidc_identities=int(oidc.rowcount or 0),
-        agents=int(agents.rowcount or 0),
-        memberships=int(members.rowcount or 0),
-        resource_grants=int(grants.rowcount or 0),
-        user=int(user.rowcount or 0),
-        archived_organizations=archived,
+        oidc_identities=int(row["deleted_oidc"] or 0),
+        agents=int(row["deleted_agents"] or 0),
+        memberships=int(row["deleted_memberships"] or 0),
+        resource_grants=int(row["deleted_grants"] or 0),
+        user=int(row["deleted_users"] or 0),
+        archived_organizations=int(row["archived_orgs"] or 0),
     )
 
 

@@ -30,20 +30,16 @@ async def _org_with_owner() -> tuple[InMemoryIdentityStore, str, str]:
 async def test_guard_blocks_sole_owner_demotion() -> None:
     store, org_id, owner_id = await _org_with_owner()
     with pytest.raises(LastOwnerError):
-        await store.update_membership_role(
-            org_id, owner_id, MembershipRole.member, guard_last_owner=True
-        )
+        await store.update_membership_role(org_id, owner_id, MembershipRole.member)
     with pytest.raises(LastOwnerError):
-        await store.revoke_membership(org_id, owner_id, guard_last_owner=True)
+        await store.revoke_membership(org_id, owner_id)
 
 
 async def test_guard_allows_demotion_when_another_owner_exists() -> None:
     store, org_id, owner_id = await _org_with_owner()
     second = await store.create_user(display_name="Second", email="s@x.com")
     await store.create_membership(org_id=org_id, user_id=second.id, role=MembershipRole.owner)
-    demoted = await store.update_membership_role(
-        org_id, owner_id, MembershipRole.member, guard_last_owner=True
-    )
+    demoted = await store.update_membership_role(org_id, owner_id, MembershipRole.member)
     assert demoted is not None and demoted.role is MembershipRole.member
 
 
@@ -116,5 +112,19 @@ async def test_owner_only_role_change_requires_owner_actor() -> None:
             target.id,
             MembershipRole.owner,
             revalidate_actor_user_id=admin.id,
-            require_owner_actor=True,
         )
+
+
+async def test_stale_admin_cannot_remove_user_who_became_final_owner() -> None:
+    """An admin's removal must fail if the target is (now) the sole active owner.
+
+    The owner-affecting decision is derived from the target's current row inside the store,
+    so even though the admin ``revalidate`` path is only ``admin/owner``, a target that is
+    the final owner triggers last-owner protection rather than an ownerless org.
+    """
+    store, org_id, owner_id = await _org_with_owner()
+    admin = await store.create_user(display_name="Admin", email="a@x.com")
+    await store.create_membership(org_id=org_id, user_id=admin.id, role=MembershipRole.admin)
+    # The only owner is the target of an admin-initiated removal.
+    with pytest.raises((LastOwnerError, PermissionDenied)):
+        await store.revoke_membership(org_id, owner_id, revalidate_actor_user_id=admin.id)

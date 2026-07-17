@@ -112,6 +112,10 @@ class Settings(BaseSettings):
     # JWKS requests so a flood of tokens with bogus ``kid``s cannot amplify into a matching
     # flood of network calls (unknown-kid amplification defense).
     oidc_jwks_min_refresh_interval_seconds: float = Field(default=60.0, ge=0)
+    # Cooldown after a failed / degenerate JWKS fetch during which further fetches are
+    # suppressed (negative provider cache). Bounds retry amplification against a flapping or
+    # down provider; the provider recovers automatically once the cooldown elapses.
+    oidc_jwks_failure_cooldown_seconds: float = Field(default=30.0, ge=0)
     # Just-in-time user provisioning: a first-seen verified subject is auto-provisioned a
     # durable user. Off by default (fail closed): an unlinked subject must be linked
     # explicitly before it can act.

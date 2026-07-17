@@ -63,7 +63,13 @@ Notes:
   is atomically blocked (`UserErasureBlockedError`, deleting nothing) when the user is the
   sole active owner of an active org that still has other active members (ownership must be
   transferred first), and it atomically archives an active org the user solely owns and is
-  the only active member of. Identity is **not event-sourced**, so no
+  the only active member of. Both primitives run through the `keel_erase_user` /
+  `keel_erase_organization` **`SECURITY DEFINER`** functions (migration `0013`, owned by the
+  dedicated `keel_maintenance` role) so the enumerate/lock/block/archive/purge is correct
+  under production RLS (`keel_runtime` is `NOBYPASSRLS` + `FORCE RLS`); normal runtime
+  principals cannot invoke cross-tenant deletion (`DELETE` on the global identity tables and
+  `EXECUTE` on the functions are revoked from `keel_runtime`). Identity is **not
+  event-sourced**, so no
   projection rebuild can resurrect an erased identity row. When durable runs land and a
   run's scope is derived from `(org, agent)`, org erasure will be folded into the scope
   coordinator; until then it is a standalone primitive (tracked honestly here).

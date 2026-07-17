@@ -12,6 +12,7 @@ import asyncio
 
 import pytest
 from sqlalchemy import text
+from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.errors import PermissionDenied
@@ -337,9 +338,7 @@ async def test_concurrent_owner_demotion_keeps_one_owner(migrated_db: AsyncEngin
 
     async def demote(user_id: str) -> object:
         try:
-            return await store.update_membership_role(
-                org.id, user_id, MembershipRole.member, guard_last_owner=True
-            )
+            return await store.update_membership_role(org.id, user_id, MembershipRole.member)
         except LastOwnerError as exc:
             return exc
 
@@ -359,7 +358,7 @@ async def test_concurrent_owner_removal_keeps_one_owner(migrated_db: AsyncEngine
 
     async def remove(user_id: str) -> object:
         try:
-            return await store.revoke_membership(org.id, user_id, guard_last_owner=True)
+            return await store.revoke_membership(org.id, user_id)
         except LastOwnerError as exc:
             return exc
 
@@ -415,9 +414,7 @@ async def test_concurrent_demote_and_grant_are_serialized(migrated_db: AsyncEngi
             return exc
 
     async def demote() -> object:
-        return await store.update_membership_role(
-            org.id, admin.id, MembershipRole.member, guard_last_owner=False
-        )
+        return await store.update_membership_role(org.id, admin.id, MembershipRole.member)
 
     grant_result, _ = await asyncio.gather(grant(), demote())
     # The membership row lock serializes the two: the grant either committed while the admin
@@ -457,14 +454,14 @@ async def test_role_change_requires_owner_actor_after_demotion(migrated_db: Asyn
     await store.create_membership(org_id=org.id, user_id=admin.id, role=MembershipRole.admin)
     target = await store.create_user(display_name="T", email="t@x.com")
     await store.create_membership(org_id=org.id, user_id=target.id, role=MembershipRole.member)
-    # An admin cannot mint an owner even if a stale check passed: require_owner_actor fails.
+    # An admin cannot mint an owner: the store derives the owner-actor requirement from the
+    # transition (promotion to owner) and refuses a non-owner actor.
     with pytest.raises(PermissionDenied):
         await store.update_membership_role(
             org.id,
             target.id,
             MembershipRole.owner,
             revalidate_actor_user_id=admin.id,
-            require_owner_actor=True,
         )
 
 
@@ -508,3 +505,144 @@ async def test_user_erasure_allowed_when_another_owner_exists(migrated_db: Async
     still = await store.get_org(org.id)
     assert still is not None and still.status.value == "active"
     assert await store.count_active_owners(org.id) == 1
+
+
+# --- #1 cross-owner mutations: deterministic + truly concurrent, no zero-owner/deadlock ---
+
+
+async def test_owner_removal_refused_when_target_is_final_owner(migrated_db: AsyncEngine) -> None:
+    store = PostgresIdentityStore(migrated_db)
+    owner, org = await _seed_org(store, "acme")
+    # An owner-actor removing the sole remaining owner is refused by the in-transaction owner
+    # recount — the protection is derived from the target row + owner count, never a stale arg.
+    with pytest.raises(LastOwnerError):
+        await store.revoke_membership(org.id, owner.id, revalidate_actor_user_id=owner.id)
+    assert await store.count_active_owners(org.id) == 1
+
+
+async def test_stale_admin_removal_of_final_owner_refused(migrated_db: AsyncEngine) -> None:
+    store = PostgresIdentityStore(migrated_db)
+    owner, org = await _seed_org(store, "acme")
+    admin = await store.create_user(display_name="Admin", email="admin@x.com")
+    await store.create_membership(org_id=org.id, user_id=admin.id, role=MembershipRole.admin)
+    # An admin's (potentially stale) removal targeting the current sole owner is refused: the
+    # store reads the target's CURRENT owner role under the lock and requires an owner actor,
+    # so a user who became the final owner can never be removed into an ownerless org.
+    with pytest.raises(PermissionDenied):
+        await store.revoke_membership(org.id, owner.id, revalidate_actor_user_id=admin.id)
+    assert await store.count_active_owners(org.id) == 1
+    assert await store.get_membership(org.id, owner.id) is not None
+
+
+async def test_cross_owner_demotions_no_deadlock_keeps_owner(migrated_db: AsyncEngine) -> None:
+    store = PostgresIdentityStore(migrated_db)
+    owner_a, org = await _seed_org(store, "acme")
+    owner_b = await store.create_user(display_name="B", email="b@x.com")
+    await store.create_membership(org_id=org.id, user_id=owner_b.id, role=MembershipRole.owner)
+
+    async def demote(actor: str, target: str) -> object:
+        try:
+            return await store.update_membership_role(
+                org.id, target, MembershipRole.member, revalidate_actor_user_id=actor
+            )
+        except (LastOwnerError, PermissionDenied) as exc:
+            return exc
+
+    # A demotes B while B demotes A — opposite actor/target orderings. The org-first lock
+    # (plus deterministic membership-row locks) serializes them: no deadlock/timeout, and an
+    # active owner always survives. wait_for guards against a hang if lock ordering regressed.
+    results = await asyncio.wait_for(
+        asyncio.gather(
+            demote(owner_a.id, owner_b.id),
+            demote(owner_b.id, owner_a.id),
+        ),
+        timeout=20,
+    )
+    assert await store.count_active_owners(org.id) >= 1
+    # At most one demotion can commit; the loser is refused (its actor was demoted or its
+    # target became the final owner) — the two can never both zero out ownership.
+    succeeded = [r for r in results if not isinstance(r, Exception)]
+    assert len(succeeded) <= 1
+
+
+async def test_cross_owner_removals_no_deadlock_keeps_owner(migrated_db: AsyncEngine) -> None:
+    store = PostgresIdentityStore(migrated_db)
+    owner_a, org = await _seed_org(store, "acme")
+    owner_b = await store.create_user(display_name="B", email="b@x.com")
+    await store.create_membership(org_id=org.id, user_id=owner_b.id, role=MembershipRole.owner)
+    owner_c = await store.create_user(display_name="C", email="c@x.com")
+    await store.create_membership(org_id=org.id, user_id=owner_c.id, role=MembershipRole.owner)
+
+    async def remove(actor: str, target: str) -> object:
+        try:
+            return await store.revoke_membership(org.id, target, revalidate_actor_user_id=actor)
+        except (LastOwnerError, PermissionDenied) as exc:
+            return exc
+
+    # Three owners; two concurrent cross removals must never drive the count below one.
+    await asyncio.wait_for(
+        asyncio.gather(
+            remove(owner_a.id, owner_b.id),
+            remove(owner_b.id, owner_c.id),
+        ),
+        timeout=20,
+    )
+    assert await store.count_active_owners(org.id) >= 1
+
+
+# --- #2 user erasure under production RLS: maintenance path vs unauthorized runtime -------
+
+
+async def _maintenance_role_available(engine: AsyncEngine) -> bool:
+    async with engine.connect() as conn:
+        found = await conn.scalar(text("SELECT 1 FROM pg_roles WHERE rolname = 'keel_maintenance'"))
+    return bool(found)
+
+
+async def test_user_erasure_via_maintenance_role_under_rls(migrated_db: AsyncEngine) -> None:
+    if not await _maintenance_role_available(migrated_db):
+        pytest.skip("keel_maintenance role not provisioned in this database")
+    store = PostgresIdentityStore(migrated_db)
+    owner, org = await _seed_org(store, "acme")
+    # Invoke the erasure through the dedicated maintenance role (the production maintenance
+    # execution path). FORCE RLS is active, yet the SECURITY DEFINER function enumerates the
+    # solely-owned org, archives it, and purges the identity rows atomically.
+    async with migrated_db.begin() as conn:
+        await conn.execute(text("SET LOCAL ROLE keel_maintenance"))
+        row = (
+            (await conn.execute(text("SELECT * FROM keel_erase_user(:u)"), {"u": owner.id}))
+            .mappings()
+            .one()
+        )
+    assert row["deleted_users"] == 1
+    assert row["archived_orgs"] == 1
+    assert not row["blocked_org_ids"]
+    assert await store.get_user(owner.id) is None
+    archived = await store.get_org(org.id)
+    assert archived is not None and archived.status.value == "archived"
+
+
+async def test_user_erasure_denied_for_runtime_role(migrated_db: AsyncEngine) -> None:
+    if not await _runtime_role_available(migrated_db):
+        pytest.skip("keel_runtime role not provisioned in this database")
+    store = PostgresIdentityStore(migrated_db)
+    owner, org = await _seed_org(store, "acme")
+
+    # keel_runtime cannot invoke the maintenance erasure function (EXECUTE revoked).
+    async with migrated_db.connect() as conn:
+        await conn.execute(text("SET ROLE keel_runtime"))
+        with pytest.raises(ProgrammingError):
+            await conn.execute(text("SELECT keel_erase_user(:u)"), {"u": owner.id})
+
+    # keel_runtime cannot cross-tenant delete the global identity rows directly (DELETE on
+    # users / oidc_identities / organizations is revoked — deleting them cascades across orgs).
+    for table, ident in (("users", owner.id), ("organizations", org.id)):
+        async with migrated_db.connect() as conn:
+            await conn.execute(text("SET ROLE keel_runtime"))
+            await conn.execute(text("SELECT set_config('app.org_id', :o, true)"), {"o": org.id})
+            with pytest.raises(ProgrammingError):
+                await conn.execute(text(f"DELETE FROM {table} WHERE id = :id"), {"id": ident})
+
+    # Every denied attempt left the data intact.
+    assert await store.get_user(owner.id) is not None
+    assert await store.get_org(org.id) is not None

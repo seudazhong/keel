@@ -165,6 +165,7 @@ def _build_identity(engine: AsyncEngine | None, settings: Settings) -> tuple[Any
             settings.oidc_jwks_uri,
             cache_ttl_seconds=settings.oidc_jwks_cache_ttl_seconds,
             min_refresh_interval_seconds=settings.oidc_jwks_min_refresh_interval_seconds,
+            failure_cooldown_seconds=settings.oidc_jwks_failure_cooldown_seconds,
         )
         verifier = OIDCVerifier(config, provider)
     return service, verifier

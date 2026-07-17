@@ -24,7 +24,6 @@ from keel_core.identity.models import (
     AgentKind,
     Capability,
     IdentityValidationError,
-    LastOwnerError,
     Membership,
     MembershipRole,
     NotFoundError,
@@ -200,7 +199,6 @@ class IdentityService:
             user_id=target_user_id,
             role=role,
             revalidate_actor_user_id=actor_user_id,
-            require_owner_actor=role is MembershipRole.owner,
         )
         self._audit.record(
             AuditEvent(
@@ -225,21 +223,15 @@ class IdentityService:
         owner_change = MembershipRole.owner in (current.role, new_role)
         if owner_change and actor.role is not MembershipRole.owner:
             raise PermissionDenied("only an owner may change owner assignments")
-        # Last-owner protection: never demote the final active owner. The store re-checks
-        # this atomically under an org lock (guard_last_owner) so a concurrent second
-        # demotion cannot slip through; this precheck only surfaces a clearer early error.
-        demotes_owner = (
-            current.role is MembershipRole.owner and new_role is not MembershipRole.owner
-        )
-        if demotes_owner:
-            await self._guard_last_owner(org_id)
+        # Last-owner protection and the owner-actor requirement are enforced atomically by
+        # the store from the target row + owner count read under the org lock (never from
+        # this possibly-stale service read); a concurrent second demotion or a target that
+        # became the final owner after this read cannot slip through.
         updated = await self._store.update_membership_role(
             org_id,
             target_user_id,
             new_role,
-            guard_last_owner=demotes_owner,
             revalidate_actor_user_id=actor_user_id,
-            require_owner_actor=owner_change,
         )
         if updated is None:
             raise NotFoundError("target membership not found")
@@ -264,16 +256,15 @@ class IdentityService:
         if current is None or not current.is_active:
             raise NotFoundError("target membership not found")
         removes_owner = current.role is MembershipRole.owner
-        if removes_owner:
-            if actor.role is not MembershipRole.owner:
-                raise PermissionDenied("only an owner may remove an owner")
-            await self._guard_last_owner(org_id)
+        if removes_owner and actor.role is not MembershipRole.owner:
+            raise PermissionDenied("only an owner may remove an owner")
+        # The store re-derives whether an owner is being removed from the target's locked row
+        # and enforces last-owner protection + the owner-actor requirement atomically, so a
+        # stale admin operation cannot remove a user who became the final owner.
         revoked = await self._store.revoke_membership(
             org_id,
             target_user_id,
-            guard_last_owner=removes_owner,
             revalidate_actor_user_id=actor_user_id,
-            require_owner_actor=removes_owner,
         )
         if revoked is None:
             raise NotFoundError("target membership not found")
@@ -281,10 +272,6 @@ class IdentityService:
             AuditEvent(AuditAction.member_removed, actor_user_id, org_id, target_user_id, {})
         )
         return revoked
-
-    async def _guard_last_owner(self, org_id: str) -> None:
-        if await self._store.count_active_owners(org_id) <= 1:
-            raise LastOwnerError("an organization must retain at least one active owner")
 
     async def list_members(self, org_id: str, actor_user_id: str) -> list[Membership]:
         await self._require_actor_membership(org_id, actor_user_id)
