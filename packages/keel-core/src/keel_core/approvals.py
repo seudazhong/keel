@@ -13,9 +13,65 @@ from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
+
+_INSERT_APPROVAL = text(
+    "INSERT INTO approvals (id, scope_id, run_id, session_id, tool, args, "
+    "call_id, idempotency_key, reason, status, created_at, expires_at, "
+    "org_id, actor, action_hash, run_attempt, batch_id) VALUES "
+    "(:id, :scope, :run_id, :session_id, :tool, CAST(:args AS jsonb), :call_id, "
+    ":key, :reason, 'pending', now(), :expires_at, :org_id, :actor, "
+    ":action_hash, :run_attempt, :batch_id)"
+)
+
+
+async def insert_pending_in_transaction(
+    conn: AsyncConnection,
+    *,
+    id: str,
+    scope_id: str,
+    run_id: str,
+    session_id: str,
+    tool: str,
+    args: dict[str, Any],
+    call_id: str,
+    idempotency_key: str,
+    reason: str,
+    expires_at: datetime,
+    org_id: str = "",
+    actor: str = "",
+    action_hash: str = "",
+    run_attempt: int = 0,
+    batch_id: str = "",
+) -> None:
+    """Insert one pending approval row inside the caller's transaction (no commit here).
+
+    Lets a suspended tool batch persist its approval rows in the *same* transaction as the
+    ``tool.call`` / ``approval.requested`` events (:func:`keel_core.loop._persist_suspension_batch`)
+    so a crash can never leave an approval row without its events (or vice versa). The caller
+    owns the transaction + ``app.scope_id`` GUC."""
+    await conn.execute(
+        _INSERT_APPROVAL,
+        {
+            "id": id,
+            "scope": scope_id,
+            "run_id": run_id,
+            "session_id": session_id,
+            "tool": tool,
+            "args": json.dumps(args),
+            "call_id": call_id,
+            "key": idempotency_key,
+            "reason": reason,
+            "expires_at": expires_at,
+            "org_id": org_id,
+            "actor": actor,
+            "action_hash": action_hash,
+            "run_attempt": run_attempt,
+            "batch_id": batch_id,
+        },
+    )
 
 
 async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
@@ -92,6 +148,8 @@ class ApprovalStore(Protocol):
 
     async def pending_for_run(self, run_id: str) -> list[ApprovalRecord]: ...
 
+    async def list_for_run(self, run_id: str) -> list[ApprovalRecord]: ...
+
     async def batch_pending_count(self, run_id: str, batch_id: str) -> int: ...
 
     async def resolve(
@@ -161,6 +219,18 @@ class InMemoryApprovalStore:
 
     async def pending_for_run(self, run_id: str) -> list[ApprovalRecord]:
         return [r for r in self._rows.values() if r.run_id == run_id and r.status == "pending"]
+
+    async def list_for_run(self, run_id: str) -> list[ApprovalRecord]:
+        """Every approval (any status) raised for ``run_id``, oldest first.
+
+        The durable source of truth for resume's call -> approval association: each row
+        carries the complete immutable action payload (tool/args/call_id/action_hash/batch),
+        so resume can reconstruct a suspended batch even if an ``approval.requested`` event was
+        lost to a crash before it committed (M3.6 approval-event atomicity repair)."""
+        return sorted(
+            (r for r in self._rows.values() if r.run_id == run_id),
+            key=lambda r: r.created_at,
+        )
 
     async def batch_pending_count(self, run_id: str, batch_id: str) -> int:
         """How many approvals in this run's batch are still pending (0 == batch terminal)."""
@@ -254,32 +324,23 @@ class PostgresApprovalStore:
         approval_id = uuid.uuid4().hex
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": scope_id})
-            await conn.execute(
-                text(
-                    "INSERT INTO approvals (id, scope_id, run_id, session_id, tool, args, "
-                    "call_id, idempotency_key, reason, status, created_at, expires_at, "
-                    "org_id, actor, action_hash, run_attempt, batch_id) VALUES "
-                    "(:id, :scope, :run_id, :session_id, :tool, CAST(:args AS jsonb), :call_id, "
-                    ":key, :reason, 'pending', now(), :expires_at, :org_id, :actor, "
-                    ":action_hash, :run_attempt, :batch_id)"
-                ),
-                {
-                    "id": approval_id,
-                    "scope": scope_id,
-                    "run_id": run_id,
-                    "session_id": session_id,
-                    "tool": tool,
-                    "args": json.dumps(args),
-                    "call_id": call_id,
-                    "key": idempotency_key,
-                    "reason": reason,
-                    "expires_at": expires_at,
-                    "org_id": org_id,
-                    "actor": actor,
-                    "action_hash": action_hash,
-                    "run_attempt": run_attempt,
-                    "batch_id": batch_id,
-                },
+            await insert_pending_in_transaction(
+                conn,
+                id=approval_id,
+                scope_id=scope_id,
+                run_id=run_id,
+                session_id=session_id,
+                tool=tool,
+                args=args,
+                call_id=call_id,
+                idempotency_key=idempotency_key,
+                reason=reason,
+                expires_at=expires_at,
+                org_id=org_id,
+                actor=actor,
+                action_hash=action_hash,
+                run_attempt=run_attempt,
+                batch_id=batch_id,
             )
         return approval_id
 
@@ -325,6 +386,24 @@ class PostgresApprovalStore:
                         text(
                             "SELECT * FROM approvals WHERE scope_id = :scope AND run_id = :run_id "
                             "AND status = 'pending'"
+                        ),
+                        {"scope": self._scope_id, "run_id": run_id},
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        return [_to_record(r) for r in rows]
+
+    async def list_for_run(self, run_id: str) -> list[ApprovalRecord]:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            rows = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT * FROM approvals WHERE scope_id = :scope AND run_id = :run_id "
+                            "ORDER BY created_at"
                         ),
                         {"scope": self._scope_id, "run_id": run_id},
                     )

@@ -32,6 +32,14 @@ survive a server **and** worker restart and are safe under N racing workers.
   persisted, so a worker crash before the ``running -> waiting_approval`` release still lets
   the lease-expiry reclaim *resume* (honouring the durable approval) instead of restarting
   fresh and silently discarding the (later approved) action.
+* A suspended tool batch persists its ``tool.call`` events, its approval rows, and its
+  ``approval.requested`` events as one atomic unit (single transaction when the event and
+  approval stores share an engine), so a crash can never leave an approval row without its
+  events (or a partially-raised batch). ``ux_approvals_run_call`` (partial, interactive rows
+  only) makes at most one approval row per (run, call, source attempt), backing resume's
+  reconstruction repair that rebuilds the call -> approval association from the durable rows
+  when an ``approval.requested`` event was lost to an older-build crash — so a granted
+  approval is never silently denied.
 
 Row-Level Security (ADR-0009 / DESIGN-REVIEW G16): ``runs`` and ``run_control`` carry the
 ``app.scope_id`` policy (mirroring ``jobs`` / ``approvals``) plus ``FORCE ROW LEVEL
@@ -184,6 +192,18 @@ def upgrade() -> None:
         "CREATE INDEX ix_approvals_batch ON approvals (scope_id, run_id, batch_id) "
         "WHERE status = 'pending'"
     )
+    # At most one durable-run approval row per (run, call, source attempt): every interactive
+    # approval carries a ``batch_id`` (legacy scheduled/digest approvals do not), so this
+    # partial unique index structurally prevents a duplicate or **injected** approval row for
+    # the same tool call within a run attempt. It backs resume's reconstruction repair — which
+    # rebuilds the call -> approval association from the durable rows when an
+    # ``approval.requested`` event was lost to a crash before it committed — so a reconstructed
+    # match is always unambiguous (M3.6 approval-event atomicity). Excludes legacy rows
+    # (empty ``batch_id``) so the migration is safe on populated DBs.
+    op.execute(
+        "CREATE UNIQUE INDEX ux_approvals_run_call ON approvals "
+        "(scope_id, run_id, call_id, run_attempt) WHERE batch_id <> ''"
+    )
 
     # --- Row-Level Security on the scope-bound run tables -----------------------------
     for table in _SCOPED_TABLES:
@@ -215,6 +235,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.execute("DROP INDEX IF EXISTS ux_events_dedup")
+    op.execute("DROP INDEX IF EXISTS ux_approvals_run_call")
     op.execute("DROP INDEX IF EXISTS ix_approvals_batch")
     op.execute("ALTER TABLE approvals DROP COLUMN IF EXISTS batch_id")
     op.execute("ALTER TABLE approvals DROP COLUMN IF EXISTS run_attempt")
