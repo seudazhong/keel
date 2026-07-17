@@ -9,6 +9,10 @@ function FakePage() {
   return <Topbar title="Chat" sub="preview" />;
 }
 
+function FakeSessionsPage() {
+  return <Topbar title="Sessions" sub="preview" />;
+}
+
 function shellAt(path: string) {
   return createMemoryRouter(
     [
@@ -16,6 +20,7 @@ function shellAt(path: string) {
         element: <AppShell />,
         children: [
           { path: "chat", element: <FakePage /> },
+          { path: "sessions", element: <FakeSessionsPage /> },
           { path: "onboarding", element: <div>onboarding</div> },
         ],
       },
@@ -24,11 +29,20 @@ function shellAt(path: string) {
   );
 }
 
+const DESKTOP_WIDTH = 1280;
+const MOBILE_WIDTH = 375;
+
+function setViewportWidth(width: number) {
+  Object.defineProperty(window, "innerWidth", { writable: true, configurable: true, value: width });
+  fireEvent(window, new Event("resize"));
+}
+
 beforeEach(() => {
   window.localStorage.clear();
 });
 afterEach(() => {
   window.localStorage.clear();
+  setViewportWidth(DESKTOP_WIDTH);
 });
 
 test("exposes a skip link that targets the main landmark", () => {
@@ -123,6 +137,57 @@ test("clicking the backdrop closes the mobile sidebar drawer", () => {
 
   fireEvent.click(container.querySelector(".bg-black\\/40")!);
   expect(container.querySelector(".bg-black\\/40")).toBeNull();
+});
+
+test("resizing from mobile to desktop clears an open drawer: sidebar is no longer modal and main is no longer inert", () => {
+  setViewportWidth(MOBILE_WIDTH);
+  renderWithClient(<RouterProvider router={shellAt("/chat")} />);
+  const main = document.getElementById("main-content")!;
+
+  fireEvent.click(screen.getByRole("button", { name: "Open navigation menu" }));
+  expect(screen.getByRole("dialog", { name: "Navigation menu" })).toBeInTheDocument();
+  expect(main).toHaveAttribute("aria-hidden", "true");
+  expect(main.hasAttribute("inert")).toBe(true);
+
+  // Simulate rotating/resizing the viewport into the desktop breakpoint
+  // while the mobile drawer is still open.
+  setViewportWidth(DESKTOP_WIDTH);
+
+  // The drawer state is cleared: no more dialog semantics, and the
+  // persistent desktop sidebar/main content are restored to non-modal.
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(main).not.toHaveAttribute("aria-hidden");
+  expect(main.hasAttribute("inert")).toBe(false);
+  expect(screen.getByRole("navigation", { name: "Primary navigation" })).toBeInTheDocument();
+});
+
+test("does not clear the drawer when resizing while still within the mobile range", () => {
+  setViewportWidth(MOBILE_WIDTH);
+  renderWithClient(<RouterProvider router={shellAt("/chat")} />);
+
+  fireEvent.click(screen.getByRole("button", { name: "Open navigation menu" }));
+  expect(screen.getByRole("dialog", { name: "Navigation menu" })).toBeInTheDocument();
+
+  // Still a narrow (non-desktop) viewport after the resize.
+  setViewportWidth(600);
+  expect(screen.getByRole("dialog", { name: "Navigation menu" })).toBeInTheDocument();
+});
+
+test("clicking a nav link in the mobile drawer sequences focus onto #main-content only after inert is removed (never <body>)", () => {
+  renderWithClient(<RouterProvider router={shellAt("/chat")} />);
+  const main = document.getElementById("main-content")!;
+
+  fireEvent.click(screen.getByRole("button", { name: "Open navigation menu" }));
+  expect(main.hasAttribute("inert")).toBe(true);
+
+  fireEvent.click(screen.getByRole("link", { name: /Sessions/ }));
+
+  // The drawer has closed (main is interactive again) and focus landed on
+  // the main landmark, not on <body>.
+  expect(main.hasAttribute("inert")).toBe(false);
+  expect(main).not.toHaveAttribute("aria-hidden");
+  expect(document.activeElement).toBe(main);
+  expect(screen.getByRole("heading", { name: "Sessions" })).toBeInTheDocument();
 });
 
 test("the shell renders semantic landmarks for navigation and main content", () => {

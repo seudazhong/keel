@@ -5,6 +5,21 @@ import { useTranslation } from "../lib/i18n";
 import { ShellContextProvider } from "./ShellContext";
 import { Sidebar } from "./Sidebar";
 
+// Keep in sync with Tailwind's default `lg` breakpoint used throughout the
+// shell (`lg:grid`, `lg:hidden`, `lg:visible`, ...): 1024px and up is the
+// persistent desktop layout where the sidebar is never a modal drawer.
+const DESKTOP_MEDIA_QUERY = "(min-width: 1024px)";
+
+function isDesktopViewport(): boolean {
+  if (typeof window === "undefined") return false;
+  if (typeof window.matchMedia === "function") {
+    return window.matchMedia(DESKTOP_MEDIA_QUERY).matches;
+  }
+  // matchMedia isn't implemented in some test environments (jsdom); fall
+  // back to a plain width check so the behavior still works there.
+  return window.innerWidth >= 1024;
+}
+
 export function AppShell() {
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [onboardingComplete, setOnboardingComplete] = useState(() => isOnboardingComplete());
@@ -13,6 +28,7 @@ export function AppShell() {
   const mainRef = useRef<HTMLElement>(null);
   const menuButtonRef = useRef<HTMLElement | null>(null);
   const firstRender = useRef(true);
+  const pendingNavFocus = useRef(false);
 
   // Close the mobile drawer whenever the route changes (link click, back/forward, etc.),
   // and re-check onboarding completion (it's set from the /onboarding route via a plain
@@ -22,15 +38,58 @@ export function AppShell() {
     setOnboardingComplete(isOnboardingComplete());
   }, [location.pathname]);
 
-  // Move focus to the main landmark on navigation so keyboard/screen-reader users
-  // land in new content instead of staying on a now-stale sidebar link.
+  // Force-close the mobile drawer once the viewport crosses into the desktop
+  // (`lg`) breakpoint. Desktop renders the sidebar as persistent, non-modal
+  // navigation, so a drawer left open from a narrower viewport must never
+  // survive a resize/rotation: otherwise main stays `inert`/`aria-hidden`,
+  // the aside keeps `role=dialog`/`aria-modal`, and the mobile-only close
+  // button (hidden via `lg:hidden`) disappears with no way to dismiss it.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    function handleViewportChange() {
+      if (isDesktopViewport()) {
+        setSidebarOpen(false);
+      }
+    }
+    if (typeof window.matchMedia === "function") {
+      const mql = window.matchMedia(DESKTOP_MEDIA_QUERY);
+      const listener = () => handleViewportChange();
+      if (typeof mql.addEventListener === "function") {
+        mql.addEventListener("change", listener);
+        return () => mql.removeEventListener("change", listener);
+      }
+      // Safari < 14 fallback API.
+      mql.addListener(listener);
+      return () => mql.removeListener(listener);
+    }
+    window.addEventListener("resize", handleViewportChange);
+    return () => window.removeEventListener("resize", handleViewportChange);
+  }, []);
+
+  // Mark that a route change happened (skipping the initial mount) so the
+  // effect below knows a focus restoration is owed.
   useEffect(() => {
     if (firstRender.current) {
       firstRender.current = false;
       return;
     }
-    mainRef.current?.focus();
+    pendingNavFocus.current = true;
   }, [location.pathname]);
+
+  // Move focus to the main landmark on navigation so keyboard/screen-reader
+  // users land in new content instead of staying on a now-stale sidebar
+  // link. This only fires once `sidebarOpen` has actually settled to
+  // `false`: while the mobile drawer is still open/closing, main is
+  // `inert`, and calling `.focus()` on an inert element is a no-op that
+  // drops focus to <body> instead of #main-content. Depending on both
+  // `sidebarOpen` and the pathname means desktop navigations (drawer never
+  // opens) focus immediately, while mobile navigations wait for the
+  // drawer-close commit to land first.
+  useEffect(() => {
+    if (!pendingNavFocus.current || sidebarOpen) return;
+    pendingNavFocus.current = false;
+    mainRef.current?.focus();
+  }, [location.pathname, sidebarOpen]);
 
   function closeSidebar() {
     setSidebarOpen(false);

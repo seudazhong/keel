@@ -94,6 +94,48 @@ test.describe("responsive shell", () => {
     await expect(main).toHaveJSProperty("inert", false);
     await expect(page.getByRole("heading", { name: "Chat" })).toBeVisible();
   });
+
+  test("resizing from mobile to desktop clears an open drawer and restores non-modal main content", async ({
+    page,
+  }) => {
+    await freshVisit(page, "/chat");
+
+    await page.getByRole("button", { name: "Open navigation menu" }).click();
+
+    const main = page.locator("#main-content");
+    await expect(page.getByRole("dialog", { name: "Navigation menu" })).toBeVisible();
+    await expect(main).toHaveAttribute("aria-hidden", "true");
+    await expect(main).toHaveJSProperty("inert", true);
+
+    // Rotate/resize into the desktop breakpoint while the drawer is still open.
+    await page.setViewportSize({ width: 1280, height: 800 });
+
+    // The drawer state is cleared: dialog semantics are gone, main is
+    // interactive again, and the persistent desktop sidebar is visible.
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(main).not.toHaveAttribute("aria-hidden", "true");
+    await expect(main).toHaveJSProperty("inert", false);
+    await expect(sidebar(page)).toBeVisible();
+  });
+
+  test("clicking a nav link in the mobile drawer moves focus to #main-content only after the drawer finishes closing", async ({
+    page,
+  }) => {
+    await freshVisit(page, "/chat");
+
+    await page.getByRole("button", { name: "Open navigation menu" }).click();
+    await expect(page.getByRole("dialog", { name: "Navigation menu" })).toBeVisible();
+
+    await sidebar(page).getByRole("link", { name: /Sessions/ }).click();
+
+    await expect(page).toHaveURL(/\/sessions$/);
+    const main = page.locator("#main-content");
+    await expect(page.getByRole("dialog")).toHaveCount(0);
+    await expect(main).not.toHaveAttribute("aria-hidden", "true");
+    await expect(main).toHaveJSProperty("inert", false);
+    // Focus lands on the main landmark, never falls back to <body>.
+    await expect(main).toBeFocused();
+  });
 });
 
 test.describe("desktop shell", () => {
