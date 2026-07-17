@@ -56,6 +56,25 @@ implemented in Compose.
   tenant-owned identity tables (`memberships`, `agents`, `resource_grants`), keyed by the
   `app.org_id` GUC — connect as a `keel_runtime` member to make RLS a hard boundary.
 
+### Managed projects & GitHub App (M3.7)
+
+- Managed projects and GitHub synchronization are enabled by configuring the GitHub App:
+  `KEEL_GITHUB_APP_ID`, `KEEL_GITHUB_PRIVATE_KEY_REF` (a **reference** — `env:NAME`,
+  `file:PATH`, or a path; never the PEM inline), `KEEL_GITHUB_WEBHOOK_SECRET`,
+  `KEEL_GITHUB_API_BASE_URL`, `KEEL_GITHUB_WEB_BASE_URL`, `KEEL_GITHUB_ALLOWED_HOSTS`
+  (comma-separated clone/API host allowlist), and `KEEL_GITHUB_TOKEN_CACHE_SECONDS`. With
+  `KEEL_GITHUB_APP_ID` unset the feature is disabled (blank/local projects still work).
+- The webhook endpoint `POST /v1/projects/github/webhook` is authenticated **independently**
+  by an `X-Hub-Signature-256` HMAC over the raw body plus the installation→org binding; it
+  enforces delivery-id replay protection, an event allowlist, and SSRF/URL allowlist checks.
+  Installation tokens are minted just in time, briefly cached in-process, and never persisted
+  or logged. See [`docs/PROJECTS.md`](PROJECTS.md).
+- Migration `0015` adds `FORCE ROW LEVEL SECURITY` + `keel_runtime` grants on the tenant-owned
+  project tables (`projects`, `project_worktrees`, `project_runs`, `repo_sync_ledger`,
+  `project_quotas`, `github_repositories`, `github_sync_state`), keyed by `app.org_id`, and
+  extends `keel_erase_organization` to purge them with the org.
+
+
 ### Identity erasure (user / organization) — maintenance path (M3.6)
 
 User (data-subject) and organization erasure are **privileged, cross-tenant maintenance

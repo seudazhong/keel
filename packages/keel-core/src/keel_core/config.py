@@ -177,6 +177,24 @@ class Settings(BaseSettings):
     # ``cloud_mode`` is on.
     telegram_webhook_secret: str = ""
 
+    # GitHub App (M3.7, WS-P). Managed-project GitHub synchronization. The integration is
+    # disabled unless ``github_app_id`` is set. The private key is supplied by *reference*
+    # (a filesystem path or an env var name resolved out-of-band, never the PEM inline in
+    # this settings object) so the raw key material is not held in a broadly-shared config;
+    # ``github_webhook_secret`` verifies inbound ``X-Hub-Signature-256`` over the raw body.
+    # ``github_allowed_hosts`` is a comma-separated host allowlist for clone/API URLs
+    # (SSRF defense); loopback/private/reserved addresses are always rejected.
+    github_app_id: int = Field(default=0, ge=0)
+    github_client_id: str = ""
+    github_private_key_ref: str = ""
+    github_webhook_secret: SecretStr = SecretStr("")
+    github_api_base_url: str = "https://api.github.com"
+    github_web_base_url: str = "https://github.com"
+    github_allowed_hosts: str = "github.com,api.github.com,codeload.github.com"
+    # Installation access tokens are minted just-in-time and cached only briefly (well under
+    # GitHub's ~1h token lifetime) and never persisted; this is the in-process cache horizon.
+    github_token_cache_seconds: int = Field(default=300, ge=0)
+
     # psycopg3 driver works for both sync (Alembic) and async (app) engines.
     database_url: str = "postgresql+psycopg://keel:keel@localhost:5432/keel"
     redis_url: str = "redis://localhost:6379/0"

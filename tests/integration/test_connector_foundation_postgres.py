@@ -112,7 +112,7 @@ async def test_connector_foundation_schema_and_rls(migrated_db: AsyncEngine) -> 
             "error_retryable",
         }
         head = await conn.scalar(text("SELECT version_num FROM alembic_version"))
-        assert head == "0015_connector_foundation"
+        assert head == "0016_connector_foundation"
 
 
 async def test_repository_scope_isolation_cursor_and_delivery_replay(
@@ -483,7 +483,7 @@ async def test_connector_migration_downgrade_and_upgrade(migrated_db: AsyncEngin
     cfg = Config(str(_ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(_ROOT / "migrations"))
     cfg.set_main_option("sqlalchemy.url", url)
-    await asyncio.to_thread(command.downgrade, cfg, "0014_durable_runs")
+    await asyncio.to_thread(command.downgrade, cfg, "0015_projects_github")
     async with migrated_db.connect() as conn:
         assert not await conn.scalar(
             text("SELECT to_regclass('public.connector_bindings') IS NOT NULL")

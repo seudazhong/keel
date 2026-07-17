@@ -23,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from keel_core import __version__
 from keel_core.api import HealthResponse, ReadinessResponse
 from keel_core.approvals import InMemoryApprovalStore, PostgresApprovalStore
+from keel_core.coding import LocalActiveGitStore, LocalCodingStorage, LocalWorktreeStore
 from keel_core.config import Settings, get_settings, load_env_file
 from keel_core.db import make_async_engine, make_redis
 from keel_core.embeddings import Embedder
@@ -45,6 +46,28 @@ from keel_core.knowledge.search import KnowledgeSearcher
 from keel_core.knowledge.service import DispatchJob, KnowledgeService
 from keel_core.knowledge.store import KnowledgeStore, PostgresKnowledgeStore
 from keel_core.oauth_state import InMemoryOAuthStateStore, PostgresOAuthStateStore
+from keel_core.projects import (
+    GitHubIntegration,
+    InMemoryProjectStore,
+    LocalProjectStorage,
+    PostgresProjectStore,
+    ProjectService,
+    ProjectStorage,
+)
+from keel_core.projects.github import (
+    AppJwtMinter,
+    GitHubClient,
+    HttpxGitHubTransport,
+    InstallationTokenService,
+    resolve_private_key,
+)
+from keel_core.projects.jobs import (
+    PROJECT_SYNC_CANCEL_MODE,
+    PROJECT_SYNC_KIND,
+    PROJECT_SYNC_MAX_ATTEMPTS,
+    ProjectSyncPayload,
+    sync_idempotency_key,
+)
 from keel_core.providers import LiteLLMGateway
 from keel_core.runs import InMemoryRunStore, PostgresRunStore
 from keel_core.tools import build_service_execution_environment
@@ -54,6 +77,7 @@ from keel_server.api import gateway as gateway_api
 from keel_server.api import identity as identity_api
 from keel_server.api import knowledge as knowledge_api
 from keel_server.api import lifecycle as lifecycle_api
+from keel_server.api import projects as projects_api
 from keel_server.api import v1
 from keel_server.auth import parse_api_keys
 from keel_server.gateway import OneBotGateway, RateLimiter, TelegramGateway
@@ -170,6 +194,60 @@ def _build_identity(engine: AsyncEngine | None, settings: Settings) -> tuple[Any
         )
         verifier = OIDCVerifier(config, provider)
     return service, verifier
+
+
+def _build_github_integration(settings: Settings) -> GitHubIntegration | None:
+    """Build the GitHub App integration when configured (else ``None`` — feature disabled)."""
+    if settings.github_app_id <= 0 or not settings.github_private_key_ref:
+        return None
+    try:
+        minter = AppJwtMinter(
+            app_id=settings.github_app_id,
+            private_key_loader=lambda: resolve_private_key(settings.github_private_key_ref),
+        )
+        transport = HttpxGitHubTransport()
+        client = GitHubClient(transport, api_base_url=settings.github_api_base_url)
+
+        async def _mint(installation_id: int, app_jwt: str) -> object:
+            return await client.mint_installation_token(
+                installation_id=installation_id, app_jwt=app_jwt
+            )
+
+        tokens = InstallationTokenService(
+            minter, _mint, cache_seconds=settings.github_token_cache_seconds
+        )
+        hosts = frozenset(
+            h.strip().lower() for h in settings.github_allowed_hosts.split(",") if h.strip()
+        )
+        return GitHubIntegration(tokens=tokens, client=client, allowed_hosts=hosts)
+    except Exception:  # noqa: BLE001 - misconfiguration disables the feature, never crashes boot
+        logger.warning("GitHub App configured but could not be initialized; import/sync disabled")
+        return None
+
+
+def _build_project_service(
+    engine: AsyncEngine | None,
+    settings: Settings,
+    identity_store: Any,
+    enqueue_sync: Any,
+) -> ProjectService:
+    """Build the managed-project service (durable when an engine is configured)."""
+    store: Any = PostgresProjectStore(engine) if engine is not None else InMemoryProjectStore()
+    storage: ProjectStorage | None = None
+    if engine is not None:
+        hosts = tuple(
+            h.strip().lower() for h in settings.github_allowed_hosts.split(",") if h.strip()
+        )
+        coding_root = Path.cwd() / ".keel" / "projects"
+        coding = LocalCodingStorage(coding_root, allowed_https_hosts=hosts)
+        storage = LocalProjectStorage(LocalActiveGitStore(coding), LocalWorktreeStore(coding))
+    return ProjectService(
+        store,
+        identity_store,
+        storage=storage,
+        github=_build_github_integration(settings),
+        enqueue_sync=enqueue_sync,
+    )
 
 
 @asynccontextmanager
@@ -367,6 +445,28 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     identity_service, oidc_verifier = _build_identity(engine, settings)
     app.state.identity = identity_service
     app.state.oidc_verifier = oidc_verifier
+
+    # Managed projects + GitHub synchronization (M3.7). Shares the identity store so project
+    # authorization reads the same memberships/agents/grants. A GitHub-sourced project's
+    # fetch is enqueued as a durable ``projects.sync`` job (restart-safe, delivery-idempotent).
+    async def _enqueue_project_sync(org_id: str, project_id: str, delivery_id: str | None) -> None:
+        jobs = app.state.jobs
+        payload = ProjectSyncPayload(
+            org_id=org_id, project_id=project_id, delivery_id=delivery_id
+        ).model_dump()
+        job, _created = await jobs.enqueue_once(
+            kind=PROJECT_SYNC_KIND,
+            payload=payload,
+            target_session_id=None,
+            idempotency_key=sync_idempotency_key(project_id, delivery_id),
+            max_attempts=PROJECT_SYNC_MAX_ATTEMPTS,
+            cancel_mode=PROJECT_SYNC_CANCEL_MODE,
+        )
+        await _dispatch_knowledge_job(jobs.scope_id, job.id)
+
+    app.state.projects = _build_project_service(
+        engine, settings, identity_service.store, _enqueue_project_sync
+    )
     # OneBot IM gateway (optional): only wired when an API base is configured.
     if settings.onebot_api_base:
         app.state.onebot_gateway = OneBotGateway(
@@ -408,6 +508,7 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Keel", version=__version__, lifespan=_lifespan)
     knowledge_api.register_exception_handlers(app)
     identity_api.register_exception_handlers(app)
+    projects_api.register_exception_handlers(app)
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def index() -> str:
@@ -455,6 +556,7 @@ def create_app() -> FastAPI:
 
     app.include_router(v1.router)
     app.include_router(identity_api.router)
+    app.include_router(projects_api.router)
     app.include_router(knowledge_api.router)
     app.include_router(lifecycle_api.router)
     app.include_router(connectors_api.router)

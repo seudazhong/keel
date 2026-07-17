@@ -1,7 +1,7 @@
 """shared connector bindings, resources, cursors, and delivery replay ledger.
 
-Revision ID: 0015_connector_foundation
-Revises: 0014_durable_runs
+Revision ID: 0016_connector_foundation
+Revises: 0015_projects_github
 Create Date: 2026-07-18
 """
 
@@ -11,8 +11,8 @@ from collections.abc import Sequence
 
 from alembic import op
 
-revision: str = "0015_connector_foundation"
-down_revision: str | None = "0014_durable_runs"
+revision: str = "0016_connector_foundation"
+down_revision: str | None = "0015_projects_github"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

@@ -124,3 +124,123 @@ class CreateGrantRequest(BaseModel):
     resource_type: str
     resource_id: str
     capability: str
+
+
+# --- Managed projects (M3.7) ---------------------------------------------------------
+
+
+class ProjectSummary(BaseModel):
+    """A managed, org-owned project."""
+
+    id: str
+    org_id: str
+    slug: str
+    display_name: str
+    source: str
+    visibility: str
+    status: str
+    default_branch: str
+    github_repository_id: int | None = None
+    version: int
+
+
+class WorktreeSummary(BaseModel):
+    """A run-scoped materialized worktree."""
+
+    id: str
+    org_id: str
+    project_id: str
+    run_id: str
+    git_ref: str
+    commit_sha: str | None = None
+    status: str
+
+
+class SyncEntrySummary(BaseModel):
+    """One repo sync ledger entry."""
+
+    id: str
+    project_id: str
+    kind: str
+    status: str
+    git_ref: str | None = None
+    before_sha: str | None = None
+    after_sha: str | None = None
+    delivery_id: str | None = None
+
+
+class InstallationSummary(BaseModel):
+    """A GitHub App installation bound to an org."""
+
+    id: str
+    org_id: str
+    installation_id: int
+    app_id: int
+    account_login: str
+    account_type: str
+    status: str
+
+
+class RunAssociation(BaseModel):
+    """The result of associating a durable run with a project."""
+
+    run_id: str
+    created: bool
+
+
+class CreateProjectRequest(BaseModel):
+    """Create a blank/local managed project."""
+
+    slug: str
+    display_name: str
+    visibility: str = "private"
+    default_branch: str = "main"
+
+
+class ImportProjectRequest(BaseModel):
+    """Import a project from a GitHub repository (via an installation)."""
+
+    slug: str
+    display_name: str
+    installation_id: int
+    repo_full_name: str
+
+
+class UpdateProjectRequest(BaseModel):
+    """Optimistically update a project's mutable fields."""
+
+    expected_version: int
+    display_name: str | None = None
+    default_branch: str | None = None
+    visibility: str | None = None
+
+
+class MaterializeWorktreeRequest(BaseModel):
+    """Materialize a run-scoped worktree."""
+
+    run_id: str
+    git_ref: str = "HEAD"
+    agent_id: str | None = None
+
+
+class AssociateRunRequest(BaseModel):
+    """Associate a durable run with a project."""
+
+    run_id: str
+    agent_id: str | None = None
+
+
+class GrantProjectRequest(BaseModel):
+    """Grant an Agent a capability on a project."""
+
+    agent_id: str
+    capability: str
+
+
+class LinkInstallationRequest(BaseModel):
+    """Bind a GitHub App installation to the selected org."""
+
+    installation_id: int
+    app_id: int
+    account_login: str
+    account_type: str = "Organization"

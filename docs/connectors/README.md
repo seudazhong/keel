@@ -27,7 +27,7 @@ worker function list, or React catalog.
 - Generic API: `keel_server.api.connectors`
 - Generic durable sync/renew jobs and recurring reconciliation: `keel_worker.connectors`
 
-Migration `0015_connector_foundation` adds bindings, generic next-sync/next-renewal state and fenced
+Migration `0016_connector_foundation` adds bindings, generic next-sync/next-renewal state and fenced
 schedule leases, typed binding targets, user-selected root resources, provider-synced item mappings,
 per-resource cursors, and delivery replay rows. All are scope-bound with RLS and
 `FORCE ROW LEVEL SECURITY`; metadata/config reject plaintext secret keys. Delivery rows store
