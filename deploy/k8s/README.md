@@ -53,8 +53,9 @@ kubectl kustomize deploy\k8s\overlays\production | Out-Null
 ```
 
 To actually install, copy `base/secret-app.example.yaml` (set a real, non-empty
-`KEEL_API_KEYS` with at least one valid `key:role` entry — required, see "What is (and is
-not) enforced here" below) and `base/datastores/objectstorage-secret.example.yaml` (fill from
+`KEEL_API_KEYS` with at least one valid `key:role` entry, **and** a real, random
+`KEEL_SANDBOX_RPC_SECRET` of at least 32 bytes — both required, see "What is (and is not)
+enforced here" below) and `base/datastores/objectstorage-secret.example.yaml` (fill from
 your secret manager, do not commit the result), point
 `base/datastores/*-external-service.example.yaml` at your managed Postgres/Redis, add those to
 your own overlay's `resources:`, then `kubectl apply -k <overlay>` against a real cluster. See
@@ -93,12 +94,17 @@ Kubernetes cluster, kind/minikube, or any credentials.
   this scaffold documents as a pending gate rather than implementing.
 - `KEEL_API_KEYS` is **required**, non-empty, contains at least one syntactically valid
   `key:role` entry (role one of `viewer`/`operator`/`admin`), and lives only in a Secret
-  (never the ConfigMap) — empty/missing/malformed means every request is an implicit,
-  unauthenticated admin. `KEEL_CLOUD_MODE: "true"` is forced in the active config and is
+  (never the ConfigMap). `KEEL_CLOUD_MODE: "true"` is forced in the active config and is
   consumed by application code (`Settings.cloud_mode` / `app.state.auth_required`, M3.3): with
   cloud mode on, an empty *or malformed* `KEEL_API_KEYS` fails every request closed instead of
   falling back to open admin mode (see
   [`docs/security-model.md`](docs/security-model.md) "What is enforced by these manifests").
+- `KEEL_SANDBOX_RPC_SECRET` is also **required**, non-empty, and at least 32 bytes, and lives
+  only in the Secret (never the ConfigMap) — unlike `KEEL_API_KEYS`, this one is
+  startup-critical: `execution_backend` defaults to `"sandbox"`, so `keel-server`/
+  `keel-worker` build an authenticated RPC client at process startup whose signer rejects an
+  empty/too-short secret immediately, crash-looping the Pod before it ever serves `/health`
+  (see [`docs/security-model.md`](docs/security-model.md) "Isolation levels").
 - `keel-server`'s tool workspace is redirected to a dedicated writable `emptyDir` at
   `/workspace` via `workingDir`, so its read-only root filesystem never has to make the app's
   own `/app` source tree the place model-chosen tool calls write to.

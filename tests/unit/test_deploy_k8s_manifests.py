@@ -10,12 +10,14 @@ is skipped gracefully when ``kubectl`` is not on PATH.
 from __future__ import annotations
 
 import importlib.util
+import re
 import sys
 import types
 from pathlib import Path
 
 import pytest
 
+from keel_core.tools.rpc_auth import MIN_RPC_SECRET_BYTES
 from keel_server.auth import parse_api_keys
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -119,6 +121,62 @@ def test_api_keys_required_in_secret_and_absent_from_configmap() -> None:
     assert not any(line.strip().startswith("KEEL_API_KEYS:") for line in configmap.splitlines()), (
         "KEEL_API_KEYS must live only in the Secret, never the ConfigMap's `data:`"
     )
+
+
+def test_sandbox_rpc_secret_required_in_secret_and_absent_from_configmap(
+    validator: types.ModuleType,
+) -> None:
+    """`execution_backend` defaults to `"sandbox"`
+    (`packages/keel-core/src/keel_core/config.py`), so `keel-server`/`keel-worker` build an
+    authenticated `SandboxExecutionEnvironment` client at startup — a missing or too-short
+    `KEEL_SANDBOX_RPC_SECRET` crash-loops the Pod before it serves `/health`, unlike
+    `KEEL_API_KEYS`/`KEEL_CLOUD_MODE`, which fail closed per-request.
+    """
+    secret = (REPO_ROOT / "deploy" / "k8s" / "base" / "secret-app.example.yaml").read_text(
+        encoding="utf-8"
+    )
+    configmap = (REPO_ROOT / "deploy" / "k8s" / "base" / "configmap-app.yaml").read_text(
+        encoding="utf-8"
+    )
+    assert "KEEL_SANDBOX_RPC_SECRET:" in secret
+    assert 'KEEL_SANDBOX_RPC_SECRET: ""' not in secret
+    assert not any(
+        line.strip().startswith("KEEL_SANDBOX_RPC_SECRET:") for line in configmap.splitlines()
+    ), "KEEL_SANDBOX_RPC_SECRET must live only in the Secret, never the ConfigMap's `data:`"
+
+    match = re.search(r'^\s*KEEL_SANDBOX_RPC_SECRET:\s*"([^"\n]*)"\s*$', secret, re.MULTILINE)
+    assert match is not None
+    assert len(match.group(1).encode("utf-8")) >= validator.MIN_SANDBOX_RPC_SECRET_BYTES
+
+    findings: list[str] = []
+    validator.check_sandbox_rpc_secret_required(findings)
+    hard_failures = [f for f in findings if not f.startswith("SKIPPED")]
+    assert not hard_failures, "\n".join(hard_failures)
+
+
+def test_sandbox_rpc_secret_minimum_length_matches_rpc_auth(
+    validator: types.ModuleType,
+) -> None:
+    """The validator's `MIN_SANDBOX_RPC_SECRET_BYTES` must match the real
+    `MIN_RPC_SECRET_BYTES` enforced by `keel_core.tools.rpc_auth.RpcRequestSigner` — otherwise
+    the validator could pass a placeholder shape the real client would still reject (or vice
+    versa) at server/worker startup.
+    """
+    assert validator.MIN_SANDBOX_RPC_SECRET_BYTES == MIN_RPC_SECRET_BYTES
+
+
+def test_sandbox_rpc_secret_check_never_leaks_secret_material(
+    validator: types.ModuleType,
+) -> None:
+    findings: list[str] = []
+    validator.check_sandbox_rpc_secret_required(findings)
+    secret = (REPO_ROOT / "deploy" / "k8s" / "base" / "secret-app.example.yaml").read_text(
+        encoding="utf-8"
+    )
+    match = re.search(r'^\s*KEEL_SANDBOX_RPC_SECRET:\s*"([^"\n]*)"\s*$', secret, re.MULTILINE)
+    assert match is not None
+    for finding in findings:
+        assert match.group(1) not in finding
 
 
 def test_scheduler_and_git_pvc_are_dormant_not_active() -> None:

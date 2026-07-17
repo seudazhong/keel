@@ -40,6 +40,11 @@ What this checks (see docs/security-model.md for the rationale behind each rule)
          config), and the active config forces `KEEL_CLOUD_MODE: "true"`, which is consumed by
          application code (``Settings.cloud_mode`` / ``app.state.auth_required``) so
          fail-closed auth is the shipped, active default;
+       - `base/secret-app.example.yaml` also requires a non-empty, >=32-byte
+         `KEEL_SANDBOX_RPC_SECRET` (without ever logging the value), absent from
+         `base/configmap-app.yaml` — `execution_backend` defaults to `"sandbox"`, so a
+         missing/short value crash-loops keel-server/keel-worker at startup, before either
+         serves `/health`;
        - keel-server's tool workspace (`workingDir`) is never the read-only `/app` source
          tree, and is backed by a real writable volume mount;
        - keel-server stays at `replicas: 1` with a non-overlapping rollout `strategy`
@@ -500,6 +505,63 @@ def _has_valid_key_role_entry(raw: str) -> bool:
     return any(_KEY_ROLE_ENTRY.match(entry.strip()) for entry in raw.split(",") if entry.strip())
 
 
+# Mirrors `MIN_RPC_SECRET_BYTES` in packages/keel-core/src/keel_core/tools/rpc_auth.py.
+# tests/unit/test_deploy_k8s_manifests.py asserts these two never drift apart.
+MIN_SANDBOX_RPC_SECRET_BYTES = 32
+
+
+def check_sandbox_rpc_secret_required(findings: list[Finding]) -> None:
+    """`KEEL_SANDBOX_RPC_SECRET` must be a real, >=32-byte value in the Secret template.
+
+    `execution_backend` defaults to `"sandbox"` (`base/configmap-app.yaml` does not override
+    it), so `keel_core.tools.wiring.build_service_execution_environment` builds an
+    authenticated `SandboxExecutionEnvironment` client for both `keel-server` and
+    `keel-worker` **at process startup**, not lazily per tool call. Its `RpcRequestSigner`
+    (`packages/keel-core/src/keel_core/tools/rpc_auth.py`) raises immediately if the shared
+    secret is empty or shorter than `MIN_RPC_SECRET_BYTES` (32) — unlike `KEEL_API_KEYS`
+    (which fails closed per-request), a missing/short sandbox RPC secret crash-loops the Pod
+    before it ever serves `/health`.
+
+    Deliberately never includes the actual secret value in a finding message — only whether a
+    non-empty, minimum-length value was found — so this check cannot leak key material into
+    CI logs.
+    """
+    secret_path = K8S_ROOT / "base/secret-app.example.yaml"
+    secret_text = read(secret_path)
+    secret_label = str(secret_path.relative_to(REPO_ROOT))
+    match = re.search(
+        r"^\s*KEEL_SANDBOX_RPC_SECRET:\s*\"?([^\"\n]*)\"?\s*$", secret_text, re.MULTILINE
+    )
+    if not match or not match.group(1).strip():
+        findings.append(
+            Finding(
+                f"{secret_label}: must define a non-empty `KEEL_SANDBOX_RPC_SECRET` — "
+                "empty/missing crash-loops keel-server/keel-worker at startup (execution_backend "
+                "defaults to `sandbox`)"
+            )
+        )
+    elif len(match.group(1).strip().encode("utf-8")) < MIN_SANDBOX_RPC_SECRET_BYTES:
+        findings.append(
+            Finding(
+                f"{secret_label}: `KEEL_SANDBOX_RPC_SECRET` must be at least "
+                f"{MIN_SANDBOX_RPC_SECRET_BYTES} bytes (matching "
+                "packages/keel-core/src/keel_core/tools/rpc_auth.py MIN_RPC_SECRET_BYTES) — "
+                "value shape/length omitted from this message on purpose"
+            )
+        )
+
+    configmap_path = K8S_ROOT / "base/configmap-app.yaml"
+    configmap_text = read(configmap_path)
+    configmap_label = str(configmap_path.relative_to(REPO_ROOT))
+    if re.search(r"^\s*KEEL_SANDBOX_RPC_SECRET:", configmap_text, re.MULTILINE):
+        findings.append(
+            Finding(
+                f"{configmap_label}: `KEEL_SANDBOX_RPC_SECRET` must live only in a Secret, "
+                "never a ConfigMap"
+            )
+        )
+
+
 def check_sandbox_isolation(findings: list[Finding]) -> None:
     sa_path = K8S_ROOT / "base/sandbox/serviceaccount.yaml"
     job_path = K8S_ROOT / "base/sandbox/job-template.yaml"
@@ -873,6 +935,7 @@ def run_all_checks() -> list[Finding]:
     check_no_active_rbac(findings)
     check_workspace_is_not_readonly_app(findings)
     check_auth_secret_required(findings)
+    check_sandbox_rpc_secret_required(findings)
     check_sandbox_isolation(findings)
     check_network_policy_default_deny(findings)
     check_network_policy_directionality(findings)

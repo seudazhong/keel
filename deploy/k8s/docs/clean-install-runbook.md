@@ -36,7 +36,14 @@ it does not by itself satisfy the hostile multi-tenant gates in
      request fail **closed** with 503 (`Settings.cloud_mode` / `app.state.auth_required`,
      `packages/keel-core/src/keel_core/config.py`; format matches
      `packages/keel-server/src/keel_server/auth.py` `parse_api_keys`) rather than falling back
-     to the local implicit-admin open mode. Fill the rest of the real values or point an
+     to the local implicit-admin open mode. **Also set a real, random `KEEL_SANDBOX_RPC_SECRET`
+     of at least 32 bytes** (e.g. `openssl rand -base64 32`) — unlike `KEEL_API_KEYS`, an
+     empty or too-short value here crash-loops `keel-server`/`keel-worker` at startup, before
+     either serves `/health` (`execution_backend` defaults to `"sandbox"`; see
+     `packages/keel-core/src/keel_core/tools/rpc_auth.py` `RpcRequestSigner`/
+     `MIN_RPC_SECRET_BYTES`), and configure the identical value on the `keel-sandbox` service
+     once one is deployed (`docs/security-model.md` "Isolation levels" — this scaffold does
+     not ship that service yet). Fill the rest of the real values or point an
      external-secret operator at this name/shape. Leave `KEEL_CLOUD_MODE: "true"` in
      `base/configmap-app.yaml` unchanged — do not set it to `"false"`.
    - `base/datastores/postgres-external-service.example.yaml` /

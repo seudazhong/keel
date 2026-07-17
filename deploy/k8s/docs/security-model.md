@@ -16,6 +16,7 @@ and §8 "Threat model & tenancy invariants" of the
 | No ServiceAccount token anywhere | every workload, `base/sandbox/serviceaccount.yaml`, `base/sandbox/job-template.yaml` | `automountServiceAccountToken: false` everywhere, including `keel-server`/`keel-worker` (which route shell/file tool calls through the `keel-sandbox` RPC boundary by default, or in-process only via an explicit opt-out — see "Isolation levels" below); `scripts/validate_manifests.py` fails the build if any workload omits this |
 | No Kubernetes RBAC at all | (nothing — deliberately) | this scaffold grants **zero** Role/ClusterRole/RoleBinding/ClusterRoleBinding to any of its own ServiceAccounts; `scripts/validate_manifests.py` fails the build if one is ever added back as an active resource. See "Sandbox Job creation is not wired up" below for why |
 | Required externally-supplied auth, fail-closed | `base/secret-app.example.yaml` (`KEEL_API_KEYS`), `base/configmap-app.yaml` (`KEEL_CLOUD_MODE`) | `KEEL_API_KEYS` must be non-empty, contain at least one syntactically valid `key:role` entry, and lives only in a Secret, never the plaintext ConfigMap. `KEEL_CLOUD_MODE: "true"` is forced in the active config and **is consumed by application code** (M3.3): `Settings.cloud_mode` drives `app.state.auth_required` (`packages/keel-server/src/keel_server/app.py`), which `authenticate()` (`packages/keel-server/src/keel_server/auth.py`) checks — with cloud mode on, an empty *or malformed* `KEEL_API_KEYS` (every entry skipped by `parse_api_keys`, leaving an empty key map) makes every request fail closed with 503, instead of the local implicit-admin open mode. `scripts/validate_manifests.py` fails the build if any of this regresses, and never logs the key value itself when it does |
+| Required sandbox RPC secret, startup-critical | `base/secret-app.example.yaml` (`KEEL_SANDBOX_RPC_SECRET`) | `execution_backend` defaults to `"sandbox"`, so both `keel-server`/`keel-worker` build an authenticated `SandboxExecutionEnvironment` client (`keel_core.tools.rpc`) **at process startup**; its `RpcRequestSigner` (`packages/keel-core/src/keel_core/tools/rpc_auth.py`) requires a non-empty, >=32-byte (`MIN_RPC_SECRET_BYTES`) secret and raises immediately otherwise, crash-looping the Pod before it ever serves `/health` — a stricter failure mode than the per-request auth checks above. `scripts/validate_manifests.py` fails the build if this key is absent, empty, too short, or leaks into the ConfigMap, and never logs the value itself when it does |
 | Single-replica, non-overlapping-rollout `keel-server` | `base/server/deployment.yaml` (`replicas: 1`, `strategy: Recreate`), `overlays/production/patch-server-single-replica.yaml` | held at exactly 1 replica in both base and production, with a `Recreate` rollout strategy so an old and new `keel-server` Pod are never scheduled at once — see "Why `keel-server` is pinned to one replica" below |
 | Non-source-tree tool workspace | `base/server/deployment.yaml` (`workingDir: /workspace` + matching `emptyDir`) | keeps the read-only root filesystem consistent with the app's actual `Path.cwd()`-based workspace (`packages/keel-server/src/keel_server/app.py`) instead of pointing it at the read-only `/app` source tree |
 | Bounded resources | every container | explicit `requests`/`limits`; sandbox Jobs additionally set `activeDeadlineSeconds` and `backoffLimit: 0` so a stuck or misbehaving run cannot retry indefinitely or run unbounded |
@@ -96,14 +97,23 @@ dynamically created — they are not.
   `keel_core.tools.wiring.build_service_execution_environment`, which **defaults to**
   `execution_backend=sandbox` — an authenticated RPC client
   (`keel_core.tools.rpc.SandboxExecutionEnvironment`) that must reach a `keel-sandbox` service
-  at `KEEL_SANDBOX_URL` (default `http://keel-sandbox:8090`). That service boundary exists in
-  code (`packages/keel-sandbox/src/keel_sandbox/service.py`) and wiring fails **closed** when
-  it is unreachable or unauthenticated — but neither `docker-compose.yml` nor this
-  `deploy/k8s` scaffold deploys a `keel-sandbox` Deployment/Service yet. Deployed as-is,
-  `keel-server`/`keel-worker` start and serve `/health`/`/readiness` normally, but every
-  tool-execution call (shell, read, write, edit, list, glob, grep) fails closed
-  ("unavailable") until a real, reachable `keel-sandbox` exists — an intentional fail-closed
-  gap, not a hidden regression. The only opt-out is explicitly setting
+  at `KEEL_SANDBOX_URL` (default `http://keel-sandbox:8090`), signed with the shared
+  `KEEL_SANDBOX_RPC_SECRET`. That service boundary exists in code
+  (`packages/keel-sandbox/src/keel_sandbox/service.py`) and wiring fails **closed** when it is
+  unreachable or unauthenticated — but neither `docker-compose.yml` nor this `deploy/k8s`
+  scaffold deploys a `keel-sandbox` Deployment/Service yet. Building the RPC client itself
+  (`keel_core.tools.rpc_auth.RpcRequestSigner`) requires a non-empty,
+  `MIN_RPC_SECRET_BYTES`-or-longer (32) `KEEL_SANDBOX_RPC_SECRET` and does this **at process
+  startup**, not lazily per call: an empty or too-short value raises immediately and
+  crash-loops the Pod before it ever serves `/health` — a stricter failure mode than
+  `KEEL_API_KEYS`/`KEEL_CLOUD_MODE`, which fail closed per-request instead.
+  `base/secret-app.example.yaml` therefore ships a syntactically-valid, 61-byte placeholder
+  (`scripts/validate_manifests.py` fails the build if it regresses to empty/short/absent, or
+  leaks into the ConfigMap) — replace it with your own real, random value before deploying.
+  With that in place, `keel-server`/`keel-worker` start and serve `/health`/`/readiness`
+  normally, but every tool-execution call (shell, read, write, edit, list, glob, grep) still
+  fails closed ("unavailable") until a real, reachable `keel-sandbox` exists — an intentional
+  fail-closed gap, not a hidden regression. The only opt-out is explicitly setting
   `KEEL_EXECUTION_BACKEND=unsafe-local-dev` together with
   `KEEL_TRUSTED_PREVIEW_ALLOW_UNSAFE_EXECUTION=true` (neither set by this scaffold's
   ConfigMap), which restores unconditional in-process execution for a trusted single-org
@@ -199,6 +209,15 @@ Operator, Sealed Secrets, or your cloud provider's CSI secret store driver) sync
 KMS/Vault into the Secret name/shape these files document, not hand-applying filled-in
 manifests. `KEEL_API_KEYS` is required in that Secret (see the table above) — there is no
 default that makes an empty value safe.
+
+`KEEL_SANDBOX_RPC_SECRET` is also required in that Secret and is startup-critical, not just
+request-critical: generate a real random value (e.g. `openssl rand -base64 32`, or your secret
+manager's equivalent) of at least 32 bytes — `base/secret-app.example.yaml`'s shipped
+placeholder is exactly that length so the build passes on a fresh checkout, but it is not a
+secret and must never reach a real cluster. Configure the identical value on the `keel-sandbox`
+service once one is deployed (see "Isolation levels" above); until then this secret only
+prevents `keel-server`/`keel-worker` from crash-looping at startup, it does not make tool
+execution actually work.
 
 ## Storage: Git PVC and object storage are dormant, not wired up
 
