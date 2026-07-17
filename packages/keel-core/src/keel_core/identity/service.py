@@ -1,0 +1,489 @@
+"""Identity service: provisioning, org selection, and authorized CRUD (M3.6, WS-L).
+
+The service is the single place that composes the repository (:class:`IdentityStore`), the
+fine-grained :class:`AuthorizationService`, input validation, last-owner protection,
+optimistic concurrency, and audit. Transport (FastAPI) and the durable schema stay out of
+it, so it is fully exercisable with the in-memory store.
+
+Provisioning policy (documented): an OIDC subject is resolved to a durable user by its
+``(issuer, subject)`` link. When ``allow_jit`` is enabled a first-seen subject is
+provisioned just-in-time (a new user + link); otherwise an unlinked subject is rejected and
+must be linked explicitly (:meth:`link_identity`). A verified subject alone never grants org
+access — the caller must additionally select an org the user is an active member of.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from keel_core.errors import PermissionDenied
+from keel_core.identity.audit import AuditAction, AuditEvent, AuditSink, LoggingAuditSink
+from keel_core.identity.authz import AuthorizationService
+from keel_core.identity.models import (
+    Agent,
+    AgentKind,
+    Capability,
+    IdentityValidationError,
+    LastOwnerError,
+    Membership,
+    MembershipRole,
+    NotFoundError,
+    Organization,
+    OrganizationStatus,
+    ResourceGrant,
+    User,
+    normalize_email,
+    validate_agent_name,
+    validate_display_name,
+    validate_org_slug,
+)
+from keel_core.identity.oidc import OIDCClaims
+from keel_core.identity.store import IdentityStore
+
+# A stable synthetic identity for the single-operator local/self-hosted profile, so local
+# identity reads/writes still bind to a durable user (never the ambient ``web:local`` scope).
+LOCAL_ISSUER = "local"
+LOCAL_SUBJECT = "operator"
+
+
+@dataclass(frozen=True)
+class OrgContext:
+    """A user's resolved, authorized position inside one organization."""
+
+    organization: Organization
+    membership: Membership
+
+    @property
+    def org_id(self) -> str:
+        return self.organization.id
+
+    @property
+    def capabilities(self) -> frozenset[Capability]:
+        return self.membership.capabilities
+
+
+class IdentityService:
+    """Authorized identity + Agent + grant operations over an :class:`IdentityStore`."""
+
+    def __init__(
+        self,
+        store: IdentityStore,
+        *,
+        authz: AuthorizationService | None = None,
+        audit: AuditSink | None = None,
+        allow_jit_provisioning: bool = False,
+    ) -> None:
+        self._store = store
+        self._authz = authz or AuthorizationService()
+        self._audit = audit or LoggingAuditSink()
+        self._allow_jit = allow_jit_provisioning
+
+    @property
+    def store(self) -> IdentityStore:
+        return self._store
+
+    @property
+    def authz(self) -> AuthorizationService:
+        return self._authz
+
+    # --- provisioning ----------------------------------------------------------------
+    async def resolve_oidc_user(self, claims: OIDCClaims) -> User:
+        """Resolve a verified OIDC subject to a durable user (JIT or explicit-link)."""
+        identity = await self._store.get_identity(claims.issuer, claims.subject)
+        if identity is not None:
+            user = await self._store.get_user(identity.user_id)
+            if user is None or not user.is_active:
+                raise NotFoundError("linked user is not active")
+            await self._store.touch_identity_login(identity.id)
+            return user
+        if not self._allow_jit:
+            raise NotFoundError(
+                "OIDC subject is not linked to a user; explicit linking is required"
+            )
+        display = claims.email or f"{claims.issuer}#{claims.subject}"
+        email = normalize_email(claims.email) if claims.email_verified else None
+        user = await self._store.create_user(
+            display_name=validate_display_name(display[:200]), email=email
+        )
+        await self._store.link_identity(
+            user_id=user.id, issuer=claims.issuer, subject=claims.subject, email=email
+        )
+        self._audit.record(
+            AuditEvent(AuditAction.user_provisioned, user.id, None, user.id, {"jit": "true"})
+        )
+        return user
+
+    async def link_identity(self, user_id: str, claims: OIDCClaims) -> None:
+        """Explicitly link a verified OIDC subject to an existing user."""
+        user = await self._store.get_user(user_id)
+        if user is None or not user.is_active:
+            raise NotFoundError("user not found")
+        email = normalize_email(claims.email) if claims.email_verified else None
+        await self._store.link_identity(
+            user_id=user_id, issuer=claims.issuer, subject=claims.subject, email=email
+        )
+
+    async def ensure_local_user(self, *, display_name: str = "Local Operator") -> User:
+        """Get-or-create the durable local-operator user (single-operator local profile)."""
+        identity = await self._store.get_identity(LOCAL_ISSUER, LOCAL_SUBJECT)
+        if identity is not None:
+            user = await self._store.get_user(identity.user_id)
+            if user is not None and user.is_active:
+                return user
+        user = await self._store.create_user(
+            display_name=validate_display_name(display_name), email=None
+        )
+        await self._store.link_identity(
+            user_id=user.id, issuer=LOCAL_ISSUER, subject=LOCAL_SUBJECT, email=None
+        )
+        return user
+
+    # --- org selection ---------------------------------------------------------------
+    async def select_org(self, user_id: str, org_ref: str) -> OrgContext:
+        """Resolve an org (by id or slug) the user is an active member of (reject spoofing)."""
+        org = await self._store.get_org(org_ref)
+        if org is None:
+            org = await self._store.get_org_by_slug(org_ref)
+        if org is None or org.status is not OrganizationStatus.active:
+            raise NotFoundError("organization not found")
+        membership = await self._store.get_membership(org.id, user_id)
+        if membership is None or not membership.is_active:
+            # Do not disclose org existence to a non-member: same error as unknown org.
+            raise NotFoundError("organization not found")
+        return OrgContext(organization=org, membership=membership)
+
+    async def list_orgs_for_user(self, user_id: str) -> list[tuple[Organization, Membership]]:
+        memberships = await self._store.list_memberships_for_user(user_id)
+        result: list[tuple[Organization, Membership]] = []
+        for membership in memberships:
+            if not membership.is_active:
+                continue
+            org = await self._store.get_org(membership.org_id)
+            if org is not None and org.status is OrganizationStatus.active:
+                result.append((org, membership))
+        return result
+
+    async def create_org(self, actor_user_id: str, *, slug: str, display_name: str) -> OrgContext:
+        """Create an org; the creating user becomes its first active owner."""
+        clean_slug = validate_org_slug(slug)
+        clean_name = validate_display_name(display_name)
+        org = await self._store.create_org(slug=clean_slug, display_name=clean_name)
+        membership = await self._store.create_membership(
+            org_id=org.id, user_id=actor_user_id, role=MembershipRole.owner
+        )
+        self._audit.record(
+            AuditEvent(AuditAction.org_created, actor_user_id, org.id, org.id, {"slug": clean_slug})
+        )
+        return OrgContext(organization=org, membership=membership)
+
+    # --- membership management -------------------------------------------------------
+    async def _require_actor_membership(self, org_id: str, actor_user_id: str) -> Membership:
+        membership = await self._store.get_membership(org_id, actor_user_id)
+        if membership is None or not membership.is_active:
+            raise PermissionDenied("no active membership in this organization")
+        return membership
+
+    async def add_member(
+        self, org_id: str, actor_user_id: str, target_user_id: str, role: MembershipRole
+    ) -> Membership:
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        if not self._authz.can_manage_members(actor):
+            raise PermissionDenied("managing members requires org admin/owner")
+        # Only an owner may create another owner (admins cannot escalate to owner).
+        if role is MembershipRole.owner and actor.role is not MembershipRole.owner:
+            raise PermissionDenied("only an owner may grant the owner role")
+        target = await self._store.get_user(target_user_id)
+        if target is None or not target.is_active:
+            raise NotFoundError("target user not found")
+        membership = await self._store.create_membership(
+            org_id=org_id, user_id=target_user_id, role=role
+        )
+        self._audit.record(
+            AuditEvent(
+                AuditAction.member_added,
+                actor_user_id,
+                org_id,
+                target_user_id,
+                {"role": role.value},
+            )
+        )
+        return membership
+
+    async def change_member_role(
+        self, org_id: str, actor_user_id: str, target_user_id: str, new_role: MembershipRole
+    ) -> Membership:
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        if not self._authz.can_manage_members(actor):
+            raise PermissionDenied("managing members requires org admin/owner")
+        current = await self._store.get_membership(org_id, target_user_id)
+        if current is None or not current.is_active:
+            raise NotFoundError("target membership not found")
+        owner_change = MembershipRole.owner in (current.role, new_role)
+        if owner_change and actor.role is not MembershipRole.owner:
+            raise PermissionDenied("only an owner may change owner assignments")
+        # Last-owner protection: never demote the final active owner.
+        if current.role is MembershipRole.owner and new_role is not MembershipRole.owner:
+            await self._guard_last_owner(org_id)
+        updated = await self._store.update_membership_role(org_id, target_user_id, new_role)
+        if updated is None:
+            raise NotFoundError("target membership not found")
+        self._audit.record(
+            AuditEvent(
+                AuditAction.member_role_changed,
+                actor_user_id,
+                org_id,
+                target_user_id,
+                {"from": current.role.value, "to": new_role.value},
+            )
+        )
+        return updated
+
+    async def remove_member(
+        self, org_id: str, actor_user_id: str, target_user_id: str
+    ) -> Membership:
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        if not self._authz.can_manage_members(actor):
+            raise PermissionDenied("managing members requires org admin/owner")
+        current = await self._store.get_membership(org_id, target_user_id)
+        if current is None or not current.is_active:
+            raise NotFoundError("target membership not found")
+        if current.role is MembershipRole.owner:
+            if actor.role is not MembershipRole.owner:
+                raise PermissionDenied("only an owner may remove an owner")
+            await self._guard_last_owner(org_id)
+        revoked = await self._store.revoke_membership(org_id, target_user_id)
+        if revoked is None:
+            raise NotFoundError("target membership not found")
+        self._audit.record(
+            AuditEvent(AuditAction.member_removed, actor_user_id, org_id, target_user_id, {})
+        )
+        return revoked
+
+    async def _guard_last_owner(self, org_id: str) -> None:
+        if await self._store.count_active_owners(org_id) <= 1:
+            raise LastOwnerError("an organization must retain at least one active owner")
+
+    async def list_members(self, org_id: str, actor_user_id: str) -> list[Membership]:
+        await self._require_actor_membership(org_id, actor_user_id)
+        return await self._store.list_memberships(org_id)
+
+    # --- agents ----------------------------------------------------------------------
+    async def create_agent(
+        self,
+        org_id: str,
+        actor_user_id: str,
+        *,
+        kind: AgentKind,
+        name: str,
+        persona: str = "",
+    ) -> Agent:
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        decision = self._authz.can_create_agent(actor, kind)
+        if not decision:
+            raise PermissionDenied(decision.reason)
+        clean_name = validate_agent_name(name)
+        if len(persona) > 20_000:
+            raise IdentityValidationError("persona is too long")
+        agent = await self._store.create_agent(
+            org_id=org_id,
+            kind=kind,
+            owner_user_id=actor_user_id,
+            name=clean_name,
+            persona=persona,
+        )
+        self._audit.record(
+            AuditEvent(
+                AuditAction.agent_created,
+                actor_user_id,
+                org_id,
+                agent.id,
+                {"kind": kind.value, "name": clean_name},
+            )
+        )
+        return agent
+
+    async def list_visible_agents(self, org_id: str, actor_user_id: str) -> list[Agent]:
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        agents = await self._store.list_agents(org_id)
+        return [
+            agent for agent in agents if self._authz.can_view_agent(actor_user_id, actor, agent)
+        ]
+
+    async def get_agent(self, org_id: str, actor_user_id: str, agent_id: str) -> Agent:
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        agent = await self._store.get_agent(org_id, agent_id)
+        if agent is None:
+            raise NotFoundError("agent not found")
+        if not self._authz.can_view_agent(actor_user_id, actor, agent):
+            # Hide existence of a private personal agent.
+            raise NotFoundError("agent not found")
+        return agent
+
+    async def update_agent(
+        self,
+        org_id: str,
+        actor_user_id: str,
+        agent_id: str,
+        *,
+        expected_version: int,
+        name: str | None = None,
+        persona: str | None = None,
+    ) -> Agent:
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        agent = await self._store.get_agent(org_id, agent_id)
+        if agent is None:
+            raise NotFoundError("agent not found")
+        decision = self._authz.can_manage_agent(actor_user_id, actor, agent)
+        if not decision:
+            # Preserve privacy of a personal agent the actor can't even see.
+            if not self._authz.can_view_agent(actor_user_id, actor, agent):
+                raise NotFoundError("agent not found")
+            raise PermissionDenied(decision.reason)
+        clean_name = validate_agent_name(name) if name is not None else None
+        if persona is not None and len(persona) > 20_000:
+            raise IdentityValidationError("persona is too long")
+        updated = await self._store.update_agent(
+            org_id,
+            agent_id,
+            expected_version=expected_version,
+            name=clean_name,
+            persona=persona,
+        )
+        if updated is None:
+            raise NotFoundError("agent not found")
+        self._audit.record(
+            AuditEvent(AuditAction.agent_updated, actor_user_id, org_id, agent_id, {})
+        )
+        return updated
+
+    async def archive_agent(
+        self, org_id: str, actor_user_id: str, agent_id: str, *, expected_version: int
+    ) -> Agent:
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        agent = await self._store.get_agent(org_id, agent_id)
+        if agent is None:
+            raise NotFoundError("agent not found")
+        decision = self._authz.can_manage_agent(actor_user_id, actor, agent)
+        if not decision:
+            if not self._authz.can_view_agent(actor_user_id, actor, agent):
+                raise NotFoundError("agent not found")
+            raise PermissionDenied(decision.reason)
+        archived = await self._store.archive_agent(
+            org_id, agent_id, expected_version=expected_version
+        )
+        if archived is None:
+            raise NotFoundError("agent not found")
+        self._audit.record(
+            AuditEvent(AuditAction.agent_archived, actor_user_id, org_id, agent_id, {})
+        )
+        return archived
+
+    async def select_agent(self, org_id: str, actor_user_id: str, agent_id: str) -> Agent:
+        """Compatibility bridge: resolve a persisted Agent the actor selects for a run.
+
+        Enforces *use* authorization now so a future durable-run integration can bind the
+        selected Agent without re-deriving the access decision.
+        """
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        agent = await self._store.get_agent(org_id, agent_id)
+        if agent is None:
+            raise NotFoundError("agent not found")
+        decision = self._authz.can_use_agent(actor_user_id, actor, agent)
+        if not decision:
+            if not self._authz.can_view_agent(actor_user_id, actor, agent):
+                raise NotFoundError("agent not found")
+            raise PermissionDenied(decision.reason)
+        return agent
+
+    # --- grants ----------------------------------------------------------------------
+    async def grant_resource(
+        self,
+        org_id: str,
+        actor_user_id: str,
+        *,
+        agent_id: str,
+        resource_type: str,
+        resource_id: str,
+        capability: Capability,
+    ) -> ResourceGrant:
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        agent = await self._store.get_agent(org_id, agent_id)
+        if agent is None:
+            raise NotFoundError("agent not found")
+        decision = self._authz.can_grant_resource(actor, agent, capability)
+        if not decision:
+            raise PermissionDenied(decision.reason)
+        self._validate_resource(resource_type, resource_id)
+        grant = await self._store.create_grant(
+            org_id=org_id,
+            agent_id=agent_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            capability=capability,
+            grantor_user_id=actor_user_id,
+        )
+        self._audit.record(
+            AuditEvent(
+                AuditAction.grant_created,
+                actor_user_id,
+                org_id,
+                grant.id,
+                {
+                    "agent_id": agent_id,
+                    "resource_type": resource_type,
+                    "resource_id": resource_id,
+                    "capability": capability.value,
+                },
+            )
+        )
+        return grant
+
+    async def list_grants(
+        self, org_id: str, actor_user_id: str, *, agent_id: str | None = None
+    ) -> list[ResourceGrant]:
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        if agent_id is not None:
+            agent = await self._store.get_agent(org_id, agent_id)
+            if agent is None:
+                raise NotFoundError("agent not found")
+            can_owner = agent.owner_user_id == actor_user_id
+            if not (self._authz.is_org_admin(actor) or can_owner):
+                raise PermissionDenied("listing grants requires org admin/owner or agent ownership")
+        elif not self._authz.is_org_admin(actor):
+            raise PermissionDenied("listing all grants requires org admin/owner")
+        return await self._store.list_grants(org_id, agent_id=agent_id)
+
+    async def revoke_grant(self, org_id: str, actor_user_id: str, grant_id: str) -> ResourceGrant:
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        grant = await self._store.get_grant(org_id, grant_id)
+        if grant is None:
+            raise NotFoundError("grant not found")
+        agent = await self._store.get_agent(org_id, grant.agent_id)
+        if agent is None:
+            raise NotFoundError("grant not found")
+        decision = self._authz.can_grant_resource(actor, agent, grant.capability)
+        if not decision:
+            raise PermissionDenied(decision.reason)
+        revoked = await self._store.revoke_grant(org_id, grant_id)
+        if revoked is None:
+            raise NotFoundError("grant not found")
+        self._audit.record(
+            AuditEvent(AuditAction.grant_revoked, actor_user_id, org_id, grant_id, {})
+        )
+        return revoked
+
+    def _validate_resource(self, resource_type: str, resource_id: str) -> None:
+        if not (1 <= len(resource_type) <= 100) or not resource_type.strip():
+            raise IdentityValidationError("resource_type must be 1-100 characters")
+        if not (1 <= len(resource_id) <= 200) or not resource_id.strip():
+            raise IdentityValidationError("resource_id must be 1-200 characters")
+
+    # --- profile ---------------------------------------------------------------------
+    async def get_profile(self, user_id: str) -> tuple[User, list[tuple[Organization, Membership]]]:
+        user = await self._store.get_user(user_id)
+        if user is None or not user.is_active:
+            raise NotFoundError("user not found")
+        return user, await self.list_orgs_for_user(user_id)
+
+
+__all__ = ["IdentityService", "OrgContext"]

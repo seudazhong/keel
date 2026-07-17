@@ -82,6 +82,9 @@ JOB = "job"
 CODING_ARTIFACT = "coding_artifact"
 TOOL_SPILL = "tool_spill"
 ERASURE_LEDGER = "erasure_ledger"
+# Durable identity (M3.6): users/orgs/memberships/Agents/grants/OIDC links. User content —
+# permanent, removed only by an explicit organization- or user-erasure (never on a timer).
+IDENTITY = "identity"
 
 
 DEFAULT_RETENTION: Mapping[str, RetentionPolicy] = {
@@ -103,6 +106,7 @@ DEFAULT_RETENTION: Mapping[str, RetentionPolicy] = {
     CODING_ARTIFACT: _policy(CODING_ARTIFACT, RetentionClass.standard),
     TOOL_SPILL: _policy(TOOL_SPILL, RetentionClass.short),
     ERASURE_LEDGER: _policy(ERASURE_LEDGER, RetentionClass.long),
+    IDENTITY: _policy(IDENTITY, RetentionClass.permanent),
 }
 """The typed retention defaults for every persisted resource class."""
 

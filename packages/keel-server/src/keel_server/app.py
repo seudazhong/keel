@@ -26,6 +26,15 @@ from keel_core.approvals import InMemoryApprovalStore, PostgresApprovalStore
 from keel_core.config import Settings, get_settings, load_env_file
 from keel_core.db import make_async_engine, make_redis
 from keel_core.embeddings import Embedder
+from keel_core.identity import (
+    HTTPJWKSProvider,
+    IdentityService,
+    InMemoryIdentityStore,
+    LoggingAuditSink,
+    OIDCConfig,
+    OIDCVerifier,
+    PostgresIdentityStore,
+)
 from keel_core.jobs import (
     InMemoryJobStore,
     JobLimits,
@@ -40,6 +49,7 @@ from keel_core.providers import LiteLLMGateway
 from keel_core.tools import build_service_execution_environment
 from keel_core.webhooks import InMemoryWebhookReplayStore, PostgresWebhookReplayStore
 from keel_server.api import gateway as gateway_api
+from keel_server.api import identity as identity_api
 from keel_server.api import knowledge as knowledge_api
 from keel_server.api import lifecycle as lifecycle_api
 from keel_server.api import oauth as oauth_api
@@ -126,6 +136,36 @@ def _build_knowledge_service(
         embedding_model=(None if embedder is None else embedder.model),
         embedding_dim=(None if embedder is None else embedder.dim),
     )
+
+
+def _build_identity(engine: AsyncEngine | None, settings: Settings) -> tuple[Any, Any]:
+    """Build the identity service + OIDC verifier (durable when an engine is configured)."""
+    store: Any = PostgresIdentityStore(engine) if engine is not None else InMemoryIdentityStore()
+    service = IdentityService(
+        store,
+        audit=LoggingAuditSink(),
+        allow_jit_provisioning=settings.identity_allow_jit_provisioning,
+    )
+    verifier: OIDCVerifier | None = None
+    if (
+        settings.oidc_enabled
+        and settings.oidc_issuer
+        and settings.oidc_audience
+        and settings.oidc_jwks_uri
+    ):
+        algorithms = tuple(a.strip() for a in settings.oidc_algorithms.split(",") if a.strip())
+        config = OIDCConfig.from_settings(
+            issuer=settings.oidc_issuer,
+            audience=settings.oidc_audience,
+            algorithms=algorithms or None,
+            leeway_seconds=settings.oidc_leeway_seconds,
+        )
+        provider = HTTPJWKSProvider(
+            settings.oidc_jwks_uri,
+            cache_ttl_seconds=settings.oidc_jwks_cache_ttl_seconds,
+        )
+        verifier = OIDCVerifier(config, provider)
+    return service, verifier
 
 
 @asynccontextmanager
@@ -226,6 +266,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         redis_client=redis_client,
         dispatch_job=_dispatch_knowledge_job,
     )
+    # Durable identity (users/orgs/memberships/Agents/grants) + OIDC verification (M3.6).
+    identity_service, oidc_verifier = _build_identity(engine, settings)
+    app.state.identity = identity_service
+    app.state.oidc_verifier = oidc_verifier
     # OneBot IM gateway (optional): only wired when an API base is configured.
     if settings.onebot_api_base:
         app.state.onebot_gateway = OneBotGateway(
@@ -266,6 +310,7 @@ def create_app() -> FastAPI:
     """Build the Keel FastAPI application."""
     app = FastAPI(title="Keel", version=__version__, lifespan=_lifespan)
     knowledge_api.register_exception_handlers(app)
+    identity_api.register_exception_handlers(app)
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def index() -> str:
@@ -312,6 +357,7 @@ def create_app() -> FastAPI:
         return JSONResponse(body.model_dump(), status_code=200 if ready else 503)
 
     app.include_router(v1.router)
+    app.include_router(identity_api.router)
     app.include_router(knowledge_api.router)
     app.include_router(lifecycle_api.router)
     app.include_router(oauth_api.router)

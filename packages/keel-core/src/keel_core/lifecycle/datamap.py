@@ -24,6 +24,8 @@ class ErasureTreatment(StrEnum):
     project_scoped = "project_scoped"  # erased on project erasure (on-disk, by project id)
     global_preserved = "global_preserved"  # shared/global config — deliberately preserved
     external = "external"  # lives in an external system — best-effort, may be partial
+    org_scoped = "org_scoped"  # erased on organization erasure (org-partitioned identity)
+    identity_global = "identity_global"  # global identity; erased on user (data-subject) erasure
 
 
 @dataclass(frozen=True)
@@ -268,6 +270,57 @@ DATA_MAP: tuple[DataMapEntry, ...] = (
         "scope_id",
         ErasureTreatment.global_preserved,
         "Per-scope retention overrides — retained.",
+    ),
+    # --- Durable identity (M3.6): erased by the dedicated identity purge, NOT the ----
+    # scope/session/project coordinator (identity is org-partitioned, not scope-bound).
+    DataMapEntry(
+        "organizations",
+        "table",
+        policies.IDENTITY,
+        "id",
+        ErasureTreatment.org_scoped,
+        "Tenant root; erased on organization erasure (cascades to its identity rows).",
+    ),
+    DataMapEntry(
+        "memberships",
+        "table",
+        policies.IDENTITY,
+        "org_id",
+        ErasureTreatment.org_scoped,
+        "User<->org RBAC edges; erased on organization erasure (and on user erasure).",
+    ),
+    DataMapEntry(
+        "agents",
+        "table",
+        policies.IDENTITY,
+        "org_id",
+        ErasureTreatment.org_scoped,
+        "Persisted personal/team Agents; erased on organization erasure (and owner erasure).",
+    ),
+    DataMapEntry(
+        "resource_grants",
+        "table",
+        policies.IDENTITY,
+        "org_id",
+        ErasureTreatment.org_scoped,
+        "Explicit Agent resource grants; erased on organization erasure (and owner erasure).",
+    ),
+    DataMapEntry(
+        "users",
+        "table",
+        policies.IDENTITY,
+        None,
+        ErasureTreatment.identity_global,
+        "Global human identity; erased on user (data-subject) erasure — cascades to the "
+        "user's OIDC links, owned Agents, memberships, and issued grants.",
+    ),
+    DataMapEntry(
+        "oidc_identities",
+        "table",
+        policies.IDENTITY,
+        None,
+        ErasureTreatment.identity_global,
+        "Global external OIDC subject links; erased on user (data-subject) erasure.",
     ),
     # --- External systems ------------------------------------------------------------
     DataMapEntry(

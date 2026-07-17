@@ -29,3 +29,98 @@ class InterruptRunResponse(BaseModel):
     """Result of an interrupt request."""
 
     ok: bool
+
+
+# --- Identity (M3.6) — additive DTOs -------------------------------------------------
+
+
+class UserSummary(BaseModel):
+    """A durable identity user."""
+
+    id: str
+    display_name: str
+    email: str | None = None
+    status: str
+
+
+class OrganizationSummary(BaseModel):
+    """An organization (tenant)."""
+
+    id: str
+    slug: str
+    display_name: str
+    status: str
+
+
+class MembershipSummary(BaseModel):
+    """A user's membership + role in an org."""
+
+    id: str
+    org_id: str
+    user_id: str
+    role: str
+    status: str
+
+
+class OrganizationMembership(BaseModel):
+    """An organization paired with the caller's membership in it."""
+
+    organization: OrganizationSummary
+    membership: MembershipSummary
+
+
+class MeResponse(BaseModel):
+    """The authenticated user and the organizations it belongs to."""
+
+    user: UserSummary
+    organizations: list[OrganizationMembership] = []
+
+
+class AgentSummary(BaseModel):
+    """A persisted personal/team Agent."""
+
+    id: str
+    org_id: str
+    kind: str
+    owner_user_id: str
+    name: str
+    persona: str
+    status: str
+    version: int
+
+
+class GrantSummary(BaseModel):
+    """An explicit Agent resource grant."""
+
+    id: str
+    org_id: str
+    agent_id: str
+    resource_type: str
+    resource_id: str
+    capability: str
+    grantor_user_id: str
+    status: str
+
+
+class CreateOrganizationRequest(BaseModel):
+    """Create an organization (the caller becomes its owner)."""
+
+    slug: str
+    display_name: str
+
+
+class CreateAgentRequest(BaseModel):
+    """Create a personal or team Agent in the selected org."""
+
+    kind: str
+    name: str
+    persona: str = ""
+
+
+class CreateGrantRequest(BaseModel):
+    """Grant an Agent a capability on a resource."""
+
+    agent_id: str
+    resource_type: str
+    resource_id: str
+    capability: str

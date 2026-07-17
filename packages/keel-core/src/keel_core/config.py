@@ -93,6 +93,22 @@ class Settings(BaseSettings):
     # implicit-admin open mode. Leave false only for local/self-hosted single-user use.
     cloud_mode: bool = False
 
+    # OIDC identity (M3.6). Human users authenticate with a provider-issued bearer JWT that
+    # the server verifies against the issuer's JWKS. Disabled -> only the API-key/local
+    # actor paths are available (identity APIs then require the local single-operator user
+    # outside cloud mode). ``oidc_audience`` accepts a comma-separated allow-list.
+    oidc_enabled: bool = False
+    oidc_issuer: str = ""
+    oidc_audience: str = ""
+    oidc_jwks_uri: str = ""
+    oidc_algorithms: str = ""  # comma-separated; empty -> safe asymmetric defaults
+    oidc_leeway_seconds: int = Field(default=60, ge=0)
+    oidc_jwks_cache_ttl_seconds: int = Field(default=3600, gt=0)
+    # Just-in-time user provisioning: a first-seen verified subject is auto-provisioned a
+    # durable user. Off by default (fail closed): an unlinked subject must be linked
+    # explicitly before it can act.
+    identity_allow_jit_provisioning: bool = False
+
     # Durable event store backend: "postgres" (default) or "memory". The in-memory
     # store is a single-process "lite" profile — and the way to run the server on a
     # Windows host, where uvicorn's Proactor loop can't drive psycopg's async driver.

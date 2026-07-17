@@ -40,6 +40,8 @@ not be — so a new store cannot be added without a conscious retention + erasur
 | `event_tombstones` | table | long | `scope_id` | **retained** (anti-resurrection marker) |
 | `erasure_requests` / `erasure_steps` | table | long | `scope_id` | **retained** (audit trail) |
 | `retention_policies` | table | long | `scope_id` | **retained** (operator overrides) |
+| `organizations` / `memberships` / `agents` / `resource_grants` | table | permanent | `org_id` | **org-scoped** — erased by organization erasure (M3.6) |
+| `users` / `oidc_identities` | table | permanent | *(global)* | **identity-global** — erased by user (data-subject) erasure (M3.6) |
 | provider logs / Langfuse telemetry | external | — | — | **external** — no delete API; recorded incomplete → `partial` |
 
 Notes:
@@ -52,6 +54,15 @@ Notes:
   `purge_all` / TTL sweep exists for full teardown).
 * **Tombstones and the erasure ledger are retained on purpose** — deleting them would
   defeat anti-resurrection and lose the audit trail.
+* **Identity is org-partitioned, not scope-bound (M3.6).** Durable users/orgs/memberships/
+  Agents/grants are *not* reached by scope/session/project erasure (they carry `org_id`,
+  not the runtime `scope_id`). They are erased by the dedicated identity purge in
+  `keel_core.identity.purge`: `purge_organization(org_id)` (tenant offboarding) and
+  `purge_user(user_id)` (a data subject; cascades through the user's OIDC links, owned
+  Agents, memberships, and issued grants). Identity is **not event-sourced**, so no
+  projection rebuild can resurrect an erased identity row. When durable runs land and a
+  run's scope is derived from `(org, agent)`, org erasure will be folded into the scope
+  coordinator; until then it is a standalone primitive (tracked honestly here).
 
 ## 2. Retention defaults
 

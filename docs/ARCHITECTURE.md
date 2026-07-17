@@ -399,7 +399,14 @@ hardening, and Tauri remain targets.
 - **Injection scanning [G6]:** tool/skill/MCP **descriptions and imported instructions** are scanned for prompt-injection at import/discovery time; a hit **quarantines** the item (excluded from the prompt) pending review.
 - **AuthN/Z target:** OAuth2/OIDC for humans, hashed/scoped API credentials, RBAC, and
   complete audit. Current API-key configuration is optional plaintext and empty means
-  implicit admin.
+  implicit admin. **M3.6 identity** adds durable users, organizations, memberships (RBAC:
+  owner/admin/member/viewer), persisted personal/team Agents, and explicit resource grants,
+  plus an OIDC bearer-JWT verifier (issuer/audience/JWKS/`exp`/`nbf`/`iat`, asymmetric-only)
+  and a per-request actor model (user / machine / local). Authorization is
+  principal/resource/capability with a fail-closed **intersection** of the acting user's
+  org capabilities and the Agent's grants (confused-deputy defense); tenant tables enforce
+  `app.org_id` RLS + `FORCE`/`keel_runtime`. The Chat/runtime scope stays fixed at
+  `web:local` until durable runs land — see [`docs/IDENTITY.md`](IDENTITY.md).
 - **Data governance target [G4]:** retention windows, trace/telemetry PII redaction,
   documented data map, and complete erasure across events/projections/vectors/Knowledge/
   tokens/artifacts. These are M3.5 work, not current capability.

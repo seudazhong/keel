@@ -48,3 +48,35 @@ async def test_client_sends_bearer_api_key_without_exposing_it() -> None:
         await client.create_message("session-1", CreateMessageRequest(content="hello"))
 
     assert observed_authorization == [f"Bearer {api_key}"]
+
+
+async def test_client_identity_methods_send_org_header() -> None:
+    seen: dict[str, object] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["org"] = request.headers.get("X-Keel-Org")
+        return httpx.Response(
+            201,
+            json={
+                "id": "agt_1",
+                "org_id": "org_1",
+                "kind": "team",
+                "owner_user_id": "usr_1",
+                "name": "Bot",
+                "persona": "",
+                "status": "active",
+                "version": 1,
+            },
+        )
+
+    from keel_sdk import CreateAgentRequest
+
+    async with httpx.AsyncClient(
+        base_url="https://keel.test", transport=httpx.MockTransport(handler)
+    ) as transport:
+        client = KeelClient("https://ignored.test", client=transport)
+        agent = await client.create_agent("org_1", CreateAgentRequest(kind="team", name="Bot"))
+
+    assert agent.id == "agt_1"
+    assert seen == {"path": "/v1/identity/agents", "org": "org_1"}

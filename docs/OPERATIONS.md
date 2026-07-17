@@ -41,6 +41,21 @@ implemented in Compose.
 - `deploy/config/` is reserved for mounted non-secret configuration; current services are
   primarily environment-configured.
 
+### Identity & OIDC (M3.6)
+
+- **Human users** authenticate with an OIDC bearer JWT. Enable with `KEEL_OIDC_ENABLED=1`
+  and set `KEEL_OIDC_ISSUER`, `KEEL_OIDC_AUDIENCE` (comma-separated), and
+  `KEEL_OIDC_JWKS_URI` (`https://`). Tokens are verified for issuer/audience, JWKS
+  signature (rotation-aware cache), and `exp`/`nbf`/`iat` with `KEEL_OIDC_LEEWAY_SECONDS`
+  skew; only asymmetric algorithms are accepted. A verified user must select an org it
+  belongs to via the `X-Keel-Org` header. See [`docs/IDENTITY.md`](IDENTITY.md).
+- `KEEL_IDENTITY_ALLOW_JIT_PROVISIONING=1` provisions a first-seen verified subject a
+  durable user; default off (an unlinked subject is rejected). With OIDC disabled only the
+  API-key and local-operator actor paths are available.
+- Migration `0013` adds `FORCE ROW LEVEL SECURITY` + `keel_runtime` grants on the
+  tenant-owned identity tables (`memberships`, `agents`, `resource_grants`), keyed by the
+  `app.org_id` GUC — connect as a `keel_runtime` member to make RLS a hard boundary.
+
 ### Cloud-safety controls (M3.3)
 
 - **Runtime DB role.** Migration `0011` provisions a non-owner, non-bypass `keel_runtime`
@@ -78,6 +93,11 @@ implemented in Compose.
   idempotency are now durable and verified (M3.3); the fixed `web:local` scope still limits
   true multi-tenancy.
 - The scope is fixed to `web:local`; there are no users, organizations, or persisted Agents.
+  *(M3.6 adds durable users/orgs/memberships/persisted Agents/grants + OIDC and an
+  identity API, but the Chat/runtime and existing `/v1` session routes still run on the
+  single `web:local` scope and are not yet multi-user — the identity APIs are additive and
+  `POST /v1/identity/agents/{id}/select` is only a forward-compatible bridge. See
+  `docs/IDENTITY.md`.)*
 - The scheduler package is not a separate elected service; worker cron performs scheduling.
 - Event versions exist but upcasters, retention, and full erasure are not implemented.
 - Observability, generated SDK/version checks, CI coverage, backup/restore, and delivery
