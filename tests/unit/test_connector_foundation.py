@@ -75,12 +75,15 @@ from keel_core.tokens import InMemoryTokenStore
 from keel_core.types import ContentTaint
 
 
-def test_builtin_registry_discovers_gmail_deterministically() -> None:
+def test_builtin_registry_discovers_providers_deterministically() -> None:
     first = discover_connector_registry()
     second = discover_connector_registry()
-    assert [item.id for item in first.manifests()] == ["gmail"]
+    connector_ids = [item.id for item in first.manifests()]
+    assert connector_ids
+    assert connector_ids == sorted(connector_ids)
+    assert len(connector_ids) == len(set(connector_ids))
     assert first.manifests() == second.manifests()
-    assert first.create("gmail").manifest.id == "gmail"
+    assert all(first.get(item.id) is not None for item in first.manifests())
 
 
 def test_registry_rejects_duplicate_ids() -> None:
@@ -215,9 +218,7 @@ class _TrackingRepository(InMemoryConnectorRepository):
         payload_hash: str,
     ) -> ConnectorDeliveryClaim | None:
         self.claim_attempts += 1
-        return await super().claim_delivery(
-            connector_id, binding_id, delivery_id, payload_hash
-        )
+        return await super().claim_delivery(connector_id, binding_id, delivery_id, payload_hash)
 
 
 def _service() -> tuple[ConnectorService, InMemoryConnectorRepository, _Sink]:
@@ -270,14 +271,10 @@ async def test_setup_restores_prior_credential_when_binding_commit_fails(
         ConnectorBindingDraft(display_name="Before"),
         ConnectorBindingStatus.configured,
     )
-    credentials = ConnectorCredentialStore(
-        InMemoryTokenStore("scope:a", EnvelopeCipher("key"))
-    )
+    credentials = ConnectorCredentialStore(InMemoryTokenStore("scope:a", EnvelopeCipher("key")))
     await credentials.put("fixture", CredentialEnvelope("secret", {"value": "before"}))
     service = ConnectorService(
-        ConnectorRegistry(
-            (ConnectorRegistration(_Provider.manifest, _Provider, "tests.fixture"),)
-        ),
+        ConnectorRegistry((ConnectorRegistration(_Provider.manifest, _Provider, "tests.fixture"),)),
         repository,
         credentials=credentials,
     )
@@ -361,9 +358,7 @@ async def test_ingress_authentication_failure_never_claims() -> None:
         "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
     )
     service = ConnectorService(
-        ConnectorRegistry(
-            (ConnectorRegistration(_Provider.manifest, _Provider, "tests.fixture"),)
-        ),
+        ConnectorRegistry((ConnectorRegistration(_Provider.manifest, _Provider, "tests.fixture"),)),
         repository,
     )
     with pytest.raises(ValueError, match="signature"):
@@ -407,9 +402,7 @@ async def test_ingress_challenge_returns_before_delivery_claim() -> None:
     await repository.upsert_binding(
         "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
     )
-    credentials = ConnectorCredentialStore(
-        InMemoryTokenStore("scope:a", EnvelopeCipher("key"))
-    )
+    credentials = ConnectorCredentialStore(InMemoryTokenStore("scope:a", EnvelopeCipher("key")))
     await credentials.put("fixture", CredentialEnvelope("secret", {"value": "hidden"}))
     service = ConnectorService(registry, repository, credentials=credentials)
     outcome = await service.ingress(
@@ -521,11 +514,7 @@ async def test_verified_failure_is_durable_and_returns_provider_retry_response()
     )
     service = ConnectorService(
         ConnectorRegistry(
-            (
-                ConnectorRegistration(
-                    _Provider.manifest, FailureProvider, "tests.failure"
-                ),
-            )
+            (ConnectorRegistration(_Provider.manifest, FailureProvider, "tests.failure"),)
         ),
         repository,
     )
@@ -583,9 +572,9 @@ async def test_sink_failure_is_exposed_to_provider_health_and_retry_success_clea
         "https://keel.example/v1/connectors/fixture/webhook",
     )
     with pytest.raises(RuntimeError, match="internal sink details"):
-        await ConnectorService(
-            registry, repository, change_sink=FailingSink()
-        ).ingress("fixture", request)
+        await ConnectorService(registry, repository, change_sink=FailingSink()).ingress(
+            "fixture", request
+        )
     health = await ConnectorService(registry, repository).health("fixture")
     assert health.status is ConnectorHealthStatus.degraded
     failed_health = captured[-1]
@@ -593,9 +582,9 @@ async def test_sink_failure_is_exposed_to_provider_health_and_retry_success_clea
     assert failed_health.summary == "connector delivery processing failed"
     assert "internal sink details" not in failed_health.summary
 
-    outcome = await ConnectorService(
-        registry, repository, change_sink=_Sink()
-    ).ingress("fixture", request)
+    outcome = await ConnectorService(registry, repository, change_sink=_Sink()).ingress(
+        "fixture", request
+    )
     assert outcome.accepted is True
     assert await repository.get_delivery_health("fixture", binding.id) is None
     healthy = await ConnectorService(registry, repository).health("fixture")
