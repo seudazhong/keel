@@ -17,6 +17,10 @@ def test_defaults() -> None:
     assert settings.redis_url.startswith("redis://")
     assert settings.server_port == 8000
     assert settings.sync_database_url == settings.database_url
+    assert settings.execution_backend == "sandbox"
+    assert settings.sandbox_rpc_secret.get_secret_value() == ""
+    assert settings.sandbox_rpc_local_test_mode is False
+    assert settings.trusted_preview_allow_unsafe_execution is False
 
 
 def test_env_override(monkeypatch: pytest.MonkeyPatch) -> None:

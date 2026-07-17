@@ -1,9 +1,8 @@
-"""Keel sandbox executor (stub).
-
-The two-level sandbox (ADR-0005, spike S3) and the least-privilege executor
-image land in M1 (WS-C).
-"""
+"""Keel sandbox executor service and admission policy."""
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from keel_sandbox.policy import EgressPolicy, PathPolicy
+from keel_sandbox.service import ExecutorAdmissionPolicy, create_app
+
+__all__ = ["EgressPolicy", "ExecutorAdmissionPolicy", "PathPolicy", "create_app"]

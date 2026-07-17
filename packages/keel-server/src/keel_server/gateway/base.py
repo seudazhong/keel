@@ -31,7 +31,14 @@ from keel_core import (
     run,
 )
 from keel_core.protocols import Tool
-from keel_core.tools import GlobTool, GrepTool, LsTool, ReadTool
+from keel_core.tools import (
+    ExecutionEnvironment,
+    GlobTool,
+    GrepTool,
+    LsTool,
+    ReadTool,
+    UnavailableExecutionEnvironment,
+)
 from keel_core.types import PermissionDecision
 
 # The safe toolset for untrusted surfaces (FR-X6): read-only, no write/edit/shell.
@@ -67,8 +74,13 @@ class RateLimiter:
         return True
 
 
-def safe_tools(workspace: Path) -> list[Tool]:
-    return [ReadTool(workspace), LsTool(workspace), GlobTool(workspace), GrepTool(workspace)]
+def safe_tools(environment: ExecutionEnvironment) -> list[Tool]:
+    return [
+        ReadTool(environment),
+        LsTool(environment),
+        GlobTool(environment),
+        GrepTool(environment),
+    ]
 
 
 def safe_permissions() -> RuleBasedPermissionEngine:
@@ -93,6 +105,9 @@ class ImRunner:
     provider: ProviderGateway
     send: SendFn
     workspace: Path = field(default_factory=lambda: Path("."))
+    execution_environment: ExecutionEnvironment = field(
+        default_factory=UnavailableExecutionEnvironment
+    )
     model: str = "gpt-4o-mini"
     rate_limiter: RateLimiter = field(default_factory=RateLimiter)
     _store: InMemoryEventStore = field(default_factory=InMemoryEventStore, init=False)
@@ -133,7 +148,7 @@ class ImRunner:
             session_id=message.session_key,
             store=self._store,
             provider=self.provider,
-            registry=ToolRegistry(safe_tools(self.workspace)),
+            registry=ToolRegistry(safe_tools(self.execution_environment)),
             permissions=safe_permissions(),
             on_event=collect,
         )

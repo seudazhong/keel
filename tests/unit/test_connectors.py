@@ -63,6 +63,54 @@ async def test_outbound_connector_is_idempotent() -> None:
     assert len(calls) == 1  # at-most-once: the second call replays, doesn't re-send
 
 
+async def test_outbound_idempotency_survives_a_fresh_tool_via_shared_store() -> None:
+    """A durable store makes at-most-once hold across tool instances (restart/worker)."""
+    from keel_core.outbox import InMemoryOutboundStore
+
+    calls: list[dict[str, object]] = []
+
+    async def send(args: dict[str, object], ctx: ToolContext) -> str:
+        calls.append(args)
+        return "sent"
+
+    store = InMemoryOutboundStore()  # stands in for the durable Postgres store
+    first = ConnectorTool(
+        name="mail_send", description="", action=send, outbound=True, idempotency_store=store
+    )
+    await first.run({"idempotency_key": "k1", "to": "x"}, _ctx(ContentTaint.clean))
+    # A brand-new tool instance sharing the store still replays instead of re-sending.
+    second = ConnectorTool(
+        name="mail_send", description="", action=send, outbound=True, idempotency_store=store
+    )
+    result = await second.run({"idempotency_key": "k1", "to": "x"}, _ctx(ContentTaint.clean))
+    assert result.output == "sent"
+    assert len(calls) == 1
+
+
+async def test_outbound_claim_released_when_action_fails() -> None:
+    """A failed send releases its claim so a later retry can re-send (not stuck)."""
+    from keel_core.outbox import InMemoryOutboundStore
+
+    attempts = {"n": 0}
+
+    async def flaky(args: dict[str, object], ctx: ToolContext) -> str:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RuntimeError("transient")
+        return "sent"
+
+    store = InMemoryOutboundStore()
+    tool = ConnectorTool(
+        name="mail_send", description="", action=flaky, outbound=True, idempotency_store=store
+    )
+    try:
+        await tool.run({"idempotency_key": "k1"}, _ctx(ContentTaint.clean))
+    except RuntimeError:
+        pass
+    result = await tool.run({"idempotency_key": "k1"}, _ctx(ContentTaint.clean))
+    assert result.output == "sent" and attempts["n"] == 2
+
+
 def test_confused_deputy_engine_escalates_only_tainted_outbound() -> None:
     base = RuleBasedPermissionEngine([Rule("*", PermissionDecision.allow)])
     engine = ConfusedDeputyEngine(base, outbound_tools={"mail_send"})

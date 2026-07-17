@@ -1143,6 +1143,7 @@ dependencies = [
     { name = "google-api-python-client" },
     { name = "google-auth" },
     { name = "google-auth-oauthlib" },
+    { name = "httpx" },
     { name = "litellm" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-sdk" },
@@ -1159,6 +1160,7 @@ requires-dist = [
     { name = "google-api-python-client", specifier = ">=2.130" },
     { name = "google-auth", specifier = ">=2.30" },
     { name = "google-auth-oauthlib", specifier = ">=1.2" },
+    { name = "httpx", specifier = ">=0.27" },
     { name = "litellm", specifier = ">=1.40" },
     { name = "opentelemetry-api", specifier = ">=1.20" },
     { name = "opentelemetry-sdk", specifier = ">=1.20" },
@@ -1174,11 +1176,17 @@ name = "keel-sandbox"
 version = "0.0.0"
 source = { editable = "packages/keel-sandbox" }
 dependencies = [
+    { name = "fastapi" },
     { name = "keel-core" },
+    { name = "uvicorn", extra = ["standard"] },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "keel-core", editable = "packages/keel-core" }]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.110" },
+    { name = "keel-core", editable = "packages/keel-core" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.29" },
+]
 
 [[package]]
 name = "keel-scheduler"
@@ -1200,12 +1208,14 @@ name = "keel-sdk"
 version = "0.0.0"
 source = { editable = "packages/keel-sdk" }
 dependencies = [
+    { name = "httpx" },
     { name = "keel-core" },
     { name = "pydantic" },
 ]
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
     { name = "keel-core", editable = "packages/keel-core" },
     { name = "pydantic", specifier = ">=2.7" },
 ]

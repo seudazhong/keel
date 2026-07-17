@@ -35,7 +35,10 @@ from keel_core.jobs import (
 from keel_core.knowledge.search import KnowledgeSearcher
 from keel_core.knowledge.service import DispatchJob, KnowledgeService
 from keel_core.knowledge.store import KnowledgeStore, PostgresKnowledgeStore
+from keel_core.oauth_state import InMemoryOAuthStateStore, PostgresOAuthStateStore
 from keel_core.providers import LiteLLMGateway
+from keel_core.tools import build_service_execution_environment
+from keel_core.webhooks import InMemoryWebhookReplayStore, PostgresWebhookReplayStore
 from keel_server.api import gateway as gateway_api
 from keel_server.api import knowledge as knowledge_api
 from keel_server.api import oauth as oauth_api
@@ -110,12 +113,18 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.engine = engine
     app.state.durable_scope = _DURABLE_SCOPE
     app.state.jobs = _build_job_store(engine, _DURABLE_SCOPE, settings)
+    execution_environment = build_service_execution_environment(
+        settings,
+        Path.cwd(),
+        service="server",
+    )
     app.state.runtime = AgentRuntime(
         redis_client=redis_client,
         engine=engine,
         scope_id=_DURABLE_SCOPE,
         model=settings.default_model,
         workspace=Path.cwd(),
+        execution_environment=execution_environment,
         embedding_model=settings.embedding_model,
         embedding_dim=settings.embedding_dim,
         embedding_send_dimensions=settings.embedding_send_dimensions,
@@ -130,6 +139,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Durable approvals raised by unattended (scheduled) runs — the Approvals page +
     # API read this; approving enqueues a resume_run onto the worker's arq queue (G5).
     app.state.api_keys = parse_api_keys(settings.api_keys)  # RBAC: empty -> open mode
+    # Cloud mode fails closed: with no API keys the auth layer rejects every request
+    # instead of falling back to implicit-admin open mode.
+    app.state.auth_required = settings.cloud_mode
+    # Durable, expiring, one-time OAuth CSRF state + webhook replay protection (M3.3).
+    app.state.oauth_state_store = (
+        PostgresOAuthStateStore(engine, ttl_seconds=settings.oauth_state_ttl_seconds)
+        if engine is not None
+        else InMemoryOAuthStateStore(ttl_seconds=settings.oauth_state_ttl_seconds)
+    )
+    app.state.webhook_replay_store = (
+        PostgresWebhookReplayStore(engine, ttl_seconds=settings.webhook_replay_ttl_seconds)
+        if engine is not None
+        else InMemoryWebhookReplayStore(ttl_seconds=settings.webhook_replay_ttl_seconds)
+    )
     app.state.durable_approvals = (
         PostgresApprovalStore(engine, _DURABLE_SCOPE)
         if engine is not None
@@ -178,6 +201,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 settings.onebot_api_base, settings.onebot_access_token
             ),
             workspace=Path.cwd(),
+            execution_environment=execution_environment,
             self_id=settings.onebot_self_id or None,
             model=settings.default_model,
             rate_limiter=RateLimiter(limit=settings.im_rate_limit),
@@ -188,6 +212,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             provider=LiteLLMGateway(),
             send=gateway_api.make_telegram_sender(settings.telegram_bot_token),
             workspace=Path.cwd(),
+            execution_environment=execution_environment,
             bot_username=settings.telegram_bot_username or None,
             model=settings.default_model,
             rate_limiter=RateLimiter(limit=settings.im_rate_limit),

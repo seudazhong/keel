@@ -21,6 +21,7 @@ from keel_core.events import Event, EventType
 from keel_core.jobs import JobResult, PostgresJobStore
 from keel_core.protocols import ProviderChunk, ToolCall, ToolContext
 from keel_core.testing import ScriptedProviderGateway
+from keel_core.tools import UnsafeLocalDevExecutionEnvironment
 from keel_core.types import FinishReason, PermissionDecision
 from keel_server.runtime import AgentRuntime
 
@@ -111,6 +112,7 @@ async def test_web_approval_gates_a_mutating_tool(
         model="test/model",
         workspace=tmp_path,
         provider=provider,
+        execution_environment=UnsafeLocalDevExecutionEnvironment(tmp_path),
     )
     session_id = f"web-approve-{uuid.uuid4().hex}"
     await runtime.admit_and_run(session_id, "write a file")

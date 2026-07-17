@@ -16,6 +16,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from keel_core import ProviderGateway
+from keel_core.tools import ExecutionEnvironment, UnavailableExecutionEnvironment
 from keel_server.gateway.base import ImRunner, InboundMessage, RateLimiter, SendFn
 
 
@@ -77,6 +78,9 @@ class TelegramGateway:
     provider: ProviderGateway
     send: SendFn
     workspace: Path = field(default_factory=lambda: Path("."))
+    execution_environment: ExecutionEnvironment = field(
+        default_factory=UnavailableExecutionEnvironment
+    )
     bot_username: str | None = None
     prefixes: tuple[str, ...] = ("/keel",)
     model: str = "gpt-4o-mini"
@@ -88,6 +92,7 @@ class TelegramGateway:
             provider=self.provider,
             send=self.send,
             workspace=self.workspace,
+            execution_environment=self.execution_environment,
             model=self.model,
             rate_limiter=self.rate_limiter,
         )

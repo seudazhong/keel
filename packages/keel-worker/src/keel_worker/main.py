@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, cast
 
 from arq import cron
@@ -45,6 +46,7 @@ from keel_core.loop import ToolRegistry, admit, resume, run
 from keel_core.memory import PostgresMemoryStore
 from keel_core.observability import configure_logging, configure_tracing
 from keel_core.state import PostgresEventStore
+from keel_core.tools import build_service_execution_environment
 from keel_scheduler.store import ScheduleRow, due_tick
 from keel_worker.jobs import dispatch_jobs, run_job
 from keel_worker.knowledge import knowledge_job_registry
@@ -69,16 +71,27 @@ def _digest_registry(ctx: dict[str, Any], settings: Settings, scope_id: str) -> 
     """
     inbox_action = None
     send_action = None
+    idempotency_store = None
+    engine = ctx.get("engine")
+    if engine is not None:
+        from keel_core.outbox import PostgresOutboundStore
+
+        idempotency_store = PostgresOutboundStore(engine)
     if settings.gmail_enabled:
         from keel_core.gmail import make_gmail_inbox_action, make_gmail_send_action
-        from keel_core.secrets import cipher_from_settings
+        from keel_core.secrets import keyring_from_settings
         from keel_core.tokens import PostgresTokenStore
 
-        store = PostgresTokenStore(ctx["engine"], scope_id, cipher_from_settings(settings))
+        store = PostgresTokenStore(ctx["engine"], scope_id, keyring_from_settings(settings))
         inbox_action = make_gmail_inbox_action(store, settings.gmail_max_messages)
         if settings.gmail_send_enabled:
             send_action = make_gmail_send_action(store)
-    return digest_registry(ctx.get("sent"), inbox_action=inbox_action, send_action=send_action)
+    return digest_registry(
+        ctx.get("sent"),
+        inbox_action=inbox_action,
+        send_action=send_action,
+        idempotency_store=idempotency_store,
+    )
 
 
 async def _run_digest(ctx: dict[str, Any], row: ScheduleRow, settings: Settings) -> str:
@@ -249,6 +262,11 @@ async def startup(ctx: dict[str, Any]) -> None:
     engine = create_async_engine(settings.database_url)
     redis = ctx["redis"]
     ctx["engine"] = engine
+    ctx["execution_environment"] = build_service_execution_environment(
+        settings,
+        Path.cwd(),
+        service="worker",
+    )
     ctx["durable_scope"] = _DURABLE_SCOPE
     ctx["job_settings"] = settings
     ctx["jobs"] = PostgresJobStore(
@@ -288,6 +306,9 @@ async def startup(ctx: dict[str, Any]) -> None:
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
+    execution_environment = ctx.get("execution_environment")
+    if execution_environment is not None:
+        await execution_environment.aclose()
     engine = ctx.get("engine")
     if engine is not None:
         await engine.dispose()

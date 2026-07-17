@@ -55,11 +55,13 @@ from keel_core.recall import MessageEmbeddingIndexer
 from keel_core.search import ArchivalSearchTool, SessionSearchTool
 from keel_core.tools import (
     EditTool,
+    ExecutionEnvironment,
     GlobTool,
     GrepTool,
     LsTool,
     ReadTool,
     ShellTool,
+    UnavailableExecutionEnvironment,
     WriteTool,
 )
 from keel_core.tools.executor import ApproveFn
@@ -75,15 +77,15 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _build_tools(workspace: Path) -> list[ToolProto]:
+def _build_tools(environment: ExecutionEnvironment) -> list[ToolProto]:
     tools: list[ToolProto] = [
-        ReadTool(workspace),
-        WriteTool(workspace),
-        EditTool(workspace),
-        LsTool(workspace),
-        GlobTool(workspace),
-        GrepTool(workspace),
-        ShellTool(workspace),
+        ReadTool(environment),
+        WriteTool(environment),
+        EditTool(environment),
+        LsTool(environment),
+        GlobTool(environment),
+        GrepTool(environment),
+        ShellTool(environment),
     ]
     return tools
 
@@ -309,6 +311,7 @@ class AgentRuntime:
         engine: AsyncEngine | None = None,
         scope_id: ScopeId = "web:local",
         provider: ProviderGateway | None = None,
+        execution_environment: ExecutionEnvironment | None = None,
         embedder: Embedder | None = None,
         embedding_model: str = "ollama/bge-m3",
         embedding_dim: int = 1024,
@@ -323,6 +326,7 @@ class AgentRuntime:
         knowledge_tool_output_max_chars: int = 8_000,
     ) -> None:
         self._engine = engine
+        self._execution_environment = execution_environment or UnavailableExecutionEnvironment()
         self._fanout = RedisEventStore(redis_client)
         self._memory = InMemoryEventStore()  # shared durable fallback when no engine
         self._scope = Scope(id=scope_id, kind=ScopeKind.personal, trust=TrustLevel.trusted)
@@ -381,7 +385,9 @@ class AgentRuntime:
             toolset=list(_READ_ONLY + _MUTATING) + list(memory_names + knowledge_names),
         )
         self._provider = provider or LiteLLMGateway()
-        self._registry = ToolRegistry(_build_tools(workspace) + memory_tools + knowledge_tools)
+        self._registry = ToolRegistry(
+            _build_tools(self._execution_environment) + memory_tools + knowledge_tools
+        )
         self._permissions = _web_permissions(memory_names + knowledge_names)
         self._approvals = ApprovalRegistry()
         self._tracer = make_tracer()  # Langfuse if configured, else no-op
@@ -513,6 +519,7 @@ class AgentRuntime:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._index_tasks.clear()
+        await self._execution_environment.aclose()
 
     def _approver(
         self, store: CompositeEventStore, session_id: SessionId, run_id: RunId

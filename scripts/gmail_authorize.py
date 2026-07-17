@@ -23,14 +23,14 @@ from pathlib import Path
 from keel_core.config import get_settings, load_env_file
 from keel_core.db import make_async_engine
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
-from keel_core.secrets import cipher_from_settings
+from keel_core.secrets import keyring_from_settings
 from keel_core.tokens import PostgresTokenStore
 
 
 async def _store(scope_id: str, creds_json: str) -> None:
     settings = get_settings()
     engine = make_async_engine(settings)
-    store = PostgresTokenStore(engine, scope_id, cipher_from_settings(settings))
+    store = PostgresTokenStore(engine, scope_id, keyring_from_settings(settings))
     try:
         await store.put(GMAIL_CONNECTOR_ID, creds_json)
     finally:

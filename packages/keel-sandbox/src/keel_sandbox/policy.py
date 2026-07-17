@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ipaddress
 import posixpath
+import re
 
 _DENY_NAMES = frozenset({".git", ".env"})
 _DENY_HOSTNAMES = frozenset({"localhost", "metadata.google.internal"})
@@ -23,11 +24,23 @@ class PathPolicy:
         self.deny_names = deny_names
 
     def is_allowed(self, path: str) -> bool:
-        raw = path if posixpath.isabs(path) else posixpath.join(self.workspace, path)
+        canonical = path.replace("\\", "/")
+        if re.match(r"^[A-Za-z]:/", canonical) or ".." in canonical.split("/"):
+            return False
+        raw = canonical if posixpath.isabs(canonical) else posixpath.join(self.workspace, canonical)
         norm = posixpath.normpath(raw)
         if any(segment in self.deny_names for segment in norm.split("/")):
             return False
         return norm == self.workspace or norm.startswith(self.workspace + "/")
+
+    def is_allowed_pattern(self, pattern: str) -> bool:
+        """Allow only relative patterns without traversal or sensitive components."""
+        canonical = pattern.replace("\\", "/")
+        if not canonical or posixpath.isabs(canonical) or re.match(r"^[A-Za-z]:/", canonical):
+            return False
+        return not any(
+            segment == ".." or segment in self.deny_names for segment in canonical.split("/")
+        )
 
 
 class EgressPolicy:
