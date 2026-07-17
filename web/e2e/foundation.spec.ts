@@ -216,7 +216,23 @@ test.describe("first-run onboarding", () => {
     await page.getByLabel("Workspace name").fill("Ops team");
     await page.getByRole("button", { name: "Next" }).click(); // -> connectors
 
-    await expect(page.getByText("Requires backend · not performed here")).toBeVisible();
+    await expect(
+      page.getByRole("heading", { level: 2, name: "Connect a service (optional)" }),
+    ).toBeVisible();
+    for (const connector of [
+      "Atom",
+      "Feishu",
+      "GitHub",
+      "Gmail",
+      "Google Calendar",
+      "Google Drive / Docs",
+      "Microsoft 365",
+      "Notion",
+      "RSS",
+      "Webhook",
+    ]) {
+      await expect(page.getByText(connector, { exact: true })).toBeVisible();
+    }
 
     await page.getByRole("button", { name: "Next" }).click(); // -> finish
     await page.getByRole("button", { name: "Finish" }).click();
