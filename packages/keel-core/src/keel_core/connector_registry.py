@@ -135,6 +135,8 @@ class ConnectorRegistry:
         return ConnectorProviderStatus(available=True, enabled=enabled)
 
     def build_actions(self, context: ConnectorActionContext) -> tuple[ConnectorAction, ...]:
+        if context.credential_store is None:
+            return ()
         actions: dict[str, ConnectorAction] = {}
         for manifest in self.manifests():
             status = self.status(manifest.id)

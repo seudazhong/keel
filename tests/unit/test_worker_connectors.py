@@ -101,10 +101,16 @@ async def test_worker_discovers_provider_local_actions_without_provider_branches
         ConnectorBindingDraft(),
         ConnectorBindingStatus.connected,
     )
+    ctx = {
+        "connector_registry": provider_registry,
+        "connector_repository": repository,
+    }
+    assert _connector_actions(ctx, Settings(), "scope:test") == ()
+
     actions = _connector_actions(
         {
-            "connector_registry": provider_registry,
-            "connector_repository": repository,
+            **ctx,
+            "connector_action_credentials": object(),
         },
         Settings(),
         "scope:test",
