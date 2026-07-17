@@ -8,9 +8,12 @@ because the approval is now bound to a superseded attempt.
 
 These tests inject a crash at each boundary and assert the invariant holds:
   1. before the marker            -> reclaim restarts fresh (no false resume), nothing lost;
-  2. after marker / before approval-> reclaim resumes fail-closed (no unapproved effect);
-  3. after approval / before the   -> reclaim resumes, the approval bound to the *source*
-     waiting_approval transition       attempt still applies exactly once (THE bug);
+  2. mid-batch (checkpoint written -> the checkpoint + rows + events roll back together
+     but rows/events not durable)     (atomic unit), so reclaim restarts fresh — no partial
+                                       checkpoint without its batch, no unapproved effect;
+  3. after the atomic batch commit, -> reclaim resumes, the approval bound to the *source*
+     before the waiting_approval        attempt still applies exactly once (THE bug);
+     transition
   4. after decision / before        -> the reconciler redispatches; approved effect applies
      dispatch                          exactly once, never twice.
 
@@ -62,10 +65,12 @@ class _CrashRunStore(InMemoryRunStore):
 
     crash_on: str | None = None
 
-    async def mark_checkpoint(self, lease: RunLease, *, now: datetime | None = None) -> bool:
+    async def mark_checkpoint(
+        self, lease: RunLease, *, batch_id: str = "", now: datetime | None = None
+    ) -> bool:
         if self.crash_on == "mark_checkpoint":
             raise RuntimeError("crash: worker died before the checkpoint marker persisted")
-        return await super().mark_checkpoint(lease, now=now)
+        return await super().mark_checkpoint(lease, batch_id=batch_id, now=now)
 
     async def release(
         self,
@@ -234,8 +239,8 @@ async def test_crash_before_marker_restarts_fresh_no_false_resume() -> None:
     assert sent == [{"to": "z@x"}]  # exactly once
 
 
-# ---- Crash 2: after marker, before the approval row/event ----------------------------------
-async def test_crash_after_marker_before_approval_resumes_fail_closed() -> None:
+# ---- Crash 2: mid-batch — checkpoint written, rows/events not (the atomic unit rolls back) --
+async def test_crash_midbatch_rolls_back_checkpoint_and_restarts_fresh() -> None:
     run_store, events, approvals, enqueued = (
         _CrashRunStore(),
         InMemoryEventStore(),
@@ -250,33 +255,43 @@ async def test_crash_after_marker_before_approval_resumes_fail_closed() -> None:
     lease1 = await run_store.claim(run_id, worker_id="w1", now=t0, lease_seconds=30)
     assert lease1 is not None
 
-    # The marker persists, then the worker dies before the approval row/event is durable.
+    # The worker dies mid-batch: the checkpoint marker is applied, then the approval row/event
+    # fails. Because the checkpoint + rows + events are ONE atomic unit, the whole thing rolls
+    # back — no marker, no approval, no tool.call event survive (blocker 2 atomicity).
     approvals.crash_create = True
     with pytest.raises(RuntimeError):
         await _exec(lease1, run_store, events, approvals, sent, _one_send("c1", "z@x"), t0)
 
     crashed = await run_store.get(run_id)
     assert crashed is not None and crashed.status is RunStatus.running
-    assert crashed.suspend_checkpoint is True and crashed.checkpoint_attempt == 1
+    assert crashed.suspend_checkpoint is False and crashed.checkpoint_attempt == 0
+    assert crashed.checkpoint_batch_id == ""
     assert await approvals.pending_for_run(run_id) == []  # approval never persisted
+    assert [e for e in events.snapshot("sess-1") if e.type is EventType.tool_call] == []
 
-    # Reclaim: the marker makes the run RESUME (not restart). With no durable approval the
-    # un-approved call is refused (fail closed) — never executed without a decision.
+    # Reclaim: with nothing durable there is no checkpoint to honour — the run RESTARTS FRESH
+    # (resume=False), never falsely resuming a rolled-back checkpoint.
     approvals.crash_create = False
     run_store.crash_on = None
     t1 = t0 + timedelta(seconds=60)
     lease2 = await run_store.claim(run_id, worker_id="w2", now=t1, lease_seconds=30)
-    assert lease2 is not None and lease2.attempt == 2 and lease2.resume is True
+    assert lease2 is not None and lease2.attempt == 2 and lease2.resume is False
 
-    status = await _exec(lease2, run_store, events, approvals, sent, _done(), t1)
+    # The fresh restart re-issues the send + re-raises the approval, then (once granted) sends
+    # exactly once — nothing was silently lost or double-applied by the mid-batch crash.
+    status = await _exec(lease2, run_store, events, approvals, sent, _one_send("c1", "z@x"), t1)
+    assert status is RunStatus.waiting_approval
+    pend = await approvals.pending_for_run(run_id)
+    assert len(pend) == 1 and pend[0].run_attempt == 2
+    assert await service.resolve_approval(
+        pend[0].id, approved=True, resolved_by="user-1", actor="user-1"
+    )
+    t2 = t1 + timedelta(seconds=60)
+    lease3 = await run_store.claim(run_id, worker_id="w3", now=t2, lease_seconds=30)
+    assert lease3 is not None and lease3.resume is True
+    status = await _exec(lease3, run_store, events, approvals, sent, _done(), t2)
     assert status is RunStatus.completed
-    assert sent == []  # no unapproved effect ever executed
-    denied = [
-        e
-        for e in events.snapshot("sess-1")
-        if e.type is EventType.tool_result and e.payload.get("call_id") == "c1"
-    ]
-    assert denied and denied[0].payload["ok"] is False
+    assert sent == [{"to": "z@x"}]  # exactly once
 
 
 # ---- Crash 3: after the approval, before the waiting_approval transition (THE bug) ---------

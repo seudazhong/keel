@@ -28,18 +28,23 @@ survive a server **and** worker restart and are safe under N racing workers.
   admission-identity uniqueness by ``(scope_id, org_id, actor, idempotency_key)`` so one
   tenant/actor cannot collide with or hijack another's run via a shared idempotency key.
 * ``runs`` carries a durable suspension checkpoint (``suspend_checkpoint`` +
-  ``checkpoint_attempt``): set — fenced by the active lease — before an approval batch is
-  persisted, so a worker crash before the ``running -> waiting_approval`` release still lets
-  the lease-expiry reclaim *resume* (honouring the durable approval) instead of restarting
-  fresh and silently discarding the (later approved) action.
-* A suspended tool batch persists its ``tool.call`` events, its approval rows, and its
-  ``approval.requested`` events as one atomic unit (single transaction when the event and
-  approval stores share an engine), so a crash can never leave an approval row without its
-  events (or a partially-raised batch). ``ux_approvals_run_call`` (partial, interactive rows
-  only) makes at most one approval row per (run, call, source attempt), backing resume's
+  ``checkpoint_attempt`` + ``checkpoint_batch_id``): set — fenced by the active lease — in the
+  SAME transaction that persists an approval batch's ``tool.call`` events, approval rows, and
+  ``approval.requested`` events (never a separate ``mark_checkpoint`` commit before it), so a
+  worker crash before the ``running -> waiting_approval`` release either rolls the whole unit
+  back (reclaim restarts fresh, nothing lost) or finds a complete durable batch bound to the
+  checkpoint (reclaim *resumes*, honouring the approval) — never a partial in-between.
+* A suspended tool batch persists its ``tool.call`` events, its approval rows, its
+  ``approval.requested`` events, **and** its run checkpoint (batch id + source attempt) as one
+  atomic unit (single transaction when the run/event/approval stores share an engine), so a
+  crash can never leave an approval row without its events (or a partially-raised batch), nor a
+  checkpoint without its batch. ``ux_approvals_run_call`` (partial, interactive rows only)
+  makes at most one approval row per (run, call, source attempt), backing resume's
   reconstruction repair that rebuilds the call -> approval association from the durable rows
-  when an ``approval.requested`` event was lost to an older-build crash — so a granted
-  approval is never silently denied.
+  when an ``approval.requested`` event was lost to an older-build crash — adopting a row only
+  when its run/session/call/action-hash **and** the checkpoint's exact source attempt + batch
+  id all match, so a granted approval is never silently denied and a foreign/injected row is
+  never adopted.
 
 Row-Level Security (ADR-0009 / DESIGN-REVIEW G16): ``runs`` and ``run_control`` carry the
 ``app.scope_id`` policy (mirroring ``jobs`` / ``approvals``) plus ``FORCE ROW LEVEL
@@ -115,9 +120,15 @@ def upgrade() -> None:
             -- the lease-expiry reclaim *resume* (honouring the approval) instead of restarting
             -- fresh and silently discarding it. checkpoint_attempt records the batch's source
             -- attempt for approval binding, preserved across a reclaim (the lease attempt
-            -- advances for fencing, this does not). Defaults so pre-existing rows upgrade safely.
+            -- advances for fencing, this does not). checkpoint_batch_id records the exact
+            -- suspended batch id — persisted, fenced by the lease, in the SAME transaction as
+            -- the batch's approval rows + events (never a separate commit), so resume's
+            -- reconstruction repair adopts a durable approval row only when its batch_id AND
+            -- source attempt match the checkpoint exactly (a foreign/older/newer attempt or
+            -- batch fails closed). Defaults so pre-existing rows upgrade safely.
             suspend_checkpoint boolean NOT NULL DEFAULT false,
             checkpoint_attempt integer NOT NULL DEFAULT 0 CHECK (checkpoint_attempt >= 0),
+            checkpoint_batch_id text NOT NULL DEFAULT '',
             created_at timestamptz NOT NULL DEFAULT now(),
             updated_at timestamptz NOT NULL DEFAULT now(),
             started_at timestamptz,

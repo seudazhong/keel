@@ -22,10 +22,10 @@ import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 from sqlalchemy import text as _sa_text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from keel_core.agents import AgentSpec
 from keel_core.approvals import (
@@ -453,6 +453,114 @@ def _notify(observer: EventObserver | None, event: Event) -> None:
         pass
 
 
+async def persist_suspension_events_and_rows(
+    conn: AsyncConnection,
+    *,
+    calls: Sequence[ToolCall],
+    asks: Sequence[ToolCall],
+    session_id: SessionId,
+    scope_id: ScopeId,
+    run_id: RunId,
+    reason: str,
+    expires_at: datetime,
+    binding: ApprovalBinding | None,
+    batch_id: str,
+) -> tuple[list[str], list[Event]]:
+    """Persist a suspended batch's events + approval rows inside the caller's transaction.
+
+    Writes a ``tool.call`` event for **every** call, a pending approval row per ask, and each
+    ask's ``approval.requested`` event — all on the caller's ``conn`` (no commit here). Returns
+    ``(approval_ids in ask order, events to fire on the live observer post-commit)``. The
+    caller owns the transaction + ``app.scope_id`` GUC, so a run checkpoint (or any other
+    fenced write) can join the *same* transaction and commit/roll back atomically with it."""
+    org_id = binding.org_id if binding else ""
+    actor = binding.actor if binding else ""
+    run_attempt = binding.run_attempt if binding else 0
+    keys = {
+        call.id: str(call.arguments.get("idempotency_key") or uuid.uuid4().hex) for call in asks
+    }
+    approval_ids = {call.id: uuid.uuid4().hex for call in asks}
+    notify: list[Event] = []
+    for call in calls:
+        event = _tool_call_event(session_id, scope_id, run_id, call)
+        event.seq = await append_event_in_transaction(conn, event)
+        notify.append(event)
+    for call in asks:
+        await insert_pending_in_transaction(
+            conn,
+            id=approval_ids[call.id],
+            scope_id=scope_id,
+            run_id=run_id,
+            session_id=session_id,
+            tool=call.name,
+            args=call.arguments,
+            call_id=call.id,
+            idempotency_key=keys[call.id],
+            reason=reason,
+            expires_at=expires_at,
+            org_id=org_id,
+            actor=actor,
+            action_hash=_action_hash(call.name, call.arguments),
+            run_attempt=run_attempt,
+            batch_id=batch_id,
+        )
+        event = _approval_requested_event(session_id, scope_id, run_id, call, approval_ids[call.id])
+        event.seq = await append_event_in_transaction(conn, event)
+        notify.append(event)
+    return [approval_ids[call.id] for call in asks], notify
+
+
+CheckpointInTx = Callable[[AsyncConnection], Awaitable[None]]
+
+
+async def persist_suspension_batch_in_engine(
+    engine: AsyncEngine,
+    store: EventStore,
+    approvals: ApprovalStore,
+    *,
+    calls: Sequence[ToolCall],
+    asks: Sequence[ToolCall],
+    session_id: SessionId,
+    scope_id: ScopeId,
+    run_id: RunId,
+    reason: str,
+    expires_at: datetime,
+    binding: ApprovalBinding | None,
+    batch_id: str,
+    checkpoint_in_tx: CheckpointInTx | None = None,
+) -> list[str]:
+    """Persist a suspended batch (and optionally a run checkpoint) in ONE Postgres transaction.
+
+    Opens a single transaction on the shared ``engine``, runs the optional ``checkpoint_in_tx``
+    callback first (a durable run injects its fenced ``runs`` checkpoint UPDATE here — the loop
+    itself stays free of any concrete run-store SQL), then writes the batch's ``tool.call``
+    events, approval rows, and ``approval.requested`` events. The whole unit commits or rolls
+    back together: a crash (or a lease-lost ``RunLeaseLostError`` from the checkpoint) before
+    commit leaves no checkpoint, no rows, and no events. The best-effort live observer fires
+    only post-commit, in seq order."""
+    inner, observer = _unwrap_store(store)
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        if checkpoint_in_tx is not None:
+            await checkpoint_in_tx(conn)
+        approval_ids, notify = await persist_suspension_events_and_rows(
+            conn,
+            calls=calls,
+            asks=asks,
+            session_id=session_id,
+            scope_id=scope_id,
+            run_id=run_id,
+            reason=reason,
+            expires_at=expires_at,
+            binding=binding,
+            batch_id=batch_id,
+        )
+    # The batch is durable; fire the (best-effort) live observer post-commit, in order.
+    for event in notify:
+        _notify(observer, event)
+    return approval_ids
+
+
 async def _persist_suspension_batch(
     store: EventStore,
     approvals: ApprovalStore,
@@ -475,56 +583,69 @@ async def _persist_suspension_batch(
     so a crash can never leave an approval row without its events, nor a partially-raised batch
     — the exact gap that let resume silently deny a granted approval. Otherwise (in-memory /
     mixed engines, one process, no crash boundary) it falls back to the sequential writes with
-    identical observable effects."""
+    identical observable effects.
+
+    This is the **default** persister (no run checkpoint). A durable run injects a
+    checkpointing :data:`SuspensionPersister` so the checkpoint joins the same transaction."""
+    inner, _observer = _unwrap_store(store)
+    engine = _shared_suspension_engine(inner, approvals)
+
+    if engine is not None:
+        return await persist_suspension_batch_in_engine(
+            engine,
+            store,
+            approvals,
+            calls=calls,
+            asks=asks,
+            session_id=session_id,
+            scope_id=scope_id,
+            run_id=run_id,
+            reason=reason,
+            expires_at=expires_at,
+            binding=binding,
+            batch_id=batch_id,
+        )
+
+    return await _persist_suspension_batch_sequential(
+        store,
+        approvals,
+        calls=calls,
+        asks=asks,
+        session_id=session_id,
+        scope_id=scope_id,
+        run_id=run_id,
+        reason=reason,
+        expires_at=expires_at,
+        binding=binding,
+        batch_id=batch_id,
+    )
+
+
+async def _persist_suspension_batch_sequential(
+    store: EventStore,
+    approvals: ApprovalStore,
+    *,
+    calls: Sequence[ToolCall],
+    asks: Sequence[ToolCall],
+    session_id: SessionId,
+    scope_id: ScopeId,
+    run_id: RunId,
+    reason: str,
+    expires_at: datetime,
+    binding: ApprovalBinding | None,
+    batch_id: str,
+) -> list[str]:
+    """Sequential (single-process) fallback: identical writes, no cross-store transaction.
+
+    Used when the event + approval stores do not share a Postgres engine (in-memory / mixed).
+    A checkpointing :data:`SuspensionPersister` wraps this call in a snapshot/rollback so a
+    partial batch never survives an injected failure in that single-process path."""
     org_id = binding.org_id if binding else ""
     actor = binding.actor if binding else ""
     run_attempt = binding.run_attempt if binding else 0
     keys = {
         call.id: str(call.arguments.get("idempotency_key") or uuid.uuid4().hex) for call in asks
     }
-
-    inner, observer = _unwrap_store(store)
-    engine = _shared_suspension_engine(inner, approvals)
-
-    if engine is not None:
-        approval_ids = {call.id: uuid.uuid4().hex for call in asks}
-        notify: list[Event] = []
-        async with engine.begin() as conn:
-            await conn.execute(_SET_SCOPE, {"scope": scope_id})
-            for call in calls:
-                event = _tool_call_event(session_id, scope_id, run_id, call)
-                event.seq = await append_event_in_transaction(conn, event)
-                notify.append(event)
-            for call in asks:
-                await insert_pending_in_transaction(
-                    conn,
-                    id=approval_ids[call.id],
-                    scope_id=scope_id,
-                    run_id=run_id,
-                    session_id=session_id,
-                    tool=call.name,
-                    args=call.arguments,
-                    call_id=call.id,
-                    idempotency_key=keys[call.id],
-                    reason=reason,
-                    expires_at=expires_at,
-                    org_id=org_id,
-                    actor=actor,
-                    action_hash=_action_hash(call.name, call.arguments),
-                    run_attempt=run_attempt,
-                    batch_id=batch_id,
-                )
-                event = _approval_requested_event(
-                    session_id, scope_id, run_id, call, approval_ids[call.id]
-                )
-                event.seq = await append_event_in_transaction(conn, event)
-                notify.append(event)
-        # The batch is durable; fire the (best-effort) live observer post-commit, in order.
-        for event in notify:
-            _notify(observer, event)
-        return [approval_ids[call.id] for call in asks]
-
-    # Sequential fallback (single process): identical writes, no cross-store transaction.
     for call in calls:
         await _emit(
             store,
@@ -569,6 +690,64 @@ async def _persist_suspension_batch(
     return created
 
 
+class SuspensionPersister(Protocol):
+    """Persists a suspended tool batch (its run checkpoint + rows + events) as one atomic unit.
+
+    A durable run injects this from :func:`keel_core.run_service.execute_run` so the run's
+    fenced suspension checkpoint (source attempt + batch id) commits in the SAME transaction as
+    the batch's approval rows and its ``tool.call`` / ``approval.requested`` events (Postgres
+    shared-engine path), or applies atomically via snapshot/rollback (in-memory single-process
+    path). It returns the created approval ids in ask order. Raising rolls the whole unit back,
+    so the run stays cleanly ``running`` with no partial checkpoint/batch and a reclaim restarts
+    fresh; on commit the reclaim always observes a complete batch bound to the checkpoint."""
+
+    async def __call__(
+        self,
+        *,
+        store: EventStore,
+        approvals: ApprovalStore,
+        calls: Sequence[ToolCall],
+        asks: Sequence[ToolCall],
+        session_id: SessionId,
+        scope_id: ScopeId,
+        run_id: RunId,
+        reason: str,
+        expires_at: datetime,
+        binding: ApprovalBinding | None,
+        batch_id: str,
+    ) -> list[str]: ...
+
+
+async def _default_suspension_persister(
+    *,
+    store: EventStore,
+    approvals: ApprovalStore,
+    calls: Sequence[ToolCall],
+    asks: Sequence[ToolCall],
+    session_id: SessionId,
+    scope_id: ScopeId,
+    run_id: RunId,
+    reason: str,
+    expires_at: datetime,
+    binding: ApprovalBinding | None,
+    batch_id: str,
+) -> list[str]:
+    """Default (no-checkpoint) persister for a standalone loop with no durable run row."""
+    return await _persist_suspension_batch(
+        store,
+        approvals,
+        calls=calls,
+        asks=asks,
+        session_id=session_id,
+        scope_id=scope_id,
+        run_id=run_id,
+        reason=reason,
+        expires_at=expires_at,
+        binding=binding,
+        batch_id=batch_id,
+    )
+
+
 async def _run_tools(
     store: EventStore,
     registry: ToolRegistry,
@@ -582,7 +761,7 @@ async def _run_tools(
     approvals: ApprovalStore | None = None,
     expires_at: datetime | None = None,
     binding: ApprovalBinding | None = None,
-    on_suspend: Callable[[], Awaitable[None]] | None = None,
+    suspension_persister: SuspensionPersister | None = None,
 ) -> list[str]:
     """Emit tool.call events, run the calls through the parallel-safe permission-gated
     executor, then emit tool.result events — all in source order. A failing tool yields
@@ -616,19 +795,20 @@ async def _run_tools(
 
     if approvals is not None and asks:
         reason = "tainted" if ctx.content_taint is ContentTaint.tainted else "first_use"
-        # Durable suspension checkpoint (M3.6 crash boundary): record the intent *before*
-        # any approval row/event is persisted, fenced by the active lease/attempt. If the
-        # worker crashes after this but before the run releases to waiting_approval, the
-        # still-``running`` row carries a marker so the lease-expiry reclaim resumes
-        # (honouring the durable approval) instead of restarting fresh and discarding it.
-        if on_suspend is not None:
-            await on_suspend()
         # Every approval raised by this one suspended batch shares a batch_id, so the run
         # resumes only once *all* of them are terminal (M3.6 blocker 5).
         batch_id = uuid.uuid4().hex
-        return await _persist_suspension_batch(
-            store,
-            approvals,
+        # Durable suspension (M3.6 crash boundary): an injected persister writes the run's
+        # fenced checkpoint (source attempt + this batch_id) in the SAME transaction as the
+        # batch's approval rows + events — never a separate commit before it — so a crash
+        # either rolls the whole unit back (reclaim restarts fresh) or leaves a complete
+        # durable batch bound to the checkpoint (reclaim resumes). Without a persister
+        # (standalone loop, no run row) the default persists the batch atomically, sans
+        # checkpoint.
+        persist = suspension_persister or _default_suspension_persister
+        return await persist(
+            store=store,
+            approvals=approvals,
             calls=calls,
             asks=asks,
             session_id=session_id,
@@ -695,7 +875,7 @@ async def _agent_loop(
     start_iteration: int = 0,
     system_context: SystemContextFn | None = None,
     binding: ApprovalBinding | None = None,
-    on_suspend: Callable[[], Awaitable[None]] | None = None,
+    suspension_persister: SuspensionPersister | None = None,
 ) -> _LoopOutcome:
     """The turn loop: build request -> call provider -> (gate) run tools -> repeat.
 
@@ -770,7 +950,7 @@ async def _agent_loop(
                 approvals,
                 expires_at,
                 binding,
-                on_suspend,
+                suspension_persister,
             )
             if suspended:
                 pending = suspended
@@ -815,7 +995,7 @@ async def run(
     system_context: SystemContextFn | None = None,
     binding: ApprovalBinding | None = None,
     start_iteration: int = 0,
-    on_suspend: Callable[[], Awaitable[None]] | None = None,
+    suspension_persister: SuspensionPersister | None = None,
 ) -> RunResult:
     """Execute the agent loop until a named termination and return the result.
 
@@ -873,7 +1053,7 @@ async def run(
         system_context=system_context,
         binding=binding,
         start_iteration=start_iteration,
-        on_suspend=on_suspend,
+        suspension_persister=suspension_persister,
     )
 
     if outcome.reason is StopReason.suspended:
@@ -938,6 +1118,8 @@ async def _reconstruct_missing_approvals(
     *,
     session_id: SessionId,
     run_id: RunId,
+    expected_attempt: int | None,
+    expected_batch_id: str | None,
 ) -> list[tuple[ToolCall, str]]:
     """Map suspended calls to durable approval rows when the ``approval.requested`` event was
     lost to a crash before it committed. Mutates ``approval_of`` in place and returns the
@@ -945,19 +1127,28 @@ async def _reconstruct_missing_approvals(
     missing event for audit consistency).
 
     The durable approval row is the authoritative record of the decision + its exact bound
-    action, so reconstruction is safe **only** on an exact match: the row's ``run_id`` (the
-    scan is run-scoped) and ``session_id`` must match, and its ``action_hash`` must equal the
-    suspended call's recomputed hash. A call that already has an event-derived approval is left
-    untouched; an ambiguous match (two candidate rows for one call) is rejected — never
-    adopted — so a duplicate/injected row cannot hijack a call (fail closed)."""
+    action, so reconstruction is safe **only** on an exact identity match. Every field must
+    agree with the run's suspension checkpoint: the row's ``run_id`` (the scan is run-scoped)
+    and ``session_id``, the ``call_id`` (keyed), the recomputed ``action_hash``, and — when the
+    checkpoint recorded them — the exact source ``run_attempt`` (``expected_attempt``) and
+    ``batch_id`` (``expected_batch_id``). A foreign/older/newer attempt or batch, a mismatched
+    session/call/hash, or an ambiguous (>1) candidate is rejected — never adopted — so a
+    stale/duplicate/injected row cannot hijack a call (fail closed). When the checkpoint did
+    not persist a batch id (``expected_batch_id`` is ``None`` — a legitimate older-build row)
+    the batch constraint is relaxed, but every other field (including source attempt when
+    known) is still enforced exactly."""
     missing = [call for call in suspended_calls if call.id not in approval_of]
     if not missing:
         return []
     rows = await approvals.list_for_run(run_id)
     by_call: dict[str, list[ApprovalRecord]] = {}
     for row in rows:
-        if row.session_id != session_id:
-            continue  # cross-session guard (never adopt a foreign session's row)
+        if row.run_id != run_id or row.session_id != session_id:
+            continue  # run/session guard (never adopt a foreign run's or session's row)
+        if expected_attempt is not None and row.run_attempt != expected_attempt:
+            continue  # foreign/older/newer source attempt -> fail closed
+        if expected_batch_id is not None and row.batch_id != expected_batch_id:
+            continue  # foreign batch -> fail closed
         by_call.setdefault(row.call_id, []).append(row)
     reconstructed: list[tuple[ToolCall, str]] = []
     for call in missing:
@@ -990,7 +1181,9 @@ async def resume(
     system_context: SystemContextFn | None = None,
     binding: ApprovalBinding | None = None,
     start_iteration: int = 0,
-    on_suspend: Callable[[], Awaitable[None]] | None = None,
+    suspension_persister: SuspensionPersister | None = None,
+    reconstruct_attempt: int | None = None,
+    reconstruct_batch_id: str | None = None,
 ) -> RunResult:
     """Resume a suspended run: resolve its pending tool batch, then continue the loop.
 
@@ -1036,9 +1229,11 @@ async def resume(
     # map above misses that call and resume would *silently deny* a granted approval. The
     # durable approval row carries the complete immutable action payload, so we rebuild the
     # call -> approval association from the rows for this run and back-fill the missing event
-    # (audit repair). Adoption is exact: the row must belong to this run (row scan is
-    # run-scoped) and session, and its ``action_hash`` must equal the suspended call's — an
-    # ambiguous/duplicate/injected candidate is rejected (never adopted), fail closed.
+    # (audit repair). Adoption is exact: the row must belong to this run (scan is run-scoped)
+    # and session, its ``action_hash`` must equal the suspended call's, and — when the run's
+    # suspension checkpoint recorded them — its source ``run_attempt`` and ``batch_id`` must
+    # match the checkpoint exactly. A foreign/older/newer attempt or batch, or an
+    # ambiguous/duplicate/injected candidate, is rejected (never adopted), fail closed.
     if approvals is not None:
         repaired = await _reconstruct_missing_approvals(
             approvals,
@@ -1046,6 +1241,8 @@ async def resume(
             suspended_calls,
             session_id=session_id,
             run_id=run_id,
+            expected_attempt=reconstruct_attempt,
+            expected_batch_id=reconstruct_batch_id,
         )
         for call, approval_id in repaired:
             await _emit(
@@ -1145,7 +1342,7 @@ async def resume(
         system_context=system_context,
         binding=binding,
         start_iteration=start_iteration,
-        on_suspend=on_suspend,
+        suspension_persister=suspension_persister,
     )
 
     if outcome.reason is StopReason.suspended:

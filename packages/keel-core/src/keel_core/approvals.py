@@ -214,6 +214,15 @@ class InMemoryApprovalStore:
     async def get(self, approval_id: str) -> ApprovalRecord | None:
         return self._rows.get(approval_id)
 
+    def _txn_snapshot(self) -> dict[str, ApprovalRecord]:
+        """Capture a rollback snapshot so an atomic multi-store suspension can undo a partial
+        batch on an injected failure. A suspended batch only ever *adds* rows, so a shallow
+        copy of the id -> row map is enough: restoring drops exactly the rows it inserted."""
+        return dict(self._rows)
+
+    def _txn_restore(self, snapshot: dict[str, ApprovalRecord]) -> None:
+        self._rows = dict(snapshot)
+
     async def list_pending(self, scope_id: str) -> list[ApprovalRecord]:
         return [r for r in self._rows.values() if r.scope_id == scope_id and r.status == "pending"]
 

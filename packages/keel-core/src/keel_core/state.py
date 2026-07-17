@@ -59,6 +59,18 @@ class InMemoryEventStore:
         """Return a copy of a session's events (test/debug helper)."""
         return list(self._events.get(session_id, []))
 
+    def _txn_snapshot(self) -> tuple[dict[str, list[Event]], set[tuple[str, str]]]:
+        """Capture a rollback snapshot so an atomic multi-store suspension can undo a partial
+        batch on an injected failure (the in-memory single-process parity for the Postgres
+        one-transaction path). Shallow-copies each session's event list + the dedup set; the
+        batch only ever *appends*, so restoring drops exactly the events it added."""
+        return ({sid: list(evs) for sid, evs in self._events.items()}, set(self._dedup))
+
+    def _txn_restore(self, snapshot: tuple[dict[str, list[Event]], set[tuple[str, str]]]) -> None:
+        events, dedup = snapshot
+        self._events = {sid: list(evs) for sid, evs in events.items()}
+        self._dedup = set(dedup)
+
 
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 

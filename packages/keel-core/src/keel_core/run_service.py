@@ -24,12 +24,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from keel_core.agents import AgentSpec
 from keel_core.approvals import ApprovalRecord, ApprovalStore
@@ -37,14 +37,18 @@ from keel_core.errors import DuplicateEventError
 from keel_core.loop import (
     ApprovalBinding,
     RunBudget,
+    SuspensionPersister,
     ToolRegistry,
+    _persist_suspension_batch,
+    _unwrap_store,
     admit_run,
+    persist_suspension_batch_in_engine,
     steer_persisted_in_log,
 )
 from keel_core.loop import admit_steer as loop_admit_steer
 from keel_core.loop import resume as loop_resume
 from keel_core.loop import run as loop_run
-from keel_core.protocols import EventStore, PermissionEngine, ProviderGateway
+from keel_core.protocols import EventStore, PermissionEngine, ProviderGateway, ToolCall
 from keel_core.runs import (
     RunBudgetSpec,
     RunControlKind,
@@ -56,6 +60,7 @@ from keel_core.runs import (
     RunStore,
     action_hash,
     admission_fingerprint,
+    mark_checkpoint_in_transaction,
 )
 from keel_core.types import RunId, ScopeId, SessionId, StopReason
 
@@ -745,6 +750,125 @@ def _budget_for(lease: RunLease) -> RunBudget:
     return RunBudget(max_iterations=lease.max_iterations, token_budget=token_budget)
 
 
+def _suspension_engine(
+    run_store: RunStore, event_store: EventStore, approvals: ApprovalStore
+) -> AsyncEngine | None:
+    """The Postgres engine shared by the run, event, AND approval stores, or ``None``.
+
+    Only when all three are backed by the *same* engine can a suspended tool batch's run
+    checkpoint, ``tool.call`` events, approval rows, and ``approval.requested`` events commit in
+    a single transaction (true atomicity). Otherwise (in-memory / mixed) the persister applies
+    the checkpoint + batch atomically via snapshot/rollback in the single process."""
+    inner, _observer = _unwrap_store(event_store)
+    engine = getattr(run_store, "_engine", None)
+    ev_engine = getattr(inner, "_engine", None)
+    ap_engine = getattr(approvals, "_engine", None)
+    if isinstance(engine, AsyncEngine) and engine is ev_engine and engine is ap_engine:
+        return engine
+    return None
+
+
+def _txn_snapshot(obj: object) -> tuple[object, object] | None:
+    """Capture a rollback snapshot of an in-memory store, or ``None`` if it has no support."""
+    fn = getattr(obj, "_txn_snapshot", None)
+    return (obj, fn()) if callable(fn) else None
+
+
+def _txn_restore(snapshots: list[tuple[object, object] | None]) -> None:
+    """Restore each captured snapshot (undo a partially-applied in-memory suspension)."""
+    for snap in snapshots:
+        if snap is None:
+            continue
+        obj, state = snap
+        restore = getattr(obj, "_txn_restore", None)
+        if callable(restore):
+            restore(state)
+
+
+def _make_suspension_persister(
+    run_store: RunStore, scope_id: ScopeId, lease: RunLease
+) -> SuspensionPersister:
+    """Build the durable-run :class:`~keel_core.loop.SuspensionPersister` for one attempt.
+
+    It writes the run's fenced suspension checkpoint (source attempt + exact batch id) as part
+    of the SAME unit that persists the batch's approval rows + events — never a separate
+    ``mark_checkpoint`` commit before it:
+
+    * Shared-engine (Postgres) path: one transaction. The checkpoint UPDATE runs first (fenced
+      on the current lease token/attempt); a lost lease raises :class:`RunLeaseLostError`,
+      rolling the whole unit back. On any failure nothing persists — a reclaim restarts fresh;
+      on commit a reclaim always observes the complete batch bound to the checkpoint.
+    * In-memory / mixed single-process path: snapshot the run/event/approval stores, mark the
+      checkpoint, persist the batch, and on any injected failure restore the snapshots so no
+      partial checkpoint/batch survives."""
+
+    async def persist(
+        *,
+        store: EventStore,
+        approvals: ApprovalStore,
+        calls: Sequence[ToolCall],
+        asks: Sequence[ToolCall],
+        session_id: SessionId,
+        scope_id: ScopeId,
+        run_id: RunId,
+        reason: str,
+        expires_at: datetime,
+        binding: ApprovalBinding | None,
+        batch_id: str,
+    ) -> list[str]:
+        engine = _suspension_engine(run_store, store, approvals)
+        if engine is not None:
+
+            async def checkpoint(conn: AsyncConnection) -> None:
+                # Fenced on the current lease token/attempt; a lost lease aborts (rolls back)
+                # the whole batch. Records this batch id + source attempt on the run row.
+                await mark_checkpoint_in_transaction(conn, scope_id, lease, batch_id=batch_id)
+
+            return await persist_suspension_batch_in_engine(
+                engine,
+                store,
+                approvals,
+                calls=calls,
+                asks=asks,
+                session_id=session_id,
+                scope_id=scope_id,
+                run_id=run_id,
+                reason=reason,
+                expires_at=expires_at,
+                binding=binding,
+                batch_id=batch_id,
+                checkpoint_in_tx=checkpoint,
+            )
+
+        # In-memory / mixed: apply the checkpoint + batch atomically via snapshot/rollback.
+        inner, _observer = _unwrap_store(store)
+        snapshots = [
+            _txn_snapshot(run_store),
+            _txn_snapshot(inner),
+            _txn_snapshot(approvals),
+        ]
+        try:
+            await run_store.mark_checkpoint(lease, batch_id=batch_id)
+            return await _persist_suspension_batch(
+                store,
+                approvals,
+                calls=calls,
+                asks=asks,
+                session_id=session_id,
+                scope_id=scope_id,
+                run_id=run_id,
+                reason=reason,
+                expires_at=expires_at,
+                binding=binding,
+                batch_id=batch_id,
+            )
+        except BaseException:
+            _txn_restore(snapshots)
+            raise
+
+    return persist
+
+
 async def execute_run(
     *,
     lease: RunLease,
@@ -809,12 +933,20 @@ async def execute_run(
 
     budget = _budget_for(lease)
 
-    async def _checkpoint() -> None:
-        # Durable suspension checkpoint, written just before the loop persists an approval
-        # batch and fenced by this lease. If the worker dies before releasing to
-        # waiting_approval, the still-``running`` row carries the marker so the lease-expiry
-        # reclaim resumes (honouring the durable approval) instead of restarting fresh.
-        await run_store.mark_checkpoint(lease)
+    # Durable suspension persister: writes the run's fenced checkpoint (source attempt + batch
+    # id) in the SAME transaction/atomic unit as the batch's approval rows + events, so a crash
+    # mid-suspension never leaves a partial checkpoint/batch (blocker 2). No separate
+    # ``mark_checkpoint`` commit precedes it.
+    persister = _make_suspension_persister(run_store, lease.scope_id, lease)
+
+    # Reconstruction expectations for resume's approval-event repair: the durable checkpoint's
+    # source attempt + exact batch id. A lost ``approval.requested`` event is repaired from the
+    # durable rows only when their run/session/call/action-hash AND these match exactly — a
+    # foreign/older/newer attempt or batch fails closed (blocker 1). ``checkpoint_batch_id``
+    # empty (a legitimate older-build row that never persisted it) relaxes only the batch
+    # constraint; the source attempt is still enforced.
+    reconstruct_attempt = record.checkpoint_attempt or lease.attempt
+    reconstruct_batch_id = record.checkpoint_batch_id or None
 
     keeper.start()
     watcher.start()
@@ -837,7 +969,9 @@ async def execute_run(
                 system_context=system_context,
                 binding=binding,
                 start_iteration=lease.iterations_used,
-                on_suspend=_checkpoint,
+                suspension_persister=persister,
+                reconstruct_attempt=reconstruct_attempt,
+                reconstruct_batch_id=reconstruct_batch_id,
             )
         else:
             result = await loop_run(
@@ -856,7 +990,7 @@ async def execute_run(
                 system_context=system_context,
                 binding=binding,
                 start_iteration=lease.iterations_used,
-                on_suspend=_checkpoint,
+                suspension_persister=persister,
             )
     except RunLeaseLostError:
         # A fenced checkpoint write found the lease lost mid-batch (another worker reclaimed):

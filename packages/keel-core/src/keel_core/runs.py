@@ -32,13 +32,13 @@ import hashlib
 import json
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 from keel_core.types import RunId, ScopeId, SessionId
 
@@ -269,6 +269,12 @@ class RunRecord:
     # decision bound to the suspended source attempt stays applicable exactly once on resume,
     # while stale approvals from a different/older checkpoint attempt remain rejected.
     checkpoint_attempt: int = 0
+    # The exact batch id the current checkpoint owns. Written — fenced by the lease — in the
+    # SAME transaction as the batch's approval rows + events, so resume's reconstruction repair
+    # adopts a durable approval row only when its ``batch_id`` (and source attempt) match the
+    # checkpoint exactly; a foreign/older/newer batch fails closed. Empty for pre-checkpoint or
+    # never-suspended rows (older-build repair then falls back to attempt + action-hash match).
+    checkpoint_batch_id: str = ""
 
     @property
     def is_terminal(self) -> bool:
@@ -384,7 +390,9 @@ class RunStore(Protocol):
 
     async def requeue(self, run_id: RunId, *, now: datetime | None = None) -> bool: ...
 
-    async def mark_checkpoint(self, lease: RunLease, *, now: datetime | None = None) -> bool: ...
+    async def mark_checkpoint(
+        self, lease: RunLease, *, batch_id: str = "", now: datetime | None = None
+    ) -> bool: ...
 
     async def claim(
         self,
@@ -590,13 +598,16 @@ class InMemoryRunStore:
         record.updated_at = now or _now()
         return True
 
-    async def mark_checkpoint(self, lease: RunLease, *, now: datetime | None = None) -> bool:
+    async def mark_checkpoint(
+        self, lease: RunLease, *, batch_id: str = "", now: datetime | None = None
+    ) -> bool:
         """Durably record a suspension checkpoint intent, fenced by the active lease.
 
-        Called (before the approval batch is persisted) so that a crash before the
+        Called (with the batch's approval rows/events, atomically) so that a crash before the
         ``running -> waiting_approval`` release still leaves a marker on the ``running`` row.
-        Records the current attempt as the checkpoint's source attempt for approval binding.
-        Idempotent within an attempt; raises if the lease is lost (never writes unfenced)."""
+        Records the current attempt as the checkpoint's source attempt and ``batch_id`` as the
+        exact suspended batch for approval binding. Idempotent within an attempt for the same
+        batch; raises if the lease is lost (never writes unfenced)."""
         record = self._rows.get(lease.run_id)
         if (
             record is None
@@ -604,13 +615,29 @@ class InMemoryRunStore:
             or record.status is not RunStatus.running
         ):
             raise RunLeaseLostError(lease.run_id)
-        if record.suspend_checkpoint and record.checkpoint_attempt == record.attempt:
-            return True  # idempotent no-op for the current attempt
+        if (
+            record.suspend_checkpoint
+            and record.checkpoint_attempt == record.attempt
+            and record.checkpoint_batch_id == batch_id
+        ):
+            return True  # idempotent no-op for the current attempt + batch
         record.suspend_checkpoint = True
         record.checkpoint_attempt = record.attempt
+        record.checkpoint_batch_id = batch_id
         record.version += 1
         record.updated_at = now or _now()
         return True
+
+    def _txn_snapshot(self) -> dict[RunId, RunRecord]:
+        """Shallow-copy every run row so a failed multi-store suspension can roll back.
+
+        The in-memory suspension persister snapshots the run store (alongside the event +
+        approval stores) before it marks the checkpoint, then restores on any injected failure
+        so a partially-applied batch never leaves a checkpoint without its rows/events."""
+        return {rid: replace(rec) for rid, rec in self._rows.items()}
+
+    def _txn_restore(self, snapshot: dict[RunId, RunRecord]) -> None:
+        self._rows = dict(snapshot)
 
     async def claim(
         self,
@@ -890,7 +917,7 @@ _RUN_COLUMNS = (
     "stop_reason, attempt, version, worker_id, lease_token, lease_expires_at, heartbeat_at, "
     "max_iterations, token_budget, prompt_tokens, completion_tokens, cost_usd, result_ref, "
     "error_kind, error_message, resume_requested, prompt_persisted, iterations, fingerprint, "
-    "suspend_checkpoint, checkpoint_attempt, "
+    "suspend_checkpoint, checkpoint_attempt, checkpoint_batch_id, "
     "created_at, updated_at, started_at, finished_at, expires_at"
 )
 
@@ -927,12 +954,74 @@ def _to_record(row: Mapping[Any, Any]) -> RunRecord:
         fingerprint=row["fingerprint"],
         suspend_checkpoint=bool(row["suspend_checkpoint"]),
         checkpoint_attempt=row["checkpoint_attempt"],
+        checkpoint_batch_id=row["checkpoint_batch_id"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         expires_at=row["expires_at"],
     )
+
+
+_CHECKPOINT_UPDATE = text(
+    "UPDATE runs SET suspend_checkpoint = true, checkpoint_attempt = attempt, "
+    "checkpoint_batch_id = :batch, version = version + 1, updated_at = :now "
+    "WHERE scope_id = :scope AND id = :id AND lease_token = :token AND status = 'running' "
+    "AND NOT (suspend_checkpoint AND checkpoint_attempt = attempt "
+    "AND checkpoint_batch_id = :batch) RETURNING id"
+)
+_CHECKPOINT_CURRENT = text(
+    "SELECT lease_token, status, suspend_checkpoint, checkpoint_attempt, checkpoint_batch_id, "
+    "attempt FROM runs WHERE scope_id = :scope AND id = :id"
+)
+
+
+async def mark_checkpoint_in_transaction(
+    conn: AsyncConnection,
+    scope_id: ScopeId,
+    lease: RunLease,
+    *,
+    batch_id: str = "",
+    now: datetime | None = None,
+) -> bool:
+    """Fenced suspension-checkpoint UPDATE inside the caller's transaction (no commit here).
+
+    Lets a suspended tool batch persist its run checkpoint (source attempt + exact batch id) in
+    the *same* transaction as its approval rows + ``tool.call`` / ``approval.requested`` events
+    (:func:`keel_core.run_service.execute_run`), so the whole unit commits or rolls back
+    together — never a checkpoint without its batch (or a batch without its checkpoint). The
+    caller owns the transaction + ``app.scope_id`` GUC. The write is fenced on
+    ``lease_token`` + ``status = 'running'``: a lost/superseded lease raises
+    :class:`RunLeaseLostError` (aborting — and rolling back — the whole batch); re-marking the
+    same attempt + batch is an idempotent no-op."""
+    now = now or _now()
+    params = {
+        "scope": scope_id,
+        "id": lease.run_id,
+        "token": lease.token,
+        "batch": batch_id,
+        "now": now,
+    }
+    row = (await conn.execute(_CHECKPOINT_UPDATE, params)).scalar_one_or_none()
+    if row is not None:
+        return True
+    # No row updated: either the marker already reflects this attempt + batch (idempotent) or
+    # the lease is lost. Distinguish so a lost lease never silently succeeds.
+    current = (
+        (await conn.execute(_CHECKPOINT_CURRENT, {"scope": scope_id, "id": lease.run_id}))
+        .mappings()
+        .one_or_none()
+    )
+    if (
+        current is not None
+        and current["lease_token"] == lease.token
+        and current["status"] == "running"
+        and current["suspend_checkpoint"]
+        and current["checkpoint_attempt"] == current["attempt"]
+        and current["checkpoint_batch_id"] == batch_id
+    ):
+        return True  # idempotent: the current attempt + batch is already checkpointed
+    raise RunLeaseLostError(lease.run_id)
 
 
 async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
@@ -1131,56 +1220,24 @@ class PostgresRunStore:
             )
         return result.rowcount == 1
 
-    async def mark_checkpoint(self, lease: RunLease, *, now: datetime | None = None) -> bool:
+    async def mark_checkpoint(
+        self, lease: RunLease, *, batch_id: str = "", now: datetime | None = None
+    ) -> bool:
         """Durably mark a suspension checkpoint on the ``running`` row, fenced by the lease.
 
-        Written (before the approval batch is persisted) so a crash before the
+        Written (atomically with the approval batch's rows/events — see
+        :func:`keel_core.run_service.execute_run`) so a crash before the
         ``running -> waiting_approval`` release still leaves a marker; ``checkpoint_attempt``
-        captures the current attempt as the batch's source attempt for approval binding. The
-        write is fenced on ``lease_token`` + ``status = 'running'``; a lost lease raises
-        rather than writing unfenced. Re-marking the current attempt is an idempotent no-op."""
+        captures the current attempt as the batch's source attempt and ``checkpoint_batch_id``
+        the exact suspended batch, both for approval binding. The write is fenced on
+        ``lease_token`` + ``status = 'running'``; a lost lease raises rather than writing
+        unfenced. Re-marking the current attempt + batch is an idempotent no-op."""
         now = now or _now()
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            row = (
-                await conn.execute(
-                    text(
-                        "UPDATE runs SET suspend_checkpoint = true, "
-                        "checkpoint_attempt = attempt, version = version + 1, updated_at = :now "
-                        "WHERE scope_id = :scope AND id = :id AND lease_token = :token "
-                        "AND status = 'running' "
-                        "AND NOT (suspend_checkpoint AND checkpoint_attempt = attempt) "
-                        "RETURNING id"
-                    ),
-                    {"scope": self._scope_id, "id": lease.run_id, "token": lease.token, "now": now},
-                )
-            ).scalar_one_or_none()
-            if row is not None:
-                return True
-            # No row updated: either the marker already reflects this attempt (idempotent), or
-            # the lease is lost. Distinguish so a lost lease never silently succeeds.
-            current = (
-                (
-                    await conn.execute(
-                        text(
-                            "SELECT lease_token, status, suspend_checkpoint, checkpoint_attempt, "
-                            "attempt FROM runs WHERE scope_id = :scope AND id = :id"
-                        ),
-                        {"scope": self._scope_id, "id": lease.run_id},
-                    )
-                )
-                .mappings()
-                .one_or_none()
+            return await mark_checkpoint_in_transaction(
+                conn, self._scope_id, lease, batch_id=batch_id, now=now
             )
-        if (
-            current is not None
-            and current["lease_token"] == lease.token
-            and current["status"] == "running"
-            and current["suspend_checkpoint"]
-            and current["checkpoint_attempt"] == current["attempt"]
-        ):
-            return True  # idempotent: the current attempt is already checkpointed
-        raise RunLeaseLostError(lease.run_id)
 
     async def claim(
         self,
@@ -1588,5 +1645,6 @@ __all__ = [
     "TERMINAL_STATUSES",
     "action_hash",
     "can_transition",
+    "mark_checkpoint_in_transaction",
     "purge_scope",
 ]
