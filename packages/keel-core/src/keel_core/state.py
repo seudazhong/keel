@@ -134,33 +134,27 @@ async def append_event_in_transaction(
             )
         ).one_or_none()
         if row is None:
-            existing_scope = await conn.scalar(
-                text("SELECT scope_id FROM sessions WHERE id = :sid"),
-                {"sid": event.session_id},
-            )
-            if existing_scope is not None and str(existing_scope) != event.scope_id:
-                raise CrossScopeError(event.scope_id, str(existing_scope))
+            # Session identity is composite ``(scope_id, id)`` (M3.6 finding 2): the same
+            # external id in another scope is a *different* session, so an absent row here means
+            # only that this scope has no such session — never a cross-scope conflict.
             raise LookupError(f"session {event.session_id!r} does not exist in this scope")
     else:
+        # Get-or-create this scope's own session row. The conflict target is the composite
+        # ``(scope_id, id)`` key, so a session id already used in a *different* scope does not
+        # conflict — it inserts a fresh, isolated session for this scope (identical external
+        # ids coexist across orgs). Only a repeat within the same scope updates the sequence.
         row = (
             await conn.execute(
                 text(
                     "INSERT INTO sessions (id, scope_id, next_seq) "
                     "VALUES (:sid, :scope, 2) "
-                    "ON CONFLICT (id) DO UPDATE "
+                    "ON CONFLICT (scope_id, id) DO UPDATE "
                     "SET next_seq = sessions.next_seq + 1, updated_at = now() "
-                    "WHERE sessions.scope_id = EXCLUDED.scope_id "
                     "RETURNING next_seq - 1 AS seq"
                 ),
                 params,
             )
-        ).one_or_none()
-        if row is None:
-            existing_scope = await conn.scalar(
-                text("SELECT scope_id FROM sessions WHERE id = :sid"),
-                {"sid": event.session_id},
-            )
-            raise CrossScopeError(event.scope_id, str(existing_scope or "<foreign-session>"))
+        ).one()
     seq = int(row.seq)
     await conn.execute(
         text(

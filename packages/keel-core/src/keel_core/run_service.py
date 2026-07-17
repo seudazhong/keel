@@ -49,6 +49,7 @@ from keel_core.loop import admit_steer as loop_admit_steer
 from keel_core.loop import resume as loop_resume
 from keel_core.loop import run as loop_run
 from keel_core.protocols import EventStore, PermissionEngine, ProviderGateway, ToolCall
+from keel_core.run_dispatch import RunDispatchOutbox
 from keel_core.runs import (
     RunBudgetSpec,
     RunControlKind,
@@ -267,6 +268,7 @@ class DurableRunService:
         admit_fn: AdmitFn,
         default_ttl_seconds: int = 24 * 3600,
         delegate_policy: DelegatePolicy | None = None,
+        dispatch_outbox: RunDispatchOutbox | None = None,
     ) -> None:
         self._runs = run_store
         self._events = event_store
@@ -276,6 +278,7 @@ class DurableRunService:
         self._admit = admit_fn
         self._default_ttl_seconds = default_ttl_seconds
         self._delegate_policy = delegate_policy
+        self._dispatch_outbox = dispatch_outbox
 
     @property
     def scope_id(self) -> ScopeId:
@@ -360,6 +363,21 @@ class DurableRunService:
         queued = await self._runs.mark_queued(record.id, now=now)
         dispatch_pending = False
         if queued:
+            # Record the global dispatch intent as part of completing the queued transition,
+            # BEFORE the best-effort enqueue. This is the durable, cross-scope pointer the
+            # worker reconciler scans: even if the enqueue below is lost, the intent survives
+            # so the reconciler redispatches this run in its own scope (M3.6 finding 4). The
+            # intent is recorded exactly once (idempotent on run_id).
+            if self._dispatch_outbox is not None:
+                try:
+                    await self._dispatch_outbox.record(record.id, self._scope_id, now=now)
+                except Exception:  # noqa: BLE001 - outbox is best-effort; per-scope reconcile backs up
+                    logger.warning(
+                        "run dispatch intent not recorded scope=%s run=%s",
+                        self._scope_id,
+                        record.id,
+                        exc_info=True,
+                    )
             # 3) Dispatch a worker job (a duplicate enqueue is deduped by the claim). The
             #    durable admission (run row + prompt + queued) has ALREADY committed, so a
             #    failed enqueue must NOT propagate as an error: that would make the caller

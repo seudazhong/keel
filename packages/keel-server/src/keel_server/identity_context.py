@@ -56,6 +56,12 @@ class Actor:
     display_name: str
     user_id: str | None = None
     oidc_subject: str | None = None
+    # For an API-key machine: an optional explicit org/Agent binding (a *scoped* machine
+    # credential) and/or an explicit global-admin marker. Unset for a user, the local operator,
+    # or an unbound legacy machine key.
+    machine_org_ref: str | None = None
+    machine_agent_ref: str | None = None
+    machine_global: bool = False
 
     @property
     def is_user(self) -> bool:
@@ -94,6 +100,9 @@ def _machine_or_local_actor(principal: Principal) -> Actor:
         kind=ActorKind.local if is_local else ActorKind.machine,
         api_role=principal.role,
         display_name=principal.name,
+        machine_org_ref=principal.org_ref,
+        machine_agent_ref=principal.agent_ref,
+        machine_global=principal.is_global,
     )
 
 

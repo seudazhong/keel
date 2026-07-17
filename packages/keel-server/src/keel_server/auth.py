@@ -37,10 +37,20 @@ _ROLE_BY_NAME = {role.name: role for role in Role}
 
 @dataclass(frozen=True)
 class Principal:
-    """The authenticated caller: a display name and its granted role."""
+    """The authenticated caller: a display name, granted role, and optional scope binding.
+
+    A plain ``key:role`` credential is **unbound** (legacy, no tenant binding). A machine
+    credential may additionally carry an explicit org/Agent binding (``org``/``agent``) so it
+    operates only inside one tenant's data plane, or an explicit ``is_global`` admin marker
+    (which must still select an org/Agent per request). The extra fields default to unbound so
+    existing behavior is unchanged.
+    """
 
     name: str
     role: Role
+    org_ref: str | None = None
+    agent_ref: str | None = None
+    is_global: bool = False
 
 
 def hash_api_key(key: str) -> str:
@@ -49,21 +59,53 @@ def hash_api_key(key: str) -> str:
 
 
 def parse_api_keys(raw: str) -> dict[str, Principal]:
-    """Parse ``key:role[,key:role...]`` into a ``{key_hash: Principal}`` map.
+    """Parse ``key:role[:binding...]`` into a ``{key_hash: Principal}`` map.
 
-    Blank entries, entries without a role, and unknown role names are skipped so a
-    typo can't silently grant access. The plaintext key is hashed immediately and never
-    retained; the map is keyed by the digest.
+    Each comma-separated entry is ``key:role`` optionally followed by colon-delimited binding
+    attributes so a machine credential can be scoped to one tenant (backward compatible — a
+    bare ``key:role`` is an unbound legacy credential):
+
+    * ``org=<org-id-or-slug>`` and ``agent=<agent-id>`` bind the credential to exactly one
+      org + Agent (a *scoped* machine credential — the only kind granted data-plane access in
+      cloud mode, and only within that scope);
+    * ``global`` marks an explicit cross-tenant admin credential (retained but must select an
+      org/Agent per request via headers, and is audited).
+
+    Blank entries, entries without a role, and unknown role names are skipped so a typo can't
+    silently grant access. The plaintext key is hashed immediately and never retained.
     """
     keys: dict[str, Principal] = {}
     for entry in raw.split(","):
-        key, sep, role_name = entry.strip().partition(":")
+        key, sep, remainder = entry.strip().partition(":")
         if not sep:
             continue
         key = key.strip()
-        role = _ROLE_BY_NAME.get(role_name.strip().lower())
-        if key and role is not None:
-            keys[hash_api_key(key)] = Principal(name=f"{role.name}:{key[:4]}…", role=role)
+        parts = [segment.strip() for segment in remainder.split(":")]
+        role = _ROLE_BY_NAME.get(parts[0].strip().lower())
+        if not key or role is None:
+            continue
+        org_ref: str | None = None
+        agent_ref: str | None = None
+        is_global = False
+        for attr in parts[1:]:
+            if not attr:
+                continue
+            attr_name, eq, value = attr.partition("=")
+            attr_name = attr_name.strip().lower()
+            value = value.strip()
+            if attr_name == "org" and eq:
+                org_ref = value or None
+            elif attr_name == "agent" and eq:
+                agent_ref = value or None
+            elif attr_name == "global" and not eq:
+                is_global = True
+        keys[hash_api_key(key)] = Principal(
+            name=f"{role.name}:{key[:4]}…",
+            role=role,
+            org_ref=org_ref,
+            agent_ref=agent_ref,
+            is_global=is_global,
+        )
     return keys
 
 

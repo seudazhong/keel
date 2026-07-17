@@ -161,15 +161,14 @@ async def test_worker_recovers_queued_run_after_restart(migrated_db: AsyncEngine
 
 
 async def test_two_orgs_identical_session_ids_are_isolated(migrated_db: AsyncEngine) -> None:
-    """Two orgs/Agents are isolated across runs/events/session lists, and a cross-scope session
-    id reuse is denied (M3.6 item 3).
+    """Two orgs/Agents are isolated across runs/events/session lists, and the *same* external
+    session id can be reused by both orgs as two distinct sessions (M3.6 findings 2 + 3).
 
     Each org+Agent derives its own ``agent:<org>/<agent>`` data-plane scope. Distinct sessions
-    are fully isolated per scope; and because session ids are globally namespaced, one org can
-    never write into a session id owned by another org's scope (a hard cross-scope denial, not a
-    silent shared write).
+    are fully isolated per scope; and because session identity is the composite ``(scope_id,
+    id)``, one org reusing another org's external session id creates its own isolated session
+    rather than writing into (or being denied by) the other's.
     """
-    from keel_core.errors import CrossScopeError
     from keel_core.scoping import derive_agent_scope
     from keel_core.state import list_sessions
 
@@ -251,14 +250,63 @@ async def test_two_orgs_identical_session_ids_are_isolated(migrated_db: AsyncEng
     sessions_b = await list_sessions(migrated_db, scope_b)
     assert [s.id for s in sessions_a] == ["sess-a"] and [s.id for s in sessions_b] == ["sess-b"]
 
-    # Session ids are globally namespaced: org B can never write into org A's session id.
-    with pytest.raises(CrossScopeError):
-        await svc_b.admit(
-            org_id="orgb",
-            actor="user-b",
-            agent_id="agtb",
-            session_id="sess-a",  # owned by org A's scope
-            surface=RunSurface.web.value,
-            content="attempted cross-scope write",
-            idempotency_key="k2",
-        )
+    # Composite (scope_id, id) identity: org B can reuse org A's external session id as its own
+    # isolated session — the same id in two orgs coexists (M3.6 finding 2), it never writes into
+    # org A's data. Admission succeeds and produces a distinct run in org B's scope.
+    reuse = await svc_b.admit(
+        org_id="orgb",
+        actor="user-b",
+        agent_id="agtb",
+        session_id="sess-a",  # same external id as org A's session, but a distinct scope
+        surface=RunSurface.web.value,
+        content="org B's own sess-a",
+        idempotency_key="k2",
+    )
+    assert reuse.run_id not in {admit_a.run_id, admit_b.run_id}
+    # Org A's "sess-a" log is untouched by org B's reuse; each scope reads only its own content.
+    texts_a_after = " ".join(
+        [str(e.payload.get("text", "")) async for e in events_a.read("sess-a")]
+    )
+    texts_b_reuse = " ".join(
+        [str(e.payload.get("text", "")) async for e in events_b.read("sess-a")]
+    )
+    assert "org A" in texts_a_after and "org B's own" not in texts_a_after
+    assert "org B's own" in texts_b_reuse and "org A" not in texts_b_reuse
+    # Org A still never sees org B's run, and vice versa.
+    assert await runs_a.get(reuse.run_id) is None
+
+
+async def test_dispatch_outbox_leases_across_scopes_and_blocks_duplicate_worker(
+    migrated_db: AsyncEngine,
+) -> None:
+    """The global dispatch outbox indexes runs across scopes and fences duplicate workers.
+
+    A single reconciler can discover open work in every scope from this one non-RLS index, and
+    the ``FOR UPDATE SKIP LOCKED`` lease guarantees two workers never both claim the same intent
+    (M3.6 finding 4). Verified on live Postgres.
+    """
+    from datetime import UTC, datetime, timedelta
+
+    from keel_core.run_dispatch import PostgresRunDispatchOutbox
+
+    outbox = PostgresRunDispatchOutbox(migrated_db)
+    now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
+    await outbox.record("run-a", "agent:orga/agta", now=now)
+    await outbox.record("run-b", "agent:orgb/agtb", now=now)
+    assert await outbox.active_scopes() == {"agent:orga/agta", "agent:orgb/agtb"}
+
+    first = await outbox.claim_due(worker_id="w1", now=now, lease_seconds=60)
+    assert {i.run_id for i in first} == {"run-a", "run-b"}
+    # A second worker sees nothing while the lease is live (SKIP LOCKED + lease window).
+    second = await outbox.claim_due(worker_id="w2", now=now + timedelta(seconds=1))
+    assert second == []
+    # After the lease expires the intents are claimable again.
+    third = await outbox.claim_due(worker_id="w2", now=now + timedelta(seconds=120))
+    assert {i.run_id for i in third} == {"run-a", "run-b"}
+
+    # A terminal run's intent is removed; a still-active one is deferred.
+    await outbox.remove("run-a")
+    await outbox.reschedule("run-b", delay_seconds=300, now=now + timedelta(seconds=120))
+    assert await outbox.active_scopes() == {"agent:orgb/agtb"}
+    # run-b is deferred past its next attempt, so an immediate claim skips it.
+    assert await outbox.claim_due(worker_id="w3", now=now + timedelta(seconds=121)) == []

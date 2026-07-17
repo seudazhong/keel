@@ -217,6 +217,45 @@ Review-finding hardening (this increment):
   `/settings/model` updates the process model in local preview only and fails closed in cloud
   mode (never a silent success the worker ignores).
 
+Second-pass review findings (this increment, migration `0016_web_routing_isolation`):
+
+- **Scoped machine API credentials.** The configured machine-principal syntax is extended
+  (backward compatible) to `key:role[:org=…:agent=…|:global]`: a scoped credential binds one
+  org/Agent and works in cloud mode without ambient cross-tenant access, a `global` admin must
+  explicitly select an org/Agent per request (audited), and an unbound credential is denied in
+  cloud. `EndpointAuth` derives the per-Agent scope from the binding and rejects a spoofed
+  `X-Keel-Org`/`X-Keel-Agent`. Evidence: `tests/unit/test_machine_credentials.py`.
+- **Composite session tenant identity.** `sessions` is re-keyed on `(scope_id, id)` and `events`
+  on `(scope_id, session_id, seq)`, so identical external session ids in two orgs coexist as
+  isolated sessions (no cross-scope denial); existing rows upgrade safely and downgrade restores
+  the global namespace when no cross-scope id collision exists. Evidence:
+  `test_state_postgres.py`, `test_run_routing_postgres.py::test_two_orgs_identical_session_ids_are_isolated`.
+- **Scoped Gmail OAuth.** `/connect` resolves through the unified `require_privilege` and binds
+  the one-time state to the caller's canonical `agent:<org>/<agent>` scope (never the app-global
+  `web:local`); the unauthenticated callback consumes that state and writes the token to that
+  scope. Evidence: `tests/unit/test_oauth_connect.py`.
+- **Global dispatch/reconciliation outbox.** `0016` adds a minimal, non-sensitive, **global**
+  `run_dispatch_outbox` (`run_id` + `scope_id` + coarse state + fenced lease, no payload).
+  Admission records the intent as part of the queued transition; the worker's
+  `reconcile_dispatch_tick` leases due intents (`FOR UPDATE SKIP LOCKED`), reconciles **every**
+  scope with open work, and retires terminal intents — replacing the `web:local`-pinned
+  reconciler. Evidence: `tests/unit/test_run_dispatch_outbox.py`,
+  `test_run_routing_postgres.py::test_dispatch_outbox_leases_across_scopes_and_blocks_duplicate_worker`.
+- **Live SSE tail.** The authenticated per-Agent SSE performs the durable replay and then keeps
+  the connection open, tailing new worker events via bounded durable polling until the run ends
+  or the client disconnects, honoring `Last-Event-ID` with no missed/duplicate events. Evidence:
+  `tests/unit/test_sse_tail.py`.
+- **Real sandbox namespace confinement.** The sandbox service resolves each validated
+  `ws_<hash>` namespace to its own confined workspace via a `WorkspaceProvider`/factory and fails
+  closed when a scoped workspace cannot be provisioned — it never ignores the namespace. Evidence:
+  `test_sandbox_rpc.py::test_rpc_namespaces_are_confined_to_distinct_workspaces`.
+- **Readiness + OpenAPI compatibility.** Readiness is degraded (503) when default durable message
+  admission cannot execute (no shared substrate / no run queue) instead of reporting 200 while
+  every message 503s. `check_openapi_compat.py` validates against the **main** baseline (the
+  branch masking is reverted) and now allows additive optional parameters by stable `(name,in)`
+  identity while still failing removals/type/required changes. Evidence:
+  `tests/unit/test_server.py`, `tests/unit/test_openapi_compat.py`.
+
 Still to do (not yet done):
 
 - **IM durable routing.** OneBot/Telegram gateways (`ImRunner`) still run the in-process
@@ -226,6 +265,12 @@ Still to do (not yet done):
   survives a server/worker restart, a reconciler sweep for the crash-after-terminalize
   delivery window, and a cloud channel→org/Agent mapping (fail closed when absent). Designed
   but not implemented in this increment.
+- **Per-scope Knowledge stores/services.** Connectors/tokens/Gmail OAuth are now per canonical
+  scope, but the Knowledge API router still builds a single `web:local`-bound `KnowledgeService`.
+  Moving it to per-request canonical scope additionally requires the worker's Knowledge indexing
+  jobs (`dispatch_jobs`/`run_job`) to be driven across scopes (the same cross-scope pattern as
+  the run-dispatch outbox), so a document created in a per-Agent scope is actually indexed rather
+  than orphaned; deferred to avoid a broken half-migration.
 - **Connector tool parity** in the durable worker path (beyond file/shell + memory +
   Knowledge) is a follow-up.
 - **SSE token-streaming liveness** from the worker: durable events (including completed

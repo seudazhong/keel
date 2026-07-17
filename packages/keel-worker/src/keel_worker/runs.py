@@ -36,6 +36,7 @@ from keel_core.interactive import (
 )
 from keel_core.loop import ToolRegistry, admission_model_in_log, admit
 from keel_core.memory import PostgresMemoryStore, format_core_memory
+from keel_core.run_dispatch import RunDispatchOutbox
 from keel_core.run_service import (
     DurableRunService,
     SystemContextFn,
@@ -346,4 +347,85 @@ async def reconcile_runs_tick(ctx: dict[str, Any]) -> int:
     return result.redispatched + result.reclaimed + result.expired + resumed + repaired
 
 
-__all__ = ["reconcile_runs_tick", "run_interactive"]
+async def reconcile_dispatch_tick(ctx: dict[str, Any]) -> int:
+    """Cross-scope durable reconciliation driven by the global dispatch outbox (finding 4).
+
+    The scope-partitioned ``runs`` table is RLS-forced, so a worker bound to one scope cannot
+    see another's runs. The global :class:`~keel_core.run_dispatch.RunDispatchOutbox` is the
+    one cross-scope index: admission records ``(run_id, scope_id)`` there, and this tick leases
+    a batch of due intents (fenced so duplicate workers never both process one), reconciles
+    **each distinct scope** the batch touches (redispatch queued-but-undispatched, reclaim
+    expired leases, expire past-deadline runs, expire approvals, repair stuck resumes), then
+    removes the intents of runs that have reached a terminal state and defers the rest. This
+    replaces the previous ``web:local``-pinned reconciler — every per-Agent scope with open work
+    is now recovered by any worker.
+    """
+    outbox: RunDispatchOutbox | None = ctx.get("dispatch_outbox")
+    if outbox is None:
+        return 0
+    enqueue = ctx["enqueue"]
+    now = datetime.now(UTC)
+    claimed = await outbox.claim_due(worker_id=_WORKER_ID, now=now)
+    if not claimed:
+        return 0
+
+    scopes: set[ScopeId] = set()
+    for intent in claimed:
+        try:
+            scopes.add(validate_scope_id(intent.scope_id))
+        except ScopeValidationError:
+            # A malformed scope can never be reconciled — drop its intent (fail closed).
+            await outbox.remove(intent.run_id)
+            logger.warning("dropped outbox intent with malformed scope=%r", intent.scope_id)
+
+    reconciled = 0
+    for scope_id in scopes:
+        run_store, event_store, approvals = _scoped_stores(ctx, scope_id)
+
+        async def _enqueue(run_id: str, _scope: ScopeId = scope_id) -> None:
+            await enqueue("run_interactive", run_id, _scope)
+
+        async def _prompt_persisted(record: RunRecord, _events: Any = event_store) -> bool:
+            return await prompt_persisted_in_log(_events, record.session_id, record.id)
+
+        async def _legacy_resume(record: ApprovalRecord) -> None:
+            await enqueue("resume_run", record.session_id, record.run_id, record.scope_id)
+
+        result = await reconcile_runs(
+            run_store=run_store,
+            enqueue=_enqueue,
+            prompt_persisted=_prompt_persisted,
+            now=now,
+        )
+        service = DurableRunService(
+            run_store=run_store,
+            event_store=event_store,
+            approvals=approvals,
+            scope_id=scope_id,
+            enqueue=_enqueue,
+            admit_fn=admit,
+            dispatch_outbox=outbox,
+        )
+        resumed = await service.expire_approvals(now=now, legacy_resume=_legacy_resume)
+        repaired = await service.repair_stuck_resumes()
+        reconciled += result.redispatched + result.reclaimed + result.expired + resumed + repaired
+
+    # Retire intents whose run is terminal (nothing left to dispatch); defer the rest so they
+    # are re-checked on a later tick without spinning.
+    for intent in claimed:
+        run_store, _events, _approvals = _scoped_stores(ctx, intent.scope_id)
+        record = await run_store.get(intent.run_id)
+        if record is None or record.status in {
+            RunStatus.completed,
+            RunStatus.failed,
+            RunStatus.cancelled,
+            RunStatus.interrupted,
+            RunStatus.expired,
+        }:
+            await outbox.remove(intent.run_id)
+        else:
+            await outbox.reschedule(intent.run_id, now=now)
+    return reconciled
+
+
+__all__ = ["reconcile_dispatch_tick", "reconcile_runs_tick", "run_interactive"]

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Protocol
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -50,6 +52,74 @@ def _failure(code: ExecutionErrorCode, message: str) -> ExecutionRpcResponse:
             error=ExecutionError(code=code, message=message),
         )
     )
+
+
+class WorkspaceProvider(Protocol):
+    """Resolve a validated ``ws_<hash>`` namespace to its own confined environment.
+
+    The executor must **never** ignore the namespace on the RPC: two scopes that operate on
+    the same relative path must resolve to two distinct, isolated workspaces (M3.6, item 6).
+    ``resolve(None)`` returns the explicit default/unscoped environment; ``resolve(namespace)``
+    returns a distinct per-namespace environment, or ``None`` when a scoped workspace cannot be
+    provisioned (the request then fails closed rather than sharing a workspace).
+    """
+
+    def resolve(self, namespace: str | None) -> ExecutionEnvironment | None: ...
+
+    async def aclose(self) -> None: ...
+
+
+class DirectoryWorkspaceProvider:
+    """A :class:`WorkspaceProvider` that roots each namespace at ``<base>/<namespace>``.
+
+    Every namespace maps one-to-one to a distinct child directory of ``base_root`` and is
+    served by an environment the factory builds *confined to that directory*, so a path in one
+    namespace can never resolve into another's tree (the environment's workspace path policy
+    resolves symlinks/junctions and rejects anything outside its own root). Because the
+    namespace is an opaque, validated ``ws_<hex>`` token it can never contain a separator or
+    ``..``; we still re-check containment defensively. Environments are cached per namespace so
+    repeated operations reuse one confined root, and the directory is created on first use
+    (explicit provisioning). A namespace that cannot be provisioned resolves to ``None``.
+    """
+
+    def __init__(
+        self,
+        base_root: Path | str,
+        factory: Callable[[Path], ExecutionEnvironment],
+        *,
+        default_environment: ExecutionEnvironment | None = None,
+    ) -> None:
+        self._base = Path(base_root).resolve()
+        self._factory = factory
+        self._default = default_environment
+        self._cache: dict[str, ExecutionEnvironment] = {}
+
+    def resolve(self, namespace: str | None) -> ExecutionEnvironment | None:
+        if namespace is None:
+            return self._default
+        if not _WORKSPACE_NAMESPACE.match(namespace):
+            return None
+        root = (self._base / namespace).resolve()
+        if root != self._base and not root.is_relative_to(self._base):
+            # Defense in depth: an opaque validated namespace can never escape, but never
+            # serve a root outside the provider's base even if that invariant regresses.
+            return None
+        environment = self._cache.get(namespace)
+        if environment is None:
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return None
+            environment = self._factory(root)
+            self._cache[namespace] = environment
+        return environment
+
+    async def aclose(self) -> None:
+        for environment in self._cache.values():
+            await environment.aclose()
+        self._cache.clear()
+        if self._default is not None:
+            await self._default.aclose()
 
 
 class ExecutorAdmissionPolicy:
@@ -144,11 +214,18 @@ def create_app(
     shared_secret: str | None = None,
     allow_unauthenticated_local_test: bool = False,
     replay_window_seconds: int = DEFAULT_REPLAY_WINDOW_SECONDS,
+    workspace_provider: WorkspaceProvider | None = None,
 ) -> FastAPI:
     """Create the authenticated service.
 
     Production requires both a strong shared secret and externally verified container
     isolation. Tests may explicitly opt into unauthenticated local mode.
+
+    When a ``workspace_provider`` is supplied the executor resolves each request's validated
+    ``ws_<hash>`` namespace to its own confined environment (never the shared ``environment``),
+    and a scoped namespace that cannot be provisioned fails closed. Without a provider the
+    executor serves the single ``environment`` and denies any scoped namespace at admission
+    unless the admission policy explicitly declares scoped workspaces supported.
     """
 
     verifier = RpcRequestVerifier(
@@ -160,10 +237,25 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         yield
-        await environment.aclose()
+        if workspace_provider is not None:
+            await workspace_provider.aclose()
+        else:
+            await environment.aclose()
 
     app = FastAPI(title="keel-sandbox", version="1", lifespan=lifespan)
-    policy = admission or ExecutorAdmissionPolicy()
+    # A provider can provision a distinct workspace per namespace, so scoped namespaces are
+    # admitted (then resolved per-namespace below). Without a provider the default policy keeps
+    # its fail-closed posture toward scoped namespaces.
+    policy = admission or ExecutorAdmissionPolicy(
+        scoped_workspaces_supported=workspace_provider is not None
+    )
+
+    def _resolve_environment(request: ExecutionRpcRequest) -> ExecutionEnvironment | None:
+        if workspace_provider is None:
+            # Legacy single-workspace mode: the admission policy has already rejected any
+            # scoped namespace it cannot serve, so the shared environment is correct here.
+            return environment
+        return workspace_provider.resolve(request.workspace)
 
     @app.post("/v1/execute", response_model=ExecutionRpcResponse)
     async def execute(raw_request: Request) -> ExecutionRpcResponse | JSONResponse:
@@ -188,8 +280,16 @@ def create_app(
         denial = policy.admit(request)
         if denial is not None:
             return denial
+        scoped_environment = _resolve_environment(request)
+        if scoped_environment is None:
+            # The namespace was admitted but a distinct confined workspace could not be
+            # provisioned: fail closed rather than fall back to a shared/default workspace.
+            return _failure(
+                ExecutionErrorCode.unavailable,
+                "scoped workspace could not be provisioned",
+            )
         try:
-            return ExecutionRpcResponse.from_result(await _dispatch(environment, request))
+            return ExecutionRpcResponse.from_result(await _dispatch(scoped_environment, request))
         except Exception:
             body = _failure(ExecutionErrorCode.failed, "sandbox executor failure")
             return JSONResponse(body.model_dump(mode="json"), status_code=500)

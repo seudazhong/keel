@@ -3,6 +3,18 @@
 from __future__ import annotations
 
 from keel_sandbox.policy import EgressPolicy, PathPolicy
-from keel_sandbox.service import ExecutorAdmissionPolicy, create_app
+from keel_sandbox.service import (
+    DirectoryWorkspaceProvider,
+    ExecutorAdmissionPolicy,
+    WorkspaceProvider,
+    create_app,
+)
 
-__all__ = ["EgressPolicy", "ExecutorAdmissionPolicy", "PathPolicy", "create_app"]
+__all__ = [
+    "DirectoryWorkspaceProvider",
+    "EgressPolicy",
+    "ExecutorAdmissionPolicy",
+    "PathPolicy",
+    "WorkspaceProvider",
+    "create_app",
+]

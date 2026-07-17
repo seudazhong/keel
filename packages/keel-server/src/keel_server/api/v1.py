@@ -18,6 +18,7 @@ Evolution policy (DESIGN-REVIEW G14): ``/v1`` is additive-only.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -41,6 +42,7 @@ from keel_core.consolidation import (
     consolidation_schedule_id,
 )
 from keel_core.errors import CrossScopeError
+from keel_core.events import EventType
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
 from keel_core.identity import NotFoundError
 from keel_core.jobs import JobStatus, JobStore, JobValidationError
@@ -231,6 +233,7 @@ def _durable_run_service(request: Request, scope_id: ScopeId) -> DurableRunServi
         scope_id=scope_id,
         enqueue=_enqueue,
         admit_fn=admit,
+        dispatch_outbox=getattr(request.app.state, "dispatch_outbox", None),
     )
 
 
@@ -609,6 +612,34 @@ async def _session_in_scope(request: Request, session_id: str, scope_id: ScopeId
     return False
 
 
+# SSE tailing bounds: how often to poll the durable log for new worker events, and a hard
+# safety cap so a run that never terminates cannot pin a connection open indefinitely.
+_SSE_POLL_INTERVAL_SECONDS = 1.0
+_SSE_MAX_STREAM_SECONDS = 30 * 60
+
+
+def _sse_frame(event: Any) -> str:
+    """One SSE frame; durable events carry their ``seq`` as the ``id`` (the resume cursor)."""
+    data = f"data: {event.model_dump_json()}\n\n"
+    return f"id: {event.seq}\n{data}" if getattr(event, "seq", 0) else data
+
+
+def _resume_cursor(request: Request, after: int | None) -> int | None:
+    """The replay cursor: the SSE ``Last-Event-ID`` reconnect header, else the ``after`` param.
+
+    A reconnecting browser resends the id of the last event it received; honoring it (over the
+    original ``after``) means the tail resumes exactly where the dropped connection left off,
+    so no event is missed or replayed twice.
+    """
+    header = (request.headers.get("last-event-id") or "").strip()
+    if header:
+        try:
+            return int(header)
+        except ValueError:
+            return after
+    return after
+
+
 @router.get(
     "/sessions/{session_id}/events",
     summary="Stream session events (SSE, replayable via after=)",
@@ -619,12 +650,18 @@ async def stream_events(
     auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
     after: int | None = None,
 ) -> StreamingResponse:
-    """Server-Sent Events: replay from ``after`` then follow the run live.
+    """Server-Sent Events: durable replay from the cursor, then tail the live run.
 
     The stream is bound to the caller's derived data-plane scope: a session id from another
     org/Agent's scope has no events here and answers 404 (no cross-scope read). The local
     single-operator preview streams live via the in-process runtime fan-out; an authenticated
-    per-Agent scope replays its isolated durable event log.
+    per-Agent scope replays its isolated durable event log **and then keeps the connection open**,
+    tailing new worker-produced events via bounded durable polling until the run ends or the
+    client disconnects — it must not close immediately after replay.
+
+    The replay cursor is the SSE ``Last-Event-ID`` header (sent automatically by the browser on
+    reconnect) when present, else the ``after`` query parameter. Only events with ``seq`` beyond
+    the cursor are emitted, so a reconnect neither misses nor duplicates events.
     """
     if not await _session_in_scope(request, session_id, auth.scope_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
@@ -647,16 +684,42 @@ async def stream_events(
         )
 
     store = _scoped_events(request, auth.scope_id)
+    cursor = _resume_cursor(request, after)
 
-    async def _replay() -> AsyncIterator[str]:
-        async for event in store.read(session_id, after):
+    async def _replay_and_tail() -> AsyncIterator[str]:
+        nonlocal cursor
+        # 1) Durable replay from the resume cursor (exclusive: seq > cursor).
+        async for event in store.read(session_id, cursor):
             if await request.is_disconnected():
-                break
-            data = f"data: {event.model_dump_json()}\n\n"
-            yield f"id: {event.seq}\n{data}" if event.seq else data
+                return
+            if event.seq:
+                cursor = max(cursor or 0, event.seq)
+            yield _sse_frame(event)
+            if event.type is EventType.run_ended:
+                return
+        # 2) Tail: keep the connection open and poll the durable log for new worker events,
+        #    advancing the cursor so nothing is missed or duplicated, until the run ends, the
+        #    client disconnects, or a safety cap elapses (a run that never terminates cannot pin
+        #    a connection open forever).
+        deadline = asyncio.get_event_loop().time() + _SSE_MAX_STREAM_SECONDS
+        while asyncio.get_event_loop().time() < deadline:
+            if await request.is_disconnected():
+                return
+            await asyncio.sleep(_SSE_POLL_INTERVAL_SECONDS)
+            terminated = False
+            async for event in store.read(session_id, cursor):
+                if await request.is_disconnected():
+                    return
+                if event.seq:
+                    cursor = max(cursor or 0, event.seq)
+                yield _sse_frame(event)
+                if event.type is EventType.run_ended:
+                    terminated = True
+            if terminated:
+                return
 
     return StreamingResponse(
-        _replay(),
+        _replay_and_tail(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

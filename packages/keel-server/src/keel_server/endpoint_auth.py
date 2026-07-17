@@ -22,6 +22,7 @@ or a cloud caller with no authenticated user is denied, never granted a default 
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Annotated
@@ -35,6 +36,8 @@ from keel_core.scoping import LOCAL_PREVIEW_SCOPE, ScopeValidationError, derive_
 from keel_core.types import ScopeId
 from keel_server.auth import Role
 from keel_server.identity_context import Actor, resolve_actor
+
+logger = logging.getLogger(__name__)
 
 
 class EndpointPrivilege(IntEnum):
@@ -135,6 +138,66 @@ async def _resolve_user_scope(
     )
 
 
+async def _resolve_machine_scope(
+    request: Request, actor: Actor, org_ref: str | None, agent_ref: str | None
+) -> EndpointAuth:
+    """Resolve an API-key machine credential's privilege + derived per-Agent scope.
+
+    A **scoped** machine credential carries an explicit org/Agent binding from trusted config;
+    it operates only inside that one tenant's data plane. A client-supplied ``X-Keel-Org`` /
+    ``X-Keel-Agent`` header may not override that binding — a mismatch is rejected as a spoof
+    (never silently honored, never widened). A **global** admin credential carries no binding
+    but must still select an org/Agent per request via those headers (explicit + audited). An
+    unbound, non-global credential confers no data-plane scope in cloud mode (fail closed).
+    """
+    service = _identity_service(request)
+    bound_org = actor.machine_org_ref
+    bound_agent = actor.machine_agent_ref
+    if bound_org and bound_agent:
+        # Reject a header that tries to point a scoped credential at a different tenant.
+        if org_ref and org_ref.strip() and org_ref.strip() not in {bound_org}:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "org header does not match credential")
+        if agent_ref and agent_ref.strip() and agent_ref.strip() not in {bound_agent}:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "agent header does not match credential")
+        selected_org, selected_agent = bound_org, bound_agent
+    elif actor.machine_global:
+        # A global admin credential must explicitly select the org/Agent it is acting on.
+        if not org_ref or not org_ref.strip() or not agent_ref or not agent_ref.strip():
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "a global admin credential must select an org and Agent via headers",
+            )
+        selected_org, selected_agent = org_ref.strip(), agent_ref.strip()
+        logger.warning(
+            "global admin credential %s acting on org=%s agent=%s",
+            actor.display_name,
+            selected_org,
+            selected_agent,
+        )
+    else:
+        # An unbound, non-global machine credential has no tenant: never an ambient scope.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "this credential is not bound to an org and Agent",
+        )
+    try:
+        org, agent = await service.resolve_machine_binding(selected_org, selected_agent)
+    except NotFoundError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "organization or agent not found") from None
+    try:
+        scope_id = derive_agent_scope(org.id, agent.id)
+    except ScopeValidationError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from None
+    privilege = _API_ROLE_PRIVILEGE.get(actor.api_role, EndpointPrivilege.viewer)
+    return EndpointAuth(
+        actor=actor,
+        privilege=privilege,
+        scope_id=scope_id,
+        org_id=org.id,
+        agent_id=agent.id,
+    )
+
+
 async def resolve_endpoint_auth(
     request: Request,
     actor: Annotated[Actor, Depends(resolve_actor)],
@@ -143,13 +206,20 @@ async def resolve_endpoint_auth(
 ) -> EndpointAuth:
     """Resolve the request's :class:`EndpointAuth` (actor + privilege + derived scope).
 
-    A **user** binds their org membership + selected Agent (fail closed). A non-cloud
-    **local**/**machine** operator maps to the explicit ``web:local`` local-preview scope with
-    its coarse API-key role. In cloud mode a non-user caller fails closed — the local-preview
-    scope is never reachable on an authenticated/cloud route.
+    A **user** binds their org membership + selected Agent (fail closed). A **scoped** or
+    **global** API-key machine credential binds its configured (or header-selected) org/Agent
+    and derives the same per-Agent scope, so an API-key client keeps working in cloud mode
+    *without* ambient cross-tenant access. A non-cloud **local**/unbound-**machine** operator
+    maps to the explicit ``web:local`` local-preview scope with its coarse API-key role. In
+    cloud mode an unbound, non-global caller fails closed — the local-preview scope is never
+    reachable on an authenticated/cloud route.
     """
     if actor.is_user:
         return await _resolve_user_scope(request, actor, x_keel_org, x_keel_agent)
+    # A machine credential with an explicit binding (or the global marker) resolves its own
+    # per-Agent scope in either mode — never the ambient local-preview scope.
+    if actor.machine_org_ref or actor.machine_global:
+        return await _resolve_machine_scope(request, actor, x_keel_org, x_keel_agent)
     if _cloud_mode(request):
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,

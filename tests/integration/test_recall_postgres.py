@@ -80,7 +80,7 @@ async def _seed_event(
             text(
                 "INSERT INTO sessions (id, scope_id, next_seq) "
                 "VALUES (:sid, :scope, :next_seq) "
-                "ON CONFLICT (id) DO UPDATE "
+                "ON CONFLICT (scope_id, id) DO UPDATE "
                 "SET next_seq = GREATEST(sessions.next_seq, :next_seq)"
             ),
             {"sid": session_id, "scope": scope, "next_seq": seq + 1},

@@ -153,7 +153,10 @@ async def test_existing_session_guard_is_scope_safe(migrated_db: AsyncEngine) ->
     scope_a = PostgresEventStore(migrated_db, "A")
     await scope_a.append(_msg(session_id, "A", "seed"))
 
-    with pytest.raises(CrossScopeError):
+    # Composite (scope_id, id) identity: appending with require_existing under scope B — which
+    # has no session of this id — is a plain "does not exist in this scope", not a cross-scope
+    # conflict (the same external id in scope A is a different, isolated session).
+    with pytest.raises(LookupError):
         async with migrated_db.begin() as conn:
             await conn.execute(text("SELECT set_config('app.scope_id', 'B', true)"))
             await append_event_in_transaction(
@@ -168,23 +171,30 @@ async def test_existing_session_guard_is_scope_safe(migrated_db: AsyncEngine) ->
     assert [e async for e in PostgresEventStore(migrated_db, "B").read(session_id)] == []
 
 
-async def test_transactional_append_rejects_guc_mismatch_and_global_id_conflict(
+async def test_transactional_append_rejects_guc_mismatch_and_scopes_reuse_ids(
     migrated_db: AsyncEngine,
 ) -> None:
+    # The GUC guard still rejects an event whose scope does not match the active app.scope_id.
     with pytest.raises(CrossScopeError):
         async with migrated_db.begin() as conn:
             await conn.execute(text("SELECT set_config('app.scope_id', 'A', true)"))
             await append_event_in_transaction(conn, _msg("mismatch", "B", "no"))
 
+    # But an external session id already used by scope A can be freely reused by scope B: the
+    # composite (scope_id, id) identity makes it a distinct, isolated session (M3.6 finding 2).
     session_id = f"s-{uuid.uuid4().hex}"
     scope_a = PostgresEventStore(migrated_db, "A")
     await scope_a.append(_msg(session_id, "A", "seed"))
-    with pytest.raises(CrossScopeError):
-        async with migrated_db.begin() as conn:
-            await conn.execute(text("SELECT set_config('app.scope_id', 'B', true)"))
-            await append_event_in_transaction(conn, _msg(session_id, "B", "no"))
+    async with migrated_db.begin() as conn:
+        await conn.execute(text("SELECT set_config('app.scope_id', 'B', true)"))
+        b_seq = await append_event_in_transaction(conn, _msg(session_id, "B", "b-own"))
+    assert b_seq == 1  # scope B's own fresh session sequence, independent of scope A
 
     next_event = _msg(session_id, "A", "next")
     await scope_a.append(next_event)
-    assert next_event.seq == 2
-    assert [e async for e in PostgresEventStore(migrated_db, "B").read(session_id)] == []
+    assert next_event.seq == 2  # scope A's sequence is untouched by scope B's reuse
+    read_a = PostgresEventStore(migrated_db, "A").read(session_id)
+    read_b = PostgresEventStore(migrated_db, "B").read(session_id)
+    texts_a = [e.payload["text"] async for e in read_a]
+    texts_b = [e.payload["text"] async for e in read_b]
+    assert texts_a == ["seed", "next"] and texts_b == ["b-own"]  # fully isolated logs

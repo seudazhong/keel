@@ -124,3 +124,55 @@ async def test_operator_can_initiate_and_create_one_time_state(
         assert consumed.scope_id == "web:local" and consumed.connector_id == "gmail"
     finally:
         get_settings.cache_clear()
+
+
+async def test_scoped_machine_credential_binds_state_to_canonical_scope(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scoped machine credential binds the OAuth state to its canonical per-Agent scope.
+
+    The Gmail connect flow must store the one-time state under the caller's derived
+    ``agent:<org>/<agent>`` scope (never the app-global ``web:local`` singleton), so the
+    callback writes the token into exactly the org/Agent that initiated the connect (finding 3).
+    """
+    from keel_core.identity import IdentityService, InMemoryIdentityStore, LoggingAuditSink
+    from keel_core.identity.models import AgentKind
+    from keel_core.oauth_state import InMemoryOAuthStateStore
+    from keel_core.scoping import derive_agent_scope
+
+    svc = IdentityService(
+        InMemoryIdentityStore(), audit=LoggingAuditSink(), allow_jit_provisioning=True
+    )
+    owner = await svc.store.create_user(display_name="Owner", email=None)
+    org = await svc.create_org(owner.id, slug="acme", display_name="Acme")
+    agent = await svc.create_agent(
+        org.org_id, owner.id, kind=AgentKind.team, name="Agent One", persona=""
+    )
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.durable_scope = "web:local"
+    app.state.auth_required = True  # cloud mode: no ambient scope
+    app.state.identity = svc
+    app.state.oidc_verifier = None
+    app.state.api_keys = parse_api_keys(f"opkey:operator:org={org.org_id}:agent={agent.id}")
+    app.state.oauth_state_store = InMemoryOAuthStateStore()
+
+    monkeypatch.setenv("KEEL_GMAIL_CLIENT_SECRETS_PATH", str(_write_client_secrets(tmp_path)))
+    get_settings.cache_clear()
+    transport = ASGITransport(app=app)
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/v1/connectors/gmail/connect",
+                headers={"X-API-Key": "opkey"},
+                follow_redirects=False,
+            )
+            assert resp.status_code in (302, 307)
+            state = parse_qs(urlparse(resp.headers["location"]).query)["state"][0]
+            consumed = await app.state.oauth_state_store.consume(state)
+            assert consumed is not None
+            assert consumed.scope_id == derive_agent_scope(org.org_id, agent.id)
+            assert consumed.scope_id != "web:local"
+    finally:
+        get_settings.cache_clear()

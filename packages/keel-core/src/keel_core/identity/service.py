@@ -405,6 +405,27 @@ class IdentityService:
             raise PermissionDenied(decision.reason)
         return agent
 
+    async def resolve_machine_binding(
+        self, org_ref: str, agent_ref: str
+    ) -> tuple[Organization, Agent]:
+        """Resolve a *configured* machine credential's org+Agent binding (no membership).
+
+        A machine credential is provisioned by a trusted operator, not a human org member, so
+        its org/Agent binding is authoritative configuration rather than a membership decision.
+        It still fails closed: the org and the Agent must both exist and be active, else the
+        credential resolves to nothing — never an ambient or cross-tenant scope. ``org_ref`` is
+        matched by id or slug; ``agent_ref`` is the persisted Agent id within that org.
+        """
+        org = await self._store.get_org(org_ref)
+        if org is None:
+            org = await self._store.get_org_by_slug(org_ref)
+        if org is None or org.status is not OrganizationStatus.active:
+            raise NotFoundError("organization not found")
+        agent = await self._store.get_agent(org.id, agent_ref)
+        if agent is None or not agent.is_active:
+            raise NotFoundError("agent not found")
+        return org, agent
+
     # --- grants ----------------------------------------------------------------------
     async def grant_resource(
         self,

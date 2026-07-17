@@ -94,7 +94,7 @@ async def seed_messages(engine: AsyncEngine, scope: str, case_id: str, messages:
             text(
                 "INSERT INTO sessions (id, scope_id, title, next_seq) "
                 "VALUES (:id, :scope, :title, :next_seq) "
-                "ON CONFLICT (id) DO UPDATE SET next_seq = EXCLUDED.next_seq"
+                "ON CONFLICT (scope_id, id) DO UPDATE SET next_seq = EXCLUDED.next_seq"
             ),
             {"id": session_id, "scope": scope, "title": case_id, "next_seq": len(messages) + 1},
         )
@@ -297,7 +297,7 @@ async def seed_recall_corpus(engine: AsyncEngine, scope: str, case: RecallCase) 
             await conn.execute(
                 text(
                     "INSERT INTO sessions (id, scope_id, title, next_seq) "
-                    "VALUES (:id, :scope, :title, :next_seq) ON CONFLICT (id) DO NOTHING"
+                    "VALUES (:id, :scope, :title, :next_seq) ON CONFLICT (scope_id, id) DO NOTHING"
                 ),
                 {
                     "id": session_id,

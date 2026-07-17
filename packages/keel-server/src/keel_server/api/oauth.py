@@ -14,7 +14,7 @@ unknown state is rejected. Requires the OAuth client JSON
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -28,7 +28,11 @@ from keel_core.oauth_state import (
 )
 from keel_core.secrets import keyring_from_settings
 from keel_core.tokens import PostgresTokenStore
-from keel_server.auth import Role, require_role
+from keel_server.endpoint_auth import (
+    EndpointAuth,
+    EndpointPrivilege,
+    require_privilege,
+)
 
 router = APIRouter(prefix="/v1/connectors/gmail", tags=["oauth"])
 
@@ -75,22 +79,29 @@ def _callback_uri(request: Request) -> str:
 @router.get(
     "/connect",
     summary="Start the Gmail in-browser OAuth connect flow",
-    dependencies=[Depends(require_role(Role.operator))],
 )
-async def gmail_oauth_connect(request: Request) -> RedirectResponse:
+async def gmail_oauth_connect(
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
+) -> RedirectResponse:
     """Redirect the browser to Google's consent screen (server callback registered).
 
-    Requires at least **operator** auth when API keys are configured: initiating a
+    Requires at least **operator** privilege via the unified endpoint auth: initiating a
     connect flow mints the durable one-time CSRF ``state`` that the (necessarily
-    unauthenticated) callback consumes, so this endpoint is the trust anchor of the
-    flow and must not be reachable by an unauthenticated/insufficient-role caller.
+    unauthenticated) callback consumes, so this endpoint is the trust anchor of the flow and
+    must not be reachable by an unauthenticated/insufficient-role caller.
+
+    The state is bound to the caller's **canonical per-Agent data-plane scope**
+    (``auth.scope_id``), never the app-global ``web:local`` singleton, so the token the
+    callback stores lands in exactly the org/Agent that initiated the connect — an OIDC user or
+    a scoped machine credential can only ever connect Gmail for its own org/Agent, and another
+    org can neither see nor revoke it.
     """
     flow = _flow(_callback_uri(request))
     auth_url, state = flow.authorization_url(
         access_type="offline", prompt="consent", include_granted_scopes="true"
     )
-    scope = getattr(request.app.state, "durable_scope", "web:local")
-    await _oauth_state_store(request).put(state, scope, GMAIL_CONNECTOR_ID)
+    await _oauth_state_store(request).put(state, auth.scope_id, GMAIL_CONNECTOR_ID)
     return RedirectResponse(auth_url)
 
 

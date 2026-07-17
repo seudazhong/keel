@@ -125,6 +125,61 @@ def test_create_message_idempotent_admission() -> None:
     assert first.json()["run_id"] == second.json()["run_id"]  # same run, no duplicate
 
 
+def _readiness_app(*, shared: bool, queue: bool) -> TestClient:
+    app = create_app()
+
+    class _FakeConn:
+        async def __aenter__(self) -> _FakeConn:
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def execute(self, *_a: object, **_k: object) -> None:
+            return None
+
+    class _FakeEngine:
+        def connect(self) -> _FakeConn:
+            return _FakeConn()
+
+    class _FakeRedis:
+        async def ping(self) -> bool:
+            return True
+
+    app.state.engine = _FakeEngine()
+    app.state.redis = _FakeRedis()
+    app.state.shared_run_substrate = shared
+    app.state.enqueue = (lambda *a, **k: None) if queue else None
+    return TestClient(app)
+
+
+def test_readiness_degraded_when_admission_cannot_execute() -> None:
+    # 200-ready while every message would 503 is a lie: with no shared substrate / queue the
+    # default durable admission path cannot execute, so readiness must be degraded (item 7).
+    client = _readiness_app(shared=False, queue=False)
+    resp = client.get("/readiness")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["ready"] is False
+    assert body["checks"]["run_admission"] == "degraded"
+
+
+def test_readiness_degraded_when_queue_missing() -> None:
+    client = _readiness_app(shared=True, queue=False)
+    resp = client.get("/readiness")
+    assert resp.status_code == 503
+    assert resp.json()["checks"]["run_queue"] == "unavailable"
+
+
+def test_readiness_ready_when_admission_available() -> None:
+    client = _readiness_app(shared=True, queue=True)
+    resp = client.get("/readiness")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ready"] is True
+    assert body["checks"]["run_admission"] == "ready"
+
+
 def test_resolve_unknown_approval_is_404() -> None:
     runtime = _FakeRuntime()
     client = _client(runtime)

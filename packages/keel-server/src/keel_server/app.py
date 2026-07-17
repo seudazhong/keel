@@ -69,6 +69,7 @@ from keel_core.projects.jobs import (
     sync_idempotency_key,
 )
 from keel_core.providers import LiteLLMGateway
+from keel_core.run_dispatch import PostgresRunDispatchOutbox
 from keel_core.runs import InMemoryRunStore, PostgresRunStore
 from keel_core.tools import build_service_execution_environment
 from keel_core.webhooks import InMemoryWebhookReplayStore, PostgresWebhookReplayStore
@@ -264,6 +265,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Worker-owned durable admission is only valid with a shared Postgres substrate a separate
     # worker process can read; in-memory stores are process-local (M3.6, item 2).
     app.state.shared_run_substrate = engine is not None
+    # Global cross-scope dispatch outbox: admission records a run's dispatch intent here so the
+    # worker reconciler can recover it from any scope (M3.6, finding 4). Only meaningful with a
+    # shared Postgres substrate; None with in-memory/process-local stores.
+    app.state.dispatch_outbox = PostgresRunDispatchOutbox(engine) if engine is not None else None
     app.state.jobs = _build_job_store(engine, _DURABLE_SCOPE, settings)
     execution_environment = build_service_execution_environment(
         settings,
@@ -473,6 +478,18 @@ def create_app() -> FastAPI:
         # cannot see (M3.6, item 2).
         shared = bool(getattr(app.state, "shared_run_substrate", engine is not None))
         checks["run_substrate"] = "shared-postgres" if shared else "in-memory (local-preview)"
+
+        # Readiness must reflect whether the *default* durable message admission path can
+        # actually execute. `POST /v1/sessions/{id}/messages` fails closed with 503 unless it
+        # has both a shared run substrate and a live run queue to dispatch `run_interactive`.
+        # Reporting 200-ready while every message would 503 is a lie; mark the probe degraded
+        # so a load balancer drains this instance instead of black-holing traffic (item 7).
+        queue_ready = getattr(app.state, "enqueue", None) is not None
+        checks["run_queue"] = "ok" if queue_ready else "unavailable"
+        admission_ready = shared and queue_ready
+        checks["run_admission"] = "ready" if admission_ready else "degraded"
+        if not admission_ready:
+            ready = False
 
         body = ReadinessResponse(ready=ready, checks=checks)
         return JSONResponse(body.model_dump(), status_code=200 if ready else 503)
