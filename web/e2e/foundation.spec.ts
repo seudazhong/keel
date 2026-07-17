@@ -146,7 +146,16 @@ test.describe("responsive shell", () => {
     await openButton.click();
     await expect(page.getByRole("dialog", { name: "Navigation menu" })).toBeVisible();
 
-    await page.locator("div.bg-black\\/40").click();
+    // The backdrop spans the full viewport, but the 288px-wide drawer sits
+    // on top of it (higher z-index) for the left portion of the screen. A
+    // default center-of-element click at this viewport width (390px) would
+    // land on the drawer instead and get intercepted, so click a real
+    // pointer position near the right edge — clearly outside the drawer —
+    // to genuinely hit-test the backdrop itself (no force/DOM dispatch).
+    const backdrop = page.locator("div.bg-black\\/40");
+    const box = await backdrop.boundingBox();
+    if (!box) throw new Error("backdrop not found");
+    await backdrop.click({ position: { x: box.width - 20, y: box.height / 2 } });
 
     const main = page.locator("#main-content");
     await expect(page.getByRole("dialog")).toHaveCount(0);
