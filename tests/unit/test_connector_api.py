@@ -24,6 +24,7 @@ from keel_core.connector_contracts import (
     ConnectorCursorUpdate,
     ConnectorHealth,
     ConnectorHealthStatus,
+    ConnectorIngressFailure,
     ConnectorIngressRequest,
     ConnectorIngressResponse,
     ConnectorIngressResult,
@@ -124,8 +125,25 @@ class ManualProvider(BaseConnectorProvider):
                     body=b"graph-challenge",
                 )
             )
-        if request.headers.get("x-signature") != "valid":
+        signature = request.headers.get("x-signature")
+        if signature not in {"valid", "retryable-failure"}:
             raise ConnectorAuthenticationError("invalid signature")
+        if signature == "retryable-failure":
+            return ConnectorIngressResult(
+                ConnectorIngressResponse(
+                    status_code=503,
+                    content_type="application/json",
+                    headers={"retry-after": "30"},
+                    body=b'{"retry":true}',
+                ),
+                delivery_id="delivery-failure",
+                payload_hash=hashlib.sha256(request.body).hexdigest(),
+                failure=ConnectorIngressFailure(
+                    "provider_processing_failed",
+                    "Verified delivery processing failed.",
+                    retryable=True,
+                ),
+            )
         return ConnectorIngressResult(
             ConnectorIngressResponse(
                 status_code=202,
@@ -328,6 +346,21 @@ async def test_generic_catalog_setup_resources_sync_health_and_revoke(
     assert first.headers["x-provider-result"] == "accepted"
     assert first.json() == {"provider": "accepted"}
     assert replay.status_code == 202
+    retryable_failure = await client.post(
+        "/v1/connectors/manual/webhook",
+        content=b"verified-failure",
+        headers={"X-Signature": "retryable-failure"},
+    )
+    assert retryable_failure.status_code == 503
+    assert retryable_failure.headers["retry-after"] == "30"
+    assert retryable_failure.json() == {"retry": True}
+    binding = await app.state.connector_repository.get_binding("manual")
+    assert binding is not None
+    delivery_health = await app.state.connector_repository.get_delivery_health(
+        "manual", binding.id
+    )
+    assert delivery_health is not None
+    assert delivery_health.summary == "Verified delivery processing failed."
     challenge = await client.post(
         "/v1/connectors/manual/webhook",
         params={"validationToken": "graph-challenge"},
