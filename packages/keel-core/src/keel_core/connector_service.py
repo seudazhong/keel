@@ -387,9 +387,7 @@ class ConnectorService:
                     "availability_error": provider_status.error,
                     "enabled": provider_enabled,
                     "operational": (
-                        operational_binding
-                        and provider_enabled
-                        and provider_status.available
+                        operational_binding and provider_enabled and provider_status.available
                     ),
                     "configured": configured,
                     "connected": connected,
@@ -400,9 +398,7 @@ class ConnectorService:
                         ConnectorHealthStatus.error.value
                         if not provider_status.available
                         or (binding is not None and binding.status is ConnectorBindingStatus.error)
-                        else (
-                            _binding_health(binding, connected).value
-                        )
+                        else (_binding_health(binding, connected).value)
                     ),
                 }
             )
@@ -461,9 +457,7 @@ class ConnectorService:
         action = provider.manifest.auth_action
         if action is None:
             raise ValueError(f"{connector_id} does not declare browser authorization")
-        if action.requires_setup and (
-            context.binding is None or context.credential is None
-        ):
+        if action.requires_setup and (context.binding is None or context.credential is None):
             raise ValueError(f"{connector_id} requires setup before browser authorization")
         start = await provider.begin_auth(context, callback_url)
         draft = (
@@ -485,9 +479,7 @@ class ConnectorService:
             renewal_expires_at=(
                 None if context.binding is None else context.binding.renewal_expires_at
             ),
-            expected_binding_id=(
-                None if context.binding is None else context.binding.id
-            ),
+            expected_binding_id=(None if context.binding is None else context.binding.id),
             enforce_binding_fence=True,
         )
         return start
@@ -764,8 +756,7 @@ class ConnectorService:
             },
             target_session_id=None,
             idempotency_key=(
-                f"recurring:{lease.operation.value}:{lease.binding_id}:"
-                f"{lease.due_at.isoformat()}"
+                f"recurring:{lease.operation.value}:{lease.binding_id}:{lease.due_at.isoformat()}"
             ),
             max_attempts=max_attempts,
             cancel_mode=CancelMode.cooperative,
@@ -1220,11 +1211,7 @@ def _next_action(
     manifest: ConnectorManifest,
     binding: ConnectorBinding | None,
 ) -> dict[str, str] | None:
-    status = (
-        ConnectorBindingStatus.unconfigured
-        if binding is None
-        else binding.status
-    )
+    status = ConnectorBindingStatus.unconfigured if binding is None else binding.status
     if status in {
         ConnectorBindingStatus.connected,
         ConnectorBindingStatus.degraded,

@@ -332,11 +332,7 @@ def handle_ingress(
         return _normalization_failure(request, payload_hash, payload)
     header = payload.get("header")
     event_id = header.get("event_id") if isinstance(header, dict) else None
-    delivery_id = (
-        event_id
-        if isinstance(event_id, str) and event_id
-        else payload_hash
-    )
+    delivery_id = event_id if isinstance(event_id, str) and event_id else payload_hash
     return ConnectorIngressResult(
         ConnectorIngressResponse(status_code=200, body=b'{"code":0}'),
         delivery_id=delivery_id,

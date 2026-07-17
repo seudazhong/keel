@@ -356,9 +356,7 @@ async def test_generic_catalog_setup_resources_sync_health_and_revoke(
     assert retryable_failure.json() == {"retry": True}
     binding = await app.state.connector_repository.get_binding("manual")
     assert binding is not None
-    delivery_health = await app.state.connector_repository.get_delivery_health(
-        "manual", binding.id
-    )
+    delivery_health = await app.state.connector_repository.get_delivery_health("manual", binding.id)
     assert delivery_health is not None
     assert delivery_health.summary == "Verified delivery processing failed."
     challenge = await client.post(
@@ -415,9 +413,7 @@ async def test_staged_setup_remains_configured_until_contextual_callback(
     assert setup.status_code == 200
     assert setup.json()["status"] == "configured"
     assert "staged-secret" not in setup.text
-    catalog = {
-        item["id"]: item for item in (await client.get("/v1/connectors")).json()
-    }
+    catalog = {item["id"]: item for item in (await client.get("/v1/connectors")).json()}
     assert catalog["staged"]["configured"] is True
     assert catalog["staged"]["connected"] is False
     assert catalog["staged"]["next_action"]["kind"] == "authorize"

@@ -458,9 +458,7 @@ class Microsoft365Provider(BaseConnectorProvider):
             CredentialEnvelope(OAUTH_CREDENTIAL_KIND, values),
         )
 
-    async def list_resources(
-        self, context: ConnectorOperationContext
-    ) -> ConnectorResourceResult:
+    async def list_resources(self, context: ConnectorOperationContext) -> ConnectorResourceResult:
         binding, values = _bound_oauth(context)
         _require_unexpired(values, now=self._now())
         _enforce_binding(binding, values)
@@ -658,30 +656,24 @@ class Microsoft365Provider(BaseConnectorProvider):
     def _initial_delta_url(self, resource: ConnectorResource) -> str:
         graph_id = quote(_resource_graph_id(resource), safe="")
         if resource.kind == "mail_folder":
-            return (
-                f"{GRAPH_ROOT}/me/mailFolders/{graph_id}/messages/delta?"
-                + urlencode(
-                    {
-                        "$select": (
-                            "id,subject,from,sender,receivedDateTime,sentDateTime,"
-                            "lastModifiedDateTime,bodyPreview,isRead,webLink"
-                        ),
-                        "$top": "50",
-                    }
-                )
+            return f"{GRAPH_ROOT}/me/mailFolders/{graph_id}/messages/delta?" + urlencode(
+                {
+                    "$select": (
+                        "id,subject,from,sender,receivedDateTime,sentDateTime,"
+                        "lastModifiedDateTime,bodyPreview,isRead,webLink"
+                    ),
+                    "$top": "50",
+                }
             )
         if resource.kind == "calendar":
             now = self._now()
             start = _graph_datetime(now - timedelta(days=CALENDAR_SYNC_PAST_DAYS))
             end = _graph_datetime(now + timedelta(days=CALENDAR_SYNC_FUTURE_DAYS))
-            return (
-                f"{GRAPH_ROOT}/me/calendars/{graph_id}/calendarView/delta?"
-                + urlencode(
-                    {
-                        "startDateTime": start,
-                        "endDateTime": end,
-                    }
-                )
+            return f"{GRAPH_ROOT}/me/calendars/{graph_id}/calendarView/delta?" + urlencode(
+                {
+                    "startDateTime": start,
+                    "endDateTime": end,
+                }
             )
         raise ValueError(f"unsupported Microsoft 365 resource kind: {resource.kind}")
 
@@ -698,18 +690,15 @@ class Microsoft365Provider(BaseConnectorProvider):
             else:
                 query = _required_argument(args, "query", max_length=512)
                 search = '"' + query.replace("\\", "\\\\").replace('"', '\\"') + '"'
-                url = (
-                    f"{GRAPH_ROOT}/me/mailFolders/{folder_id}/messages?"
-                    + urlencode(
-                        {
-                            "$search": search,
-                            "$select": (
-                                "id,subject,from,sender,receivedDateTime,sentDateTime,"
-                                "bodyPreview,isRead,webLink,lastModifiedDateTime"
-                            ),
-                            "$top": str(_page_size(args)),
-                        }
-                    )
+                url = f"{GRAPH_ROOT}/me/mailFolders/{folder_id}/messages?" + urlencode(
+                    {
+                        "$search": search,
+                        "$select": (
+                            "id,subject,from,sender,receivedDateTime,sentDateTime,"
+                            "bodyPreview,isRead,webLink,lastModifiedDateTime"
+                        ),
+                        "$top": str(_page_size(args)),
+                    }
                 )
             payload = await graph.get(url, headers={"ConsistencyLevel": "eventual"})
             binding = _active_binding(state.binding)
@@ -731,17 +720,14 @@ class Microsoft365Provider(BaseConnectorProvider):
             resource = _selected_resource(state.resources, args, "mail_folder")
             folder_id = quote(_resource_graph_id(resource), safe="")
             message_id = quote(_required_argument(args, "message_id"), safe="")
-            url = (
-                f"{GRAPH_ROOT}/me/mailFolders/{folder_id}/messages/{message_id}?"
-                + urlencode(
-                    {
-                        "$select": (
-                            "id,subject,from,sender,toRecipients,ccRecipients,"
-                            "receivedDateTime,sentDateTime,body,bodyPreview,isRead,"
-                            "webLink,lastModifiedDateTime,internetMessageId"
-                        )
-                    }
-                )
+            url = f"{GRAPH_ROOT}/me/mailFolders/{folder_id}/messages/{message_id}?" + urlencode(
+                {
+                    "$select": (
+                        "id,subject,from,sender,toRecipients,ccRecipients,"
+                        "receivedDateTime,sentDateTime,body,bodyPreview,isRead,"
+                        "webLink,lastModifiedDateTime,internetMessageId"
+                    )
+                }
             )
             item = await graph.get(url)
             return _render_object(
@@ -803,30 +789,24 @@ class Microsoft365Provider(BaseConnectorProvider):
         if page_token:
             url = _validated_page_token(page_token, f"/calendars/{calendar_id}/calendarView")
         else:
-            url = (
-                f"{GRAPH_ROOT}/me/calendars/{calendar_id}/calendarView?"
-                + urlencode(
-                    {
-                        "startDateTime": start,
-                        "endDateTime": end,
-                        "$select": (
-                            "id,subject,bodyPreview,start,end,location,organizer,"
-                            "attendees,isCancelled,lastModifiedDateTime,changeKey,webLink"
-                        ),
-                        "$orderby": "start/dateTime",
-                        "$top": str(_page_size(args)),
-                    }
-                )
+            url = f"{GRAPH_ROOT}/me/calendars/{calendar_id}/calendarView?" + urlencode(
+                {
+                    "startDateTime": start,
+                    "endDateTime": end,
+                    "$select": (
+                        "id,subject,bodyPreview,start,end,location,organizer,"
+                        "attendees,isCancelled,lastModifiedDateTime,changeKey,webLink"
+                    ),
+                    "$orderby": "start/dateTime",
+                    "$top": str(_page_size(args)),
+                }
             )
         timezone = _timezone(args)
         payload = await graph.get(url, headers={"Prefer": f'outlook.timezone="{timezone}"'})
         binding = _active_binding(state.binding)
         return _render_page(
             payload,
-            [
-                _calendar_record(binding, resource, item, timezone)
-                for item in _values(payload)
-            ],
+            [_calendar_record(binding, resource, item, timezone) for item in _values(payload)],
             timezone=timezone,
         )
 
@@ -920,9 +900,7 @@ def _required_string(values: Mapping[str, Any], key: str, label: str) -> str:
     return value
 
 
-def _required_argument(
-    args: Mapping[str, Any], key: str, *, max_length: int = 4096
-) -> str:
+def _required_argument(args: Mapping[str, Any], key: str, *, max_length: int = 4096) -> str:
     value = _string(args.get(key)).strip()
     if not value:
         raise ValueError(f"{key} is required")
@@ -1172,9 +1150,7 @@ async def _refresh_values(
         app,
         {
             "grant_type": "refresh_token",
-            "refresh_token": _required_string(
-                values, "refresh_token", "Microsoft 365 credential"
-            ),
+            "refresh_token": _required_string(values, "refresh_token", "Microsoft 365 credential"),
             "scope": " ".join(SCOPES),
         },
     )
@@ -1224,10 +1200,7 @@ def _enforce_tenant(values: Mapping[str, Any], expected_tenant_id: str) -> None:
 
 def _enforce_binding(binding: ConnectorBinding, values: Mapping[str, Any]) -> None:
     tenant_id = _required_string(values, "tenant_id", "Microsoft 365 credential")
-    if (
-        not binding.external_tenant_id
-        or binding.external_tenant_id.lower() != tenant_id.lower()
-    ):
+    if not binding.external_tenant_id or binding.external_tenant_id.lower() != tenant_id.lower():
         raise Microsoft365TenantMismatchError(
             "Microsoft 365 binding tenant does not match the configured tenant"
         )

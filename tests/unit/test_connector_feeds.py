@@ -181,9 +181,7 @@ async def test_200_new_item_duplicate_and_304_conditional_polling(
         "if-none-match": '"v1"',
         "if-modified-since": "Fri, 17 Jul 2026 18:00:00 GMT",
     }
-    assert dict(transport.targets[2].request_headers) == dict(
-        transport.targets[1].request_headers
-    )
+    assert dict(transport.targets[2].request_headers) == dict(transport.targets[1].request_headers)
 
 
 async def test_duplicate_item_ids_in_one_feed_emit_once() -> None:

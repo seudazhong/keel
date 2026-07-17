@@ -279,11 +279,7 @@ async def connector_callback(
         if any(item.kind is ConnectorSetupArtifactKind.secret for item in outcome.artifacts)
         else "<script>setTimeout(()=>window.close(),1500)</script>"
     )
-    state_message = (
-        "已连接"
-        if outcome.binding.status.value == "connected"
-        else "授权状态已保存"
-    )
+    state_message = "已连接" if outcome.binding.status.value == "connected" else "授权状态已保存"
     return HTMLResponse(
         "<!doctype html><meta charset=utf-8>"
         "<body style='font:16px system-ui;padding:40px'>"
@@ -517,8 +513,7 @@ async def connector_webhook(connector_id: str, request: Request) -> Response:
         raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "webhook body is too large")
     try:
         query: dict[str, tuple[str, ...]] = {
-            key: tuple(request.query_params.getlist(key))
-            for key in request.query_params
+            key: tuple(request.query_params.getlist(key)) for key in request.query_params
         }
         outcome = await _service(request).ingress(
             connector_id,

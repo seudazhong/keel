@@ -133,9 +133,7 @@ async def test_setup_returns_unique_endpoint_and_secret_once_then_rotates_locall
     assert stored.values["signing_secret"] == "signing-secret-two"
     assert first_secret not in str(rotated.binding.metadata)
     assert [
-        item.value
-        for item in rotated.artifacts
-        if item.kind is ConnectorSetupArtifactKind.secret
+        item.value for item in rotated.artifacts if item.kind is ConnectorSetupArtifactKind.secret
     ] == ["signing-secret-two"]
 
 

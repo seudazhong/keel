@@ -642,9 +642,7 @@ async def test_graph_throttling_fails_after_bounded_retries() -> None:
 
 async def test_mail_and_calendar_tools_preserve_pagination_timezone_and_provenance() -> None:
     next_mail = f"{GRAPH_ROOT}/me/mailFolders/folder-1/messages?$skiptoken=mail-next"
-    next_calendar = (
-        f"{GRAPH_ROOT}/me/calendars/calendar-1/calendarView?$skiptoken=calendar-next"
-    )
+    next_calendar = f"{GRAPH_ROOT}/me/calendars/calendar-1/calendarView?$skiptoken=calendar-next"
     message = {
         "id": "message-1",
         "subject": "Sanitized mail",
@@ -762,9 +760,7 @@ async def test_mail_and_calendar_tools_preserve_pagination_timezone_and_provenan
 
 
 async def test_calendar_delta_mapping() -> None:
-    delta_url = (
-        f"{GRAPH_ROOT}/me/calendars/calendar-1/calendarView/delta?$deltatoken=calendar-new"
-    )
+    delta_url = f"{GRAPH_ROOT}/me/calendars/calendar-1/calendarView/delta?$deltatoken=calendar-new"
     event = {
         "id": "event-1",
         "subject": "Sanitized event",

@@ -328,25 +328,19 @@ async def test_sync_renders_paginated_nested_blocks_and_marks_unsupported_conten
                     {
                         "id": "heading",
                         "type": "heading_1",
-                        "heading_1": {
-                            "rich_text": [{"plain_text": "Overview", "annotations": {}}]
-                        },
+                        "heading_1": {"rich_text": [{"plain_text": "Overview", "annotations": {}}]},
                         "has_children": False,
                     },
                     {
                         "id": "toggle",
                         "type": "toggle",
-                        "toggle": {
-                            "rich_text": [{"plain_text": "Details", "annotations": {}}]
-                        },
+                        "toggle": {"rich_text": [{"plain_text": "Details", "annotations": {}}]},
                         "has_children": True,
                     },
                 ],
                 cursor="block-next",
             )
-        if path == (
-            "/blocks/page-root/children?page_size=100&start_cursor=block-next"
-        ):
+        if path == ("/blocks/page-root/children?page_size=100&start_cursor=block-next"):
             return _page_result(
                 [
                     {
@@ -397,9 +391,7 @@ async def test_sync_renders_paginated_nested_blocks_and_marks_unsupported_conten
     assert root_change.provenance.revision is not None
     assert "> Notion ID: page-root" in (root_change.content or "")
     assert "> Last edited: 2026-07-18T01:00:00.000Z" in (root_change.content or "")
-    assert "[Unsupported Notion block: unsupported_future_block]" in (
-        root_change.content or ""
-    )
+    assert "[Unsupported Notion block: unsupported_future_block]" in (root_change.content or "")
     assert "**tainted child content**" in (by_id["page-child"].content or "")
     cursor = result.cursor_updates[0]
     inventory = json.loads(cursor.value)

@@ -240,9 +240,7 @@ class NotionProvider(BaseConnectorProvider):
             status=ConnectorBindingStatus.connected,
         )
 
-    async def list_resources(
-        self, context: ConnectorOperationContext
-    ) -> ConnectorResourceResult:
+    async def list_resources(self, context: ConnectorOperationContext) -> ConnectorResourceResult:
         token = _token(context)
         rows = await self._paginate("POST", "/search", token, {})
         resources: list[ConnectorResourceDraft] = []
@@ -684,11 +682,7 @@ def _state_roots(document: Mapping[str, Any]) -> dict[str, tuple[str, ...]]:
     raw = document.get("roots")
     if not isinstance(raw, dict):
         return {}
-    return {
-        key: _string_tuple(value)
-        for key, value in raw.items()
-        if isinstance(key, str)
-    }
+    return {key: _string_tuple(value) for key, value in raw.items() if isinstance(key, str)}
 
 
 def _string_tuple(value: object) -> tuple[str, ...]:

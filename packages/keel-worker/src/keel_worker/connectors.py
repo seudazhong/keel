@@ -18,9 +18,7 @@ from keel_core.jobs import CancelMode, JobResult, PermanentJobError
 from .jobs import JobContext, JobDefinition, JobRegistry
 
 
-def connector_job_definition(
-    service: ConnectorService, settings: Settings
-) -> JobDefinition:
+def connector_job_definition(service: ConnectorService, settings: Settings) -> JobDefinition:
     async def sync(context: JobContext, payload: dict[str, Any]) -> JobResult:
         connector_id = payload.get("connector_id")
         binding_id = payload.get("binding_id")
@@ -44,9 +42,7 @@ def connector_job_definition(
     )
 
 
-def connector_renew_job_definition(
-    service: ConnectorService, settings: Settings
-) -> JobDefinition:
+def connector_renew_job_definition(service: ConnectorService, settings: Settings) -> JobDefinition:
     async def renew(context: JobContext, payload: dict[str, Any]) -> JobResult:
         connector_id = payload.get("connector_id")
         binding_id = payload.get("binding_id")

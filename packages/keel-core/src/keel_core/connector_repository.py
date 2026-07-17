@@ -415,9 +415,7 @@ class InMemoryConnectorRepository:
     ) -> ConnectorBinding:
         now = datetime.now(UTC)
         prior = self._bindings.get(connector_id)
-        if enforce_binding_fence and (
-            None if prior is None else prior.id
-        ) != expected_binding_id:
+        if enforce_binding_fence and (None if prior is None else prior.id) != expected_binding_id:
             raise LookupError("connector binding changed before setup commit")
         renewal_cadence = None if renewal is None else renewal.cadence_seconds
         renewal_behavior = None if renewal is None else renewal.expiry_behavior
@@ -503,7 +501,8 @@ class InMemoryConnectorRepository:
             next_renewal_at=next_renewal_at,
             error_code=(
                 None
-                if next_status in {
+                if next_status
+                in {
                     ConnectorBindingStatus.connected,
                     ConnectorBindingStatus.configured,
                     ConnectorBindingStatus.authorizing,
@@ -512,7 +511,8 @@ class InMemoryConnectorRepository:
             ),
             error_summary=(
                 None
-                if next_status in {
+                if next_status
+                in {
                     ConnectorBindingStatus.connected,
                     ConnectorBindingStatus.configured,
                     ConnectorBindingStatus.authorizing,
@@ -860,9 +860,7 @@ class InMemoryConnectorRepository:
             if existing.payload_hash != payload_hash:
                 raise ValueError("connector delivery id was reused with a different payload")
             stale = now - existing.updated_at >= timedelta(minutes=5)
-            if existing.status != "failed" and not (
-                existing.status == "processing" and stale
-            ):
+            if existing.status != "failed" and not (existing.status == "processing" and stale):
                 return None
             token = uuid.uuid4().hex
             self._deliveries[key] = replace(
@@ -882,9 +880,7 @@ class InMemoryConnectorRepository:
             token,
             now,
         )
-        return ConnectorDeliveryClaim(
-            self._scope_id, connector_id, binding_id, delivery_id, token
-        )
+        return ConnectorDeliveryClaim(self._scope_id, connector_id, binding_id, delivery_id, token)
 
     async def finish_delivery(
         self,
@@ -931,10 +927,7 @@ class InMemoryConnectorRepository:
                 row.status == "failed"
                 or (
                     row.status == "processing"
-                    and (
-                        row.failure is not None
-                        or now - row.updated_at >= timedelta(minutes=5)
-                    )
+                    and (row.failure is not None or now - row.updated_at >= timedelta(minutes=5))
                 )
             )
         ]
@@ -1053,9 +1046,7 @@ class InMemoryConnectorRepository:
             raise ConnectorScheduleLeaseLostError("connector schedule lease was lost")
         return row
 
-    async def complete_schedule(
-        self, lease: ConnectorScheduleLease, *, next_at: datetime
-    ) -> None:
+    async def complete_schedule(self, lease: ConnectorScheduleLease, *, next_at: datetime) -> None:
         row = self._require_schedule_lease(lease)
         updates: dict[str, Any] = {"updated_at": datetime.now(UTC)}
         if lease.operation is ConnectorScheduleOperation.sync:
@@ -1090,9 +1081,7 @@ class InMemoryConnectorRepository:
         self._bindings[lease.connector_id] = replace(row, **updates)
         del self._schedule_leases[lease.connector_id]
 
-    async def suspend_schedule(
-        self, lease: ConnectorScheduleLease, *, resume_at: datetime
-    ) -> None:
+    async def suspend_schedule(self, lease: ConnectorScheduleLease, *, resume_at: datetime) -> None:
         row = self._require_schedule_lease(lease)
         updates: dict[str, Any] = {"updated_at": datetime.now(UTC)}
         if lease.operation is ConnectorScheduleOperation.sync:
@@ -1258,10 +1247,7 @@ class PostgresConnectorRepository:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             if enforce_binding_fence:
                 await conn.execute(
-                    text(
-                        "SELECT pg_advisory_xact_lock("
-                        "hashtextextended(:binding_key, 0))"
-                    ),
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:binding_key, 0))"),
                     {"binding_key": f"{self._scope_id}:{connector_id}"},
                 )
                 current_id = await conn.scalar(
@@ -1271,9 +1257,7 @@ class PostgresConnectorRepository:
                     ),
                     {"scope": self._scope_id, "cid": connector_id},
                 )
-                if (
-                    None if current_id is None else str(current_id)
-                ) != expected_binding_id:
+                if (None if current_id is None else str(current_id)) != expected_binding_id:
                     raise LookupError("connector binding changed before setup commit")
             row = (
                 await conn.execute(
@@ -1385,10 +1369,7 @@ class PostgresConnectorRepository:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
             await conn.execute(
-                text(
-                    "SELECT pg_advisory_xact_lock("
-                    "hashtextextended(:binding_key, 0))"
-                ),
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:binding_key, 0))"),
                 {"binding_key": f"{self._scope_id}:{connector_id}"},
             )
             result = await conn.execute(
@@ -1934,9 +1915,7 @@ class PostgresConnectorRepository:
                 if latest.error_summary is not None
                 else "connector delivery processing timed out"
             ),
-            retryable=(
-                True if latest.error_retryable is None else bool(latest.error_retryable)
-            ),
+            retryable=(True if latest.error_retryable is None else bool(latest.error_retryable)),
         )
 
     async def claim_due_schedules(
@@ -2029,9 +2008,7 @@ class PostgresConnectorRepository:
                 )
         return leases
 
-    async def complete_schedule(
-        self, lease: ConnectorScheduleLease, *, next_at: datetime
-    ) -> None:
+    async def complete_schedule(self, lease: ConnectorScheduleLease, *, next_at: datetime) -> None:
         next_column = (
             "next_sync_at"
             if lease.operation is ConnectorScheduleOperation.sync
@@ -2114,9 +2091,7 @@ class PostgresConnectorRepository:
         if not result.rowcount:
             raise ConnectorScheduleLeaseLostError("connector schedule lease was lost")
 
-    async def suspend_schedule(
-        self, lease: ConnectorScheduleLease, *, resume_at: datetime
-    ) -> None:
+    async def suspend_schedule(self, lease: ConnectorScheduleLease, *, resume_at: datetime) -> None:
         next_column = (
             "next_sync_at"
             if lease.operation is ConnectorScheduleOperation.sync

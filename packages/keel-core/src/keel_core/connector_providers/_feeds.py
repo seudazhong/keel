@@ -45,7 +45,7 @@ FEED_MAX_TITLE_CHARS = 512
 FEED_MAX_IDENTIFIER_CHARS = 2_048
 FEED_MAX_SEEN_IDS = 256
 _CURSOR_STREAM = "feed"
-_XML_FORBIDDEN = re.compile(br"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
+_XML_FORBIDDEN = re.compile(rb"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,12 +206,14 @@ def parse_rss(body: bytes, base_url: str) -> ParsedFeed:
     for item in item_elements:
         raw_id = _element_text(_first_child(item, "guid"), limit=FEED_MAX_IDENTIFIER_CHARS) or None
         raw_link = _element_text(_first_child(item, "link"), limit=FEED_MAX_IDENTIFIER_CHARS)
-        item_title = _element_text(
-            _first_child(item, "title"), limit=FEED_MAX_TITLE_CHARS
-        ) or "Untitled item"
-        published = _element_text(
-            _first_child(item, "pubdate", "date"), limit=FEED_MAX_IDENTIFIER_CHARS
-        ) or None
+        item_title = (
+            _element_text(_first_child(item, "title"), limit=FEED_MAX_TITLE_CHARS)
+            or "Untitled item"
+        )
+        published = (
+            _element_text(_first_child(item, "pubdate", "date"), limit=FEED_MAX_IDENTIFIER_CHARS)
+            or None
+        )
         content = _element_text(
             _first_child(item, "encoded", "description", "content"),
             limit=FEED_MAX_TEXT_CHARS,
@@ -249,12 +251,16 @@ def parse_atom(body: bytes, base_url: str) -> ParsedFeed:
         )
         raw_link = alternate.attrib.get("href") if alternate is not None else None
         raw_id = _element_text(_first_child(entry, "id"), limit=FEED_MAX_IDENTIFIER_CHARS) or None
-        item_title = _element_text(
-            _first_child(entry, "title"), limit=FEED_MAX_TITLE_CHARS
-        ) or "Untitled entry"
-        published = _element_text(
-            _first_child(entry, "published", "updated"), limit=FEED_MAX_IDENTIFIER_CHARS
-        ) or None
+        item_title = (
+            _element_text(_first_child(entry, "title"), limit=FEED_MAX_TITLE_CHARS)
+            or "Untitled entry"
+        )
+        published = (
+            _element_text(
+                _first_child(entry, "published", "updated"), limit=FEED_MAX_IDENTIFIER_CHARS
+            )
+            or None
+        )
         content = _element_text(
             _first_child(entry, "content", "summary"), limit=FEED_MAX_TEXT_CHARS
         )
@@ -312,11 +318,7 @@ def _seen_ids(cursor: ConnectorCursor | None) -> tuple[str, ...]:
         return ()
     if not isinstance(parsed, dict) or not isinstance(parsed.get("seen"), list):
         return ()
-    values = [
-        value
-        for value in parsed["seen"]
-        if isinstance(value, str) and len(value) == 64
-    ]
+    values = [value for value in parsed["seen"] if isinstance(value, str) and len(value) == 64]
     return tuple(values[:FEED_MAX_SEEN_IDS])
 
 
@@ -352,9 +354,7 @@ class FeedProvider(BaseConnectorProvider):
             )
         )
 
-    async def list_resources(
-        self, context: ConnectorOperationContext
-    ) -> ConnectorResourceResult:
+    async def list_resources(self, context: ConnectorOperationContext) -> ConnectorResourceResult:
         response = await self._http.get_response(_feed_url(context))
         final_url = _canonical_feed_url(response.final_url)
         parsed = self.parser(response.body, final_url)

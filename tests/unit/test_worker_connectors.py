@@ -213,11 +213,14 @@ async def test_recurring_lease_reclaims_crash_without_duplicate_job() -> None:
     due = binding.next_sync_at
     first = (await repository.claim_due_schedules(due, limit=1, lease_seconds=10))[0]
     assert first.operation is ConnectorScheduleOperation.sync
-    assert await repository.claim_due_schedules(
-        due + timedelta(seconds=5),
-        limit=1,
-        lease_seconds=10,
-    ) == []
+    assert (
+        await repository.claim_due_schedules(
+            due + timedelta(seconds=5),
+            limit=1,
+            lease_seconds=10,
+        )
+        == []
+    )
     reclaimed = (
         await repository.claim_due_schedules(
             due + timedelta(seconds=11),
@@ -470,11 +473,14 @@ async def test_renewal_expiry_behavior_revokes_before_dispatch() -> None:
         renewal_expires_at=datetime.now(UTC) + timedelta(seconds=1),
     )
     assert binding.next_renewal_at is not None
-    assert await repository.claim_due_schedules(
-        binding.next_renewal_at,
-        limit=10,
-        lease_seconds=10,
-    ) == []
+    assert (
+        await repository.claim_due_schedules(
+            binding.next_renewal_at,
+            limit=10,
+            lease_seconds=10,
+        )
+        == []
+    )
     expired = await repository.get_binding("expiring")
     assert expired is not None
     assert expired.status is ConnectorBindingStatus.revoked

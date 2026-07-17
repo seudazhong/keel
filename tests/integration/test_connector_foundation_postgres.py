@@ -248,9 +248,7 @@ async def test_repository_scope_isolation_cursor_and_delivery_replay(
             ),
             {"scope": scope_a},
         )
-    stale_retry = await repo_a.claim_delivery(
-        "fixture", binding.id, "delivery-stale", "c" * 64
-    )
+    stale_retry = await repo_a.claim_delivery("fixture", binding.id, "delivery-stale", "c" * 64)
     assert stale_retry is not None and stale_retry.token != stale.token
     await repo_a.finish_delivery(stale_retry)
 
@@ -291,9 +289,7 @@ async def test_delivery_binding_fence_survives_replacement(
     original = await repository.upsert_binding(
         "fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
     )
-    claim = await repository.claim_delivery(
-        "fixture", original.id, "delivery", "a" * 64
-    )
+    claim = await repository.claim_delivery("fixture", original.id, "delivery", "a" * 64)
     assert claim is not None
     await repository.delete_connector("fixture")
     replacement = await repository.upsert_binding(
@@ -452,11 +448,14 @@ async def test_postgres_recurring_schedule_claim_reclaims_and_fences(
     assert binding.next_sync_at is not None
     due = binding.next_sync_at
     first = (await first_worker.claim_due_schedules(due, limit=1, lease_seconds=10))[0]
-    assert await second_worker.claim_due_schedules(
-        due + timedelta(seconds=5),
-        limit=1,
-        lease_seconds=10,
-    ) == []
+    assert (
+        await second_worker.claim_due_schedules(
+            due + timedelta(seconds=5),
+            limit=1,
+            lease_seconds=10,
+        )
+        == []
+    )
     reclaimed = (
         await second_worker.claim_due_schedules(
             due + timedelta(seconds=11),

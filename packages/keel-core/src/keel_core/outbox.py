@@ -38,8 +38,7 @@ async def purge_connector(engine: AsyncEngine, scope_id: str, connector_id: str)
         await conn.execute(_SET_SCOPE, {"scope": scope_id})
         result = await conn.execute(
             text(
-                "DELETE FROM connector_outbox "
-                "WHERE scope_id = :scope AND connector_id = :connector"
+                "DELETE FROM connector_outbox WHERE scope_id = :scope AND connector_id = :connector"
             ),
             {"scope": scope_id, "connector": connector_id},
         )

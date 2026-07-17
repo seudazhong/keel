@@ -207,11 +207,14 @@ class WebhookProvider(BaseConnectorProvider):
         if not supplied.startswith("v1=") or len(supplied) != 67:
             raise ConnectorAuthenticationError("webhook signature is invalid")
         signed = f"{timestamp_text}.{delivery_id}.".encode("ascii") + request.body
-        expected = "v1=" + hmac.new(
-            signing_secret.encode("utf-8"),
-            signed,
-            hashlib.sha256,
-        ).hexdigest()
+        expected = (
+            "v1="
+            + hmac.new(
+                signing_secret.encode("utf-8"),
+                signed,
+                hashlib.sha256,
+            ).hexdigest()
+        )
         if not hmac.compare_digest(supplied, expected):
             raise ConnectorAuthenticationError("webhook signature is invalid")
         payload = _json_payload(request.body)

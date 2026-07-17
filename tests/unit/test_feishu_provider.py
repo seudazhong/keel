@@ -247,8 +247,7 @@ async def test_setup_encrypts_app_and_webhook_secrets_and_verifies_tenant() -> N
                 "code": 0,
                 "data": {
                     "scopes": [
-                        {"scope_name": scope, "grant_status": 1}
-                        for scope in FEISHU_REQUIRED_SCOPES
+                        {"scope_name": scope, "grant_status": 1} for scope in FEISHU_REQUIRED_SCOPES
                     ]
                 },
             }
@@ -589,6 +588,7 @@ async def test_duplicate_reply_uses_outbox_and_requires_selected_chat() -> None:
     client = FakeFeishuClient(handler)
     token_store = InMemoryTokenStore("scope-a", EnvelopeCipher("test-key"))
     await token_store.put("feishu", _credential().envelope().serialize())
+
     async def load_state(connector_id: str) -> ConnectorOperationContext:
         assert connector_id == "feishu"
         return ConnectorOperationContext(
@@ -666,9 +666,7 @@ async def test_resource_discovery_lists_docs_wiki_drive_and_chats_but_excludes_b
                 return {
                     "code": 0,
                     "data": {
-                        "items": [
-                            {"type": "folder", "token": "folder-a", "name": "Shared"}
-                        ],
+                        "items": [{"type": "folder", "token": "folder-a", "name": "Shared"}],
                         "has_more": False,
                     },
                 }

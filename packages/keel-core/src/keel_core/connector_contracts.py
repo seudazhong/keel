@@ -230,10 +230,7 @@ class ConnectorManifest:
         action_names = [item.name for item in self.actions]
         if len(set(action_names)) != len(action_names):
             raise ValueError(f"connector {connector_id!r} has duplicate action names")
-        if (
-            self.default_sync_cadence_seconds is not None
-            and self.default_sync_cadence_seconds <= 0
-        ):
+        if self.default_sync_cadence_seconds is not None and self.default_sync_cadence_seconds <= 0:
             raise ValueError("connector sync cadence must be positive")
         if (
             self.default_sync_cadence_seconds is not None
@@ -748,9 +745,7 @@ class ConnectorIngressResponse:
                 not name
                 or name in _UNSAFE_RESPONSE_HEADERS
                 or any(
-                    not ch.isascii()
-                    or not (ch.isalnum() or ch in "!#$%&'*+-.^_`|~")
-                    for ch in name
+                    not ch.isascii() or not (ch.isalnum() or ch in "!#$%&'*+-.^_`|~") for ch in name
                 )
                 or "\r" in value
                 or "\n" in value
@@ -803,10 +798,7 @@ class ConnectorIngressResult:
             raise ValueError("connector ingress deliveries require an id and payload hash")
         if self.failure is not None and self.changes:
             raise ValueError("failed connector ingress deliveries cannot contain changes")
-        if (
-            "\x00" in self.delivery_id
-            or len(self.delivery_id.encode("utf-8")) > 512
-        ):
+        if "\x00" in self.delivery_id or len(self.delivery_id.encode("utf-8")) > 512:
             raise ValueError("connector ingress delivery id is invalid")
         if len(self.payload_hash) != 64 or any(
             ch not in "0123456789abcdef" for ch in self.payload_hash
