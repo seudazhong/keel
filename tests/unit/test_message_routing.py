@@ -1,0 +1,206 @@
+"""Web message routing: durable admission binding (cloud org/Agent + local-preview) (M3.6).
+
+Exercises the production ``POST /v1/sessions/{id}/messages`` wrapper: a cloud user binds
+their selected org + persisted Agent (re-authorized), the open-mode local operator maps to
+the explicit local-preview profile, and cloud fails closed for a caller with no authenticated
+user + selected org/Agent. Uses the real FastAPI app with in-memory durable stores injected.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections.abc import Awaitable
+from dataclasses import dataclass
+from typing import Any, cast
+
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+
+import keel_server.api.v1 as v1
+from keel_core.approvals import InMemoryApprovalStore
+from keel_core.errors import PermissionDenied
+from keel_core.identity import NotFoundError
+from keel_core.runs import InMemoryRunStore, RunStatus
+from keel_server.app import create_app
+from keel_server.auth import Principal, Role, hash_api_key
+from keel_server.identity_context import Actor, ActorKind
+
+_SCOPE = "web:local"
+
+
+def _run[T](coro: Awaitable[T]) -> T:
+    return asyncio.run(coro)  # type: ignore[arg-type]
+
+
+class _FakeRuntime:
+    def interrupt_run(self, run_id: str) -> bool:
+        return False
+
+
+def _app(
+    runs: InMemoryRunStore,
+    enqueued: list[tuple[str, tuple[object, ...]]],
+    *,
+    cloud: bool = False,
+    api_keys: dict[str, Principal] | None = None,
+) -> TestClient:
+    app = create_app()
+    app.state.runs = runs
+    app.state.durable_approvals = InMemoryApprovalStore()
+    app.state.durable_scope = _SCOPE
+    app.state.engine = None
+    app.state.runtime = _FakeRuntime()
+    app.state.auth_required = cloud
+    app.state.api_keys = api_keys or {}
+
+    async def _enqueue(name: str, *args: object, **_options: object) -> None:
+        enqueued.append((name, args))
+
+    app.state.enqueue = _enqueue
+    return TestClient(app)
+
+
+@dataclass
+class _Org:
+    org_id: str
+
+
+@dataclass
+class _Agent:
+    id: str
+
+
+class _FakeIdentity:
+    """Grants ``member_of`` orgs and ``uses`` agents; everything else fails closed."""
+
+    def __init__(
+        self,
+        member_of: set[str],
+        agents: dict[str, str],
+        *,
+        denied: set[str] | None = None,
+    ) -> None:
+        self._member_of = member_of
+        self._agents = agents  # agent_ref -> agent_id
+        self._denied = denied or set()  # agent_refs the actor may see but not use
+
+    async def select_org(self, user_id: str, org_ref: str) -> _Org:
+        if org_ref in self._member_of:
+            return _Org(org_id=org_ref)
+        raise NotFoundError("organization not found")
+
+    async def select_agent(self, org_id: str, user_id: str, agent_ref: str) -> _Agent:
+        if agent_ref in self._denied:
+            raise PermissionDenied("agent not permitted")
+        if agent_ref in self._agents:
+            return _Agent(id=self._agents[agent_ref])
+        raise NotFoundError("agent not found")
+
+
+def _as_user(monkeypatch: Any) -> None:
+    async def _actor(_request: object) -> Actor:
+        return Actor(
+            kind=ActorKind.user,
+            api_role=Role.operator,
+            display_name="alice",
+            user_id="user-alice",
+        )
+
+    monkeypatch.setattr(v1, "resolve_actor", _actor)
+
+
+def test_local_preview_admission_binds_local_profile() -> None:
+    runs = InMemoryRunStore()
+    enqueued: list[tuple[str, tuple[object, ...]]] = []
+    client = _app(runs, enqueued)
+    resp = client.post("/v1/sessions/s1/messages", json={"content": "hi"})
+    assert resp.status_code == 202
+    run_id = resp.json()["run_id"]
+    assert enqueued == [("run_interactive", (run_id, _SCOPE))]
+    record = _run(runs.get(run_id))
+    assert record is not None
+    assert (record.org_id, record.actor, record.agent_id) == ("local", "local:local", "web")
+
+
+def test_cloud_user_admission_binds_org_and_agent(monkeypatch: Any) -> None:
+    runs = InMemoryRunStore()
+    enqueued: list[tuple[str, tuple[object, ...]]] = []
+    client = _app(runs, enqueued)
+    _as_user(monkeypatch)
+    cast(FastAPI, client.app).state.identity = _FakeIdentity({"org-A"}, {"agent-ref": "agent-1"})
+    resp = client.post(
+        "/v1/sessions/s1/messages",
+        json={"content": "hi"},
+        headers={"X-Keel-Org": "org-A", "X-Keel-Agent": "agent-ref"},
+    )
+    assert resp.status_code == 202
+    record = _run(runs.get(resp.json()["run_id"]))
+    assert record is not None
+    assert (record.org_id, record.actor, record.agent_id) == ("org-A", "user-alice", "agent-1")
+    assert record.status is RunStatus.queued
+
+
+def test_cloud_user_requires_org_header(monkeypatch: Any) -> None:
+    client = _app(InMemoryRunStore(), [])
+    _as_user(monkeypatch)
+    cast(FastAPI, client.app).state.identity = _FakeIdentity({"org-A"}, {"agent-ref": "agent-1"})
+    resp = client.post(
+        "/v1/sessions/s1/messages", json={"content": "hi"}, headers={"X-Keel-Agent": "agent-ref"}
+    )
+    assert resp.status_code == 400
+
+
+def test_cloud_user_requires_agent_header(monkeypatch: Any) -> None:
+    client = _app(InMemoryRunStore(), [])
+    _as_user(monkeypatch)
+    cast(FastAPI, client.app).state.identity = _FakeIdentity({"org-A"}, {"agent-ref": "agent-1"})
+    resp = client.post(
+        "/v1/sessions/s1/messages", json={"content": "hi"}, headers={"X-Keel-Org": "org-A"}
+    )
+    assert resp.status_code == 400
+
+
+def test_cloud_user_non_member_org_is_404(monkeypatch: Any) -> None:
+    client = _app(InMemoryRunStore(), [])
+    _as_user(monkeypatch)
+    cast(FastAPI, client.app).state.identity = _FakeIdentity(set(), {"agent-ref": "agent-1"})
+    resp = client.post(
+        "/v1/sessions/s1/messages",
+        json={"content": "hi"},
+        headers={"X-Keel-Org": "org-B", "X-Keel-Agent": "agent-ref"},
+    )
+    assert resp.status_code == 404
+
+
+def test_cloud_user_unauthorized_agent_is_403(monkeypatch: Any) -> None:
+    client = _app(InMemoryRunStore(), [])
+    _as_user(monkeypatch)
+    cast(FastAPI, client.app).state.identity = _FakeIdentity({"org-A"}, {}, denied={"agent-ref"})
+    resp = client.post(
+        "/v1/sessions/s1/messages",
+        json={"content": "hi"},
+        headers={"X-Keel-Org": "org-A", "X-Keel-Agent": "agent-ref"},
+    )
+    assert resp.status_code == 403
+
+
+def test_cloud_mode_machine_actor_denied() -> None:
+    # In cloud mode an API-key machine (no durable user + selected org/Agent) fails closed:
+    # the local-preview profile is never reachable on an authenticated/cloud route.
+    keys = {hash_api_key("k-op"): Principal(name="machine", role=Role.operator)}
+    client = _app(InMemoryRunStore(), [], cloud=True, api_keys=keys)
+    resp = client.post(
+        "/v1/sessions/s1/messages", json={"content": "hi"}, headers={"X-API-Key": "k-op"}
+    )
+    assert resp.status_code == 403
+
+
+def test_admission_conflict_is_409() -> None:
+    runs = InMemoryRunStore()
+    client = _app(runs, [])
+    headers = {"Idempotency-Key": "dup"}
+    first = client.post("/v1/sessions/s1/messages", json={"content": "hi"}, headers=headers)
+    assert first.status_code == 202
+    # Same identity, different content -> immutable fingerprint mismatch -> conflict.
+    second = client.post("/v1/sessions/s1/messages", json={"content": "other"}, headers=headers)
+    assert second.status_code == 409

@@ -2,17 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
 from fastapi.testclient import TestClient
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from keel_core.approvals import InMemoryApprovalStore
 from keel_core.config import Settings
 from keel_core.embeddings import FakeEmbedder
 from keel_core.events import Event, EventType
 from keel_core.jobs import InMemoryJobStore, PostgresJobStore
 from keel_core.knowledge.service import KnowledgeService
+from keel_core.runs import InMemoryRunStore, RunStatus
 from keel_server.app import (
     _build_job_store,
     _build_knowledge_service,
@@ -50,14 +53,74 @@ def _client(runtime: _FakeRuntime) -> TestClient:
     return TestClient(app)
 
 
-def test_create_message_launches_run() -> None:
-    runtime = _FakeRuntime()
-    client = _client(runtime)
+def test_create_message_admits_durable_run() -> None:
+    # The default Web path durably admits + dispatches a worker-owned run (no in-process task):
+    # it persists a run row, enqueues run_interactive, and returns the run_id (response shape
+    # preserved). Open mode binds the explicit local-preview org/actor/Agent profile.
+    runs = InMemoryRunStore()
+    enqueued: list[tuple[str, tuple[object, ...]]] = []
+
+    async def _enqueue(name: str, *args: object, **_options: object) -> None:
+        enqueued.append((name, args))
+
+    app = create_app()
+    app.state.runtime = _FakeRuntime()
+    app.state.runs = runs
+    app.state.durable_approvals = InMemoryApprovalStore()
+    app.state.durable_scope = "web:local"
+    app.state.engine = None
+    app.state.enqueue = _enqueue
+    client = TestClient(app)
+
     resp = client.post("/v1/sessions/s1/messages", json={"content": "hi"})
     assert resp.status_code == 202
     body = resp.json()
-    assert body["session_id"] == "s1" and body["run_id"] == "run-abc"
-    assert runtime.admitted == [("s1", "hi")]
+    assert body["session_id"] == "s1" and body["accepted"] is True
+    run_id = body["run_id"]
+    assert enqueued == [("run_interactive", (run_id, "web:local"))]
+    # The durable run row is bound to the local-preview compatibility profile.
+    record = asyncio.run(runs.get(run_id))
+    assert record is not None
+    assert record.org_id == "local" and record.actor == "local:local"
+    assert record.agent_id == "web" and record.status is RunStatus.queued
+
+
+def test_create_message_requires_queue() -> None:
+    # Admission fails closed (503) with no live queue — never an in-process fallback.
+    app = create_app()
+    app.state.runtime = _FakeRuntime()
+    app.state.runs = InMemoryRunStore()
+    app.state.durable_approvals = InMemoryApprovalStore()
+    app.state.durable_scope = "web:local"
+    app.state.engine = None
+    app.state.enqueue = None
+    client = TestClient(app)
+    resp = client.post("/v1/sessions/s1/messages", json={"content": "hi"})
+    assert resp.status_code == 503
+
+
+def test_create_message_idempotent_admission() -> None:
+    # A retried message with the same Idempotency-Key admits the run exactly once.
+    runs = InMemoryRunStore()
+    enqueued: list[tuple[str, tuple[object, ...]]] = []
+
+    async def _enqueue(name: str, *args: object, **_options: object) -> None:
+        enqueued.append((name, args))
+
+    app = create_app()
+    app.state.runtime = _FakeRuntime()
+    app.state.runs = runs
+    app.state.durable_approvals = InMemoryApprovalStore()
+    app.state.durable_scope = "web:local"
+    app.state.engine = None
+    app.state.enqueue = _enqueue
+    client = TestClient(app)
+
+    headers = {"Idempotency-Key": "req-1"}
+    first = client.post("/v1/sessions/s1/messages", json={"content": "hi"}, headers=headers)
+    second = client.post("/v1/sessions/s1/messages", json={"content": "hi"}, headers=headers)
+    assert first.status_code == 202 and second.status_code == 202
+    assert first.json()["run_id"] == second.json()["run_id"]  # same run, no duplicate
 
 
 def test_resolve_unknown_approval_is_404() -> None:

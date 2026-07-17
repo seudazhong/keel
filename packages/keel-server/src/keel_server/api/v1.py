@@ -2,14 +2,23 @@
 
 Evolution policy (DESIGN-REVIEW G14): ``/v1`` is additive-only.
 
-- ``POST /sessions/{id}/messages`` durably admits input and launches a run.
+- ``POST /sessions/{id}/messages`` **durably admits** input via the identity-bound
+  :class:`~keel_core.run_service.DurableRunService` and dispatches the worker-owned
+  ``run_interactive`` job — the default path (M3.6). There is no server-local asyncio run
+  task and no in-process fallback: a live run queue is required (explicit 503 otherwise).
+  The tenant/actor/Agent identity is derived from the request actor + selected org/Agent
+  (re-authorized here), never from the ambient data-plane scope; an open-mode local operator
+  maps to the explicit local-preview compatibility profile, gated to non-cloud mode.
 - ``GET  /sessions/{id}/events``   streams the event log as SSE (replayable via
   ``after=``, then live). The client closes the stream when it sees ``run.ended``.
-- ``POST /approvals/{id}``         resolves a pending tool approval.
+- ``POST /approvals/{id}/approve|reject`` resolves a durable approval through the bound
+  :class:`~keel_core.run_service.DurableRunService` (org/actor-bound); the legacy
+  ``POST /approvals/{id}`` resolves an **in-process** future and is local-preview only.
 """
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Annotated, Any
@@ -31,12 +40,14 @@ from keel_core.consolidation import (
     ProposalResolution,
     consolidation_schedule_id,
 )
+from keel_core.errors import PermissionDenied
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
 from keel_core.identity import NotFoundError
+from keel_core.interactive import LOCAL_PREVIEW_AGENT_ID, LOCAL_PREVIEW_ORG_ID
 from keel_core.jobs import JobStatus, JobStore, JobValidationError
 from keel_core.loop import admit
 from keel_core.run_service import DurableRunService
-from keel_core.runs import RunControlKind, RunRecord, RunStore
+from keel_core.runs import RunAdmissionConflict, RunControlKind, RunRecord, RunStore, RunSurface
 from keel_core.search import hybrid_search_sessions
 from keel_core.state import InMemoryEventStore, PostgresEventStore, list_sessions
 from keel_core.tokens import delete_token, list_connected
@@ -148,6 +159,76 @@ def _durable_run_service(request: Request) -> DurableRunService:
     )
 
 
+def _cloud_mode(request: Request) -> bool:
+    """Whether the server runs in cloud (fail-closed auth) mode; gates local-preview."""
+    return bool(getattr(request.app.state, "auth_required", False))
+
+
+async def _admission_binding(request: Request) -> tuple[str, str, str]:
+    """Resolve ``(org_id, actor, agent_id)`` for a durable admission (M3.6, item 1).
+
+    A real authenticated **user** binds their selected org (``X-Keel-Org``, re-authorized as
+    an active member) and their selected **persisted Agent** (``X-Keel-Agent``, re-authorized
+    for *use* — visibility + membership + not-archived — via the identity service). This is
+    the single source of the run's tenant/actor/Agent identity; nothing is derived from the
+    ambient data-plane scope.
+
+    An open-mode **local operator** / API-key **machine** maps to the explicit, non-blank
+    local-preview compatibility profile (``local`` org + ``web`` Agent) — but **only** in
+    non-cloud mode. In cloud mode a caller with no authenticated user + selected org/Agent is
+    rejected (fail closed): no authenticated/cloud route relies on the local-preview profile.
+    """
+    actor = await resolve_actor(request)
+    if actor.is_user:
+        assert actor.user_id is not None
+        service = getattr(request.app.state, "identity", None)
+        if service is None:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "identity service unavailable")
+        org_ref = (request.headers.get("x-keel-org") or "").strip()
+        if not org_ref:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "select an organization via the X-Keel-Org header"
+            )
+        try:
+            org_context = await service.select_org(actor.user_id, org_ref)
+        except NotFoundError:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "organization not found") from None
+        agent_ref = (request.headers.get("x-keel-agent") or "").strip()
+        if not agent_ref:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "select an Agent via the X-Keel-Agent header"
+            )
+        try:
+            agent = await service.select_agent(org_context.org_id, actor.user_id, agent_ref)
+        except NotFoundError:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found") from None
+        except PermissionDenied as exc:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from None
+        return org_context.org_id, actor.user_id, agent.id
+    if _cloud_mode(request):
+        # Fail closed: cloud admission requires an authenticated user + selected org/Agent.
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "durable admission requires an authenticated user with a selected org and Agent",
+        )
+    return LOCAL_PREVIEW_ORG_ID, durable_actor_id(actor), LOCAL_PREVIEW_AGENT_ID
+
+
+def _idempotency_key(request: Request, body: CreateMessageRequest) -> str:
+    """A stable request identifier for at-most-once admission (header, body, or generated).
+
+    A client that supplies a stable ``Idempotency-Key`` header (or body field) makes a
+    retried message idempotent — the durable admission dedups on
+    ``(scope, org, actor, idempotency_key)`` and never creates a second run/message. When
+    none is supplied a fresh key is generated (each request is a distinct admission)."""
+    header = (request.headers.get("idempotency-key") or "").strip()
+    if header:
+        return header
+    if body.idempotency_key and body.idempotency_key.strip():
+        return body.idempotency_key.strip()
+    return uuid.uuid4().hex
+
+
 @router.post(
     "/sessions/{session_id}/messages",
     response_model=CreateMessageResponse,
@@ -158,10 +239,36 @@ def _durable_run_service(request: Request) -> DurableRunService:
 async def create_message(
     session_id: str, body: CreateMessageRequest, request: Request
 ) -> CreateMessageResponse:
-    """Durably admit input (FR-C5) and launch a run; return its ``run_id``."""
-    runtime = _runtime(request)
-    run_id = await runtime.admit_and_run(session_id, body.content)
-    return CreateMessageResponse(session_id=session_id, run_id=run_id)
+    """Durably admit input (FR-C5) and dispatch a **worker-owned** run; return its ``run_id``.
+
+    The durable path is the default: admission binds the request actor's org / actor /
+    selected Agent (re-authorized here), persists the user turn + run row idempotently, and
+    enqueues ``run_interactive`` for a worker to execute — there is no server-local asyncio
+    run task and no silent in-process fallback. A live run queue is **required** (explicit
+    503 when unavailable); admission never executes the run in-process.
+    """
+    enqueue = getattr(request.app.state, "enqueue", None)
+    if enqueue is None:
+        # Fail closed: without a live queue the run could not be dispatched to a worker. We do
+        # NOT fall back to in-process execution — that is the process-local model M3.6 removes.
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "run queue unavailable")
+    org_id, actor, agent_id = await _admission_binding(request)
+    service = _durable_run_service(request)
+    try:
+        result = await service.admit(
+            org_id=org_id,
+            actor=actor,
+            agent_id=agent_id,
+            session_id=session_id,
+            surface=RunSurface.web.value,
+            content=body.content,
+            idempotency_key=_idempotency_key(request, body),
+        )
+    except RunAdmissionConflict:
+        # Same idempotency identity, different immutable binding/content: reject (never repair
+        # with attacker/client-supplied values). The caller must use a fresh idempotency key.
+        raise HTTPException(status.HTTP_409_CONFLICT, "admission identity conflict") from None
+    return CreateMessageResponse(session_id=session_id, run_id=result.run_id)
 
 
 @router.post(
@@ -433,7 +540,14 @@ async def stream_events(
 async def resolve_approval(
     approval_id: str, body: ApprovalResolution, request: Request
 ) -> dict[str, bool]:
-    """Resolve a pending tool approval (allow -> run the tool, deny -> refuse)."""
+    """Resolve an **in-process** tool approval (local-preview only).
+
+    This resolves a server-local :class:`~keel_server.runtime.ApprovalRegistry` future, which
+    only exists for the local-preview in-process runtime. Production Web/IM approvals are
+    durable and go through :func:`_resolve_durable` (``/approvals/{id}/approve|reject``) —
+    org/actor-bound, no in-memory futures. In a cloud deployment there are no in-process runs,
+    so this returns 404 (nothing pending).
+    """
     runtime = _runtime(request)
     approved = body.decision is PermissionDecision.allow
     resolved = runtime.resolve_approval(approval_id, approved)

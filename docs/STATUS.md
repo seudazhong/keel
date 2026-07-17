@@ -162,25 +162,46 @@ exit-gate audit before declaring the milestone complete.
 - Complete Memory block/history editing, Admin/RBAC UI, and local first-run onboarding.
 - Correct current copy, responsive behavior, internationalization, and accessibility.
 
-### Durable runs — remaining limitations (M3.6, WS-M)
+### Durable runs — routing status (M3.6, WS-M)
 
 The durable substrate (schema, run state machine/repository, worker executor, durable
 approval binding, reconciliation, `/v1/runs` status/interrupt/steer APIs, lifecycle
-erasure) is implemented and tested. Not yet flipped on by default / still to do:
+erasure) is implemented and tested. Routing status:
 
-- The server's default `POST /v1/sessions/{id}/messages` admission still runs the
-  in-process `AgentRuntime` as the **explicitly-labelled local-preview compatibility path**
-  for the existing unauthenticated single-scope mode. Routing web admission through
-  `DurableRunService`/`run_interactive` by default is staged behind authenticated identity
-  wiring (org/user/Agent scope derivation for `web:local` is not yet removed).
-- The worker interactive toolset (`keel_worker.runs`) uses the shared file/shell toolset +
-  web permission policy (`keel_core.interactive`); memory/knowledge/connector tool parity
-  with the server runtime in the durable worker path is a follow-up.
-- IM gateways (`ImRunner`, OneBot/Telegram) still use their in-process event store/loop;
-  re-pointing them at the same durable admission path is pending.
-- Agent visibility re-check at worker claim is wired as an injectable hook
-  (`execute_run(visibility_check=...)`) but the concrete persisted-Agent grant check is not
-  yet bound in `run_interactive`.
+- **Web admission is durable by default.** `POST /v1/sessions/{id}/messages` admits through
+  the identity-bound `DurableRunService.admit` and dispatches the worker-owned
+  `run_interactive` job; there is no server-local asyncio run task and no in-process fallback
+  (a live run queue is required — explicit 503 otherwise). The tenant/actor/Agent identity is
+  derived from the request actor + selected org (`X-Keel-Org`) + selected Agent
+  (`X-Keel-Agent`, re-authorized via `select_agent`); an idempotency key (`Idempotency-Key`
+  header/body) makes a retried message admit exactly once. The in-process `AgentRuntime`
+  remains only as the explicitly-labelled **local-preview** path (`admit_and_run`), never the
+  production default. Evidence: `tests/unit/test_message_routing.py`, `tests/unit/test_server.py`.
+- **Local-preview compatibility profile** (`local` org + `web` Agent + `im:`/`local:` actor)
+  is used only in non-cloud mode; a cloud request with no authenticated user + selected
+  org/Agent fails closed (403). Authorization is org-bound (`select_org`/`select_agent`/
+  `_authorize_run`) — the `web:local` data-plane scope is never an authorization basis.
+- **Worker execution parity.** `run_interactive` rebuilds the interactive Agent from the
+  *persisted* selected-Agent profile (id/name/persona) via the shared builders
+  (`keel_core.interactive`), with file/shell + memory + Knowledge tool + permission parity to
+  the server web runtime, and re-checks Agent visibility / org membership / archived status at
+  claim time (a revoke between admit and claim fails the run closed). Evidence:
+  `tests/unit/test_worker_run_routing.py`.
+
+Still to do (not yet done):
+
+- **IM durable routing.** OneBot/Telegram gateways (`ImRunner`) still run the in-process
+  untrusted safe-agent loop and reply inline. Re-pointing them at `DurableRunService`
+  requires an untrusted **safe-agent** branch in the worker (IM must keep the read-only safe
+  toolset — it must never reach write/shell), a durable outbox-idempotent reply delivery that
+  survives a server/worker restart, a reconciler sweep for the crash-after-terminalize
+  delivery window, and a cloud channel→org/Agent mapping (fail closed when absent). Designed
+  but not implemented in this increment.
+- **Connector tool parity** in the durable worker path (beyond file/shell + memory +
+  Knowledge) is a follow-up.
+- **SSE token-streaming liveness** from the worker: durable events (including completed
+  assistant turns) appear via the server's durable-polling SSE tail, but sub-100ms
+  token-by-token deltas are not fanned out from the worker to Redis yet.
 
 ## Next work
 

@@ -257,6 +257,11 @@ async def startup(ctx: dict[str, Any]) -> None:
 
     from keel_core.approvals import PostgresApprovalStore
     from keel_core.embeddings import LiteLLMEmbedder
+    from keel_core.identity import (
+        IdentityService,
+        LoggingAuditSink,
+        PostgresIdentityStore,
+    )
     from keel_core.knowledge import KnowledgeStore, PostgresKnowledgeStore
     from keel_core.providers import LiteLLMGateway
     from keel_scheduler.store import PostgresClaimStore, PostgresScheduleStore
@@ -295,6 +300,14 @@ async def startup(ctx: dict[str, Any]) -> None:
     )
     ctx["embedder"] = embedder
     ctx["knowledge"] = knowledge
+    # Durable identity for worker-owned interactive runs (M3.6): the run's persisted selected
+    # Agent profile is rebuilt from here, and Agent visibility / org membership / archived
+    # status is re-checked at claim time (a revoke between admit and claim fails closed).
+    ctx["identity"] = IdentityService(
+        PostgresIdentityStore(engine),
+        audit=LoggingAuditSink(),
+        allow_jit_provisioning=settings.identity_allow_jit_provisioning,
+    )
     job_registry = knowledge_job_registry(
         cast(KnowledgeStore, knowledge),
         embedder,
