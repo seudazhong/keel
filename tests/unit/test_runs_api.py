@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -16,11 +17,11 @@ from fastapi.testclient import TestClient
 
 import keel_server.api.v1 as v1
 from keel_core.approvals import InMemoryApprovalStore
-from keel_core.identity import NotFoundError
+from keel_core.identity import MembershipRole, NotFoundError
 from keel_core.runs import InMemoryRunStore, RunBudgetSpec, RunStatus, RunSurface, action_hash
 from keel_server.app import create_app
 from keel_server.auth import Role
-from keel_server.identity_context import Actor, ActorKind
+from keel_server.identity_context import Actor, ActorKind, resolve_actor
 
 _SCOPE = "web:local"
 
@@ -54,10 +55,12 @@ def _app_with_state(
     return TestClient(app)
 
 
-async def _admit_run(runs: InMemoryRunStore, run_id: str, *, org_id: str = "org-1") -> None:
+async def _admit_run(
+    runs: InMemoryRunStore, run_id: str, *, org_id: str = "org-1", scope_id: str = _SCOPE
+) -> None:
     await runs.admit(
         run_id=run_id,
-        scope_id=_SCOPE,
+        scope_id=scope_id,
         org_id=org_id,
         actor="local:local",
         agent_id="agent-1",
@@ -69,8 +72,10 @@ async def _admit_run(runs: InMemoryRunStore, run_id: str, *, org_id: str = "org-
     )
 
 
-async def _suspend_run(runs: InMemoryRunStore, run_id: str, *, org_id: str = "org-1") -> None:
-    await _admit_run(runs, run_id, org_id=org_id)
+async def _suspend_run(
+    runs: InMemoryRunStore, run_id: str, *, org_id: str = "org-1", scope_id: str = _SCOPE
+) -> None:
+    await _admit_run(runs, run_id, org_id=org_id, scope_id=scope_id)
     await runs.mark_queued(run_id)
     lease = await runs.claim(run_id, worker_id="w1", lease_seconds=30)
     assert lease is not None
@@ -290,10 +295,10 @@ def test_legacy_approval_routes_to_resume_run_after_new_helpers() -> None:
 
 
 async def _seed_interactive_approval(
-    approvals: InMemoryApprovalStore, run_id: str, *, org_id: str, to: str
+    approvals: InMemoryApprovalStore, run_id: str, *, org_id: str, to: str, scope_id: str = _SCOPE
 ) -> str:
     return await approvals.create_pending(
-        scope_id=_SCOPE,
+        scope_id=scope_id,
         run_id=run_id,
         session_id="sess-1",
         tool="email.send",
@@ -309,18 +314,10 @@ async def _seed_interactive_approval(
     )
 
 
-def test_list_approvals_isolates_durable_interactive_across_orgs(monkeypatch: Any) -> None:
-    # Two orgs' durable interactive approvals share one data-plane scope; a user who is a
-    # member of only org-A must never see org-B's tool/args (item 8).
-    runs = InMemoryRunStore()
-    approvals = InMemoryApprovalStore()
-    client = _app_with_state(runs, approvals, [])
-    _run(_suspend_run(runs, "run-A", org_id="org-A"))
-    _run(_suspend_run(runs, "run-B", org_id="org-B"))
-    aid_a = _run(_seed_interactive_approval(approvals, "run-A", org_id="org-A", to="a@x"))
-    _run(_seed_interactive_approval(approvals, "run-B", org_id="org-B", to="b@x"))
+def _override_user(client: TestClient, identity: Any) -> None:
+    """Route the endpoint auth through a durable user + a fake identity (per-scope)."""
 
-    async def _user_actor(_request: object) -> Actor:
+    async def _user_actor() -> Actor:
         return Actor(
             kind=ActorKind.user,
             api_role=Role.operator,
@@ -328,22 +325,81 @@ def test_list_approvals_isolates_durable_interactive_across_orgs(monkeypatch: An
             user_id="user-alice",
         )
 
-    class _OrgAOnlyIdentity:
-        async def select_org(self, user_id: str, org_ref: str) -> Any:
-            if org_ref == "org-A":
-                return object()
-            raise NotFoundError("organization not found")
+    cast(FastAPI, client.app).dependency_overrides[resolve_actor] = _user_actor
+    cast(FastAPI, client.app).state.identity = identity
 
-    monkeypatch.setattr(v1, "resolve_actor", _user_actor)
-    cast(FastAPI, client.app).state.identity = _OrgAOnlyIdentity()
-    listed = client.get("/v1/approvals?status=pending").json()
-    assert [a["id"] for a in listed] == [aid_a]  # only org-A; org-B's args never exposed
+
+@dataclass
+class _MemberEdge:
+    role: MembershipRole = MembershipRole.member
+
+
+@dataclass
+class _MemberOrg:
+    _org: str
+
+    @property
+    def org_id(self) -> str:
+        return self._org
+
+    @property
+    def membership(self) -> _MemberEdge:
+        return _MemberEdge()
+
+
+@dataclass
+class _AgentRef:
+    id: str
+
+
+class _ScopedIdentity:
+    """A fake identity granting one org (as ``member``) + one agent, deriving a scope."""
+
+    def __init__(self, org: str, agent_ref: str, agent_id: str) -> None:
+        self._org = org
+        self._agent_ref = agent_ref
+        self._agent_id = agent_id
+
+    async def select_org(self, user_id: str, org_ref: str) -> Any:
+        if org_ref == self._org:
+            return _MemberOrg(self._org)
+        raise NotFoundError("organization not found")
+
+    async def select_agent(self, org_id: str, user_id: str, agent_ref: str) -> Any:
+        if agent_ref == self._agent_ref:
+            return _AgentRef(self._agent_id)
+        raise NotFoundError("agent not found")
+
+
+def test_list_approvals_isolates_durable_interactive_across_orgs() -> None:
+    # Two orgs' durable interactive approvals live in their own derived per-Agent scopes; a
+    # user who selects org-A's scope must never see org-B's tool/args (M3.6, item 3/8).
+    from keel_core.scoping import derive_agent_scope
+
+    runs = InMemoryRunStore()
+    approvals = InMemoryApprovalStore()
+    client = _app_with_state(runs, approvals, [])
+    scope_a = derive_agent_scope("org-A", "agent-A")
+    scope_b = derive_agent_scope("org-B", "agent-B")
+    _run(_suspend_run(runs, "run-A", org_id="org-A", scope_id=scope_a))
+    _run(_suspend_run(runs, "run-B", org_id="org-B", scope_id=scope_b))
+    aid_a = _run(
+        _seed_interactive_approval(approvals, "run-A", org_id="org-A", to="a@x", scope_id=scope_a)
+    )
+    _run(_seed_interactive_approval(approvals, "run-B", org_id="org-B", to="b@x", scope_id=scope_b))
+
+    _override_user(client, _ScopedIdentity("org-A", "agent-A", "agent-A"))
+    listed = client.get(
+        "/v1/approvals?status=pending",
+        headers={"X-Keel-Org": "org-A", "X-Keel-Agent": "agent-A"},
+    ).json()
+    assert [a["id"] for a in listed] == [aid_a]  # only org-A's scope; org-B never exposed
     assert listed[0]["origin"] == "interactive" and listed[0]["org_id"] == "org-A"
 
 
-def test_list_approvals_legacy_isolated_to_local_operator(monkeypatch: Any) -> None:
+def test_list_approvals_legacy_isolated_to_local_operator() -> None:
     # A legacy local-preview approval (no durable run row) is visible to the local operator,
-    # labeled, and never surfaced to a cloud user's org view.
+    # labeled, and never surfaced to a cloud user's per-Agent scope.
     runs = InMemoryRunStore()
     approvals = InMemoryApprovalStore()
     client = _app_with_state(runs, approvals, [])
@@ -365,19 +421,12 @@ def test_list_approvals_legacy_isolated_to_local_operator(monkeypatch: Any) -> N
     assert [a["id"] for a in listed_local] == [aid]
     assert listed_local[0]["origin"] == "local-preview"
 
-    # A cloud user never sees a legacy local-preview approval.
-    async def _user_actor(_request: object) -> Actor:
-        return Actor(
-            kind=ActorKind.user,
-            api_role=Role.operator,
-            display_name="alice",
-            user_id="user-alice",
-        )
-
-    class _DenyingIdentity:
-        async def select_org(self, user_id: str, org_ref: str) -> Any:
-            raise NotFoundError("organization not found")
-
-    monkeypatch.setattr(v1, "resolve_actor", _user_actor)
-    cast(FastAPI, client.app).state.identity = _DenyingIdentity()
-    assert client.get("/v1/approvals?status=pending").json() == []
+    # A cloud user's derived scope never contains the legacy web:local approval.
+    _override_user(client, _ScopedIdentity("org-A", "agent-A", "agent-A"))
+    assert (
+        client.get(
+            "/v1/approvals?status=pending",
+            headers={"X-Keel-Org": "org-A", "X-Keel-Agent": "agent-A"},
+        ).json()
+        == []
+    )

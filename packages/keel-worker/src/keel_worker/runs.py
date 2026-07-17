@@ -19,9 +19,10 @@ import logging
 import socket
 import uuid
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
-from keel_core.approvals import ApprovalRecord, ApprovalStore
+from keel_core.approvals import ApprovalRecord, ApprovalStore, PostgresApprovalStore
 from keel_core.config import Settings, get_settings
 from keel_core.errors import PermissionDenied
 from keel_core.identity import IdentityService, NotFoundError
@@ -33,7 +34,7 @@ from keel_core.interactive import (
     build_interactive_registry,
     interactive_permissions,
 )
-from keel_core.loop import ToolRegistry, admit
+from keel_core.loop import ToolRegistry, admission_model_in_log, admit
 from keel_core.memory import PostgresMemoryStore, format_core_memory
 from keel_core.run_service import (
     DurableRunService,
@@ -43,12 +44,62 @@ from keel_core.run_service import (
     prompt_persisted_in_log,
     reconcile_runs,
 )
-from keel_core.runs import RunRecord, RunStatus, RunStore
+from keel_core.runs import PostgresRunStore, RunRecord, RunStatus, RunStore
+from keel_core.scoping import ScopeValidationError, validate_scope_id
+from keel_core.state import PostgresEventStore
+from keel_core.tools import (
+    ExecutionEnvironment,
+    UnavailableExecutionEnvironment,
+    build_scoped_execution_environment,
+)
 from keel_core.types import ScopeId
 
 logger = logging.getLogger("keel.worker.runs")
 
 _WORKER_ID = f"{socket.gethostname()}:{uuid.uuid4().hex[:8]}"
+
+
+def _scoped_stores(
+    ctx: dict[str, Any], scope_id: ScopeId
+) -> tuple[RunStore, PostgresEventStore | Any, ApprovalStore]:
+    """Build the run/event/approval stores bound to ``scope_id`` (M3.6, item 3).
+
+    The worker executes runs across many per-Agent scopes, so it constructs each run's stores
+    for that run's *own* ``scope_id`` (revalidated) rather than a single process-wide scope. A
+    Postgres engine yields per-scope stores; the in-memory test doubles in ``ctx`` are used
+    unchanged when no engine is wired.
+    """
+    engine = ctx.get("engine")
+    if engine is not None:
+        return (
+            PostgresRunStore(engine, scope_id),
+            PostgresEventStore(engine, scope_id),
+            PostgresApprovalStore(engine, scope_id),
+        )
+    return ctx["runs"], ctx["store"], ctx["approvals"]
+
+
+def _scoped_environment(
+    ctx: dict[str, Any], scope_id: ScopeId
+) -> tuple[ExecutionEnvironment, bool]:
+    """A per-scope execution environment + whether the caller owns (must close) it.
+
+    Each scope gets its own isolated workspace (no shared writable workspace across scopes). If
+    the worker has the settings + workspace root wired it builds a fresh scoped environment
+    (owned here, closed after the run); otherwise it falls back to the shared ``ctx``
+    environment (a fail-closed :class:`UnavailableExecutionEnvironment` when none was wired).
+    """
+    settings = ctx.get("job_settings") or ctx.get("settings")
+    root = ctx.get("workspace_root")
+    if settings is not None and root is not None:
+        env = build_scoped_execution_environment(
+            settings, Path(root), service="worker", scope_id=scope_id
+        )
+        return env, True
+    shared = ctx.get("execution_environment")
+    if shared is not None:
+        return shared, False
+    return UnavailableExecutionEnvironment(), False
 
 
 def _capabilities(settings: Settings) -> InteractiveCapabilities:
@@ -134,19 +185,32 @@ def _system_context(engine: Any, scope_id: ScopeId, persona: str) -> SystemConte
 
 
 async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> str:
-    """Claim + execute (or resume) a durable interactive run under a fenced lease."""
+    """Claim + execute (or resume) a durable interactive run under a fenced lease.
+
+    The run's stores, tools, execution environment, and model are all constructed from the
+    run's **own** revalidated ``scope_id`` (M3.6, item 3) — the worker is multi-scope, not
+    pinned to a single process scope. The model is the one captured at admission (item 5), not
+    the worker's process default.
+    """
     settings: Settings = get_settings()
-    durable_scope = str(ctx["durable_scope"])
-    if scope_id != durable_scope:
-        logger.warning(
-            "run_interactive scope mismatch configured=%s got=%s", durable_scope, scope_id
-        )
-        return "scope_mismatch"
-    run_store: RunStore = ctx["runs"]
-    event_store = ctx["store"]
+    try:
+        scope_id = validate_scope_id(scope_id)
+    except ScopeValidationError:
+        logger.warning("run_interactive rejected malformed scope=%r run=%s", scope_id, run_id)
+        return "scope_invalid"
+    run_store, event_store, approvals = _scoped_stores(ctx, scope_id)
     record = await run_store.get(run_id)
     if record is None:
         return "missing"
+    # Fail closed: the run must live in the scope it was dispatched under (no cross-scope claim).
+    if record.scope_id != scope_id:
+        logger.warning(
+            "run_interactive scope mismatch run=%s record=%s dispatched=%s",
+            run_id,
+            record.scope_id,
+            scope_id,
+        )
+        return "scope_mismatch"
     if record.status in {
         RunStatus.completed,
         RunStatus.failed,
@@ -175,51 +239,63 @@ async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> st
     identity: IdentityService | None = ctx.get("identity")
     engine = ctx.get("engine")
     embedder = ctx.get("embedder")
-    environment = ctx["execution_environment"]
-    # Capability parity with the server web runtime: the same file/shell + memory + Knowledge
-    # tools + permissions, built from the shared builders (one toolset contract, two surfaces).
-    tools, extra_names = build_interactive_registry(
-        environment,
-        engine=engine,
-        scope_id=lease.scope_id,
-        embedder=embedder,
-        caps=_capabilities(settings),
-    )
-    agent_id, agent_name, persona = await _resolve_agent_profile(identity, record)
-    agent = build_interactive_agent(
-        scope_id=lease.scope_id,
-        model=settings.default_model,
-        agent_id=agent_id,
-        name=agent_name,
-        persona=persona,
-        extra_tool_names=extra_names,
-    )
-    final = await execute_run(
-        lease=lease,
-        run_store=run_store,
-        event_store=event_store,
-        approvals=ctx["approvals"],
-        agent=agent,
-        provider=ctx["provider"],
-        registry=ToolRegistry(tools),
-        permissions=interactive_permissions(extra_names),
-        admit_fn=admit,
-        approval_ttl_hours=settings.approval_timeout_hours,
-        # Re-check Agent visibility / org membership / archived at claim (revoke fails closed).
-        visibility_check=_visibility_check(identity),
-        system_context=_system_context(engine, lease.scope_id, persona),
-        # Resume vs fresh-start is decided atomically at claim time (explicit durable marker
-        # or a reclaimed mid-approval run), never inferred from a mutable pre-claim status.
-        resume=lease.resume,
-    )
+    # Per-scope, isolated execution environment (no shared writable workspace across scopes).
+    environment, owns_environment = _scoped_environment(ctx, lease.scope_id)
+    try:
+        # Capability parity with the server web runtime: the same file/shell + memory +
+        # Knowledge tools + permissions, from the shared builders (one contract, two surfaces).
+        tools, extra_names = build_interactive_registry(
+            environment,
+            engine=engine,
+            scope_id=lease.scope_id,
+            embedder=embedder,
+            caps=_capabilities(settings),
+        )
+        agent_id, agent_name, persona = await _resolve_agent_profile(identity, record)
+        # The model captured at admission (reproducibility) — not the worker's process default.
+        model = (
+            await admission_model_in_log(event_store, record.session_id, run_id)
+            or settings.default_model
+        )
+        agent = build_interactive_agent(
+            scope_id=lease.scope_id,
+            model=model,
+            agent_id=agent_id,
+            name=agent_name,
+            persona=persona,
+            extra_tool_names=extra_names,
+        )
+        final = await execute_run(
+            lease=lease,
+            run_store=run_store,
+            event_store=event_store,
+            approvals=approvals,
+            agent=agent,
+            provider=ctx["provider"],
+            registry=ToolRegistry(tools),
+            permissions=interactive_permissions(extra_names),
+            admit_fn=admit,
+            approval_ttl_hours=settings.approval_timeout_hours,
+            # Re-check Agent visibility / org membership / archived at claim (revoke fails closed).
+            visibility_check=_visibility_check(identity),
+            system_context=_system_context(engine, lease.scope_id, persona),
+            # Resume vs fresh-start is decided atomically at claim time (explicit durable marker
+            # or a reclaimed mid-approval run), never inferred from a mutable pre-claim status.
+            resume=lease.resume,
+        )
+    finally:
+        if owns_environment:
+            await environment.aclose()
     logger.info(
-        "run_interactive scope=%s run=%s attempt=%d resume=%s status=%s agent=%s worker=%s",
+        "run_interactive scope=%s run=%s attempt=%d resume=%s status=%s agent=%s model=%s "
+        "worker=%s",
         lease.scope_id,
         run_id,
         lease.attempt,
         lease.resume,
         final.status.value,
         agent_id,
+        model,
         _WORKER_ID,
     )
     return final.status.value

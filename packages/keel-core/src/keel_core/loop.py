@@ -236,7 +236,13 @@ async def admit(store: EventStore, session_id: SessionId, scope_id: ScopeId, con
 
 
 async def admit_run(
-    store: EventStore, session_id: SessionId, scope_id: ScopeId, content: str, run_id: RunId
+    store: EventStore,
+    session_id: SessionId,
+    scope_id: ScopeId,
+    content: str,
+    run_id: RunId,
+    *,
+    model: str | None = None,
 ) -> None:
     """Persist a durable run's user turn, tagged with an admission marker for ``run_id``.
 
@@ -245,20 +251,43 @@ async def admit_run(
     duplicate user turn or dispatch a prompt-less run (invariant I2, M3.6). The ``dedup_key``
     is enforced by a partial-unique index on ``events`` so two concurrent admitters (or a
     retried request across processes) can never both append the prompt — the loser raises
-    :class:`~keel_core.errors.DuplicateEventError` and observes the winner's turn."""
+    :class:`~keel_core.errors.DuplicateEventError` and observes the winner's turn.
+
+    ``admission_model`` records the model selected at admission (no schema migration: it lives
+    in the event payload) so the worker executes the run with the admitted model rather than
+    its own process default (reproducibility)."""
+    payload: dict[str, object] = {
+        "role": "user",
+        "text": content,
+        "admission_run": run_id,
+        "dedup_key": f"admit:{run_id}",
+    }
+    if model:
+        payload["admission_model"] = model
     await _emit(
         store,
         EventType.message_token,
         session_id,
         scope_id,
         run_id,
-        {
-            "role": "user",
-            "text": content,
-            "admission_run": run_id,
-            "dedup_key": f"admit:{run_id}",
-        },
+        payload,
     )
+
+
+async def admission_model_in_log(
+    store: EventStore, session_id: SessionId, run_id: RunId
+) -> str | None:
+    """The model recorded on ``run_id``'s durable admission turn, if any (M3.6 item 5).
+
+    The worker reads the admitted model from the event log so it executes with the model the
+    request selected at admission — not the worker's own process default. Returns ``None`` for
+    an older admission that predates model capture (the worker then falls back to its
+    default)."""
+    async for event in store.read(session_id):
+        if event.payload.get("admission_run") == run_id:
+            model = event.payload.get("admission_model")
+            return model if isinstance(model, str) and model else None
+    return None
 
 
 async def admit_steer(

@@ -69,6 +69,7 @@ def test_create_message_admits_durable_run() -> None:
     app.state.durable_approvals = InMemoryApprovalStore()
     app.state.durable_scope = "web:local"
     app.state.engine = None
+    app.state.shared_run_substrate = True  # simulate a shared durable substrate with doubles
     app.state.enqueue = _enqueue
     client = TestClient(app)
 
@@ -113,6 +114,7 @@ def test_create_message_idempotent_admission() -> None:
     app.state.durable_approvals = InMemoryApprovalStore()
     app.state.durable_scope = "web:local"
     app.state.engine = None
+    app.state.shared_run_substrate = True  # simulate a shared durable substrate with doubles
     app.state.enqueue = _enqueue
     client = TestClient(app)
 

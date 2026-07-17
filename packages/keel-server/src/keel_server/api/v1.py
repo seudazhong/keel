@@ -32,7 +32,7 @@ from keel_core.api import (
     CreateMessageResponse,
     JobResponse,
 )
-from keel_core.approvals import ApprovalStore
+from keel_core.approvals import ApprovalStore, InMemoryApprovalStore, PostgresApprovalStore
 from keel_core.consolidation import (
     MemoryProposal,
     MemoryProposalStore,
@@ -40,26 +40,43 @@ from keel_core.consolidation import (
     ProposalResolution,
     consolidation_schedule_id,
 )
-from keel_core.errors import PermissionDenied
+from keel_core.errors import CrossScopeError
 from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
 from keel_core.identity import NotFoundError
-from keel_core.interactive import LOCAL_PREVIEW_AGENT_ID, LOCAL_PREVIEW_ORG_ID
 from keel_core.jobs import JobStatus, JobStore, JobValidationError
 from keel_core.loop import admit
+from keel_core.protocols import EventStore
 from keel_core.run_service import DurableRunService
-from keel_core.runs import RunAdmissionConflict, RunControlKind, RunRecord, RunStore, RunSurface
+from keel_core.runs import (
+    PostgresRunStore,
+    RunAdmissionConflict,
+    RunControlKind,
+    RunRecord,
+    RunStore,
+    RunSurface,
+)
+from keel_core.scoping import LOCAL_PREVIEW_SCOPE
 from keel_core.search import hybrid_search_sessions
 from keel_core.state import InMemoryEventStore, PostgresEventStore, list_sessions
 from keel_core.tokens import delete_token, list_connected
-from keel_core.types import PermissionDecision
+from keel_core.types import PermissionDecision, ScopeId
 from keel_server.auth import Role, require_role
+from keel_server.endpoint_auth import (
+    EndpointAuth,
+    EndpointPrivilege,
+    require_authenticated,
+    require_privilege,
+)
 from keel_server.identity_context import Actor, resolve_actor
 from keel_server.runtime import AgentRuntime
 
-# Baseline authorization: every /v1 route needs at least `viewer`. In open mode (no
-# KEEL_API_KEYS) that resolves to an implicit admin, so single-user stays unauthenticated;
-# with keys configured, reads need viewer while mutations/admin raise the bar per-route.
-router = APIRouter(prefix="/v1", tags=["v1"], dependencies=[Depends(require_role(Role.viewer))])
+# Baseline authorization: every /v1 route needs an authenticated caller. Unlike the previous
+# API-key-only gate, a verified OIDC user is accepted here (not rejected as an unknown API
+# key — the fix for the JWT-rejected-first defect); API-key machines and the non-cloud local
+# operator keep the hashed-key/open path. Fine-grained privilege + the derived per-Agent
+# data-plane scope are enforced per-route via require_privilege; scope-wide management routes
+# keep the coarse API-key require_role gate (preserving API-key behavior).
+router = APIRouter(prefix="/v1", tags=["v1"], dependencies=[Depends(require_authenticated)])
 
 
 def _runtime(request: Request) -> AgentRuntime:
@@ -79,30 +96,72 @@ def _jobs(request: Request) -> JobStore:
     return store
 
 
-def _durable_approvals(request: Request) -> tuple[ApprovalStore, str]:
-    store: ApprovalStore | None = getattr(request.app.state, "durable_approvals", None)
-    if store is None:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "durable approvals unavailable")
-    scope: str = getattr(request.app.state, "durable_scope", "web:local")
-    return store, scope
+def _shared_substrate(request: Request) -> bool:
+    """Whether the durable run substrate is shared with the worker (M3.6, item 2).
+
+    Worker-owned durable admission is only valid when the event/run/job/approval stores are a
+    **shared** Postgres substrate a separate worker process can read. In-memory / process-local
+    stores are private to this server process, so a dispatched ``run_interactive`` job would
+    reference a run the worker can never see. The signal defaults to ``engine is not None``
+    (Postgres wired); tests may set ``app.state.shared_run_substrate`` to exercise either mode
+    with in-memory doubles.
+    """
+    explicit = getattr(request.app.state, "shared_run_substrate", None)
+    if isinstance(explicit, bool):
+        return explicit
+    return getattr(request.app.state, "engine", None) is not None
 
 
-def _runs(request: Request) -> RunStore:
-    store: RunStore | None = getattr(request.app.state, "runs", None)
+def _scoped_runs(request: Request, scope_id: ScopeId) -> RunStore:
+    """A run store bound to ``scope_id`` (Postgres per-scope, or the in-memory double)."""
+    store = _maybe_scoped_runs(request, scope_id)
     if store is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "durable runs unavailable")
     return store
 
 
-async def _authorize_run(request: Request, record: RunRecord) -> None:
-    """Authorize the request's actor against a durable run's owning org (M3.6, item 6).
+def _maybe_scoped_runs(request: Request, scope_id: ScopeId) -> RunStore | None:
+    """A run store bound to ``scope_id``, or ``None`` when no durable substrate is wired."""
+    engine = getattr(request.app.state, "engine", None)
+    if engine is not None:
+        return PostgresRunStore(engine, scope_id)
+    store: RunStore | None = getattr(request.app.state, "runs", None)
+    return store
 
-    A real authenticated **user** may only touch a run whose ``org_id`` they are an active
-    member of — a cross-org run answers with the same 404 as an unknown run (no existence
-    leak). The open-mode **local** operator and configured **API-key** machines stay within
-    their single scope-bound tenant (local-preview compatibility) and are allowed; a user is
-    never permitted to use the local-preview path to cross orgs.
+
+def _scoped_events(request: Request, scope_id: ScopeId) -> EventStore:
+    """An event store bound to ``scope_id`` (Postgres per-scope, or the in-memory double)."""
+    engine = getattr(request.app.state, "engine", None)
+    if engine is not None:
+        return PostgresEventStore(engine, scope_id)
+    store: EventStore | None = getattr(request.app.state, "events", None)
+    return store if store is not None else InMemoryEventStore()
+
+
+def _scoped_approvals(request: Request, scope_id: ScopeId) -> ApprovalStore:
+    """An approval store bound to ``scope_id`` (Postgres per-scope, or the in-memory double)."""
+    engine = getattr(request.app.state, "engine", None)
+    if engine is not None:
+        return PostgresApprovalStore(engine, scope_id)
+    store: ApprovalStore | None = getattr(request.app.state, "durable_approvals", None)
+    return store if store is not None else InMemoryApprovalStore()
+
+
+async def _authorize_run(
+    request: Request, record: RunRecord, scope_id: ScopeId | None = None
+) -> None:
+    """Authorize the request's actor + derived scope against a durable run (M3.6, items 3/6).
+
+    A run may only be touched from within its own data-plane ``scope_id`` — a run admitted
+    under one org/Agent's ``agent:<org>/<agent>`` scope is invisible from another's (cross-org
+    /Agent session ids return the same 404 as an unknown run, no existence leak). A real
+    authenticated **user** must additionally be an active member of the run's ``org_id``. The
+    open-mode **local** operator / **API-key** machine stays within its single ``web:local``
+    tenant.
     """
+    if scope_id is not None and record.scope_id != scope_id:
+        # The run belongs to a different derived scope — deny without leaking existence.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
     actor = await resolve_actor(request)
     if not actor.is_user:
         return  # local-preview / API-key machine: single scope-bound tenant
@@ -131,29 +190,45 @@ def durable_actor_id(actor: Actor) -> str:
     return f"{actor.kind.value}:{actor.display_name}"
 
 
-def _durable_run_service(request: Request) -> DurableRunService:
-    """Build a :class:`DurableRunService` bound to the server's durable run/approval stores.
+def _admission_model(request: Request) -> str:
+    """The model captured in the durable admission (reproducibility, M3.6 item 5).
 
-    Used by the durable interactive approval path so resolution goes through the fully bound
-    service (org/actor/action-hash/attempt/state/expiry) and enqueues ``run_interactive``.
+    The selected model is persisted with the admission (fingerprint + admission event) so the
+    worker executes the run with the **admitted** model rather than its own process default.
+    The source is the server's configured/selected model (mutable only in non-cloud local
+    preview via ``/settings/model``); a cloud deployment captures the deployment default.
     """
-    scope: str = getattr(request.app.state, "durable_scope", "web:local")
-    engine = getattr(request.app.state, "engine", None)
-    approvals, _ = _durable_approvals(request)
+    runtime = getattr(request.app.state, "runtime", None)
+    model = getattr(runtime, "model", None)
+    if isinstance(model, str) and model:
+        return model
+    settings = getattr(request.app.state, "settings", None)
+    default = getattr(settings, "default_model", None)
+    return default if isinstance(default, str) and default else "github_copilot/claude-sonnet-4.5"
+
+
+def _durable_run_service(request: Request, scope_id: ScopeId) -> DurableRunService:
+    """Build a :class:`DurableRunService` bound to ``scope_id`` (per-Agent data plane).
+
+    The run/approval/event stores are all constructed for the *derived* scope so admission,
+    approval resolution, and dispatch stay within one org/Agent's isolated data plane — never
+    the ambient ``web:local`` shared across organizations.
+    """
+    approvals = _scoped_approvals(request, scope_id)
     # resolve_approval never reads the event store; a lightweight fallback is safe when the
     # server runs without Postgres (in-memory preview).
-    events = PostgresEventStore(engine, scope) if engine is not None else InMemoryEventStore()
+    events = _scoped_events(request, scope_id)
     enqueue_raw = getattr(request.app.state, "enqueue", None)
 
     async def _enqueue(run_id: str) -> None:
         if enqueue_raw is not None:
-            await enqueue_raw("run_interactive", run_id, scope)
+            await enqueue_raw("run_interactive", run_id, scope_id)
 
     return DurableRunService(
-        run_store=_runs(request),
+        run_store=_scoped_runs(request, scope_id),
         event_store=events,
         approvals=approvals,
-        scope_id=scope,
+        scope_id=scope_id,
         enqueue=_enqueue,
         admit_fn=admit,
     )
@@ -162,56 +237,6 @@ def _durable_run_service(request: Request) -> DurableRunService:
 def _cloud_mode(request: Request) -> bool:
     """Whether the server runs in cloud (fail-closed auth) mode; gates local-preview."""
     return bool(getattr(request.app.state, "auth_required", False))
-
-
-async def _admission_binding(request: Request) -> tuple[str, str, str]:
-    """Resolve ``(org_id, actor, agent_id)`` for a durable admission (M3.6, item 1).
-
-    A real authenticated **user** binds their selected org (``X-Keel-Org``, re-authorized as
-    an active member) and their selected **persisted Agent** (``X-Keel-Agent``, re-authorized
-    for *use* — visibility + membership + not-archived — via the identity service). This is
-    the single source of the run's tenant/actor/Agent identity; nothing is derived from the
-    ambient data-plane scope.
-
-    An open-mode **local operator** / API-key **machine** maps to the explicit, non-blank
-    local-preview compatibility profile (``local`` org + ``web`` Agent) — but **only** in
-    non-cloud mode. In cloud mode a caller with no authenticated user + selected org/Agent is
-    rejected (fail closed): no authenticated/cloud route relies on the local-preview profile.
-    """
-    actor = await resolve_actor(request)
-    if actor.is_user:
-        assert actor.user_id is not None
-        service = getattr(request.app.state, "identity", None)
-        if service is None:
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "identity service unavailable")
-        org_ref = (request.headers.get("x-keel-org") or "").strip()
-        if not org_ref:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "select an organization via the X-Keel-Org header"
-            )
-        try:
-            org_context = await service.select_org(actor.user_id, org_ref)
-        except NotFoundError:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "organization not found") from None
-        agent_ref = (request.headers.get("x-keel-agent") or "").strip()
-        if not agent_ref:
-            raise HTTPException(
-                status.HTTP_400_BAD_REQUEST, "select an Agent via the X-Keel-Agent header"
-            )
-        try:
-            agent = await service.select_agent(org_context.org_id, actor.user_id, agent_ref)
-        except NotFoundError:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found") from None
-        except PermissionDenied as exc:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from None
-        return org_context.org_id, actor.user_id, agent.id
-    if _cloud_mode(request):
-        # Fail closed: cloud admission requires an authenticated user + selected org/Agent.
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "durable admission requires an authenticated user with a selected org and Agent",
-        )
-    return LOCAL_PREVIEW_ORG_ID, durable_actor_id(actor), LOCAL_PREVIEW_AGENT_ID
 
 
 def _idempotency_key(request: Request, body: CreateMessageRequest) -> str:
@@ -234,61 +259,92 @@ def _idempotency_key(request: Request, body: CreateMessageRequest) -> str:
     response_model=CreateMessageResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Admit a user message and schedule a run",
-    dependencies=[Depends(require_role(Role.operator))],
 )
 async def create_message(
-    session_id: str, body: CreateMessageRequest, request: Request
+    session_id: str,
+    body: CreateMessageRequest,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
 ) -> CreateMessageResponse:
     """Durably admit input (FR-C5) and dispatch a **worker-owned** run; return its ``run_id``.
 
-    The durable path is the default: admission binds the request actor's org / actor /
-    selected Agent (re-authorized here), persists the user turn + run row idempotently, and
-    enqueues ``run_interactive`` for a worker to execute — there is no server-local asyncio
-    run task and no silent in-process fallback. A live run queue is **required** (explicit
-    503 when unavailable); admission never executes the run in-process.
+    Admission binds the request actor's org / actor / selected Agent (re-authorized by the
+    unified :func:`require_privilege` dependency, which accepts a verified OIDC user or the
+    non-cloud API-key/local operator and fails a cloud caller with no user closed) and derives
+    the canonical ``agent:<org>/<agent>`` data-plane scope — never the ambient ``web:local``
+    shared across orgs. It persists the user turn + run row idempotently and enqueues
+    ``run_interactive`` for a worker to execute; there is no server-local run task.
+
+    Worker-owned admission requires a **shared** durable substrate (Postgres stores + a live
+    queue): with in-memory / process-local stores a worker in another process could never see
+    the run, so we fail closed with 503 rather than accept a run a worker cannot execute.
     """
+    if not _shared_substrate(request):
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "worker-owned durable admission requires a shared Postgres run substrate; "
+            "this server is running with in-memory/process-local stores",
+        )
     enqueue = getattr(request.app.state, "enqueue", None)
     if enqueue is None:
-        # Fail closed: without a live queue the run could not be dispatched to a worker. We do
-        # NOT fall back to in-process execution — that is the process-local model M3.6 removes.
+        # Fail closed: without a live queue the run could not be dispatched to a worker.
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "run queue unavailable")
-    org_id, actor, agent_id = await _admission_binding(request)
-    service = _durable_run_service(request)
+    idempotency_key = _idempotency_key(request, body)
+    actor_id = durable_actor_id(auth.actor)
+    assert auth.org_id is not None and auth.agent_id is not None
+    service = _durable_run_service(request, auth.scope_id)
     try:
         result = await service.admit(
-            org_id=org_id,
-            actor=actor,
-            agent_id=agent_id,
+            org_id=auth.org_id,
+            actor=actor_id,
+            agent_id=auth.agent_id,
             session_id=session_id,
             surface=RunSurface.web.value,
             content=body.content,
-            idempotency_key=_idempotency_key(request, body),
+            idempotency_key=idempotency_key,
+            model=_admission_model(request),
         )
     except RunAdmissionConflict:
         # Same idempotency identity, different immutable binding/content: reject (never repair
         # with attacker/client-supplied values). The caller must use a fresh idempotency key.
         raise HTTPException(status.HTTP_409_CONFLICT, "admission identity conflict") from None
-    return CreateMessageResponse(session_id=session_id, run_id=result.run_id)
+    except CrossScopeError:
+        # The session id is globally owned by a different org/Agent's scope. Deny with the same
+        # 404 as an unknown session (no cross-scope write, no existence leak).
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found") from None
+    # Even when the post-commit worker enqueue could not be delivered (dispatch_pending), the
+    # run is durably accepted (202): the reconciler redispatches it. Returning an error here
+    # would make the client retry and risk a duplicate run.
+    return CreateMessageResponse(
+        session_id=session_id,
+        run_id=result.run_id,
+        idempotency_key=idempotency_key,
+        dispatch_pending=result.dispatch_pending,
+    )
 
 
 @router.post(
     "/runs/{run_id}/interrupt",
     summary="Interrupt a running agent run",
-    dependencies=[Depends(require_role(Role.operator))],
 )
-async def interrupt_run(run_id: str, request: Request) -> dict[str, bool]:
+async def interrupt_run(
+    run_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
+) -> dict[str, bool]:
     """Ask an in-flight run to stop at its next iteration (StopReason.interrupted).
 
     Records a **durable** interrupt against the run so a worker honours it across a
     server/worker restart, and (best-effort) also flips the local-preview in-process runtime
-    flag so a same-process run stops immediately.
+    flag so a same-process run stops immediately. The run is looked up within the caller's
+    derived scope, so a cross-org/Agent run id is invisible (404).
     """
     durable = False
-    store: RunStore | None = getattr(request.app.state, "runs", None)
+    store = _maybe_scoped_runs(request, auth.scope_id)
     if store is not None:
         record = await store.get(run_id)
-        if record is not None:
-            await _authorize_run(request, record)
+        if record is not None and record.scope_id == auth.scope_id:
+            await _authorize_run(request, record, auth.scope_id)
             durable = await store.request_control(
                 run_id, kind=RunControlKind.interrupt, requested_by="web"
             )
@@ -299,18 +355,22 @@ async def interrupt_run(run_id: str, request: Request) -> dict[str, bool]:
 @router.post(
     "/runs/{run_id}/steer",
     summary="Steer a running agent run (durable steering message)",
-    dependencies=[Depends(require_role(Role.operator))],
 )
-async def steer_run(run_id: str, body: dict[str, Any], request: Request) -> dict[str, bool]:
+async def steer_run(
+    run_id: str,
+    body: dict[str, Any],
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
+) -> dict[str, bool]:
     """Record a durable steering message consumed by the owning worker mid-run."""
     text_value = str(body.get("text", "")).strip()
     if not text_value:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "text is required")
-    store = _runs(request)
+    store = _scoped_runs(request, auth.scope_id)
     record = await store.get(run_id)
-    if record is None:
+    if record is None or record.scope_id != auth.scope_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown or terminal run")
-    await _authorize_run(request, record)
+    await _authorize_run(request, record, auth.scope_id)
     ok = await store.request_control(
         run_id, kind=RunControlKind.steer, requested_by="web", payload={"text": text_value}
     )
@@ -320,12 +380,16 @@ async def steer_run(run_id: str, body: dict[str, Any], request: Request) -> dict
 
 
 @router.get("/runs/{run_id}", summary="Get durable run status")
-async def get_run(run_id: str, request: Request) -> dict[str, object]:
+async def get_run(
+    run_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> dict[str, object]:
     """Read the durable run's authoritative status/attempt/cost (worker-owned execution)."""
-    record = await _runs(request).get(run_id)
-    if record is None:
+    record = await _scoped_runs(request, auth.scope_id).get(run_id)
+    if record is None or record.scope_id != auth.scope_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
-    await _authorize_run(request, record)
+    await _authorize_run(request, record, auth.scope_id)
     return {
         "id": record.id,
         "status": record.status.value,
@@ -490,21 +554,59 @@ async def get_model(request: Request) -> dict[str, object]:
     runtime = _runtime(request)
     current = runtime.model
     available = _AVAILABLE_MODELS if current in _AVAILABLE_MODELS else [current, *_AVAILABLE_MODELS]
-    return {"current": current, "available": available}
+    # In cloud/authenticated mode the model is captured per-run at admission (bound to the
+    # selected Agent), not a mutable server-global; surface that so a client does not expect a
+    # global switch to take effect.
+    return {"current": current, "available": available, "mutable": not _cloud_mode(request)}
 
 
 @router.put(
     "/settings/model",
-    summary="Switch the model for subsequent runs",
+    summary="Switch the model for subsequent runs (local preview only)",
     dependencies=[Depends(require_role(Role.operator))],
 )
 async def set_model(request: Request, body: dict[str, Any]) -> dict[str, object]:
+    """Switch the process model — **local preview only**.
+
+    In non-cloud local preview the server runtime executes runs, so switching its model takes
+    effect for subsequent admissions (the admitted model is captured per-run). In cloud mode
+    the worker executes runs with the model captured at admission from the selected Agent, so
+    a server-global switch would be silently ignored — we fail closed (409) rather than report
+    a success the worker never honours. Model selection is per-Agent/per-run in cloud.
+    """
     model = str(body.get("model", "")).strip()
     if not model:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "model is required")
+    if _cloud_mode(request):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "model selection is bound to the selected Agent at admission in cloud mode; "
+            "the server-global model cannot be switched here",
+        )
     runtime = _runtime(request)
     runtime.set_model(model)
     return {"ok": True, "current": model}
+
+
+async def _session_in_scope(request: Request, session_id: str, scope_id: ScopeId) -> bool:
+    """Whether ``session_id`` has any durable event in ``scope_id`` (ownership check).
+
+    Used to authorize history/SSE access: a session id that belongs to a different org/Agent's
+    derived scope has no events in *this* scope, so it is treated as not found (no cross-scope
+    read, no existence leak). The local-preview scope is the single-operator tenant and is
+    always allowed.
+    """
+    if scope_id == LOCAL_PREVIEW_SCOPE:
+        return True
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        # No durable substrate to check against; the scoped in-memory replay is empty anyway.
+        store = _scoped_events(request, scope_id)
+    else:
+        store = PostgresEventStore(engine, scope_id)
+    async for _event in store.read(session_id):
+        return True
+    return False
 
 
 @router.get(
@@ -512,21 +614,49 @@ async def set_model(request: Request, body: dict[str, Any]) -> dict[str, object]
     summary="Stream session events (SSE, replayable via after=)",
 )
 async def stream_events(
-    session_id: str, request: Request, after: int | None = None
+    session_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+    after: int | None = None,
 ) -> StreamingResponse:
-    """Server-Sent Events: replay from ``after`` then follow the run live."""
-    runtime = _runtime(request)
+    """Server-Sent Events: replay from ``after`` then follow the run live.
 
-    async def _events() -> AsyncIterator[str]:
-        async for event in runtime.tail(session_id, after):
+    The stream is bound to the caller's derived data-plane scope: a session id from another
+    org/Agent's scope has no events here and answers 404 (no cross-scope read). The local
+    single-operator preview streams live via the in-process runtime fan-out; an authenticated
+    per-Agent scope replays its isolated durable event log.
+    """
+    if not await _session_in_scope(request, session_id, auth.scope_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+
+    if auth.scope_id == LOCAL_PREVIEW_SCOPE:
+        runtime = _runtime(request)
+
+        async def _live() -> AsyncIterator[str]:
+            async for event in runtime.tail(session_id, after):
+                if await request.is_disconnected():
+                    break
+                data = f"data: {event.model_dump_json()}\n\n"
+                # Partial deltas carry no durable seq; only real events advance the cursor.
+                yield f"id: {event.seq}\n{data}" if event.seq else data
+
+        return StreamingResponse(
+            _live(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    store = _scoped_events(request, auth.scope_id)
+
+    async def _replay() -> AsyncIterator[str]:
+        async for event in store.read(session_id, after):
             if await request.is_disconnected():
                 break
             data = f"data: {event.model_dump_json()}\n\n"
-            # Partial deltas carry no durable seq; only real events advance the cursor.
             yield f"id: {event.seq}\n{data}" if event.seq else data
 
     return StreamingResponse(
-        _events(),
+        _replay(),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
@@ -558,25 +688,25 @@ async def resolve_approval(
 
 @router.get("/approvals", summary="List durable approvals for the current scope")
 async def list_approvals(
-    request: Request, status_filter: str = Query("pending", alias="status")
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+    status_filter: str = Query("pending", alias="status"),
 ) -> list[dict[str, object]]:
-    """Durable approvals visible to the requesting actor (pending queue by default).
+    """Durable approvals for the caller's derived data-plane scope (pending queue by default).
 
-    The durable interactive runtime shares a single data-plane scope across orgs, so a raw
-    ``list_pending`` would leak one org's tool/args to another (M3.6, item 8). Each approval
-    is therefore filtered by ownership: a **durable interactive** approval (its ``run_id`` is
-    a durable run) is exposed only to an actor authorized for that run's org — a cloud user
-    must be an active member; the local/machine single-tenant operator sees its own scope.
-    A **legacy local-preview** approval (no durable run row) is explicitly isolated to the
-    local/machine operator and labeled ``origin=local-preview`` — never surfaced to a cloud
-    user's org view.
+    Approvals are listed within the caller's derived ``agent:<org>/<agent>`` scope (or the
+    local-preview scope), so one org/Agent's tool/args are never surfaced to another. Each
+    durable-interactive approval (its ``run_id`` is a durable run) is still cross-checked
+    against the run's org membership for a user; a **legacy local-preview** approval (no
+    durable run row) is isolated to the local/machine operator and labeled
+    ``origin=local-preview``.
     """
-    store, scope = _durable_approvals(request)
+    store = _scoped_approvals(request, auth.scope_id)
     if status_filter != "pending":
         return []
-    actor = await resolve_actor(request)
-    run_store: RunStore | None = getattr(request.app.state, "runs", None)
-    rows = await store.list_pending(scope)
+    actor = auth.actor
+    run_store = _maybe_scoped_runs(request, auth.scope_id)
+    rows = await store.list_pending(auth.scope_id)
     org_access: dict[str, bool] = {}
     result: list[dict[str, object]] = []
     for r in rows:
@@ -631,27 +761,30 @@ async def _may_access_org(request: Request, actor: Any, org_id: str) -> bool:
     return True
 
 
-async def _resolve_durable(request: Request, approval_id: str, decision: str) -> dict[str, bool]:
+async def _resolve_durable(
+    request: Request, approval_id: str, decision: str, auth: EndpointAuth
+) -> dict[str, bool]:
     """Resolve a durable approval, routing durable-interactive runs through the bound service.
 
-    A durable **interactive** run's approval (its ``run_id`` is a row in the durable run
-    store) resolves through :class:`DurableRunService` — fully bound to the resolver's
+    A durable **interactive** run's approval (its ``run_id`` is a row in the derived-scope
+    run store) resolves through :class:`DurableRunService` — fully bound to the resolver's
     org/actor and the approval's action-hash/attempt, gated on the run being
     ``waiting_approval`` and not expired — which transitions ``waiting_approval -> queued``
     and enqueues ``run_interactive`` (the worker owns the resume). A **legacy** scheduled/
-    digest approval keeps the existing ``resume_run`` behavior.
+    digest approval keeps the existing ``resume_run`` behavior. Everything is scoped to the
+    caller's derived data plane, so a cross-org/Agent approval id is invisible.
     """
-    store, _ = _durable_approvals(request)
+    store = _scoped_approvals(request, auth.scope_id)
     record = await store.get(approval_id)
     if record is None:
         return {"ok": False}
-    run_store: RunStore | None = getattr(request.app.state, "runs", None)
+    run_store = _maybe_scoped_runs(request, auth.scope_id)
     durable_run = await run_store.get(record.run_id) if run_store is not None else None
     if durable_run is not None:
         # Durable interactive path — bound resolution + run_interactive resume.
-        await _authorize_run(request, durable_run)
-        actor = await resolve_actor(request)
-        service = _durable_run_service(request)
+        await _authorize_run(request, durable_run, auth.scope_id)
+        actor = auth.actor
+        service = _durable_run_service(request, auth.scope_id)
         ok = await service.resolve_approval(
             approval_id,
             approved=decision == "granted",
@@ -674,19 +807,25 @@ async def _resolve_durable(request: Request, approval_id: str, decision: str) ->
 @router.post(
     "/approvals/{approval_id}/approve",
     summary="Approve a durable approval",
-    dependencies=[Depends(require_role(Role.operator))],
 )
-async def approve_durable(approval_id: str, request: Request) -> dict[str, bool]:
-    return await _resolve_durable(request, approval_id, "granted")
+async def approve_durable(
+    approval_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
+) -> dict[str, bool]:
+    return await _resolve_durable(request, approval_id, "granted", auth)
 
 
 @router.post(
     "/approvals/{approval_id}/reject",
     summary="Reject a durable approval",
-    dependencies=[Depends(require_role(Role.operator))],
 )
-async def reject_durable(approval_id: str, request: Request) -> dict[str, bool]:
-    return await _resolve_durable(request, approval_id, "denied")
+async def reject_durable(
+    approval_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
+) -> dict[str, bool]:
+    return await _resolve_durable(request, approval_id, "denied", auth)
 
 
 def _short_scope(scope: str) -> str:
@@ -706,13 +845,15 @@ CONNECTOR_CATALOG: list[dict[str, object]] = [
 
 
 @router.get("/connectors", summary="List connectors and connection status for the scope")
-async def list_connectors(request: Request) -> list[dict[str, object]]:
-    """Known connectors joined with per-scope connection status (no token decryption)."""
+async def list_connectors(
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> list[dict[str, object]]:
+    """Known connectors joined with the derived-scope connection status (no token decryption)."""
     engine = getattr(request.app.state, "engine", None)
-    scope = getattr(request.app.state, "durable_scope", "web:local")
     connected: dict[str, str | None] = {}
     if engine is not None:
-        for info in await list_connected(engine, scope):
+        for info in await list_connected(engine, auth.scope_id):
             connected[info.connector_id] = info.updated_at.isoformat() if info.updated_at else None
     return [
         {**c, "connected": str(c["id"]) in connected, "updated_at": connected.get(str(c["id"]))}
@@ -723,21 +864,25 @@ async def list_connectors(request: Request) -> list[dict[str, object]]:
 @router.delete(
     "/connectors/{connector_id}",
     summary="Revoke a connector's stored token",
-    dependencies=[Depends(require_role(Role.operator))],
 )
-async def revoke_connector(connector_id: str, request: Request) -> dict[str, bool]:
-    """Delete the scope's stored token for a connector (revoke access)."""
+async def revoke_connector(
+    connector_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
+) -> dict[str, bool]:
+    """Delete the derived scope's stored token for a connector (revoke access)."""
     engine = getattr(request.app.state, "engine", None)
-    scope = getattr(request.app.state, "durable_scope", "web:local")
-    revoked = engine is not None and await delete_token(engine, scope, connector_id)
+    revoked = engine is not None and await delete_token(engine, auth.scope_id, connector_id)
     return {"ok": bool(revoked)}
 
 
 @router.get("/sessions", summary="List the scope's sessions (newest first)")
-async def list_sessions_endpoint(request: Request) -> list[dict[str, object]]:
-    """Session summaries for the Sessions list (title preview + message count)."""
+async def list_sessions_endpoint(
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> list[dict[str, object]]:
+    """Session summaries for the Sessions list (title preview + message count), scoped."""
     engine = getattr(request.app.state, "engine", None)
-    scope = getattr(request.app.state, "durable_scope", "web:local")
     if engine is None:
         return []
     return [
@@ -748,7 +893,7 @@ async def list_sessions_endpoint(request: Request) -> list[dict[str, object]]:
             "created_at": s.created_at.isoformat(),
             "updated_at": s.updated_at.isoformat(),
         }
-        for s in await list_sessions(engine, scope)
+        for s in await list_sessions(engine, auth.scope_id)
     ]
 
 
@@ -756,11 +901,11 @@ async def list_sessions_endpoint(request: Request) -> list[dict[str, object]]:
 async def search_sessions_endpoint(
     request: Request,
     response: Response,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
     q: str = Query(""),
 ) -> list[dict[str, object]]:
-    """Rank sessions by lexical + semantic RRF, with explicit degradation mode."""
+    """Rank sessions by lexical + semantic RRF within the derived scope, with degradation."""
     engine = getattr(request.app.state, "engine", None)
-    scope = getattr(request.app.state, "durable_scope", "web:local")
     runtime = getattr(request.app.state, "runtime", None)
     embedder = getattr(runtime, "embedder", None)
     batch_size = int(getattr(runtime, "session_embedding_batch_size", 64))
@@ -771,7 +916,7 @@ async def search_sessions_endpoint(
 
     hits, recall_status = await hybrid_search_sessions(
         engine,
-        scope,
+        auth.scope_id,
         q,
         embedder=embedder,
         batch_size=batch_size,
@@ -791,22 +936,30 @@ async def search_sessions_endpoint(
 
 
 @router.get("/sessions/{session_id}/history", summary="Durable event history for a session")
-async def session_history(session_id: str, request: Request) -> list[dict[str, object]]:
-    """The session's durable event log (oldest first) for a read-only replay."""
+async def session_history(
+    session_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> list[dict[str, object]]:
+    """The session's durable event log (oldest first) for a read-only replay, scoped.
+
+    The session must belong to the caller's derived scope: a cross-org/Agent session id has no
+    events here and answers 404 (no cross-scope read).
+    """
     engine = getattr(request.app.state, "engine", None)
-    scope = getattr(request.app.state, "durable_scope", "web:local")
     if engine is None:
         return []
-    store = PostgresEventStore(engine, scope)
+    if not await _session_in_scope(request, session_id, auth.scope_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    store = PostgresEventStore(engine, auth.scope_id)
     return [event.model_dump(mode="json") async for event in store.read(session_id)]
 
 
-def _proposal_store(request: Request) -> tuple[MemoryProposalStore, str]:
+def _proposal_store(request: Request, scope_id: ScopeId) -> MemoryProposalStore:
     engine = getattr(request.app.state, "engine", None)
-    scope: str = getattr(request.app.state, "durable_scope", "web:local")
     if engine is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "datastore unavailable")
-    return MemoryProposalStore(engine, scope), scope
+    return MemoryProposalStore(engine, scope_id)
 
 
 def _proposal_dict(proposal: MemoryProposal) -> dict[str, object]:
@@ -846,45 +999,54 @@ def _resolution_response(resolution: ProposalResolution) -> JSONResponse:
 
 @router.get("/memory/proposals", summary="List core-memory rewrite proposals for the scope")
 async def list_memory_proposals(
-    request: Request, status_filter: str | None = Query(None, alias="status")
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+    status_filter: str | None = Query(None, alias="status"),
 ) -> list[dict[str, object]]:
-    """Core-memory rewrite proposals awaiting (or past) human review."""
-    store, _ = _proposal_store(request)
+    """Core-memory rewrite proposals awaiting (or past) human review, scoped."""
+    store = _proposal_store(request, auth.scope_id)
     return [_proposal_dict(p) for p in await store.list_proposals(status=status_filter)]
 
 
 @router.post(
     "/memory/proposals/{proposal_id}/approve",
     summary="Approve a proposal (atomically apply it to core memory)",
-    dependencies=[Depends(require_role(Role.operator))],
 )
-async def approve_memory_proposal(proposal_id: str, request: Request) -> JSONResponse:
+async def approve_memory_proposal(
+    proposal_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
+) -> JSONResponse:
     """Apply the proposal under an optimistic version check; stale ones 409."""
-    store, _ = _proposal_store(request)
+    store = _proposal_store(request, auth.scope_id)
     return _resolution_response(await store.approve(proposal_id, "web"))
 
 
 @router.post(
     "/memory/proposals/{proposal_id}/reject",
     summary="Reject a proposal (no change to core memory)",
-    dependencies=[Depends(require_role(Role.operator))],
 )
-async def reject_memory_proposal(proposal_id: str, request: Request) -> JSONResponse:
+async def reject_memory_proposal(
+    proposal_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
+) -> JSONResponse:
     """Mark the proposal rejected; core memory is untouched."""
-    store, _ = _proposal_store(request)
+    store = _proposal_store(request, auth.scope_id)
     return _resolution_response(await store.reject(proposal_id, "web"))
 
 
 @router.post(
     "/memory/consolidation/run",
     summary="Enqueue a memory-consolidation run for the scope now",
-    dependencies=[Depends(require_role(Role.operator))],
 )
-async def run_consolidation(request: Request) -> dict[str, bool]:
-    """Manually trigger the scope's consolidation schedule (same path as the daily tick)."""
+async def run_consolidation(
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
+) -> dict[str, bool]:
+    """Manually trigger the derived scope's consolidation schedule (same path as the tick)."""
     enqueue = getattr(request.app.state, "enqueue", None)
-    scope = getattr(request.app.state, "durable_scope", "web:local")
     if enqueue is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "job queue unavailable")
-    await enqueue("run_agent", consolidation_schedule_id(scope))
+    await enqueue("run_agent", consolidation_schedule_id(auth.scope_id))
     return {"ok": True}

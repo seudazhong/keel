@@ -30,6 +30,13 @@ class CreateMessageResponse(BaseModel):
     session_id: SessionId
     run_id: RunId
     accepted: bool = True
+    # Echo the idempotency key the admission was deduped on (header/body/generated) so a
+    # client can correlate a retry with the accepted run.
+    idempotency_key: str | None = None
+    # True when the run committed durably but its worker dispatch could not be delivered; the
+    # durable reconciler will redispatch it. The run is still accepted — the client must not
+    # treat this as a failure or retry (that would risk a duplicate run).
+    dispatch_pending: bool = False
 
 
 class ApprovalResolution(BaseModel):

@@ -230,6 +230,12 @@ class AdmitResult:
 
     run_id: RunId
     created: bool
+    # True when the durable admission committed (run row + prompt + ``queued``) but the
+    # post-commit worker enqueue could not be delivered (e.g. the queue was briefly
+    # unavailable). The run is still accepted (202): the durable reconciler redispatches
+    # queued-but-undispatched runs, so the caller must NOT surface an error / retry — doing
+    # so would risk a duplicate run. See :meth:`DurableRunService.admit`.
+    dispatch_pending: bool = False
 
 
 async def prompt_persisted_in_log(
@@ -288,6 +294,7 @@ class DurableRunService:
         budget: RunBudgetSpec | None = None,
         ttl_seconds: int | None = None,
         run_id: RunId | None = None,
+        model: str | None = None,
         now: datetime | None = None,
     ) -> AdmitResult:
         """Idempotently admit a run and complete admission with crash-safe repair.
@@ -300,12 +307,18 @@ class DurableRunService:
         never leaves a prompt-less run behind. The prompt is always persisted *before* the
         queued/dispatch transition (invariant I2). A retry whose immutable fingerprint
         mismatches the persisted admission raises :class:`~keel_core.runs.RunAdmissionConflict`
-        rather than repairing with the caller-supplied binding/content."""
+        rather than repairing with the caller-supplied binding/content.
+
+        ``model`` — the model selected at admission — is folded into the immutable fingerprint
+        and persisted in the admission event so the worker executes the run with the admitted
+        model (reproducibility) rather than its own process default. It is part of the
+        immutable identity: a retry that reuses the idempotency key but changes the model is a
+        conflict."""
         now = now or datetime.now(UTC)
         run_id = run_id or uuid.uuid4().hex
         expires_at = now + timedelta(seconds=ttl_seconds or self._default_ttl_seconds)
         # Immutable admission fingerprint: a retry that reuses the identity but mismatches the
-        # tenant/actor/agent/session/surface/content is rejected as a conflict by the store.
+        # tenant/actor/agent/session/surface/content/model is rejected as a conflict.
         fingerprint = admission_fingerprint(
             org_id=org_id,
             actor=actor,
@@ -313,6 +326,7 @@ class DurableRunService:
             session_id=session_id,
             surface=surface,
             content=content,
+            model=model,
         )
         record, created = await self._runs.create(
             run_id=run_id,
@@ -339,14 +353,30 @@ class DurableRunService:
         # 1) Persist the user turn *before* any dispatch (invariant I2), exactly once — a
         #    concurrent/duplicate admitter loses the durable-append race (DuplicateEventError)
         #    and observes the winner's turn rather than appending a second prompt.
-        await self._ensure_prompt(record.id, session_id, content)
+        await self._ensure_prompt(record.id, session_id, content, model)
         # 2) admitted -> queued is an atomic, single-winner transition; only the caller that
         #    wins it dispatches, so N concurrent admitters enqueue the worker job exactly once
         #    (a lost enqueue after this point is repaired by the reconciler, not re-sent here).
         queued = await self._runs.mark_queued(record.id, now=now)
+        dispatch_pending = False
         if queued:
-            # 3) Dispatch a worker job (a duplicate enqueue is deduped by the claim).
-            await self._enqueue(record.id)
+            # 3) Dispatch a worker job (a duplicate enqueue is deduped by the claim). The
+            #    durable admission (run row + prompt + queued) has ALREADY committed, so a
+            #    failed enqueue must NOT propagate as an error: that would make the caller
+            #    retry and risk a duplicate run. We swallow the enqueue failure, mark the
+            #    admission as dispatch-pending, and rely on the durable reconciler to
+            #    redispatch queued-but-undispatched runs (durable-outbox reconciliation).
+            try:
+                await self._enqueue(record.id)
+            except Exception:  # noqa: BLE001 - dispatch is best-effort; the reconciler backs it up
+                dispatch_pending = True
+                logger.warning(
+                    "run dispatch pending scope=%s run=%s (enqueue failed; reconciler will "
+                    "redispatch)",
+                    self._scope_id,
+                    record.id,
+                    exc_info=True,
+                )
         if created:
             logger.info(
                 "run admitted scope=%s run=%s org=%s actor=%s agent=%s session=%s surface=%s",
@@ -358,9 +388,11 @@ class DurableRunService:
                 session_id,
                 surface,
             )
-        return AdmitResult(run_id=record.id, created=created)
+        return AdmitResult(run_id=record.id, created=created, dispatch_pending=dispatch_pending)
 
-    async def _ensure_prompt(self, run_id: RunId, session_id: SessionId, content: str) -> None:
+    async def _ensure_prompt(
+        self, run_id: RunId, session_id: SessionId, content: str, model: str | None = None
+    ) -> None:
         """Append the admission user turn exactly once (crash- and concurrency-safe).
 
         The ``dedup_key`` partial-unique index makes the append atomic across processes: two
@@ -372,7 +404,7 @@ class DurableRunService:
             await self._runs.mark_prompt_persisted(run_id)
             return
         try:
-            await admit_run(self._events, session_id, self._scope_id, content, run_id)
+            await admit_run(self._events, session_id, self._scope_id, content, run_id, model=model)
         except DuplicateEventError:
             pass  # a concurrent admitter won the durable append; observe, never duplicate
         await self._runs.mark_prompt_persisted(run_id)

@@ -27,7 +27,11 @@ from keel_core.tools.files import EditTool, GlobTool, GrepTool, LsTool, ReadTool
 from keel_core.tools.rpc import SandboxExecutionEnvironment
 from keel_core.tools.rpc_auth import RpcRequestSigner, RpcRequestVerifier
 from keel_core.tools.shell import ShellTool
-from keel_core.tools.wiring import ExecutionBackend, build_service_execution_environment
+from keel_core.tools.wiring import (
+    ExecutionBackend,
+    build_scoped_execution_environment,
+    build_service_execution_environment,
+)
 
 __all__ = [
     "BoundedOutput",
@@ -53,6 +57,7 @@ __all__ = [
     "UnsafeLocalDevExecutionEnvironment",
     "WorkspacePathPolicy",
     "WriteRequest",
+    "build_scoped_execution_environment",
     "build_service_execution_environment",
     "ExecRequest",
     "execute",

@@ -11,19 +11,18 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import cast
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-import keel_server.api.v1 as v1
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.errors import PermissionDenied
-from keel_core.identity import NotFoundError
+from keel_core.identity import MembershipRole, NotFoundError
 from keel_core.runs import InMemoryRunStore, RunStatus
 from keel_server.app import create_app
 from keel_server.auth import Principal, Role, hash_api_key
-from keel_server.identity_context import Actor, ActorKind
+from keel_server.identity_context import Actor, ActorKind, resolve_actor
 
 _SCOPE = "web:local"
 
@@ -43,12 +42,16 @@ def _app(
     *,
     cloud: bool = False,
     api_keys: dict[str, Principal] | None = None,
+    shared: bool = True,
 ) -> TestClient:
     app = create_app()
     app.state.runs = runs
     app.state.durable_approvals = InMemoryApprovalStore()
     app.state.durable_scope = _SCOPE
     app.state.engine = None
+    # A shared durable substrate is simulated with in-memory doubles unless a test opts out to
+    # exercise the memory-mode denial (M3.6, item 2).
+    app.state.shared_run_substrate = shared
     app.state.runtime = _FakeRuntime()
     app.state.auth_required = cloud
     app.state.api_keys = api_keys or {}
@@ -63,6 +66,15 @@ def _app(
 @dataclass
 class _Org:
     org_id: str
+
+    @property
+    def membership(self) -> _Membership:
+        return _Membership()
+
+
+@dataclass
+class _Membership:
+    role: MembershipRole = MembershipRole.member
 
 
 @dataclass
@@ -97,8 +109,8 @@ class _FakeIdentity:
         raise NotFoundError("agent not found")
 
 
-def _as_user(monkeypatch: Any) -> None:
-    async def _actor(_request: object) -> Actor:
+def _as_user(client: TestClient) -> None:
+    async def _actor() -> Actor:
         return Actor(
             kind=ActorKind.user,
             api_role=Role.operator,
@@ -106,7 +118,7 @@ def _as_user(monkeypatch: Any) -> None:
             user_id="user-alice",
         )
 
-    monkeypatch.setattr(v1, "resolve_actor", _actor)
+    cast(FastAPI, client.app).dependency_overrides[resolve_actor] = _actor
 
 
 def test_local_preview_admission_binds_local_profile() -> None:
@@ -122,11 +134,11 @@ def test_local_preview_admission_binds_local_profile() -> None:
     assert (record.org_id, record.actor, record.agent_id) == ("local", "local:local", "web")
 
 
-def test_cloud_user_admission_binds_org_and_agent(monkeypatch: Any) -> None:
+def test_cloud_user_admission_binds_org_and_agent() -> None:
     runs = InMemoryRunStore()
     enqueued: list[tuple[str, tuple[object, ...]]] = []
     client = _app(runs, enqueued)
-    _as_user(monkeypatch)
+    _as_user(client)
     cast(FastAPI, client.app).state.identity = _FakeIdentity({"org-A"}, {"agent-ref": "agent-1"})
     resp = client.post(
         "/v1/sessions/s1/messages",
@@ -140,9 +152,9 @@ def test_cloud_user_admission_binds_org_and_agent(monkeypatch: Any) -> None:
     assert record.status is RunStatus.queued
 
 
-def test_cloud_user_requires_org_header(monkeypatch: Any) -> None:
+def test_cloud_user_requires_org_header() -> None:
     client = _app(InMemoryRunStore(), [])
-    _as_user(monkeypatch)
+    _as_user(client)
     cast(FastAPI, client.app).state.identity = _FakeIdentity({"org-A"}, {"agent-ref": "agent-1"})
     resp = client.post(
         "/v1/sessions/s1/messages", json={"content": "hi"}, headers={"X-Keel-Agent": "agent-ref"}
@@ -150,9 +162,9 @@ def test_cloud_user_requires_org_header(monkeypatch: Any) -> None:
     assert resp.status_code == 400
 
 
-def test_cloud_user_requires_agent_header(monkeypatch: Any) -> None:
+def test_cloud_user_requires_agent_header() -> None:
     client = _app(InMemoryRunStore(), [])
-    _as_user(monkeypatch)
+    _as_user(client)
     cast(FastAPI, client.app).state.identity = _FakeIdentity({"org-A"}, {"agent-ref": "agent-1"})
     resp = client.post(
         "/v1/sessions/s1/messages", json={"content": "hi"}, headers={"X-Keel-Org": "org-A"}
@@ -160,9 +172,9 @@ def test_cloud_user_requires_agent_header(monkeypatch: Any) -> None:
     assert resp.status_code == 400
 
 
-def test_cloud_user_non_member_org_is_404(monkeypatch: Any) -> None:
+def test_cloud_user_non_member_org_is_404() -> None:
     client = _app(InMemoryRunStore(), [])
-    _as_user(monkeypatch)
+    _as_user(client)
     cast(FastAPI, client.app).state.identity = _FakeIdentity(set(), {"agent-ref": "agent-1"})
     resp = client.post(
         "/v1/sessions/s1/messages",
@@ -172,9 +184,9 @@ def test_cloud_user_non_member_org_is_404(monkeypatch: Any) -> None:
     assert resp.status_code == 404
 
 
-def test_cloud_user_unauthorized_agent_is_403(monkeypatch: Any) -> None:
+def test_cloud_user_unauthorized_agent_is_403() -> None:
     client = _app(InMemoryRunStore(), [])
-    _as_user(monkeypatch)
+    _as_user(client)
     cast(FastAPI, client.app).state.identity = _FakeIdentity({"org-A"}, {}, denied={"agent-ref"})
     resp = client.post(
         "/v1/sessions/s1/messages",

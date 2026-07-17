@@ -62,6 +62,12 @@ class ExecutionRpcRequest(BaseModel):
     glob: str | None = None
     requested_egress_hosts: list[str] = Field(default_factory=list)
     limits: RpcLimits = Field(default_factory=RpcLimits)
+    # Opaque per-scope workspace namespace (``ws_<hex>``) requested by the caller so the
+    # executor confines file/shell operations to that scope's isolated workspace under the
+    # sandbox's configured root — never a shared writable workspace across scopes (M3.6 item
+    # 3). ``None`` means the caller did not request scoped isolation (single-workspace/local
+    # preview). A malformed value, or a scoped request a sandbox cannot provision, fails closed.
+    workspace: str | None = Field(default=None, max_length=64)
 
 
 class RpcError(BaseModel):
@@ -150,6 +156,7 @@ class SandboxExecutionEnvironment(ExecutionEnvironment):
         *,
         shared_secret: str | None = None,
         allow_unauthenticated_local_test: bool = False,
+        workspace: str | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
         if not base_url:
@@ -158,8 +165,13 @@ class SandboxExecutionEnvironment(ExecutionEnvironment):
             shared_secret,
             allow_unauthenticated_local_test=allow_unauthenticated_local_test,
         )
+        self._workspace = workspace or None
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(base_url=base_url.rstrip("/"))
+
+    def _envelope(self, **fields: Any) -> ExecutionRpcRequest:
+        """Build an RPC request, stamping the per-scope workspace namespace on every call."""
+        return ExecutionRpcRequest(workspace=self._workspace, **fields)
 
     async def _send(
         self,
@@ -244,7 +256,7 @@ class SandboxExecutionEnvironment(ExecutionEnvironment):
 
     async def execute(self, request: CommandRequest) -> ExecutionResult:
         return await self._send(
-            ExecutionRpcRequest(
+            self._envelope(
                 operation=ExecutionOperation.command,
                 command=request.command,
                 requested_egress_hosts=sorted(request.requested_egress_hosts),
@@ -255,7 +267,7 @@ class SandboxExecutionEnvironment(ExecutionEnvironment):
 
     async def read(self, request: ReadRequest) -> ExecutionResult:
         return await self._send(
-            ExecutionRpcRequest(
+            self._envelope(
                 operation=ExecutionOperation.read,
                 path=request.path,
                 limits=_rpc_limits(request.options),
@@ -265,7 +277,7 @@ class SandboxExecutionEnvironment(ExecutionEnvironment):
 
     async def write(self, request: WriteRequest) -> ExecutionResult:
         return await self._send(
-            ExecutionRpcRequest(
+            self._envelope(
                 operation=ExecutionOperation.write,
                 path=request.path,
                 content=request.content,
@@ -276,7 +288,7 @@ class SandboxExecutionEnvironment(ExecutionEnvironment):
 
     async def edit(self, request: EditRequest) -> ExecutionResult:
         return await self._send(
-            ExecutionRpcRequest(
+            self._envelope(
                 operation=ExecutionOperation.edit,
                 path=request.path,
                 old=request.old,
@@ -288,7 +300,7 @@ class SandboxExecutionEnvironment(ExecutionEnvironment):
 
     async def list(self, request: ListRequest) -> ExecutionResult:
         return await self._send(
-            ExecutionRpcRequest(
+            self._envelope(
                 operation=ExecutionOperation.list,
                 path=request.path,
                 limits=_rpc_limits(request.options),
@@ -298,7 +310,7 @@ class SandboxExecutionEnvironment(ExecutionEnvironment):
 
     async def glob(self, request: GlobRequest) -> ExecutionResult:
         return await self._send(
-            ExecutionRpcRequest(
+            self._envelope(
                 operation=ExecutionOperation.glob,
                 pattern=request.pattern,
                 limits=_rpc_limits(request.options),
@@ -308,7 +320,7 @@ class SandboxExecutionEnvironment(ExecutionEnvironment):
 
     async def grep(self, request: GrepRequest) -> ExecutionResult:
         return await self._send(
-            ExecutionRpcRequest(
+            self._envelope(
                 operation=ExecutionOperation.grep,
                 pattern=request.pattern,
                 glob=request.glob,

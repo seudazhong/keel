@@ -269,6 +269,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     engine = create_async_engine(settings.database_url)
     redis = ctx["redis"]
     ctx["engine"] = engine
+    ctx["workspace_root"] = Path.cwd()
     ctx["execution_environment"] = build_service_execution_environment(
         settings,
         Path.cwd(),

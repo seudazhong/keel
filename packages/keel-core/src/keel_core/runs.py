@@ -177,13 +177,15 @@ def admission_fingerprint(
     session_id: str,
     surface: str,
     content: str,
+    model: str | None = None,
 ) -> str:
     """Immutable fingerprint of an admission request (M3.6 blocker 3).
 
     Covers the full tenant/actor binding, the selected agent, the target session, the
-    surface, and a hash of the normalized admission content. Two admissions that share an
-    idempotency identity must present an identical fingerprint; a mismatch is a conflict.
-    Canonical JSON with sorted keys makes the hash stable across equivalent inputs."""
+    surface, the selected model, and a hash of the normalized admission content. Two
+    admissions that share an idempotency identity must present an identical fingerprint; a
+    mismatch is a conflict. Canonical JSON with sorted keys makes the hash stable across
+    equivalent inputs."""
     canonical = json.dumps(
         {
             "org_id": org_id,
@@ -191,6 +193,7 @@ def admission_fingerprint(
             "agent_id": agent_id,
             "session_id": session_id,
             "surface": surface,
+            "model": model or "",
             "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
         },
         sort_keys=True,

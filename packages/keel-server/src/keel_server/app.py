@@ -181,7 +181,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     engine = make_async_engine(settings) if settings.event_store == "postgres" else None
     app.state.redis = redis_client
     app.state.engine = engine
+    app.state.settings = settings
     app.state.durable_scope = _DURABLE_SCOPE
+    # Worker-owned durable admission is only valid with a shared Postgres substrate a separate
+    # worker process can read; in-memory stores are process-local (M3.6, item 2).
+    app.state.shared_run_substrate = engine is not None
     app.state.jobs = _build_job_store(engine, _DURABLE_SCOPE, settings)
     execution_environment = build_service_execution_environment(
         settings,
@@ -361,6 +365,13 @@ def create_app() -> FastAPI:
         except Exception as exc:  # noqa: BLE001
             checks["redis"] = f"error: {exc.__class__.__name__}"
             ready = False
+
+        # Surface whether worker-owned durable admission is available. It requires a shared
+        # Postgres run substrate a separate worker can read; with in-memory/process-local
+        # stores the message endpoint fails closed (503) rather than accept a run a worker
+        # cannot see (M3.6, item 2).
+        shared = bool(getattr(app.state, "shared_run_substrate", engine is not None))
+        checks["run_substrate"] = "shared-postgres" if shared else "in-memory (local-preview)"
 
         body = ReadinessResponse(ready=ready, checks=checks)
         return JSONResponse(body.model_dump(), status_code=200 if ready else 503)

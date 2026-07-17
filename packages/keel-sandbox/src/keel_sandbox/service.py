@@ -38,6 +38,9 @@ from keel_sandbox.policy import EgressPolicy, PathPolicy
 # container mount contract are the security boundary for shell path confinement.
 _DENIED_COMMAND_PATH = re.compile(r"(^|[/\\\s'\"=])(?:\.\.|\.git|\.env)(?=$|[/\\\s'\"=])")
 
+# An opaque per-scope workspace namespace produced by ``keel_core.scoping.workspace_namespace``.
+_WORKSPACE_NAMESPACE = re.compile(r"^ws_[0-9a-f]{1,64}$")
+
 
 def _failure(code: ExecutionErrorCode, message: str) -> ExecutionRpcResponse:
     return ExecutionRpcResponse.from_result(
@@ -57,11 +60,27 @@ class ExecutorAdmissionPolicy:
         workspace: str = "/workspace",
         *,
         egress: EgressPolicy | None = None,
+        scoped_workspaces_supported: bool = False,
     ) -> None:
         self.paths = PathPolicy(workspace)
         self.egress = egress or EgressPolicy()
+        # Whether this executor can provision an isolated per-scope workspace. When False, a
+        # request that asks for a scoped ``workspace`` namespace is denied (fail closed) rather
+        # than silently served from the single shared workspace (M3.6, item 3).
+        self.scoped_workspaces_supported = scoped_workspaces_supported
 
     def admit(self, request: ExecutionRpcRequest) -> ExecutionRpcResponse | None:
+        namespace = request.workspace
+        if namespace is not None:
+            if not _WORKSPACE_NAMESPACE.match(namespace):
+                return _failure(ExecutionErrorCode.denied, "invalid workspace namespace")
+            if not self.scoped_workspaces_supported:
+                # A scoped workspace was requested but this executor cannot provision one:
+                # fail closed rather than share a single writable workspace across scopes.
+                return _failure(
+                    ExecutionErrorCode.unavailable,
+                    "scoped workspace is not provisioned by this sandbox",
+                )
         if any(not self.egress.is_allowed(host) for host in request.requested_egress_hosts):
             return _failure(ExecutionErrorCode.denied, "network egress denied")
         path = request.path

@@ -188,6 +188,35 @@ erasure) is implemented and tested. Routing status:
   claim time (a revoke between admit and claim fails the run closed). Evidence:
   `tests/unit/test_worker_run_routing.py`.
 
+Review-finding hardening (this increment):
+
+- **Unified OIDC/API-key auth.** `/v1` no longer gates on an API-key-only dependency that
+  rejects a JWT first: a single `require_privilege` dependency resolves the actor (OIDC-first,
+  never downgraded into open-mode admin), maps org membership role → endpoint privilege, and
+  preserves API-key/local behavior. Evidence: `keel_server/endpoint_auth.py`,
+  `tests/unit/test_future_run_routing_review.py::test_real_oidc_user_admits_message`.
+- **Shared-store requirement.** Worker-owned admission requires a shared Postgres run
+  substrate (`app.state.shared_run_substrate`); with in-memory/process-local stores the
+  message endpoint returns 503 (never accepts a run a worker cannot see). Readiness surfaces
+  `run_substrate`. Evidence: `test_memory_mode_admission_denied_503`.
+- **Org/Agent data-plane isolation.** The canonical scope `agent:<org>/<agent>` is derived +
+  validated centrally (`keel_core.scoping`) and used for session/event/memory/connectors/run
+  admission and SSE/history/list/search in authenticated routes; a cross-org/Agent session id
+  is denied 404 (globally-namespaced sessions + per-scope stores). The worker builds all
+  stores/tools with `record.scope_id` (revalidated). Evidence:
+  `tests/integration/test_run_routing_postgres.py::test_two_orgs_identical_session_ids_are_isolated`.
+- **Per-scope workspace isolation.** A scoped execution-environment factory
+  (`build_scoped_execution_environment`) gives each scope its own workspace (validated opaque
+  `ws_<hash>` namespace, no traversal); the sandbox RPC carries the namespace and fails file/
+  shell closed when it cannot provision a scoped workspace (never a shared one).
+- **Dispatch failure semantics.** Once durable admission commits, a failed enqueue returns the
+  accepted run (202 + `dispatch_pending`, idempotency key echoed) and relies on the reconciler
+  — never an opaque 500 that risks duplicate retries.
+- **Persisted model selection.** The model selected at admission is captured in the admission
+  fingerprint + event; the worker executes with the admitted model, not its process default.
+  `/settings/model` updates the process model in local preview only and fails closed in cloud
+  mode (never a silent success the worker ignores).
+
 Still to do (not yet done):
 
 - **IM durable routing.** OneBot/Telegram gateways (`ImRunner`) still run the in-process

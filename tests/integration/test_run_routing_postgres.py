@@ -158,3 +158,107 @@ async def test_worker_recovers_queued_run_after_restart(migrated_db: AsyncEngine
     assert status == RunStatus.completed.value
     record = await fresh_runs.get(admitted.run_id)
     assert record is not None and record.status is RunStatus.completed
+
+
+async def test_two_orgs_identical_session_ids_are_isolated(migrated_db: AsyncEngine) -> None:
+    """Two orgs/Agents are isolated across runs/events/session lists, and a cross-scope session
+    id reuse is denied (M3.6 item 3).
+
+    Each org+Agent derives its own ``agent:<org>/<agent>`` data-plane scope. Distinct sessions
+    are fully isolated per scope; and because session ids are globally namespaced, one org can
+    never write into a session id owned by another org's scope (a hard cross-scope denial, not a
+    silent shared write).
+    """
+    from keel_core.errors import CrossScopeError
+    from keel_core.scoping import derive_agent_scope
+    from keel_core.state import list_sessions
+
+    scope_a = derive_agent_scope("orga", "agta")
+    scope_b = derive_agent_scope("orgb", "agtb")
+    runs_a = PostgresRunStore(migrated_db, scope_a)
+    runs_b = PostgresRunStore(migrated_db, scope_b)
+    events_a = PostgresEventStore(migrated_db, scope_a)
+    events_b = PostgresEventStore(migrated_db, scope_b)
+
+    async def _noop(_run_id: str) -> None:
+        return None
+
+    svc_a = DurableRunService(
+        run_store=runs_a,
+        event_store=events_a,
+        approvals=PostgresApprovalStore(migrated_db, scope_a),
+        scope_id=scope_a,
+        enqueue=_noop,
+        admit_fn=admit,
+    )
+    svc_b = DurableRunService(
+        run_store=runs_b,
+        event_store=events_b,
+        approvals=PostgresApprovalStore(migrated_db, scope_b),
+        scope_id=scope_b,
+        enqueue=_noop,
+        admit_fn=admit,
+    )
+
+    admit_a = await svc_a.admit(
+        org_id="orga",
+        actor="user-a",
+        agent_id="agta",
+        session_id="sess-a",
+        surface=RunSurface.web.value,
+        content="secret for org A",
+        idempotency_key="k",
+    )
+    admit_b = await svc_b.admit(
+        org_id="orgb",
+        actor="user-b",
+        agent_id="agtb",
+        session_id="sess-b",
+        surface=RunSurface.web.value,
+        content="secret for org B",
+        idempotency_key="k",  # identical idempotency key, different scope + session
+    )
+    assert admit_a.run_id != admit_b.run_id  # distinct runs despite identical idempotency key
+
+    for scope, run_id, reply in (
+        (scope_a, admit_a.run_id, "reply A"),
+        (scope_b, admit_b.run_id, "reply B"),
+    ):
+        provider = ScriptedProviderGateway(
+            [[ProviderChunk(delta=reply, finish_reason=FinishReason.end_turn)]]
+        )
+        ctx = _ctx(
+            PostgresRunStore(migrated_db, scope),
+            PostgresEventStore(migrated_db, scope),
+            PostgresApprovalStore(migrated_db, scope),
+            migrated_db,
+            provider,
+        )
+        assert await run_interactive(ctx, run_id, scope) == RunStatus.completed.value
+
+    # Each scope's durable event log contains ONLY its own content.
+    texts_a = " ".join([str(e.payload.get("text", "")) async for e in events_a.read("sess-a")])
+    texts_b = " ".join([str(e.payload.get("text", "")) async for e in events_b.read("sess-b")])
+    assert "org A" in texts_a and "org B" not in texts_a
+    assert "org B" in texts_b and "org A" not in texts_b
+
+    # A run admitted under org A's scope is invisible from org B's run store (cross-scope 404).
+    assert await runs_b.get(admit_a.run_id) is None
+    assert await runs_a.get(admit_b.run_id) is None
+
+    # Session listings are per-scope: each org sees exactly its own session.
+    sessions_a = await list_sessions(migrated_db, scope_a)
+    sessions_b = await list_sessions(migrated_db, scope_b)
+    assert [s.id for s in sessions_a] == ["sess-a"] and [s.id for s in sessions_b] == ["sess-b"]
+
+    # Session ids are globally namespaced: org B can never write into org A's session id.
+    with pytest.raises(CrossScopeError):
+        await svc_b.admit(
+            org_id="orgb",
+            actor="user-b",
+            agent_id="agtb",
+            session_id="sess-a",  # owned by org A's scope
+            surface=RunSurface.web.value,
+            content="attempted cross-scope write",
+            idempotency_key="k2",
+        )

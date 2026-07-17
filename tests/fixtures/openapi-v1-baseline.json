@@ -338,6 +338,22 @@
             "title": "Accepted",
             "type": "boolean"
           },
+          "dispatch_pending": {
+            "default": false,
+            "title": "Dispatch Pending",
+            "type": "boolean"
+          },
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          },
           "run_id": {
             "$ref": "#/components/schemas/RunId"
           },
@@ -2068,7 +2084,7 @@
     },
     "/v1/approvals": {
       "get": {
-        "description": "Durable approvals raised by unattended runs (pending queue by default).",
+        "description": "Durable approvals for the caller's derived data-plane scope (pending queue by default).\n\nApprovals are listed within the caller's derived ``agent:<org>/<agent>`` scope (or the\nlocal-preview scope), so one org/Agent's tool/args are never surfaced to another. Each\ndurable-interactive approval (its ``run_id`` is a durable run) is still cross-checked\nagainst the run's org membership for a user; a **legacy local-preview** approval (no\ndurable run row) is isolated to the local/machine operator and labeled\n``origin=local-preview``.",
         "operationId": "list_approvals_v1_approvals_get",
         "parameters": [
           {
@@ -2079,6 +2095,38 @@
               "default": "pending",
               "title": "Status",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -2117,7 +2165,7 @@
     },
     "/v1/approvals/{approval_id}": {
       "post": {
-        "description": "Resolve a pending tool approval (allow -> run the tool, deny -> refuse).",
+        "description": "Resolve an **in-process** tool approval (local-preview only).\n\nThis resolves a server-local :class:`~keel_server.runtime.ApprovalRegistry` future, which\nonly exists for the local-preview in-process runtime. Production Web/IM approvals are\ndurable and go through :func:`_resolve_durable` (``/approvals/{id}/approve|reject``) \u2014\norg/actor-bound, no in-memory futures. In a cloud deployment there are no in-process runs,\nso this returns 404 (nothing pending).",
         "operationId": "resolve_approval_v1_approvals__approval_id__post",
         "parameters": [
           {
@@ -2184,6 +2232,38 @@
               "title": "Approval Id",
               "type": "string"
             }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
           }
         ],
         "responses": {
@@ -2230,6 +2310,38 @@
               "title": "Approval Id",
               "type": "string"
             }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
           }
         ],
         "responses": {
@@ -2266,8 +2378,42 @@
     },
     "/v1/connectors": {
       "get": {
-        "description": "Known connectors joined with per-scope connection status (no token decryption).",
+        "description": "Known connectors joined with the derived-scope connection status (no token decryption).",
         "operationId": "list_connectors_v1_connectors_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -2283,6 +2429,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List connectors and connection status for the scope",
@@ -2370,7 +2526,7 @@
     },
     "/v1/connectors/{connector_id}": {
       "delete": {
-        "description": "Delete the scope's stored token for a connector (revoke access).",
+        "description": "Delete the derived scope's stored token for a connector (revoke access).",
         "operationId": "revoke_connector_v1_connectors__connector_id__delete",
         "parameters": [
           {
@@ -2380,6 +2536,38 @@
             "schema": {
               "title": "Connector Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4362,8 +4550,42 @@
     },
     "/v1/memory/consolidation/run": {
       "post": {
-        "description": "Manually trigger the scope's consolidation schedule (same path as the daily tick).",
+        "description": "Manually trigger the derived scope's consolidation schedule (same path as the tick).",
         "operationId": "run_consolidation_v1_memory_consolidation_run_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -4378,6 +4600,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Enqueue a memory-consolidation run for the scope now",
@@ -4388,7 +4620,7 @@
     },
     "/v1/memory/proposals": {
       "get": {
-        "description": "Core-memory rewrite proposals awaiting (or past) human review.",
+        "description": "Core-memory rewrite proposals awaiting (or past) human review, scoped.",
         "operationId": "list_memory_proposals_v1_memory_proposals_get",
         "parameters": [
           {
@@ -4405,6 +4637,38 @@
                 }
               ],
               "title": "Status"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4454,6 +4718,38 @@
               "title": "Proposal Id",
               "type": "string"
             }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
           }
         ],
         "responses": {
@@ -4494,6 +4790,38 @@
             "schema": {
               "title": "Proposal Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4536,6 +4864,38 @@
               "title": "Run Id",
               "type": "string"
             }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
           }
         ],
         "responses": {
@@ -4570,7 +4930,7 @@
     },
     "/v1/runs/{run_id}/interrupt": {
       "post": {
-        "description": "Ask an in-flight run to stop at its next iteration (StopReason.interrupted).\n\nRecords a **durable** interrupt against the run so a worker honours it across a\nserver/worker restart, and (best-effort) also flips the local-preview in-process runtime\nflag so a same-process run stops immediately.",
+        "description": "Ask an in-flight run to stop at its next iteration (StopReason.interrupted).\n\nRecords a **durable** interrupt against the run so a worker honours it across a\nserver/worker restart, and (best-effort) also flips the local-preview in-process runtime\nflag so a same-process run stops immediately. The run is looked up within the caller's\nderived scope, so a cross-org/Agent run id is invisible (404).",
         "operationId": "interrupt_run_v1_runs__run_id__interrupt_post",
         "parameters": [
           {
@@ -4580,6 +4940,38 @@
             "schema": {
               "title": "Run Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4627,6 +5019,38 @@
             "schema": {
               "title": "Run Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4804,8 +5228,42 @@
     },
     "/v1/sessions": {
       "get": {
-        "description": "Session summaries for the Sessions list (title preview + message count).",
+        "description": "Session summaries for the Sessions list (title preview + message count), scoped.",
         "operationId": "list_sessions_endpoint_v1_sessions_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -4821,6 +5279,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List the scope's sessions (newest first)",
@@ -4831,7 +5299,7 @@
     },
     "/v1/sessions/search": {
       "get": {
-        "description": "Rank sessions by lexical + semantic RRF, with explicit degradation mode.",
+        "description": "Rank sessions by lexical + semantic RRF within the derived scope, with degradation.",
         "operationId": "search_sessions_endpoint_v1_sessions_search_get",
         "parameters": [
           {
@@ -4842,6 +5310,38 @@
               "default": "",
               "title": "Q",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4880,7 +5380,7 @@
     },
     "/v1/sessions/{session_id}/events": {
       "get": {
-        "description": "Server-Sent Events: replay from ``after`` then follow the run live.",
+        "description": "Server-Sent Events: replay from ``after`` then follow the run live.\n\nThe stream is bound to the caller's derived data-plane scope: a session id from another\norg/Agent's scope has no events here and answers 404 (no cross-scope read). The local\nsingle-operator preview streams live via the in-process runtime fan-out; an authenticated\nper-Agent scope replays its isolated durable event log.",
         "operationId": "stream_events_v1_sessions__session_id__events_get",
         "parameters": [
           {
@@ -4906,6 +5406,38 @@
                 }
               ],
               "title": "After"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4937,7 +5469,7 @@
     },
     "/v1/sessions/{session_id}/history": {
       "get": {
-        "description": "The session's durable event log (oldest first) for a read-only replay.",
+        "description": "The session's durable event log (oldest first) for a read-only replay, scoped.\n\nThe session must belong to the caller's derived scope: a cross-org/Agent session id has no\nevents here and answers 404 (no cross-scope read).",
         "operationId": "session_history_v1_sessions__session_id__history_get",
         "parameters": [
           {
@@ -4947,6 +5479,38 @@
             "schema": {
               "title": "Session Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4985,7 +5549,7 @@
     },
     "/v1/sessions/{session_id}/messages": {
       "post": {
-        "description": "Durably admit input (FR-C5) and launch a run; return its ``run_id``.",
+        "description": "Durably admit input (FR-C5) and dispatch a **worker-owned** run; return its ``run_id``.\n\nAdmission binds the request actor's org / actor / selected Agent (re-authorized by the\nunified :func:`require_privilege` dependency, which accepts a verified OIDC user or the\nnon-cloud API-key/local operator and fails a cloud caller with no user closed) and derives\nthe canonical ``agent:<org>/<agent>`` data-plane scope \u2014 never the ambient ``web:local``\nshared across orgs. It persists the user turn + run row idempotently and enqueues\n``run_interactive`` for a worker to execute; there is no server-local run task.\n\nWorker-owned admission requires a **shared** durable substrate (Postgres stores + a live\nqueue): with in-memory / process-local stores a worker in another process could never see\nthe run, so we fail closed with 503 rather than accept a run a worker cannot execute.",
         "operationId": "create_message_v1_sessions__session_id__messages_post",
         "parameters": [
           {
@@ -4995,6 +5559,38 @@
             "schema": {
               "title": "Session Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -5059,6 +5655,7 @@
         ]
       },
       "put": {
+        "description": "Switch the process model \u2014 **local preview only**.\n\nIn non-cloud local preview the server runtime executes runs, so switching its model takes\neffect for subsequent admissions (the admitted model is captured per-run). In cloud mode\nthe worker executes runs with the model captured at admission from the selected Agent, so\na server-global switch would be silently ignored \u2014 we fail closed (409) rather than report\na success the worker never honours. Model selection is per-Agent/per-run in cloud.",
         "operationId": "set_model_v1_settings_model_put",
         "requestBody": {
           "content": {
@@ -5096,7 +5693,7 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Switch the model for subsequent runs",
+        "summary": "Switch the model for subsequent runs (local preview only)",
         "tags": [
           "v1"
         ]
