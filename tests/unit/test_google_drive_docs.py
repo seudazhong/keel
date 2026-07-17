@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import urllib.error
 import urllib.request
@@ -317,6 +318,16 @@ def _library_client(
     return client, credentials, seen
 
 
+def _assert_bearer_credential(value: str, expected_token: str) -> None:
+    scheme, credential = value.split(" ", 1)
+    assert scheme == "Bearer"
+    assert (
+        hashlib.sha256(credential.encode()).digest()
+        == hashlib.sha256(expected_token.encode()).digest()
+    )
+    assert value != "******"
+
+
 def test_google_client_refreshes_credentials_and_builds_drive_v3(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -343,7 +354,10 @@ def test_google_client_refreshes_credentials_and_builds_drive_v3(
     authorization_checked: list[bool] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers["Authorization"] == "Bearer refreshed-token"
+        _assert_bearer_credential(
+            request.headers["Authorization"],
+            "refreshed-token",
+        )
         authorization_checked.append(True)
         return httpx.Response(200, content=b"refreshed export")
 
@@ -626,11 +640,12 @@ def test_direct_export_stream_success_uses_fixed_origin_and_bearer_auth() -> Non
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
+        _assert_bearer_credential(request.headers["Authorization"], token)
         seen.update(
             host=request.url.host,
             raw_path=request.url.raw_path,
             mime_type=request.url.params["mimeType"],
-            authorized=request.headers["Authorization"] == f"Bearer {token}",
+            authorized=True,
             identity_encoding=request.headers["Accept-Encoding"] == "identity",
             no_range="range" not in request.headers,
         )
@@ -680,6 +695,26 @@ def test_direct_export_status_auth_and_rate_limit_classification(
     with pytest.raises(expected) as raised:
         transport.export_text("doc-1")
     assert token not in str(raised.value)
+
+
+def test_direct_export_transport_failure_never_logs_or_prints_token(
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    token = "transport-failure-secret"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_bearer_credential(request.headers["Authorization"], token)
+        raise httpx.ConnectError("network unavailable", request=request)
+
+    transport = _export_transport(handler, token=token)
+    with pytest.raises(GoogleDriveError) as raised:
+        transport.export_text("doc-1")
+    captured = capsys.readouterr()
+    assert token not in str(raised.value)
+    assert token not in caplog.text
+    assert token not in captured.out
+    assert token not in captured.err
 
 
 class _GoogleHttpError(Exception):

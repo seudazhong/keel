@@ -249,6 +249,10 @@ def _export_http_client() -> httpx.Client:
     )
 
 
+def _bearer_authorization(access_token: str) -> str:
+    return "Bearer " + access_token
+
+
 class _GoogleDriveExportTransport:
     def __init__(
         self,
@@ -273,7 +277,7 @@ class _GoogleDriveExportTransport:
                     params={"mimeType": TEXT_MIME_TYPE},
                     headers={
                         "Accept-Encoding": "identity",
-                        "Authorization": f"Bearer {self._access_token}",
+                        "Authorization": _bearer_authorization(self._access_token),
                     },
                 ) as response:
                     if response.status_code != 200:
