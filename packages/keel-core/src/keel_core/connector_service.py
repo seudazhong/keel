@@ -42,6 +42,7 @@ from keel_core.connector_registry import ConnectorRegistry
 from keel_core.connector_repository import (
     ConnectorRepository,
     ConnectorScheduleLease,
+    ConnectorScheduleLeaseLostError,
     next_schedule_time,
 )
 from keel_core.jobs import CancelMode, JobRecord, JobStore, retry_delay_seconds
@@ -816,12 +817,20 @@ class ConnectorService:
                         retry_max_seconds,
                     )
                 )
-                await self.repository.fail_schedule(
-                    lease,
-                    retry_at=retry_at,
-                    error_code="connector_schedule_dispatch_failed",
-                    error_summary="connector recurring operation dispatch failed",
-                )
+                try:
+                    await self.repository.fail_schedule(
+                        lease,
+                        retry_at=retry_at,
+                        error_code="connector_schedule_dispatch_failed",
+                        error_summary="connector recurring operation dispatch failed",
+                    )
+                except ConnectorScheduleLeaseLostError:
+                    logger.info(
+                        "connector schedule lease lost while recording failure "
+                        "connector=%s operation=%s",
+                        lease.connector_id,
+                        lease.operation.value,
+                    )
                 logger.warning(
                     "connector recurring dispatch failed connector=%s operation=%s "
                     "attempt=%d error_type=%s",

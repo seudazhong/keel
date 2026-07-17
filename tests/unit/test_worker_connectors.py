@@ -27,7 +27,11 @@ from keel_core.connector_contracts import (
     ConnectorSyncResult,
 )
 from keel_core.connector_registry import ConnectorRegistration, ConnectorRegistry
-from keel_core.connector_repository import InMemoryConnectorRepository
+from keel_core.connector_repository import (
+    ConnectorScheduleLease,
+    ConnectorScheduleLeaseLostError,
+    InMemoryConnectorRepository,
+)
 from keel_core.connector_service import (
     CONNECTOR_RENEW_JOB_KIND,
     CONNECTOR_SYNC_JOB_KIND,
@@ -335,6 +339,116 @@ async def test_recurring_dispatch_failure_backs_off_and_records_degraded_health(
     assert updated.sync_failures == 1
     assert updated.next_sync_at == binding.next_sync_at + timedelta(seconds=5)
     assert updated.error_code == "connector_schedule_dispatch_failed"
+
+
+async def test_recurring_lease_loss_while_recording_failure_does_not_abort_batch() -> None:
+    first_manifest = ConnectorManifest(
+        id="a_unavailable",
+        name="First unavailable",
+        description="first unavailable fixture",
+        auth_kind=ConnectorAuthKind.url,
+        capabilities=(ConnectorCapability.sync,),
+        default_sync_cadence_seconds=30,
+    )
+    second_manifest = ConnectorManifest(
+        id="b_unavailable",
+        name="Second unavailable",
+        description="second unavailable fixture",
+        auth_kind=ConnectorAuthKind.url,
+        capabilities=(ConnectorCapability.sync,),
+        default_sync_cadence_seconds=30,
+    )
+
+    class FirstUnavailableProvider(BaseConnectorProvider):
+        pass
+
+    class SecondUnavailableProvider(BaseConnectorProvider):
+        pass
+
+    FirstUnavailableProvider.manifest = first_manifest
+    SecondUnavailableProvider.manifest = second_manifest
+
+    def unavailable() -> None:
+        raise ModuleNotFoundError("missing optional", name="missing_sdk")
+
+    registry = ConnectorRegistry(
+        (
+            ConnectorRegistration(
+                first_manifest,
+                FirstUnavailableProvider,
+                "tests.first_unavailable",
+                availability=unavailable,
+            ),
+            ConnectorRegistration(
+                second_manifest,
+                SecondUnavailableProvider,
+                "tests.second_unavailable",
+                availability=unavailable,
+            ),
+        )
+    )
+
+    class LeaseLossRepository(InMemoryConnectorRepository):
+        def __init__(self, scope_id: str) -> None:
+            super().__init__(scope_id)
+            self.fail_calls = 0
+
+        async def fail_schedule(
+            self,
+            lease: ConnectorScheduleLease,
+            *,
+            retry_at: datetime,
+            error_code: str,
+            error_summary: str,
+        ) -> None:
+            self.fail_calls += 1
+            if self.fail_calls == 1:
+                raise ConnectorScheduleLeaseLostError("connector schedule lease was lost")
+            await super().fail_schedule(
+                lease,
+                retry_at=retry_at,
+                error_code=error_code,
+                error_summary=error_summary,
+            )
+
+    repository = LeaseLossRepository("scope:test")
+    first = await repository.upsert_binding(
+        first_manifest.id,
+        ConnectorBindingDraft(),
+        ConnectorBindingStatus.connected,
+        sync_cadence_seconds=30,
+    )
+    second = await repository.upsert_binding(
+        second_manifest.id,
+        ConnectorBindingDraft(),
+        ConnectorBindingStatus.connected,
+        sync_cadence_seconds=30,
+    )
+    assert first.next_sync_at is not None
+    assert second.next_sync_at is not None
+    due_at = max(first.next_sync_at, second.next_sync_at)
+
+    service = ConnectorService(
+        registry,
+        repository,
+        jobs=InMemoryJobStore("scope:test"),
+    )
+    assert (
+        await service.reconcile_recurring(
+            due_at,
+            limit=10,
+            lease_seconds=10,
+            retry_base_seconds=5,
+            retry_max_seconds=60,
+        )
+        == 0
+    )
+
+    assert repository.fail_calls == 2
+    updated = await repository.get_binding(second_manifest.id)
+    assert updated is not None
+    assert updated.status is ConnectorBindingStatus.degraded
+    assert updated.sync_failures == 1
 
 
 async def test_renewal_expiry_behavior_revokes_before_dispatch() -> None:
