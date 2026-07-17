@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import httpx
@@ -34,6 +34,11 @@ class FeishuClient(Protocol):
 class HttpFeishuClient:
     base_url: str = FEISHU_API_BASE
     timeout_seconds: float = 15.0
+    transport: httpx.AsyncBaseTransport | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     async def request(
         self,
@@ -46,11 +51,12 @@ class HttpFeishuClient:
     ) -> dict[str, Any]:
         if not path.startswith("/open-apis/"):
             raise ValueError("Feishu API path must stay under /open-apis/")
-        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        headers = {"Authorization": "Bearer " + token} if token else {}
         async with httpx.AsyncClient(
             base_url=self.base_url,
             timeout=self.timeout_seconds,
             follow_redirects=False,
+            transport=self.transport,
         ) as client:
             response = await client.request(
                 method,
