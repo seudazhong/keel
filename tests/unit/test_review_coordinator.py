@@ -355,6 +355,7 @@ async def test_claim_time_auth_revocation_cancels_run(tmp_path: Path) -> None:
 class _JobCtx:
     scope_id: str = "scope-1"
     job_id: str = "job-1"
+    job_lease_seconds: int = 300
     checkpoints: int = 0
 
     async def checkpoint(self) -> None:

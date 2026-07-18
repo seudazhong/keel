@@ -296,6 +296,10 @@ def _build_review_coordinator(
     """
     if engine is None or coding_root is None:
         return None
+    if not settings.review_enabled:
+        # Review explicitly disabled: the server neither builds the coordinator nor accepts/
+        # enqueues review jobs (the reviews API then fails closed with 503).
+        return None
     from keel_core.state import PostgresEventStore
 
     hosts = tuple(h.strip().lower() for h in settings.github_allowed_hosts.split(",") if h.strip())
@@ -828,8 +832,10 @@ def create_app() -> FastAPI:
         # worker writes them to. In cloud a durable substrate means reviews are offered; if the
         # shared root was unavailable/unwritable at startup the coordinator is absent, so report
         # reads (and admission) would fail. Report degraded so a load balancer drains this
-        # instance instead of accepting reviews whose reports it can never serve (WS-R, F1).
-        if settings.cloud_mode and engine is not None:
+        # instance instead of accepting reviews whose reports it can never serve (WS-R, F1). When
+        # review is explicitly disabled this instance offers no review API, so it is not a
+        # readiness concern.
+        if settings.cloud_mode and engine is not None and settings.review_enabled:
             storage_root = getattr(app.state, "project_storage_root", None)
             review_ready = (
                 getattr(app.state, "review_coordinator", None) is not None

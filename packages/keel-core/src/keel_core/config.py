@@ -220,6 +220,13 @@ class Settings(BaseSettings):
     # Read-only code review (WS-R). The model MUST come from this allowlist, never an arbitrary
     # caller string; ``default_model`` is always allowed. Budgets are always enforced and are
     # never unlimited (fail closed).
+    #
+    # ``review_enabled`` gates whether this process participates in read-only review at all. When
+    # true (default) a worker that cannot reach the shared project-storage volume the review
+    # reports live on FAILS STARTUP (crash-loops) rather than run without review handlers, and the
+    # server offers the review API. When explicitly false, a process neither enqueues nor consumes
+    # ``review.run`` jobs — a local profile with review disabled never touches shared storage.
+    review_enabled: bool = True
     review_model_allowlist: str = ""
     review_token_budget: int = Field(default=200_000, gt=0, le=2_000_000)
     review_output_max_tokens: int = Field(default=8_000, gt=0, le=32_000)

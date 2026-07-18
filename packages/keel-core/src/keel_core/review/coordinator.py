@@ -31,6 +31,7 @@ from keel_core.coding.models import CodingRunId, ProjectId
 from keel_core.coding.protocols import ArtifactStore
 from keel_core.errors import DuplicateEventError, PermissionDenied
 from keel_core.events import Event, EventType
+from keel_core.jobs import JobCancellationRequested
 from keel_core.projects.service import ProjectService
 from keel_core.projects.storage import worktree_storage_id
 from keel_core.protocols import EventStore, Usage
@@ -78,6 +79,47 @@ DEFAULT_REVIEW_LEASE_SECONDS = 900
 # request from this marker so they stay truthful across a process restart — the report artifact
 # only exists once a review completes.
 REVIEW_REQUEST_MARKER = "review_request"
+# Schema version of the durably-persisted review request metadata. v2 adds the full budget/
+# policy envelope (token/output budget, cost ceiling, provider-attempt/repair count) so the
+# exact values a review was admitted under can be reconstructed for stranded re-dispatch. A
+# record without these fields (legacy v1 / pre-budget) is reconstructed **fail-closed** (see
+# ``load_request_metadata``) rather than back-filled with larger implicit defaults.
+REVIEW_REQUEST_METADATA_VERSION = 2
+
+# A durable job-lease heartbeat must fire safely *below* the lease expiry — never on/after it.
+# The interval is derived from the ACTUAL job lease (``min(lease/3, cap)``): a third of the
+# lease keeps two consecutive missed beats inside the window, and the absolute cap keeps a
+# cancellation responsive under a very long lease. The result is ALWAYS strictly < the lease.
+JOB_HEARTBEAT_MIN_INTERVAL_SECONDS = 1.0
+JOB_HEARTBEAT_MAX_INTERVAL_SECONDS = 30.0
+
+
+def _heartbeat_interval(lease_seconds: float) -> float:
+    """A heartbeat interval strictly *below* ``lease_seconds`` (never equal to the expiry).
+
+    Uses ``min(lease/3, cap)`` bounded to a small floor. The final value is guaranteed to be
+    strictly less than the lease even for a tiny lease (e.g. a 1s lease yields 0.5s, not 1.0s),
+    so a beat can never land exactly on lease expiry.
+    """
+    if lease_seconds <= 0:
+        return JOB_HEARTBEAT_MIN_INTERVAL_SECONDS
+    interval = min(lease_seconds / 3.0, JOB_HEARTBEAT_MAX_INTERVAL_SECONDS)
+    interval = max(JOB_HEARTBEAT_MIN_INTERVAL_SECONDS, interval)
+    if interval >= lease_seconds:
+        # A very short lease (<= the floor): halve it so the beat stays strictly inside.
+        interval = lease_seconds / 2.0
+    return interval
+
+
+class _JobSignalAbort(Exception):
+    """Internal marker: the durable job heartbeat aborted the review (cancellation/lease loss).
+
+    Bridges ``asyncio.CancelledError`` (a ``BaseException``) into the single ``except Exception``
+    job-signal handler so the cancellation/lease-loss resolution runs exactly once. It never
+    escapes :meth:`ReviewCoordinator.execute_review` — the handler always re-raises the real
+    signal (``JobCancellationRequested`` / ``ReviewLeaseLost``) in its place.
+    """
+
 
 _STATUS_MAP: dict[RunStatus, ReviewStatus] = {
     RunStatus.admitted: ReviewStatus.pending,
@@ -93,7 +135,13 @@ _STATUS_MAP: dict[RunStatus, ReviewStatus] = {
 
 
 def review_fingerprint(request: ReviewRequest) -> str:
-    """Immutable binding of a review request so a reused idempotency key can't be hijacked."""
+    """Immutable binding of a review request so a reused idempotency key can't be hijacked.
+
+    Binds the full budget/policy envelope (token/output budget, cost ceiling, provider-attempt/
+    repair count) in addition to the identity/source/model, so a retry that reuses an
+    idempotency key but presents a *different* budget is a conflict rather than silently reusing
+    the original run under mismatched limits.
+    """
     payload = json.dumps(
         {
             "org_id": request.org_id,
@@ -102,6 +150,12 @@ def review_fingerprint(request: ReviewRequest) -> str:
             "head": request.head,
             "base": request.base or "",
             "model": request.model,
+            "max_findings": request.max_findings,
+            "max_diff_bytes": request.max_diff_bytes,
+            "token_budget": request.token_budget,
+            "output_max_tokens": request.output_max_tokens,
+            "cost_ceiling_usd": request.cost_ceiling_usd,
+            "max_provider_attempts": request.max_provider_attempts,
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -215,6 +269,7 @@ class ReviewCoordinator:
             ts=self._clock(),
             payload={
                 REVIEW_REQUEST_MARKER: {
+                    "version": REVIEW_REQUEST_METADATA_VERSION,
                     "org_id": request.org_id,
                     "project_id": request.project_id,
                     "source": request.source.value,
@@ -224,6 +279,13 @@ class ReviewCoordinator:
                     "agent_id": request.agent_id,
                     "max_findings": request.max_findings,
                     "max_diff_bytes": request.max_diff_bytes,
+                    # Full budget/policy envelope: the exact values the review was admitted
+                    # under, so a stranded re-dispatch reconstructs them precisely instead of
+                    # applying (possibly larger) implicit defaults.
+                    "token_budget": request.token_budget,
+                    "output_max_tokens": request.output_max_tokens,
+                    "cost_ceiling_usd": request.cost_ceiling_usd,
+                    "max_provider_attempts": request.max_provider_attempts,
                 },
                 "dedup_key": f"review-meta:{run_id}",
             },
@@ -234,28 +296,55 @@ class ReviewCoordinator:
             pass
 
     async def load_request_metadata(self, run_id: str) -> ReviewRequest | None:
-        """Reconstruct the durably-persisted review request for ``run_id`` (or ``None``)."""
+        """Reconstruct the durably-persisted review request for ``run_id`` (or ``None``).
+
+        The full budget/policy envelope (token/output budget, cost ceiling, provider-attempt/
+        repair count) is reconstructed **exactly** from the persisted metadata. A legacy record
+        that predates the budget envelope (missing any of these fields, i.e. below the current
+        metadata version) is reconstructed **fail-closed** — this returns ``None`` rather than
+        back-filling larger implicit defaults, so a stranded re-dispatch never silently runs a
+        review under a wider budget than it was admitted with.
+        """
         if self._events is None:
             return None
         async for event in self._events.read(run_id):
             meta = event.payload.get(REVIEW_REQUEST_MARKER)
             if isinstance(meta, dict):
-                try:
-                    return ReviewRequest(
-                        org_id=str(meta["org_id"]),
-                        project_id=str(meta["project_id"]),
-                        source=ReviewSource(str(meta["source"])),
-                        head=str(meta["head"]),
-                        base=str(meta["base"]) if meta.get("base") is not None else None,
-                        model=str(meta["model"]),
-                        idempotency_key=f"review-meta:{run_id}",
-                        agent_id=str(meta["agent_id"]) if meta.get("agent_id") else None,
-                        max_findings=int(meta.get("max_findings", 0)) or 1,
-                        max_diff_bytes=int(meta.get("max_diff_bytes", 0)) or 1,
-                    )
-                except (KeyError, ValueError, ReviewError):
-                    return None
+                return self._reconstruct_request(run_id, meta)
         return None
+
+    def _reconstruct_request(self, run_id: str, meta: dict[str, Any]) -> ReviewRequest | None:
+        budget_keys = (
+            "token_budget",
+            "output_max_tokens",
+            "cost_ceiling_usd",
+            "max_provider_attempts",
+        )
+        if any(meta.get(key) is None for key in budget_keys):
+            # Legacy / pre-budget metadata: fail closed rather than assume implicit defaults.
+            logger.warning(
+                "review request metadata missing budget envelope; failing closed run=%s", run_id
+            )
+            return None
+        try:
+            return ReviewRequest(
+                org_id=str(meta["org_id"]),
+                project_id=str(meta["project_id"]),
+                source=ReviewSource(str(meta["source"])),
+                head=str(meta["head"]),
+                base=str(meta["base"]) if meta.get("base") is not None else None,
+                model=str(meta["model"]),
+                idempotency_key=f"review-meta:{run_id}",
+                agent_id=str(meta["agent_id"]) if meta.get("agent_id") else None,
+                max_findings=int(meta.get("max_findings", 0)) or 1,
+                max_diff_bytes=int(meta.get("max_diff_bytes", 0)) or 1,
+                token_budget=int(meta["token_budget"]),
+                output_max_tokens=int(meta["output_max_tokens"]),
+                cost_ceiling_usd=float(meta["cost_ceiling_usd"]),
+                max_provider_attempts=int(meta["max_provider_attempts"]),
+            )
+        except (KeyError, ValueError, TypeError, ReviewError):
+            return None
 
     async def build_review_record(
         self, record: RunRecord, *, report: ReviewReport | None = None
@@ -271,13 +360,16 @@ class ReviewCoordinator:
         *,
         run_id: str,
         job_checkpoint: Callable[[], Awaitable[None]] | None = None,
+        job_lease_seconds: int | None = None,
     ) -> ReviewOutcome | None:
         """Claim + run a durably-admitted review. Idempotent/restart-safe.
 
         ``job_checkpoint`` is an optional durable job-lease heartbeat (the worker's
         ``JobContext.checkpoint``): it is invoked periodically throughout the review so a lost
         job lease or a cancellation request aborts execution *without* a terminal success under
-        a superseded fence (the durable job then retries or the reconciler terminalizes).
+        a superseded fence. ``job_lease_seconds`` is the ACTUAL durable job lease duration used
+        to derive a heartbeat interval safely below that lease's expiry (never equal); when it is
+        omitted the run lease duration is used as a conservative fallback.
         """
         record = await self._runs.get(run_id)
         if record is None:
@@ -343,14 +435,18 @@ class ReviewCoordinator:
         keeper = _LeaseKeeper(
             run_store=self._runs,
             lease=lease,
-            interval_seconds=max(1.0, self._lease_seconds / 3),
+            interval_seconds=_heartbeat_interval(self._lease_seconds),
         )
         keeper.start()
         job_keeper: _JobHeartbeatKeeper | None = None
         if job_checkpoint is not None:
+            # Heartbeat interval derives from the ACTUAL durable job lease (not the run lease):
+            # a lost job lease / cancellation must be detected safely before the job lease
+            # expires. Fall back to the run lease only when the job lease is not threaded through.
+            heartbeat_lease = job_lease_seconds if job_lease_seconds else self._lease_seconds
             job_keeper = _JobHeartbeatKeeper(
                 checkpoint=job_checkpoint,
-                interval_seconds=max(1.0, self._lease_seconds / 3),
+                interval_seconds=_heartbeat_interval(heartbeat_lease),
             )
         prior_usage = Usage(
             prompt_tokens=record.prompt_tokens,
@@ -385,26 +481,36 @@ class ReviewCoordinator:
                 try:
                     outcome = await review_task
                 except asyncio.CancelledError:
+                    # ``asyncio.CancelledError`` is a ``BaseException`` (not ``Exception``) so the
+                    # single job-signal handler in the ``except Exception`` below would miss it.
+                    # When the heartbeat aborted the review (cancellation / lost job lease) convert
+                    # it to an internal marker so that handler resolves it exactly once; otherwise
+                    # (an external cancellation) propagate untouched.
                     if job_keeper is not None and job_keeper.lost:
-                        # Preserve the original job signal (cancellation vs lost lease) so the
-                        # worker can honour a cancel; fall back to lease-lost for a bare cancel.
-                        if job_keeper.error is not None:
-                            raise job_keeper.error from None
-                        raise ReviewLeaseLost(
-                            f"review job lease lost during execution: {run_id}"
-                        ) from None
+                        raise _JobSignalAbort from None
                     raise
                 finally:
                     if job_keeper is not None:
                         await job_keeper.stop()
             except Exception as exc:
-                if job_keeper is not None and job_keeper.lost and job_keeper.error is exc:
-                    # A cancellation / lost-job-lease signal propagates untouched (never turned
-                    # into a terminal success): the worker honours cancel, or retries the lease.
-                    raise
-                if keeper.lost or (job_keeper is not None and job_keeper.lost):
-                    # Lease lost mid-flight (run or job): another worker may own the run. Abort
-                    # all effects WITHOUT terminalizing (contention is never a terminal success).
+                if job_keeper is not None and job_keeper.lost:
+                    # A job cancellation / lost-job-lease signal (converted marker, or a normal
+                    # review exception that raced with the heartbeat). Resolve it ONCE under the
+                    # run fence and re-raise: never a terminal success, never a live running lease.
+                    signal = job_keeper.error
+                    if signal is None and not isinstance(exc, _JobSignalAbort):
+                        signal = exc
+                    await self._handle_lost_job_signal(
+                        lease=lease,
+                        run_id=run_id,
+                        record=record,
+                        request=request,
+                        error=signal,
+                        run_lease_lost=keeper.lost,
+                    )
+                if keeper.lost:
+                    # Run lease lost mid-flight: another worker may own the run. Abort all
+                    # effects WITHOUT terminalizing (contention is never a terminal success).
                     if isinstance(exc, ReviewLeaseLost):
                         raise
                     raise ReviewLeaseLost(f"review lease lost during execution: {run_id}") from exc
@@ -537,6 +643,67 @@ class ReviewCoordinator:
             await release(lease, to_status=RunStatus.queued, now=self._clock(), cost=cost)
         except Exception:  # noqa: BLE001 — release is best-effort; the lease also expires
             logger.debug("review lease release to queued failed run=%s", lease.run_id)
+
+    async def _handle_lost_job_signal(
+        self,
+        *,
+        lease: RunLease,
+        run_id: str,
+        record: RunRecord,
+        request: ReviewRequest,
+        error: BaseException | None,
+        run_lease_lost: bool,
+    ) -> None:
+        """Resolve a cancellation / lost-job-lease signal, then re-raise it (never returns).
+
+        * A **cancellation** while we still own the run fence terminalizes the run ``cancelled``
+          atomically under the current lease (so it never lingers admitted/running), then
+          propagates the cancellation untouched so the worker honours it.
+        * A **lost job lease** while the run lease is still valid releases the run back to
+          ``queued`` so it is promptly retryable — never leaving a live ``running`` lease behind;
+          the durable job's hooks / reconciler then proceed. When the run lease is ALSO lost
+          another worker owns the run, so no terminal/release write is attempted.
+
+        Cleanup is best-effort and idempotent; the primary signal is always preserved.
+        """
+        if isinstance(error, JobCancellationRequested):
+            if not run_lease_lost:
+                await self._terminalize_cancelled(
+                    lease, run_id=run_id, record=record, request=request
+                )
+            raise error from None
+        # Lost job lease: the checkpoint raised a non-cancellation error (lease reclaimed).
+        if not run_lease_lost:
+            await self._release(lease)
+        if isinstance(error, ReviewLeaseLost):
+            raise error from None
+        raise ReviewLeaseLost(f"review job lease lost during execution: {run_id}") from error
+
+    async def _terminalize_cancelled(
+        self, lease: RunLease, *, run_id: str, record: RunRecord, request: ReviewRequest
+    ) -> None:
+        """Best-effort terminalize the run ``cancelled`` under the current lease (idempotent)."""
+        try:
+            await self._runs.terminalize(
+                lease,
+                status=RunStatus.cancelled,
+                stop_reason="review_cancelled",
+                now=self._clock(),
+                error_kind="review_cancelled",
+                error_message="review cancelled",
+            )
+        except Exception:  # noqa: BLE001 — best-effort; hook/reconciler backstop, signal preserved
+            logger.warning("review cancellation terminalization failed run=%s", run_id)
+            return
+        self._audit.record(
+            ReviewAuditEvent(
+                ReviewAuditAction.review_failed,
+                record.actor,
+                record.org_id,
+                run_id,
+                {"project_id": request.project_id, "error_kind": "review_cancelled"},
+            )
+        )
 
     # --- read path -------------------------------------------------------------------
     async def get_run(self, run_id: str) -> RunRecord:

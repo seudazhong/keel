@@ -159,6 +159,7 @@ class JobContext:
         self.scope_id = lease.scope_id
         self.attempt = lease.attempt
         self.max_attempts = lease.max_attempts
+        self.job_lease_seconds = lease.lease_seconds
 
     async def progress(
         self,

@@ -40,13 +40,19 @@ from keel_core.projects import (
 from keel_core.projects.github.urls import UntrustedUrlError, normalize_https_url
 from keel_core.protocols import ProviderChunk, ProviderRequest, Usage
 from keel_core.review import ReviewCoordinator, ReviewRequest, ReviewService, ReviewSource
+from keel_core.review.coordinator import (
+    REVIEW_REQUEST_MARKER,
+    REVIEW_REQUEST_METADATA_VERSION,
+    _heartbeat_interval,
+    review_fingerprint,
+)
 from keel_core.review.errors import (
     ReviewLeaseLost,
     ReviewProviderUnavailable,
     ReviewValidationError,
 )
 from keel_core.review.evidence import _contiguous_ordered_match, _snippet_complete_at
-from keel_core.runs import InMemoryRunStore, RunStatus
+from keel_core.runs import InMemoryRunStore, RunAdmissionConflict, RunStatus
 
 
 # =============================================================================================
@@ -597,3 +603,324 @@ class TestReviewReaper:
         # But it IS reclaimable once considered orphaned (cutoff in the future).
         reaped = worktrees.reap(older_than=datetime.now(UTC) + timedelta(seconds=1))
         assert reaped.removed == 1
+
+
+# =============================================================================================
+# Final blocker 1 — durable job-lease heartbeat interval derives from the ACTUAL job lease
+# =============================================================================================
+class TestJobHeartbeatIntervalDerivation:
+    def test_interval_for_300s_job_lease(self) -> None:
+        # A 300s job lease -> min(100, cap=30) == 30, strictly below expiry (never equal).
+        interval = _heartbeat_interval(300)
+        assert interval == 30.0
+        assert interval < 300
+
+    @pytest.mark.parametrize("lease", [0.5, 1, 2, 3, 30, 90, 300, 900, 100_000])
+    def test_interval_always_strictly_below_lease(self, lease: float) -> None:
+        interval = _heartbeat_interval(lease)
+        assert 0 < interval < lease
+
+    def test_interval_clock_boundary_small_lease(self) -> None:
+        # A 1s lease must NOT beat exactly on expiry: it is halved to stay strictly inside.
+        assert _heartbeat_interval(1) == 0.5
+        # A 3s lease -> lease/3 == 1.0 (< 3), the value the 300s-lease cap never reaches.
+        assert _heartbeat_interval(3) == 1.0
+
+    async def test_heartbeat_uses_job_lease_not_run_lease(self, tmp_path: Path) -> None:
+        # Long RUN lease (900s -> run keeper interval 30s) but a short JOB lease (3s -> heartbeat
+        # interval 1s). A cancellation surfaced via the job checkpoint must fire within the
+        # JOB-lease-derived interval (≈1s) and abort the slow review, proving the heartbeat is
+        # driven by the actual job lease, not the run lease (which would never fire in time).
+        env = await _bootstrap(tmp_path, _SlowProvider(delay=4.0), lease_seconds=900)
+        handle = await env.coordinator.request_review(_request(env), actor=env.actor)
+        beats = 0
+
+        async def _cancel_on_second_beat() -> None:
+            nonlocal beats
+            beats += 1
+            if beats >= 1:
+                raise JobCancellationRequested
+
+        with pytest.raises(JobCancellationRequested):
+            await env.coordinator.execute_review(
+                _request(env),
+                run_id=handle.run_id,
+                job_checkpoint=_cancel_on_second_beat,
+                job_lease_seconds=3,
+            )
+        assert beats >= 1
+
+
+# =============================================================================================
+# Final blocker 2 — cancellation terminalizes; job-lease loss releases; run-lease loss aborts
+# =============================================================================================
+class TestCancellationAndLeaseLoss:
+    async def test_cancellation_terminalizes_run_cancelled(self, tmp_path: Path) -> None:
+        env = await _bootstrap(tmp_path, _SlowProvider(delay=3.0), lease_seconds=3)
+        handle = await env.coordinator.request_review(_request(env), actor=env.actor)
+
+        async def _cancel_checkpoint() -> None:
+            raise JobCancellationRequested
+
+        # A cancellation while we still own the run fence terminalizes the run CANCELLED
+        # atomically under the current lease AND propagates the cancellation (worker honours it).
+        with pytest.raises(JobCancellationRequested):
+            await env.coordinator.execute_review(
+                _request(env),
+                run_id=handle.run_id,
+                job_checkpoint=_cancel_checkpoint,
+                job_lease_seconds=3,
+            )
+        run = await env.runs.get(handle.run_id)
+        assert run is not None and run.status is RunStatus.cancelled
+        assert run.is_terminal
+
+    async def test_job_lease_loss_releases_run_to_queued(self, tmp_path: Path) -> None:
+        env = await _bootstrap(tmp_path, _SlowProvider(delay=3.0), lease_seconds=3)
+        handle = await env.coordinator.request_review(_request(env), actor=env.actor)
+
+        async def _lost_checkpoint() -> None:
+            raise RuntimeError("job lease reclaimed by another worker")
+
+        # A lost job lease while the run lease is still valid releases the run back to QUEUED
+        # (retryable) — never left as a live running lease, and never terminalized.
+        with pytest.raises(ReviewLeaseLost):
+            await env.coordinator.execute_review(
+                _request(env),
+                run_id=handle.run_id,
+                job_checkpoint=_lost_checkpoint,
+                job_lease_seconds=3,
+            )
+        run = await env.runs.get(handle.run_id)
+        assert run is not None
+        assert run.status is RunStatus.queued
+        assert not run.is_terminal
+        assert run.worker_id is None and run.lease_token is None
+
+    async def test_run_lease_loss_aborts_without_terminalizing(self, tmp_path: Path) -> None:
+        env = await _bootstrap(tmp_path, _SlowProvider(delay=2.0), lease_seconds=3)
+        handle = await env.coordinator.request_review(_request(env), actor=env.actor)
+
+        async def _false_renew(lease, *, lease_seconds, now=None):  # type: ignore[no-untyped-def]
+            return False
+
+        # Simulate our run lease being reclaimed by another worker mid-review (renew fails).
+        env.runs.renew = _false_renew  # type: ignore[assignment]
+        with pytest.raises(ReviewLeaseLost):
+            await env.coordinator.execute_review(_request(env), run_id=handle.run_id)
+        run = await env.runs.get(handle.run_id)
+        # We do NOT own the run any more, so we must NOT write a terminal state for it.
+        assert run is not None and not run.is_terminal
+
+    async def test_cancellation_cleanup_is_idempotent_when_already_terminal(
+        self, tmp_path: Path
+    ) -> None:
+        env = await _bootstrap(tmp_path, _SlowProvider(delay=3.0), lease_seconds=3)
+        handle = await env.coordinator.request_review(_request(env), actor=env.actor)
+
+        async def _cancel_checkpoint() -> None:
+            raise JobCancellationRequested
+
+        # The primary cancellation signal is preserved even though cleanup terminalizes the run;
+        # a subsequent orphan terminalization is a no-op (run already terminal).
+        with pytest.raises(JobCancellationRequested):
+            await env.coordinator.execute_review(
+                _request(env), run_id=handle.run_id, job_checkpoint=_cancel_checkpoint
+            )
+        again = await env.coordinator.terminalize_orphaned_run(
+            handle.run_id,
+            status=RunStatus.cancelled,
+            stop_reason="review_job_cancelled",
+            error_kind="review_job_cancelled",
+            error_message="cancelled",
+        )
+        assert again is False
+
+
+# =============================================================================================
+# Final blocker 3 — persist the full budget/policy envelope; bind it into the fingerprint
+# =============================================================================================
+class TestBudgetMetadataAndFingerprint:
+    def test_fingerprint_binds_budget_fields(self) -> None:
+        base = ReviewRequest(
+            org_id="o",
+            project_id="p",
+            source=ReviewSource.branch,
+            head="main",
+            idempotency_key="k",
+            model="m",
+        )
+        bigger = ReviewRequest(
+            org_id="o",
+            project_id="p",
+            source=ReviewSource.branch,
+            head="main",
+            idempotency_key="k",
+            model="m",
+            token_budget=base.token_budget + 1,
+        )
+        assert review_fingerprint(base) != review_fingerprint(bigger)
+
+    async def test_same_key_different_budget_is_a_conflict(self, tmp_path: Path) -> None:
+        env = await _bootstrap(tmp_path, _good_provider())
+        await env.coordinator.request_review(
+            _request(env, idempotency_key="dup", token_budget=100_000), actor=env.actor
+        )
+        # Re-using the idempotency key with a DIFFERENT budget mismatches the immutable
+        # fingerprint (budget is bound into it) and is rejected rather than silently reused.
+        with pytest.raises(RunAdmissionConflict):
+            await env.coordinator.request_review(
+                _request(env, idempotency_key="dup", token_budget=100_001), actor=env.actor
+            )
+
+    async def test_metadata_round_trips_exact_budget(self, tmp_path: Path) -> None:
+        env = await _bootstrap(tmp_path, _good_provider())
+        handle = await env.coordinator.request_review(
+            _request(
+                env,
+                token_budget=123_456,
+                output_max_tokens=1_234,
+                cost_ceiling_usd=0.5,
+                max_provider_attempts=1,
+            ),
+            actor=env.actor,
+        )
+        loaded = await env.coordinator.load_request_metadata(handle.run_id)
+        assert loaded is not None
+        assert loaded.token_budget == 123_456
+        assert loaded.output_max_tokens == 1_234
+        assert loaded.cost_ceiling_usd == 0.5
+        assert loaded.max_provider_attempts == 1
+
+    async def test_reconstructed_payload_uses_exact_not_default_budget(
+        self, tmp_path: Path
+    ) -> None:
+        from keel_core.review.jobs import ReviewJobPayload
+        from keel_core.review.models import DEFAULT_REVIEW_TOKEN_BUDGET
+
+        env = await _bootstrap(tmp_path, _good_provider())
+        assert 123_456 != DEFAULT_REVIEW_TOKEN_BUDGET
+        handle = await env.coordinator.request_review(
+            _request(env, token_budget=123_456), actor=env.actor
+        )
+        loaded = await env.coordinator.load_request_metadata(handle.run_id)
+        assert loaded is not None
+        payload = ReviewJobPayload.from_request(loaded, run_id=handle.run_id)
+        # A stranded re-dispatch reconstructs the EXACT admitted budget, never a larger default.
+        assert payload.token_budget == 123_456
+
+    async def test_legacy_metadata_missing_budget_fails_closed(self, tmp_path: Path) -> None:
+        from datetime import datetime as _dt
+
+        from keel_core.events import Event, EventType
+
+        env = await _bootstrap(tmp_path, _good_provider())
+        run_id = "rev_legacy_no_budget"
+        # A pre-budget (legacy) metadata record: identity present, budget envelope absent.
+        await env.events.append(  # type: ignore[attr-defined]
+            Event(
+                type=EventType.run_started,
+                seq=0,
+                session_id=run_id,
+                scope_id=env.scope_id,
+                run_id=run_id,
+                ts=_dt.now(UTC),
+                payload={
+                    REVIEW_REQUEST_MARKER: {
+                        "org_id": env.org,
+                        "project_id": env.project_id,
+                        "source": "branch",
+                        "head": "main",
+                        "base": None,
+                        "model": "test-model",
+                        "agent_id": None,
+                        "max_findings": 5,
+                        "max_diff_bytes": 1000,
+                    },
+                    "dedup_key": f"review-meta:{run_id}",
+                },
+            )
+        )
+        # Fail closed: never back-fill (possibly larger) implicit budget defaults.
+        assert await env.coordinator.load_request_metadata(run_id) is None
+
+    async def test_current_metadata_carries_version(self, tmp_path: Path) -> None:
+        env = await _bootstrap(tmp_path, _good_provider())
+        handle = await env.coordinator.request_review(_request(env), actor=env.actor)
+        found = False
+        async for event in env.events.read(handle.run_id):  # type: ignore[attr-defined]
+            meta = event.payload.get(REVIEW_REQUEST_MARKER)
+            if isinstance(meta, dict):
+                assert meta["version"] == REVIEW_REQUEST_METADATA_VERSION
+                found = True
+        assert found
+
+
+# =============================================================================================
+# Final blocker 4 — worker storage readiness fails fast (or review disabled skips entirely)
+# =============================================================================================
+class TestWorkerStorageReadiness:
+    def _settings(self, **overrides):  # type: ignore[no-untyped-def]
+        from keel_core.config import Settings
+
+        return Settings(**overrides)
+
+    def test_review_disabled_skips_storage_and_returns_none(self) -> None:
+        from keel_worker.review import resolve_review_storage_root
+
+        calls: list[object] = []
+
+        def _probe(root: object) -> None:
+            calls.append(root)
+
+        settings = self._settings(review_enabled=False, project_storage_root="")
+        assert resolve_review_storage_root(settings, probe=_probe) is None
+        # A review-disabled worker never even probes shared storage.
+        assert calls == []
+
+    def test_review_enabled_failfast_on_unavailable_storage(self, tmp_path: Path) -> None:
+        from keel_worker.review import ReviewStorageNotReady, resolve_review_storage_root
+
+        def _failing_probe(root: object) -> None:
+            raise SharedStorageUnavailable("volume not mounted")
+
+        settings = self._settings(
+            review_enabled=True, project_storage_root=str(tmp_path), app_env="production"
+        )
+        with pytest.raises(ReviewStorageNotReady):
+            resolve_review_storage_root(settings, probe=_failing_probe)
+
+    def test_review_enabled_returns_root_when_storage_ok(self, tmp_path: Path) -> None:
+        from keel_worker.review import resolve_review_storage_root
+
+        def _ok_probe(root: object) -> None:
+            return None
+
+        settings = self._settings(
+            review_enabled=True, project_storage_root=str(tmp_path), app_env="production"
+        )
+        root = resolve_review_storage_root(settings, probe=_ok_probe)
+        assert root == tmp_path
+
+    def test_k8s_and_compose_worker_share_project_storage(self) -> None:
+        import yaml
+
+        repo_root = Path(__file__).resolve().parents[2]
+        # K8s: the worker mounts the shared project-storage PVC at the same path as the server,
+        # so a review-enabled worker can always reach the volume its reports live on.
+        worker_manifest = (
+            repo_root / "deploy" / "k8s" / "base" / "worker" / "deployment.yaml"
+        ).read_text(encoding="utf-8")
+        assert "keel-project-storage" in worker_manifest
+        assert "/var/lib/keel/projects" in worker_manifest
+
+        # Compose: server and worker mount the SAME named volume so review storage is shared.
+        compose = yaml.safe_load((repo_root / "docker-compose.yml").read_text(encoding="utf-8"))
+        server_vols = compose["services"]["keel-server"]["volumes"]
+        worker_vols = compose["services"]["keel-worker"]["volumes"]
+        assert any("projectdata:" in v for v in server_vols)
+        assert any("projectdata:" in v for v in worker_vols)
+        # Same mount path on both so a worker-written report is readable by the server APIs.
+        server_path = [v.split(":", 1)[1] for v in server_vols if "projectdata:" in v][0]
+        worker_path = [v.split(":", 1)[1] for v in worker_vols if "projectdata:" in v][0]
+        assert server_path == worker_path

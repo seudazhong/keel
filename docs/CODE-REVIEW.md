@@ -117,10 +117,14 @@ to a shared volume path mounted identically into both:
   asserts the PVC is active + RWX and that both workloads mount it at the same path as the
   configmap's `KEEL_PROJECT_STORAGE_ROOT`. There is
   **no** container-local `.keel/projects` default in cloud: when the root is unset (or unwritable)
-  outside a local/dev environment, startup fails closed and managed projects + review are
-  disabled (server **readiness** reports `review: degraded` / `project_storage: unavailable`, and
-  the worker disables the review job) rather than silently splitting server/worker storage. A
-  container-local default is accepted only for single-host local development.
+  outside a local/dev environment, startup fails closed. The **server** disables managed projects
+  + review (**readiness** reports `review: degraded` / `project_storage: unavailable`). A
+  **review-enabled worker** (`KEEL_REVIEW_ENABLED=true`, the default) that cannot reach the shared
+  volume **fails startup and crash-loops** rather than silently running WITHOUT review handlers
+  (which would strand every review under reports the server can never serve); set
+  `KEEL_REVIEW_ENABLED=false` on a local profile to fully disable review so the process neither
+  enqueues nor consumes `review.run` jobs and never probes shared storage. A container-local
+  default is accepted only for single-host local development.
 
 ## Model, budget & pricing policy
 
@@ -130,6 +134,11 @@ un-allowlisted model is rejected (`422`). Every review runs under an **explicit,
 budget**: `KEEL_REVIEW_TOKEN_BUDGET`, `KEEL_REVIEW_OUTPUT_MAX_TOKENS` (a hard per-turn output
 cap passed to the provider), `KEEL_REVIEW_COST_CEILING_USD`, and `KEEL_REVIEW_MAX_PROVIDER_ATTEMPTS`
 (total provider turns including the repair). Token/cost usage is propagated onto the durable run.
+The **full budget/policy envelope (token/output budget, cost ceiling, provider-attempt/repair
+count, and model) is durably persisted** in the immutable request metadata and **bound into the
+admission fingerprint**, so a reused idempotency key with a different budget is a conflict and a
+stranded re-dispatch reconstructs the **exact** admitted values (a legacy record predating the
+envelope fails closed rather than assume larger implicit defaults).
 
 Cost is enforced against an **authoritative price** — never a provider's self-reported `cost_usd`
 (which is often `0`). A model must be priced by the built-in known-model map **or** an explicit
@@ -147,9 +156,14 @@ budget or cost ceiling is exceeded.
   reclaimed review re-produces identical content-addressed artifacts.
 * **Restart-safe & retryable** — the worker claims/reconciles/retries the `review.run` job on the
   existing jobs substrate; the run lease is heartbeated during execution and a crash reclaims it
-  and starts clean. The durable **job** lease is also heartbeated throughout the review (a lost
-  job lease or a cancellation aborts the in-flight review without a terminal write under a
-  superseded fence). Transient provider/GitHub failures (transport/timeout/rate limit/5xx) retry
+  and starts clean. The durable **job** lease is also heartbeated throughout the review at an
+  interval derived from the **actual job lease** duration (`min(lease/3, cap)`, always strictly
+  below expiry). A lost job lease while the run lease is still valid **releases the run back to
+  `queued`** (retryable — never a live running lease left behind); a user/job **cancellation**
+  while we still own the run fence **terminalizes the run `cancelled` atomically under the current
+  lease** and propagates the cancellation so the worker honours it; when the run lease itself is
+  lost another worker owns the run, so no terminal/release write is made. Transient provider/GitHub
+  failures (transport/timeout/rate limit/5xx) retry
   with any upstream `Retry-After`/backoff honoured, and the **partial** tokens/cost consumed
   before a transient failure are durably charged so a subsequent attempt runs under only the
   remaining budget (cumulative usage can never exceed the review's envelope). A permanent error or

@@ -134,6 +134,9 @@ class ReviewJobContext(Protocol):
     @property
     def job_id(self) -> str: ...
 
+    @property
+    def job_lease_seconds(self) -> int: ...
+
     async def checkpoint(self) -> None: ...
 
 
@@ -169,6 +172,7 @@ class ReviewJobHandlers:
                 payload.to_request(),
                 run_id=payload.run_id,
                 job_checkpoint=context.checkpoint,
+                job_lease_seconds=context.job_lease_seconds,
             )
         except _PERMANENT as exc:
             raise PermanentJobError("review_failed", "Review failed.") from exc

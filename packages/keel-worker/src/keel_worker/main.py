@@ -522,32 +522,25 @@ async def startup(ctx: dict[str, Any]) -> None:
     from keel_core.coding import (
         LocalWorktreeStore as _ReviewWorktreeStore,
     )
-    from keel_core.coding.storage_root import (
-        SharedStorageUnavailable,
-        resolve_project_storage_root,
-        verify_shared_storage,
-    )
     from keel_core.projects import PostgresProjectStore as _ReviewProjectStore
     from keel_core.projects import ProjectService as _ReviewProjectService
     from keel_core.review import ReviewCoordinator, ReviewService
     from keel_core.state import PostgresEventStore as _ReviewEventStore
-    from keel_worker.review import register_review_jobs
+    from keel_worker.review import register_review_jobs, resolve_review_storage_root
 
-    # Server and worker MUST resolve the SAME storage root so a worker-written review artifact
-    # is readable by the server's report APIs (shared/RWX volume in cloud). Fail closed when it
-    # is unavailable rather than silently splitting storage.
+    # Server and worker MUST resolve the SAME storage root so a worker-written review artifact is
+    # readable by the server's report APIs (shared/RWX volume in cloud). When review is enabled a
+    # missing/unwritable shared root FAILS STARTUP (crash-loop) rather than silently running this
+    # worker without review handlers; when review is explicitly disabled the worker skips review
+    # entirely (never enqueues/consumes ``review.run``). ``resolve_review_storage_root`` raises
+    # ``ReviewStorageNotReady`` in the fail-fast case, which propagates out of startup by design.
     _review_coding: _ReviewCodingStorage | None = None
-    try:
-        _coding_root = resolve_project_storage_root(
-            settings.project_storage_root, app_env=settings.app_env
-        )
-        verify_shared_storage(_coding_root)
+    _coding_root = resolve_review_storage_root(settings)
+    if _coding_root is not None:
         _review_hosts = tuple(
             h.strip().lower() for h in settings.github_allowed_hosts.split(",") if h.strip()
         )
         _review_coding = _ReviewCodingStorage(_coding_root, allowed_https_hosts=_review_hosts)
-    except SharedStorageUnavailable:
-        logger.warning("shared project storage root unavailable; review job disabled")
 
     # Durable data-erasure coordinator + job (M3.5). Bounded Redis stream cleanup uses the
     # worker's Redis connection; external provider/telemetry deletion has no API and is

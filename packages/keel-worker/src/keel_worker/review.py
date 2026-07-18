@@ -5,8 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
+from keel_core.coding.storage_root import (
+    SharedStorageUnavailable,
+    resolve_project_storage_root,
+    verify_shared_storage,
+)
 from keel_core.config import Settings
 from keel_core.jobs import JobError, JobRecord
 from keel_core.review.coordinator import ReviewCoordinator
@@ -22,6 +28,44 @@ from keel_core.runs import RunStatus
 from .jobs import JobDefinition, JobRegistry
 
 logger = logging.getLogger("keel.worker.review")
+
+
+class ReviewStorageNotReady(RuntimeError):
+    """A review-enabled worker cannot reach the shared storage the review reports live on.
+
+    Raised at startup so the worker crash-loops (fail-fast) instead of silently running WITHOUT
+    review handlers — a worker that claims/dispatches ``review.run`` but cannot read/write the
+    shared project-storage volume would strand every review (reports the server can never serve).
+    """
+
+
+def resolve_review_storage_root(
+    settings: Settings, *, probe: Any = verify_shared_storage
+) -> Path | None:
+    """Resolve+verify the shared storage root for review, or ``None`` when review is disabled.
+
+    * ``review_enabled`` false: returns ``None`` — the worker neither builds review handlers nor
+      touches shared storage (a local profile with review explicitly disabled).
+    * ``review_enabled`` true: resolves the shared root and probes it. A probe failure raises
+      :class:`ReviewStorageNotReady` (fail-fast) rather than degrading to no review handlers.
+
+    ``probe`` is injectable for tests; by default it is
+    :func:`keel_core.coding.storage_root.verify_shared_storage`.
+    """
+    if not settings.review_enabled:
+        logger.info("review disabled (KEEL_REVIEW_ENABLED=false); review jobs not registered")
+        return None
+    root = resolve_project_storage_root(settings.project_storage_root, app_env=settings.app_env)
+    try:
+        probe(root)
+    except SharedStorageUnavailable as exc:
+        raise ReviewStorageNotReady(
+            "shared project storage is unavailable but review is enabled; refusing to start a "
+            "worker that would consume review.run jobs without readable/writable shared storage "
+            "(set KEEL_REVIEW_ENABLED=false to disable review on this worker)"
+        ) from exc
+    return root
+
 
 # Single-owner fence for the artifact reaper: only one worker reaps per interval (the reap
 # itself is idempotent + atomic, so this is a de-duplication optimization, not a correctness
@@ -231,8 +275,10 @@ async def reconcile_stranded_reviews_tick(ctx: dict[str, Any]) -> int:
 
 __all__ = [
     "REVIEW_REAPER_LOCK_KEY",
+    "ReviewStorageNotReady",
     "reconcile_stranded_reviews_tick",
     "register_review_jobs",
+    "resolve_review_storage_root",
     "review_artifact_reaper_tick",
     "review_job_definition",
 ]
