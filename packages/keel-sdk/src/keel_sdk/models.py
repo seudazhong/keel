@@ -254,6 +254,7 @@ class ImMappingPolicy(BaseModel):
 
     reply_enabled: bool = True
     partial_replies: bool = False
+    approvals_enabled: bool = False
     allow_tools: list[str] = []
 
 

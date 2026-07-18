@@ -17,6 +17,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 
 from keel_core.im_routing import (
+    ImApprovalCommand,
     ImChannelMapping,
     ImChatKind,
     ImInboundContext,
@@ -25,6 +26,7 @@ from keel_core.im_routing import (
     ImProvider,
     ImReplyPolicy,
     ImRouteIndexStore,
+    parse_approval_command,
     resolve_inbound_route,
     route_key,
 )
@@ -106,6 +108,14 @@ class DurableImIngress:
         if mapping is None or mapping.status is not ImMappingStatus.active:
             logger.info("im ingress dropped: mapping %s revoked/missing", resolved.mapping_id)
             return None
+        # An IM-originated approval decision (opt-in per mapping) resolves an existing durable
+        # approval instead of admitting a new run; the exact approval/attempt/action-hash + org
+        # binding is re-validated by resolve_approval (stale/replay denied).
+        if mapping.policy.approvals_enabled:
+            command = parse_approval_command(inbound.text)
+            if command is not None:
+                await self._resolve_approval(resolved.scope_id, resolved.org_id, mapping, command)
+                return None
         context = self._context(inbound, mapping)
         actor = mapping.created_by or _IM_SERVICE_ACTOR
         service = self.run_service_factory(resolved.scope_id)
@@ -147,6 +157,36 @@ class DurableImIngress:
         return (
             f"{inbound.provider.value}:{inbound.external_bot_id}:"
             f"{inbound.external_chat_id}:{inbound.external_message_id}"
+        )
+
+    async def _resolve_approval(
+        self,
+        scope_id: ScopeId,
+        org_id: str,
+        mapping: ImChannelMapping,
+        command: ImApprovalCommand,
+    ) -> None:
+        """Resolve a durable approval from an IM command under the mapping's authority.
+
+        The decision resolves as the mapping's authorizing principal (``created_by`` — the same
+        actor an IM run binds), so the durable ``resolve_approval`` owner check passes; every
+        other binding (org, current run attempt, recomputed action hash, terminal state) is
+        verified there, denying a stale/replayed or cross-org command."""
+        actor = mapping.created_by or _IM_SERVICE_ACTOR
+        service = self.run_service_factory(scope_id)
+        ok = await service.resolve_approval(
+            command.approval_id,
+            approved=command.approved,
+            resolved_by=f"im:{mapping.provider.value}",
+            actor=actor,
+            org_id=org_id,
+        )
+        logger.info(
+            "im approval command mapping=%s approval=%s approved=%s resolved=%s",
+            mapping.id,
+            command.approval_id,
+            command.approved,
+            ok,
         )
 
 

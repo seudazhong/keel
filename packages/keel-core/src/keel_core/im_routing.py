@@ -137,6 +137,34 @@ def pseudonymous_trace_id(*parts: str) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
 
 
+@dataclass(frozen=True)
+class ImApprovalCommand:
+    """A parsed IM approval decision command bound to an exact durable approval id."""
+
+    approved: bool
+    approval_id: str
+
+
+def parse_approval_command(text_payload: str) -> ImApprovalCommand | None:
+    """Parse an IM approval command (``approve <id>`` / ``reject <id>``) or ``None``.
+
+    Only an exact two-token command with a whitelisted verb + an approval id is recognized, so
+    an ordinary chat message can never be mistaken for an approval decision. The mapped exact
+    approval id is later verified against the run's *current* attempt + action hash by
+    :meth:`~keel_core.run_service.DurableRunService.resolve_approval` (stale/replay denied)."""
+    tokens = text_payload.strip().split()
+    if len(tokens) != 2:
+        return None
+    verb, approval_id = tokens[0].lower(), tokens[1].strip()
+    if not approval_id:
+        return None
+    if verb in {"approve", "yes", "allow"}:
+        return ImApprovalCommand(approved=True, approval_id=approval_id)
+    if verb in {"reject", "no", "deny"}:
+        return ImApprovalCommand(approved=False, approval_id=approval_id)
+    return None
+
+
 def reply_idempotency_key(
     *,
     run_id: RunId,
@@ -182,12 +210,14 @@ class ImReplyPolicy:
 
     reply_enabled: bool = True
     partial_replies: bool = False
+    approvals_enabled: bool = False
     allow_tools: tuple[str, ...] = ()
 
     def to_json(self) -> dict[str, object]:
         return {
             "reply_enabled": self.reply_enabled,
             "partial_replies": self.partial_replies,
+            "approvals_enabled": self.approvals_enabled,
             "allow_tools": list(self.allow_tools),
         }
 
@@ -198,6 +228,7 @@ class ImReplyPolicy:
         return cls(
             reply_enabled=bool(data.get("reply_enabled", True)),
             partial_replies=bool(data.get("partial_replies", False)),
+            approvals_enabled=bool(data.get("approvals_enabled", False)),
             allow_tools=tuple(str(name) for name in allow if isinstance(name, str)),
         )
 
@@ -1478,6 +1509,7 @@ class PostgresImReplyDispatchIndex:
 
 __all__ = [
     "IM_SAFE_TOOLS",
+    "ImApprovalCommand",
     "ImChannelMapping",
     "ImChatKind",
     "ImInboundContext",
@@ -1513,6 +1545,7 @@ __all__ = [
     "im_context_in_log",
     "im_safe_permissions",
     "im_safe_tools",
+    "parse_approval_command",
     "persist_terminal_reply",
     "pseudonymous_trace_id",
     "purge_scope",

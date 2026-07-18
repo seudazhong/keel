@@ -73,6 +73,7 @@ async def _publish_mapping(
     *,
     status: ImMappingStatus = ImMappingStatus.active,
     reply_enabled: bool = True,
+    policy: ImReplyPolicy | None = None,
 ) -> ImChannelMapping:
     mapping = ImChannelMapping(
         id="map-1",
@@ -83,7 +84,7 @@ async def _publish_mapping(
         chat_kind=ImChatKind.group,
         agent_id="agent-1",
         scope_id="agent:org-a/agent-1",
-        policy=ImReplyPolicy(reply_enabled=reply_enabled),
+        policy=policy or ImReplyPolicy(reply_enabled=reply_enabled),
         status=status,
         created_by="user-admin",
     )
@@ -166,6 +167,57 @@ async def test_ingress_different_chat_is_unmapped() -> None:
         text="hi",
     )
     assert await h.ingress().admit(other) is None
+
+
+async def test_ingress_approval_command_resolves_when_enabled() -> None:
+    h = _Harness()
+    await _publish_mapping(h, policy=ImReplyPolicy(reply_enabled=True, approvals_enabled=True))
+    cmd = ImInbound(
+        provider=ImProvider.telegram,
+        external_bot_id="bot-9",
+        external_chat_id="4242",
+        external_message_id="m-approve",
+        chat_kind=ImChatKind.group,
+        text="approve appr-1",
+    )
+    # An approval command routes to resolve_approval, not a new run admission.
+    assert await h.ingress().admit(cmd) is None
+    assert h.enqueued == []
+
+
+async def test_ingress_approval_command_is_a_normal_message_when_disabled() -> None:
+    h = _Harness()
+    # approvals_enabled defaults False → "approve X" is just a chat message that admits a run.
+    await _publish_mapping(h, policy=ImReplyPolicy(reply_enabled=True))
+    cmd = ImInbound(
+        provider=ImProvider.telegram,
+        external_bot_id="bot-9",
+        external_chat_id="4242",
+        external_message_id="m-x",
+        chat_kind=ImChatKind.group,
+        text="approve appr-1",
+    )
+    run_id = await h.ingress().admit(cmd)
+    assert run_id is not None
+    assert h.enqueued == [(run_id, "agent:org-a/agent-1")]
+
+
+# --------------------------------------------------------------------------- parsers
+
+
+def test_parse_approval_command() -> None:
+    from keel_core.im_routing import parse_approval_command
+
+    approve = parse_approval_command("approve abc123")
+    assert approve is not None and approve.approved is True and approve.approval_id == "abc123"
+    reject = parse_approval_command("reject abc123")
+    assert reject is not None and reject.approved is False
+    yes = parse_approval_command("yes id-9")
+    assert yes is not None and yes.approval_id == "id-9"
+    # Ordinary chat is never a command.
+    assert parse_approval_command("please approve my request now") is None
+    assert parse_approval_command("approve") is None
+    assert parse_approval_command("hello") is None
 
 
 # --------------------------------------------------------------------------- parsers

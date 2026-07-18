@@ -49,12 +49,14 @@ class PolicyModel(_Model):
 
     reply_enabled: bool = True
     partial_replies: bool = False
+    approvals_enabled: bool = False
     allow_tools: list[str] = Field(default_factory=list)
 
     def to_policy(self) -> ImReplyPolicy:
         return ImReplyPolicy(
             reply_enabled=self.reply_enabled,
             partial_replies=self.partial_replies,
+            approvals_enabled=self.approvals_enabled,
             allow_tools=tuple(self.allow_tools),
         )
 
@@ -63,6 +65,7 @@ class PolicyModel(_Model):
         return cls(
             reply_enabled=policy.reply_enabled,
             partial_replies=policy.partial_replies,
+            approvals_enabled=policy.approvals_enabled,
             allow_tools=list(policy.allow_tools),
         )
 
