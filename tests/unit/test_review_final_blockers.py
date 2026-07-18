@@ -27,6 +27,7 @@ from keel_core.coding.models import (
 from keel_core.review.diff import parse_unified_diff
 from keel_core.review.errors import ReviewValidationError
 from keel_core.review.pricing import PriceBook, parse_price_overrides
+from keel_core.review.ref_materializer import _basic_auth_header
 
 
 # --- F5: authoritative pricing -----------------------------------------------------------
@@ -202,7 +203,7 @@ def test_fetch_commits_pulls_missing_object_without_token_in_argv(tmp_path: Path
             project,
             source,
             [target_sha],
-            auth_header="Basic c2VjcmV0LXRva2Vu",  # base64("secret-token") style value
+            auth_header="Authorization: Basic c2VjcmV0LXRva2Vu",
         )
     finally:
         local_mod.subprocess.run = original  # type: ignore[assignment]
@@ -220,11 +221,17 @@ def test_fetch_commits_pulls_missing_object_without_token_in_argv(tmp_path: Path
 
 
 def test_auth_header_env_is_git_config_env_only() -> None:
-    env = LocalCodingStorage._auth_header_env("Basic abc")
+    env = LocalCodingStorage._auth_header_env("authorization: Basic abc")
     assert env["GIT_CONFIG_KEY_0"] == "http.extraHeader"
-    assert env["GIT_CONFIG_VALUE_0"] == "Basic abc"
+    assert env["GIT_CONFIG_VALUE_0"] == "Authorization: Basic abc"
+    with pytest.raises(InvalidStorageInput):
+        LocalCodingStorage._auth_header_env("Basic abc")
     with pytest.raises(InvalidStorageInput):
         LocalCodingStorage._auth_header_env("bad\nheader")
+
+
+def test_github_basic_auth_includes_header_name() -> None:
+    assert _basic_auth_header("token").startswith("Authorization: Basic ")
 
 
 # --- F7: artifact reaper (expiry / non-expiry / cross-project) ---------------------------
