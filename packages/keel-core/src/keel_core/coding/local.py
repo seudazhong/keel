@@ -896,6 +896,10 @@ class LocalCodingStorage:
         header = auth_header.strip()
         if not header or "\r" in header or "\n" in header or "\x00" in header:
             raise InvalidStorageInput("invalid authorization header")
+        name, separator, value = header.partition(":")
+        if separator != ":" or name.strip().lower() != "authorization" or not value.strip():
+            raise InvalidStorageInput("authorization header name and value are required")
+        header = f"Authorization: {value.strip()}"
         return {
             "GIT_CONFIG_COUNT": "1",
             "GIT_CONFIG_KEY_0": "http.extraHeader",

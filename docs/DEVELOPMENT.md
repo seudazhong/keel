@@ -53,7 +53,7 @@ surface on `http://127.0.0.1:3000` by default and requires an already-running st
 not start/stop Compose or delete volumes:
 
 ```powershell
-docker compose --profile dev up -d
+docker compose -f docker-compose.yml --profile dev up -d
 Set-Location web
 npm run test:e2e:install   # first run only: installs the Chromium browser
 npm run test:e2e
@@ -65,8 +65,12 @@ fails fast with an actionable error if the target is unreachable or is a stale p
 
 ## Local services
 
+The Compose `dev` profile is a trusted local preview: server/worker run the opt-in
+`unsafe-local-dev` execution backend (no `keel-sandbox` service), with shell execution
+disabled. Pass `-f docker-compose.yml` so a local override cannot change that contract.
+
 ```powershell
-docker compose --profile dev up -d --build
+docker compose -f docker-compose.yml --profile dev up -d --build
 Invoke-RestMethod http://localhost:8000/readiness
 docker compose logs --tail 100 keel-server keel-worker
 ```

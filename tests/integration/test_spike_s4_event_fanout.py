@@ -10,6 +10,7 @@ import redis.asyncio as aioredis
 
 from keel_core.eventbus import RedisEventStore
 from keel_core.events import Event, EventType
+from keel_core.evolution import current_event_version
 
 pytestmark = pytest.mark.integration
 
@@ -17,10 +18,12 @@ pytestmark = pytest.mark.integration
 def _event(seq: int, session_id: str) -> Event:
     return Event(
         type=EventType.message_token,
+        version=current_event_version(EventType.message_token),
         seq=seq,
         session_id=session_id,
         scope_id="sc",
         ts=datetime.now(UTC),
+        payload={"role": "assistant", "text": f"token-{seq}", "partial": True},
     )
 
 

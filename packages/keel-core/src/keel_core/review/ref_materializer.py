@@ -34,7 +34,7 @@ def _basic_auth_header(token: str) -> str:
     if not token or "\r" in token or "\n" in token:
         raise ReviewValidationError("invalid installation token")
     encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
-    return f"Basic {encoded}"
+    return f"Authorization: Basic {encoded}"
 
 
 @dataclass
