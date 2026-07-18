@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -32,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 from keel_core.errors import RuntimePrincipalError
 from keel_core.outbox import PostgresOutboundStore
+from keel_core.provision_runtime_secret import ensure_runtime_secret
 from keel_core.runtime_db import (
     inspect_runtime_principal,
     provision_runtime_login,
@@ -362,3 +364,68 @@ async def test_provision_runtime_login_fails_closed_without_group(
             text("SELECT 1 FROM pg_roles WHERE rolname = 'keel_runtime_login_test_orphan'")
         )
     assert exists is None
+
+
+async def test_runtime_login_connects_password_less_via_pgpass(
+    migrated_db: AsyncEngine, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end the exact Compose mechanism: the secret bootstrap generates the password + a
+    libpq pgpass file, the login is provisioned with it, and the app connects PASSWORD-LESS (no
+    secret in the URL) via ``PGPASSFILE`` — proving current_user is the least-privilege login and
+    RLS/DDL still bind through that path."""
+    if not await _runtime_group_available(migrated_db):
+        pytest.skip("keel_runtime role not provisioned in this database")
+    if not await _can_create_login(migrated_db):
+        pytest.skip("test principal cannot CREATE ROLE for the runtime-login test")
+
+    base = make_url(os.environ["KEEL_TEST_DATABASE_URL"])
+    login = "keel_runtime_login_pgpass_test"
+    pw_path = tmp_path / "runtime_db_password"
+    pgpass_path = tmp_path / "runtime_pgpass"
+
+    # 1) The bootstrap generates a random password + a pgpass line matching this DB (host/port/db).
+    ensure_runtime_secret(
+        password_path=pw_path,
+        pgpass_path=pgpass_path,
+        host=base.host or "localhost",
+        port=str(base.port or 5432),
+        dbname=base.database or "keel",
+        user=login,
+    )
+    password = pw_path.read_text(encoding="utf-8").strip()
+
+    # 2) Provision the login with that generated password (the operator/provision path).
+    await provision_runtime_login(
+        migrated_db, password=password, login_name=login, group_role="keel_runtime"
+    )
+
+    # 3) Connect PASSWORD-LESS: the URL carries only the username; libpq reads PGPASSFILE.
+    monkeypatch.setenv("PGPASSFILE", str(pgpass_path))
+    pwless = f"{base.drivername}://{login}@{base.host}:{base.port}/{base.database}"
+    engine = create_async_engine(pwless)
+    try:
+        async with engine.connect() as conn:
+            who = await conn.scalar(text("SELECT current_user"))
+            assert who == login, "must authenticate as the runtime login via pgpass (no URL pw)"
+
+            report = await inspect_runtime_principal(conn)
+            assert report.principal == login
+            assert report.is_superuser is False
+            assert report.can_bypass_rls is False
+            assert report.owns_tables is False
+            assert report.least_privilege is True
+            assert await verify_runtime_principal(conn) == login
+
+            # No scope set -> FORCE RLS denies by default (same boundary, via the pgpass path).
+            await conn.execute(text("SELECT set_config('app.scope_id', '', false)"))
+            denied = (await conn.execute(text("SELECT scope_id FROM connector_outbox"))).fetchall()
+            assert denied == []
+
+        # DDL is still refused for this least-privilege login.
+        async with engine.connect() as conn:
+            with pytest.raises((ProgrammingError, DBAPIError)):
+                await conn.execute(text("CREATE TABLE keel_runtime_pgpass_probe (id int)"))
+    finally:
+        await engine.dispose()
+        async with migrated_db.begin() as conn:
+            await conn.execute(text(f"DROP ROLE IF EXISTS {login}"))

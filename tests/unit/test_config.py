@@ -326,6 +326,44 @@ def test_require_migration_database_url_env_override(monkeypatch: pytest.MonkeyP
     assert settings.sync_database_url == "postgresql+psycopg://owner@db/keel"
 
 
+def test_require_runtime_db_principal_defaults_false() -> None:
+    from keel_core.config import Settings
+
+    settings = Settings()
+    assert settings.require_runtime_db_principal is False
+    assert settings.enforce_runtime_db_principal is False
+
+
+@pytest.mark.parametrize(
+    ("require_flag", "cloud", "expected"),
+    [
+        (False, False, False),  # trusted local open API: gate off, local owner login is fine
+        (True, False, True),  # opt-in: enforce non-owner login WITHOUT forcing cloud auth
+        (False, True, True),  # cloud mode implies the gate
+        (True, True, True),  # both -> still enforced
+    ],
+)
+def test_enforce_runtime_db_principal_truth_table(
+    require_flag: bool, cloud: bool, expected: bool
+) -> None:
+    from keel_core.config import Settings
+
+    settings = Settings(require_runtime_db_principal=require_flag, cloud_mode=cloud)
+    assert settings.enforce_runtime_db_principal is expected
+
+
+def test_require_runtime_db_principal_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KEEL_REQUIRE_RUNTIME_DB_PRINCIPAL", "true")
+
+    from keel_core.config import Settings
+
+    settings = Settings()
+    assert settings.require_runtime_db_principal is True
+    # Enforced even though cloud mode is off (trusted-local fail-closed without breaking open API).
+    assert settings.cloud_mode is False
+    assert settings.enforce_runtime_db_principal is True
+
+
 @pytest.mark.parametrize("overlap", [100, 101])
 def test_knowledge_settings_reject_overlap_at_or_above_target(overlap: int) -> None:
     from pydantic import ValidationError

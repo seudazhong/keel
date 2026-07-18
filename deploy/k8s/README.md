@@ -61,6 +61,14 @@ your secret manager, do not commit the result), point
 your own overlay's `resources:`, then `kubectl apply -k <overlay>` against a real cluster. See
 [`docs/clean-install-runbook.md`](docs/clean-install-runbook.md) for the full sequence.
 
+Set `KEEL_DATABASE_URL` in that Secret to the **least-privilege** runtime login
+(`keel_runtime_login`, a member of only `keel_runtime`); keep the privileged owner/migrator
+`KEEL_MIGRATION_DATABASE_URL` + `KEEL_RUNTIME_DB_PASSWORD` in `base/secret-migration.example.yaml`
+and run the one-shot `base/jobs-migrate-provision.example.yaml` (migrate, then provision the login)
+before the app starts. With `KEEL_CLOUD_MODE: "true"` keel-server/keel-worker fail **closed**
+unless that runtime login is non-owner / non-`BYPASSRLS` (M3A — see the runbook and
+[`../../docs/OPERATIONS.md`](../../docs/OPERATIONS.md) "Runtime database login").
+
 ## Validation
 
 ```powershell

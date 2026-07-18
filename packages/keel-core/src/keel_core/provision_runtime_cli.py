@@ -12,9 +12,10 @@ Design (mirrors ``keel_core.identity.erase_cli``):
   :meth:`Settings.require_migration_database_url` (in cloud mode a missing
   ``KEEL_MIGRATION_DATABASE_URL`` is refused rather than falling back to the runtime
   ``KEEL_DATABASE_URL``). A missing ``keel_runtime`` group also fails closed.
-* **Secret hygiene.** The login password is NEVER a CLI argument: it comes from an environment
-  variable (``--password-env``, default ``KEEL_RUNTIME_DB_PASSWORD``) or ``--password-stdin``.
-  It is quoted server-side and never printed, and no connection URL is logged.
+* **Secret hygiene.** The login password is NEVER a CLI argument: it comes from a mounted secret
+  file (``--password-file``, preferred for Compose/K8s), an environment variable
+  (``--password-env``, default ``KEEL_RUNTIME_DB_PASSWORD``), or ``--password-stdin``. It is
+  quoted server-side and never printed, and no connection URL is logged.
 * **Optional end-to-end verify.** ``--verify`` connects AS the freshly provisioned login and
   asserts it is least-privilege (not superuser / bypass / owner) so a misprovisioned role is
   caught immediately.
@@ -84,6 +85,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="read the login password from the first line of stdin instead of the environment.",
     )
+    secret.add_argument(
+        "--password-file",
+        metavar="PATH",
+        help=(
+            "read the login password from the first line of this file (e.g. a mounted Docker/K8s "
+            "secret volume). Preferred for Compose/K8s: the secret never appears in argv, the "
+            "process environment, or a shell echo."
+        ),
+    )
     parser.add_argument(
         "--verify",
         action="store_true",
@@ -93,12 +103,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _resolve_password(args: argparse.Namespace) -> str:
-    """Resolve the login password from stdin or the environment (never a CLI argument)."""
+    """Resolve the login password from a file, stdin, or the environment (never a CLI argument)."""
     if args.password_stdin:
         # First line only; strip the trailing newline but preserve any interior characters.
         raw = sys.stdin.readline()
         password = raw.rstrip("\r\n")
         source = "stdin"
+    elif args.password_file:
+        # A mounted secret file (e.g. a Docker/K8s secret volume). Read only the first line so a
+        # trailing newline is not part of the secret; the value is never echoed to argv/logs.
+        try:
+            with open(args.password_file, encoding="utf-8") as handle:
+                raw = handle.readline()
+        except OSError as exc:
+            raise ValueError(
+                "could not read runtime login password from --password-file "
+                f"{args.password_file!r} ({exc.__class__.__name__})"
+            ) from None
+        password = raw.rstrip("\r\n")
+        source = f"--password-file {args.password_file}"
     else:
         password = os.environ.get(args.password_env, "")
         source = f"${args.password_env}"

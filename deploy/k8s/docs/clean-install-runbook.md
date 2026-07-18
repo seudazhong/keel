@@ -46,6 +46,15 @@ it does not by itself satisfy the hostile multi-tenant gates in
      not ship that service yet). Fill the rest of the real values or point an
      external-secret operator at this name/shape. Leave `KEEL_CLOUD_MODE: "true"` in
      `base/configmap-app.yaml` unchanged — do not set it to `"false"`.
+   - **Set the runtime/owner database split (M3A).** In your `secret-app.yaml` set
+     `KEEL_DATABASE_URL` to the **least-privilege** runtime login (`keel_runtime_login`, a member
+     of only `keel_runtime`) — with `KEEL_CLOUD_MODE: "true"` keel-server/keel-worker fail
+     readiness/startup **closed** unless this connection is non-owner / non-`BYPASSRLS` /
+     non-table-owner (M3A, `docs/OPERATIONS.md` "Runtime database login"). Copy
+     `base/secret-migration.example.yaml` → `secret-migration.yaml` (your overlay) and set the
+     privileged owner/migrator `KEEL_MIGRATION_DATABASE_URL` and `KEEL_RUNTIME_DB_PASSWORD` (which
+     must equal the password embedded in `KEEL_DATABASE_URL`). That Secret is mounted only into the
+     migrate/provision Jobs (step 5), never into keel-server/keel-worker.
    - `base/datastores/postgres-external-service.example.yaml` /
      `redis-external-service.example.yaml` → copy, set the real `externalName` (or replace
      with your operator's Service if self-hosting in-cluster).
@@ -75,10 +84,21 @@ it does not by itself satisfy the hostile multi-tenant gates in
    There is no RBAC to apply — this scaffold intentionally grants none of its own
    ServiceAccounts any Kubernetes API access (see `docs/security-model.md`).
 
-5. **Run the migration Job** (mirrors `keel-migrate` in `docker-compose.yml`; not included as
-   a standing manifest here since it is a one-shot Job your overlay should add, e.g.
-   `command: ["alembic", "upgrade", "head"]` against the same image, run to completion before
-   step 6).
+5. **Run the migrate + provision Jobs** (`base/jobs-migrate-provision.example.yaml`; copy into
+   your overlay, pin the image digest, and run to completion **in order** — they are one-shot,
+   owner-privileged Jobs intentionally kept out of the standing manifests):
+   ```powershell
+   kubectl apply -f <your-overlay>/secret-migration.yaml -n keel
+   kubectl apply -f <your-overlay>/jobs-migrate-provision.yaml -n keel
+   kubectl wait --for=condition=complete job/keel-migrate   -n keel --timeout=300s
+   kubectl wait --for=condition=complete job/keel-provision -n keel --timeout=120s
+   ```
+   `keel-migrate` runs `alembic upgrade head` (mirrors `keel-migrate` in `docker-compose.yml`);
+   `keel-provision` then mints/repairs the non-owner `keel_runtime_login` and `--verify`s it is
+   least-privilege. Both use the owner/migrator `keel-migration-secret`, never the runtime login.
+   If you skip provision, keel-server readiness fails **closed** (503, `runtime_db_principal`
+   degraded) because `KEEL_CLOUD_MODE` requires a verified non-owner runtime login — intended, not
+   a bug.
 
 6. **Wait for the control plane to become ready:**
    ```powershell

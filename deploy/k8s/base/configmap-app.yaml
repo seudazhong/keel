@@ -35,6 +35,12 @@ data:
   # DB/Redis hostnames resolve to the Service references in base/datastores/. Point them at a
   # managed Postgres/Redis (recommended) or an in-cluster StatefulSet you operate yourself;
   # this scaffold does not ship a stock in-cluster database (see ../docs/storage-topology.md).
+  #
+  # Connection URLs are credentials, so they live in Secrets, never here: the least-privilege
+  # runtime login is `KEEL_DATABASE_URL` in secret-app.example.yaml (used by keel-server/
+  # keel-worker), and the privileged owner/migrator `KEEL_MIGRATION_DATABASE_URL` is in
+  # secret-migration.example.yaml (used by the migrate/provision Jobs only). See
+  # ../../docs/OPERATIONS.md "Runtime database login".
   KEEL_DATABASE_HOST: "keel-postgres.keel.svc.cluster.local"
   KEEL_REDIS_HOST: "keel-redis.keel.svc.cluster.local"
   # Shared, durable project/coding storage root (WS-R). keel-server and keel-worker both mount

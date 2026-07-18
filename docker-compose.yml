@@ -46,11 +46,29 @@ x-app: &app
   image: keel-app:dev
 
 x-app-env: &app-env
-  KEEL_DATABASE_URL: postgresql+psycopg://keel:keel@postgres:5432/keel
   KEEL_REDIS_URL: redis://redis:6379/0
   # Shared project/coding storage root: server and worker MUST mount the SAME volume
   # here so a worker-written review artifact is readable by the server report APIs (WS-R).
   KEEL_PROJECT_STORAGE_ROOT: /var/lib/keel/projects
+
+# Privileged owner/migrator DB principal. Used ONLY by keel-migrate (Alembic) and
+# keel-provision (mint/repair the runtime login) - NEVER by keel-server/keel-worker.
+# Migrations and role provisioning need DDL / CREATE ROLE, so they must not run as the
+# least-privilege runtime login.
+x-owner-db-env: &owner-db-env
+  KEEL_MIGRATION_DATABASE_URL: postgresql+psycopg://keel:keel@postgres:5432/keel
+
+# Least-privilege, NON-OWNER data-plane login for keel-server/keel-worker (M3A, WS-DB). The
+# URL carries NO password: libpq reads it from the 0600 PGPASSFILE that keel-runtime-secret-
+# init writes into the `runtimesecret` volume, so the runtime secret is never in this file,
+# in argv, in the process environment, or in logs. KEEL_REQUIRE_RUNTIME_DB_PRINCIPAL makes
+# server readiness + worker startup fail CLOSED unless this connection is a non-owner,
+# non-BYPASSRLS, non-table-owner login (so FORCE ROW LEVEL SECURITY is a real boundary) even
+# though this trusted local stack is not KEEL_CLOUD_MODE. Delete `runtimesecret` to rotate.
+x-runtime-db-env: &runtime-db-env
+  KEEL_DATABASE_URL: postgresql+psycopg://keel_runtime_login@postgres:5432/keel
+  PGPASSFILE: /keel-secrets-db/runtime_pgpass
+  KEEL_REQUIRE_RUNTIME_DB_PRINCIPAL: "true"
 
 # Real sandbox execution — applied to keel-server and keel-worker only. Both call the isolated
 # keel-sandbox executor over the internal RPC network; they run NO file/shell tool in process
@@ -95,7 +113,7 @@ services:
     <<: *app
     command: ["alembic", "upgrade", "head"]
     environment:
-      <<: *app-env
+      <<: *owner-db-env
     depends_on:
       postgres:
         condition: service_healthy
@@ -215,6 +233,57 @@ services:
       start_period: 10s
     profiles: ["dev", "full"]
 
+  # Runtime DB secret bootstrap (runs once, then exits). Generates a random password for the
+  # non-owner keel_runtime_login and writes it + a libpq pgpass file
+  # (host:port:db:user:password) 0600 into the `runtimesecret` volume. keel-server/keel-worker
+  # then connect PASSWORD-LESS via PGPASSFILE, so the runtime secret is never in a URL / argv /
+  # env / logs. Idempotent: an existing password is reused (pgpass refreshed) so re-runs never
+  # desync from the provisioned login. Delete the `runtimesecret` volume to rotate.
+  keel-runtime-secret-init:
+    <<: *app
+    command: ["python", "-m", "keel_core.provision_runtime_secret"]
+    environment:
+      KEEL_RUNTIME_DB_PASSWORD_FILE: /keel-secrets-db/runtime_db_password
+      KEEL_RUNTIME_PGPASS_FILE: /keel-secrets-db/runtime_pgpass
+      KEEL_RUNTIME_DB_HOST: postgres
+      KEEL_RUNTIME_DB_PORT: "5432"
+      KEEL_RUNTIME_DB_NAME: keel
+      KEEL_RUNTIME_DB_USER: keel_runtime_login
+    volumes:
+      - "runtimesecret:/keel-secrets-db"
+    restart: "no"
+    profiles: ["dev", "full"]
+
+  # Idempotently mint/repair the least-privilege runtime login keel_runtime_login (a member of
+  # ONLY the non-owner keel_runtime group from migration 0011/0020) and set its password from
+  # the generated secret file - on the OWNER/migrator connection (KEEL_MIGRATION_DATABASE_URL).
+  # Runs after keel-migrate (group role + schema exist) and keel-runtime-secret-init (password
+  # file). --password-file keeps the secret off argv/env/logs; --verify then connects AS the
+  # login and asserts it is non-super / non-BYPASSRLS / non-owner, so a misprovisioned login is
+  # caught here instead of crash-looping the server. Runs once and exits.
+  keel-provision:
+    <<: *app
+    command:
+      - "python"
+      - "-m"
+      - "keel_core.provision_runtime_cli"
+      - "--password-file"
+      - "/keel-secrets-db/runtime_db_password"
+      - "--verify"
+    environment:
+      <<: *owner-db-env
+    volumes:
+      - "runtimesecret:/keel-secrets-db:ro"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      keel-migrate:
+        condition: service_completed_successfully
+      keel-runtime-secret-init:
+        condition: service_completed_successfully
+    restart: "no"
+    profiles: ["dev", "full"]
+
   keel-server:
     <<: *app
     command: ["keel-server"]
@@ -224,8 +293,9 @@ services:
     volumes:
       - "projectdata:/var/lib/keel/projects"
       - "sandboxsecret:/keel-secrets:ro"
+      - "runtimesecret:/keel-secrets-db:ro"
     environment:
-      <<: [*app-env, *sandbox-exec]
+      <<: [*app-env, *sandbox-exec, *runtime-db-env]
       KEEL_SERVER_HOST: 0.0.0.0
       KEEL_SERVER_PORT: 8000
       OLLAMA_API_BASE: "http://ollama:11434"
@@ -236,6 +306,8 @@ services:
       redis:
         condition: service_healthy
       keel-migrate:
+        condition: service_completed_successfully
+      keel-provision:
         condition: service_completed_successfully
       keel-secret-init:
         condition: service_completed_successfully
@@ -265,15 +337,18 @@ services:
     volumes:
       - "projectdata:/var/lib/keel/projects"
       - "sandboxsecret:/keel-secrets:ro"
+      - "runtimesecret:/keel-secrets-db:ro"
     deploy:
       replicas: 1  # override with `--scale keel-worker=N`; scale-out is CAS-safe
     environment:
-      <<: [*app-env, *sandbox-exec]
+      <<: [*app-env, *sandbox-exec, *runtime-db-env]
       OLLAMA_API_BASE: "http://ollama:11434"
     depends_on:
       redis:
         condition: service_healthy
       keel-migrate:
+        condition: service_completed_successfully
+      keel-provision:
         condition: service_completed_successfully
       keel-secret-init:
         condition: service_completed_successfully
@@ -350,3 +425,8 @@ volumes:
   # Generated RPC shared secret (written once by keel-secret-init; mounted read-only into
   # server/worker/sandbox). Delete this volume to rotate the secret.
   sandboxsecret:
+  # Generated runtime DB login password + libpq pgpass file (written once by
+  # keel-runtime-secret-init; mounted read-only into server/worker for password-less connects
+  # and into keel-provision to mint the login). Delete this volume to rotate the runtime
+  # password.
+  runtimesecret:

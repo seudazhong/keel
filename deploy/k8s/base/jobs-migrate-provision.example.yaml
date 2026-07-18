@@ -1,0 +1,113 @@
+# TEMPLATE — the two owner-privileged, one-shot bootstrap Jobs. Copy into your own overlay (not
+# this repo), pin the image digest, and run them (in order) between `kubectl apply -k` and waiting
+# for keel-server/keel-worker readiness. Intentionally NOT in kustomization.yaml resources: a
+# completed Job is immutable, so re-applying the base would error; run these deliberately per
+# install/upgrade instead. See ../../docs/clean-install-runbook.md steps 5-6.
+#
+# Both use the PRIVILEGED owner/migrator credentials (secret-migration.example.yaml,
+# `keel-migration-secret`) — NEVER keel-app-secret's least-privilege runtime login. keel-server /
+# keel-worker never mount keel-migration-secret.
+---
+# Alembic `upgrade head`. Needs DDL, so it runs as the owner/migrator (KEEL_MIGRATION_DATABASE_URL).
+# Mirrors `keel-migrate` in docker-compose.yml. Must complete before the provision Job (the runtime
+# GROUP role + schema it grants must exist first) and before server/worker start.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: keel-migrate
+  labels:
+    app.kubernetes.io/name: keel-migrate
+    app.kubernetes.io/part-of: keel
+    app.kubernetes.io/component: bootstrap
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keel-migrate
+        app.kubernetes.io/part-of: keel
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keel-migrate
+          image: ghcr.io/OWNER/keel-app:REPLACE_WITH_PINNED_DIGEST
+          command: ["alembic", "upgrade", "head"]
+          envFrom:
+            - secretRef:
+                name: keel-migration-secret
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
+---
+# Idempotently mint/repair the least-privilege runtime login keel_runtime_login (member of only the
+# non-owner keel_runtime group created by migration 0011/0020) and set its password, then `--verify`
+# reconnects AS that login and asserts it is NOT superuser / BYPASSRLS / a table owner — so a
+# misprovisioned login is caught here instead of crash-looping keel-server readiness. Runs on the
+# owner/migrator connection AFTER keel-migrate. Mirrors `keel-provision` in docker-compose.yml.
+#
+# The password comes from the `KEEL_RUNTIME_DB_PASSWORD` env (keel-migration-secret) — the default
+# env var the CLI reads. For stronger hygiene (keep the secret off the process environment) project
+# it as a file and use `--password-file` instead, e.g.:
+#   command: ["python","-m","keel_core.provision_runtime_cli","--password-file","/keel-secrets-db/runtime_db_password","--verify"]
+#   volumeMounts: [{name: runtime-secret, mountPath: /keel-secrets-db, readOnly: true}]
+#   volumes: [{name: runtime-secret, secret: {secretName: keel-migration-secret, defaultMode: 0400,
+#             items: [{key: KEEL_RUNTIME_DB_PASSWORD, path: runtime_db_password}]}}]
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: keel-provision
+  labels:
+    app.kubernetes.io/name: keel-provision
+    app.kubernetes.io/part-of: keel
+    app.kubernetes.io/component: bootstrap
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: keel-provision
+        app.kubernetes.io/part-of: keel
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: keel-provision
+          image: ghcr.io/OWNER/keel-app:REPLACE_WITH_PINNED_DIGEST
+          command: ["python", "-m", "keel_core.provision_runtime_cli", "--verify"]
+          envFrom:
+            - secretRef:
+                name: keel-migration-secret
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

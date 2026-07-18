@@ -780,16 +780,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             cloud_mode=settings.cloud_mode,
             default_model=settings.default_model,
         )
-    # M3A runtime-role gate (WS-DB). In cloud mode the data plane MUST be served from a
-    # least-privilege, non-owner runtime login so ``FORCE ROW LEVEL SECURITY`` is a hard
-    # boundary — a superuser / BYPASSRLS / table-owner connection silently bypasses RLS for
-    # every tenant. Verify the *connected* principal at startup and fail closed (crash-loop)
-    # when it is over-privileged: an over-privileged principal is a definitive misconfiguration
-    # that must never serve traffic. A transient DB error is tolerated here (the readiness probe
-    # re-checks and keeps the instance drained until the DB is reachable). Outside cloud mode the
-    # local-preview single-owner login is expected, so the gate is readiness-informational only.
+    # M3A runtime-role gate (WS-DB). When enforced (``KEEL_REQUIRE_RUNTIME_DB_PRINCIPAL``, implied
+    # by ``cloud_mode``) the data plane MUST be served from a least-privilege, non-owner runtime
+    # login so ``FORCE ROW LEVEL SECURITY`` is a hard boundary — a superuser / BYPASSRLS /
+    # table-owner connection silently bypasses RLS for every tenant. Verify the *connected*
+    # principal at startup and fail closed (crash-loop) when it is over-privileged: an
+    # over-privileged principal is a definitive misconfiguration that must never serve traffic. A
+    # transient DB error is tolerated here (the readiness probe re-checks and keeps the instance
+    # drained until the DB is reachable). When the gate is not enforced (open local preview) the
+    # single-owner login is expected, so the check is readiness-informational only.
     app.state.runtime_db_principal = None
-    if settings.cloud_mode and engine is not None:
+    if settings.enforce_runtime_db_principal and engine is not None:
         try:
             async with engine.connect() as conn:
                 app.state.runtime_db_principal = await verify_runtime_principal(conn)
@@ -852,17 +853,19 @@ def create_app() -> FastAPI:
                     await conn.execute(text("SELECT 1"))
                     principal_report = await inspect_runtime_principal(conn)
                 checks["postgres"] = "ok"
-                # Runtime-role gate (see startup): cloud must serve the data plane from a
-                # least-privilege, non-owner login or FORCE RLS is not a real boundary. An
-                # over-privileged principal fails readiness (503) so the instance is drained
-                # rather than serving every tenant from an RLS-exempt connection. In local
-                # preview the single owner login is expected and surfaced informationally (never
-                # reported as "least-privilege", so the posture is not misrepresented).
+                # Runtime-role gate (see startup): when enforced
+                # (KEEL_REQUIRE_RUNTIME_DB_PRINCIPAL, implied by cloud_mode) the data plane must be
+                # served from a least-privilege, non-owner login or FORCE RLS is not a real
+                # boundary. An over-privileged principal fails readiness (503) so the instance is
+                # drained rather than serving every tenant from an RLS-exempt connection. When the
+                # gate is not enforced the single owner login is expected and surfaced
+                # informationally (never reported as "least-privilege", so the posture is not
+                # misrepresented).
                 if principal_report.least_privilege:
                     checks["runtime_db_principal"] = (
                         f"least-privilege ({principal_report.principal})"
                     )
-                elif settings.cloud_mode:
+                elif settings.enforce_runtime_db_principal:
                     checks["runtime_db_principal"] = (
                         f"over-privileged: {principal_report.describe_violation()}"
                     )

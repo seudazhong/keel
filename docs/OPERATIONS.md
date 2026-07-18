@@ -168,9 +168,10 @@ the local single-owner profile, but in **cloud mode** a missing value **fails cl
 `KEEL_DATABASE_URL` is then the non-owner runtime login).
 
 Provision (or idempotently repair) the runtime login with the operator CLI. The password comes
-from an env var (default `KEEL_RUNTIME_DB_PASSWORD`) or `--password-stdin` — never a CLI argument
-— is quoted server-side, and is never surfaced in error output (a DB failure is re-raised
-sanitized, carrying only the exception class name):
+from a mounted secret file (`--password-file`, preferred for Compose/K8s), an env var (default
+`KEEL_RUNTIME_DB_PASSWORD`), or `--password-stdin` — never a CLI argument — is quoted server-side,
+and is never surfaced in error output (a DB failure is re-raised sanitized, carrying only the
+exception class name):
 
 ```bash
 export KEEL_MIGRATION_DATABASE_URL=postgresql+psycopg://<owner>:<pw>@<host>/keel
@@ -203,6 +204,23 @@ and the worker refuses to start if the connection is a superuser, can `BYPASSRLS
 application tables — so the data plane is never served from an RLS-exempt connection. In
 local-preview (non-cloud) the single owner login is expected; `/readiness` surfaces it as
 `owner (local-preview)` (never reported as least-privilege) and does not fail.
+
+**Enforce the non-owner login without cloud mode.** A trusted local/self-hosted stack that keeps
+the local open API (not `KEEL_CLOUD_MODE`) can still require the least-privilege login by setting
+`KEEL_REQUIRE_RUNTIME_DB_PRINCIPAL=true`: server readiness and worker startup then apply the same
+non-owner / non-`BYPASSRLS` / non-table-owner check and fail closed, without forcing API-key auth.
+Cloud mode implies this gate, so you never need both.
+
+**Standard Compose wires this automatically.** `docker-compose.yml` splits the DB env: `keel-migrate`
+and `keel-provision` use the owner/migrator `KEEL_MIGRATION_DATABASE_URL`, while `keel-server`/
+`keel-worker` use the non-owner runtime login with `KEEL_REQUIRE_RUNTIME_DB_PRINCIPAL=true`. A
+one-shot `keel-runtime-secret-init` generates a random runtime password and a `0600` libpq pgpass
+file into a dedicated `runtimesecret` volume, so the server/worker connect **password-less** via a
+`KEEL_DATABASE_URL` that carries no secret plus `PGPASSFILE` — the runtime password never appears in
+a URL, in argv, in the environment, or in logs. `keel-provision` (`--password-file` + `--verify`)
+mints the login and asserts it is least-privilege before the app starts. Delete the `runtimesecret`
+volume to rotate. See the K8s equivalents in `deploy/k8s/base/secret-migration.example.yaml` and
+`jobs-migrate-provision.example.yaml`.
 
 ### Cloud-safety controls (M3.3)
 

@@ -100,6 +100,17 @@ class Settings(BaseSettings):
     # implicit-admin open mode. Leave false only for local/self-hosted single-user use.
     cloud_mode: bool = False
 
+    # M3A runtime-role gate (WS-DB). When true, the server (startup + readiness) and worker
+    # (startup) verify that the *connected* ``KEEL_DATABASE_URL`` principal is a least-privilege,
+    # non-owner login — not a superuser, cannot ``BYPASSRLS`` (directly or via role membership),
+    # and does not own the application tables — and fail **closed** otherwise, so ``FORCE ROW
+    # LEVEL SECURITY`` is a real boundary. Kept independent of ``cloud_mode`` so a trusted
+    # local/Compose stack can require the non-owner runtime login WITHOUT adopting the cloud auth
+    # posture (which also makes an empty ``api_keys`` fatal). ``cloud_mode`` implies it — see
+    # ``enforce_runtime_db_principal`` — because the cloud data plane must never be served from an
+    # RLS-exempt connection.
+    require_runtime_db_principal: bool = False
+
     # Legacy API-key migration mapping (M3.6 review finding 5). A pre-identity API key of the
     # bare ``key:role`` form (no ``org=``/``agent=`` binding) carries no tenant, so in cloud
     # mode it fails closed — there is no ambient data-plane scope. To let an existing cloud
@@ -354,6 +365,19 @@ class Settings(BaseSettings):
         ``cloud_mode`` when no migrator url is configured.
         """
         return self.migration_database_url.strip() or self.database_url
+
+    @property
+    def enforce_runtime_db_principal(self) -> bool:
+        """Whether to fail closed unless ``KEEL_DATABASE_URL`` is a least-privilege runtime login.
+
+        True when explicitly requested via ``KEEL_REQUIRE_RUNTIME_DB_PRINCIPAL`` OR implied by
+        ``cloud_mode``. Kept separate from ``cloud_mode`` so a trusted local/Compose deployment can
+        enforce the non-owner runtime login (making ``FORCE ROW LEVEL SECURITY`` a hard boundary)
+        without also turning on the cloud auth posture (an empty ``api_keys`` becoming fatal,
+        signed webhooks, etc.). The server uses it at startup + readiness and the worker at
+        startup; both reject a superuser / ``BYPASSRLS`` / table-owner runtime connection.
+        """
+        return self.require_runtime_db_principal or self.cloud_mode
 
     def require_migration_database_url(self) -> str:
         """Resolve the owner/migrator URL for migrations + role provisioning, failing closed.
