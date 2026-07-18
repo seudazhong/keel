@@ -951,6 +951,25 @@ def _replace_intent(intent: ImReplyIntent, **changes: object) -> ImReplyIntent:
     return dataclasses.replace(intent, **changes)  # type: ignore[arg-type]
 
 
+async def purge_scope(engine: AsyncEngine, scope_id: ScopeId) -> int:
+    """Erase a scope's durable IM reply outbox + its global route/dispatch pointers.
+
+    Deletes the scope's ``im_reply_intents`` (which cascades the global ``im_reply_dispatch_index``
+    rows) and its ``im_route_index`` rows, so an org/scope/user erasure removes every reply row +
+    global index and the webhook route is invalid immediately. Returns the total rows removed."""
+    async with engine.begin() as conn:
+        await conn.execute(_SET_SCOPE, {"scope": scope_id})
+        replies = await conn.execute(
+            text("DELETE FROM im_reply_intents WHERE scope_id = :scope"),
+            {"scope": scope_id},
+        )
+        routes = await conn.execute(
+            text("DELETE FROM im_route_index WHERE scope_id = :scope"),
+            {"scope": scope_id},
+        )
+    return (replies.rowcount or 0) + (routes.rowcount or 0)
+
+
 # --------------------------------------------------------------------------- postgres stores
 
 _SET_ORG = text("SELECT set_config('app.org_id', :org, true)")
@@ -1496,6 +1515,7 @@ __all__ = [
     "im_safe_tools",
     "persist_terminal_reply",
     "pseudonymous_trace_id",
+    "purge_scope",
     "reply_idempotency_key",
     "resolve_inbound_route",
     "route_key",
