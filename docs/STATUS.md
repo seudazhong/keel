@@ -1,6 +1,6 @@
 # Keel implementation status
 
-> **Snapshot:** 2026-07-19 · **Branch:** `main` · **HEAD:** `810a64c`
+> **Snapshot:** 2026-07-19 · **Branch:** `main` · **HEAD:** `2ae9dc0`
 > **Target:** [PRD](./PRD.md) · **Architecture fidelity:** [ARCHITECTURE](./ARCHITECTURE.md#0-implementation-status-and-fidelity) · **Active execution:** [ROADMAP](./ROADMAP.md)
 
 This document is the authority for **what is true on `main` now**. It is rebuilt from directly
@@ -29,21 +29,23 @@ surface. It is **not** a multi-user product: there is no browser login flow, no 
 sandbox, and the runtime database role still owns the schema. Most product surfaces are a
 **trusted single-operator local preview**, not a production or multi-tenant deployment.
 
-## Verified baseline (M0 green baseline)
+## Verified baseline (M0 green baseline + M2 patch merge)
 
-Measured on `main` at `810a64c`:
+Measured on `main` at `2ae9dc0` (patch foundation merged; migration `0019` actually applied
+in the standard Compose database):
 
 - **Standard stack launches.** `docker compose -f docker-compose.yml --profile dev up -d --build`
   starts cleanly; server `/readiness` returns `true`, the worker arq health check succeeds, and
   the web surface returns `200` on `/health` and `/`.
 - **Backend CI green.** `ruff check`, `ruff format --check`, `mypy`, and the OpenAPI
   compatibility check all pass.
-- **Backend tests.** Non-integration suite: **1795 passed / 1 skipped**. Full Postgres/Redis
-  integration suite: **385 passed / 385**.
+- **Backend tests.** Non-integration suite: **1830 passed / 1 skipped** (1831 selected). Full
+  Postgres/Redis integration suite: **387 passed / 387**.
+- **Patch/review targeted tests.** **45** patch/review targeted tests pass on merged `main`.
 - **Frontend tests.** **116 passed.**
 - **Images build.** Both the `app` and `web` container images build.
 - **Git JIT auth fix.** The Git just-in-time credential bug is fixed on `main` — JIT
-  credentials are sent as an `Authorization` header (commit `810a64c`).
+  credentials are sent as an `Authorization` header.
 
 ## Capability maturity
 
@@ -57,6 +59,7 @@ Measured on `main` at `810a64c`:
 | Identity / org / agents / grants APIs | ✓ | ✓ | ✓ | — | REST + RBAC exist and are tested, but there is **no browser login flow**, so no end-to-end product scenario. |
 | Projects / GitHub App / storage | ✓ | ✓ | ✓ | ~ | Backend + storage exist; product journey is preview-level. |
 | Read-only code review API + worker | ✓ | ✓ | ✓ | — | Review generation runs server + worker side; **no review UI** ships. |
+| Patch / Draft PR foundation (models/store/bundle/generation/approval/writeback/coordinator) | ✓ | ✓ | ✓ | — | Merged on `main` (M2); C/T foundation only. No API/SDK/worker/outbox/reconciler/UI (M4/M5). |
 | Connectors: Gmail native, IM routing (OneBot/Telegram) | ✓ | ✓ | ✓ | ~ | Gmail OAuth/read/status/send preview works; IM message routing exists, IM durable routing + admin UI do not. |
 
 ### Product surface (React)
@@ -88,18 +91,21 @@ preview**. They are **not production-safe** and must not be exposed to untrusted
 No level of green tests changes this: a real isolated sandbox and a non-owner runtime DB role
 are **not** deployed on `main`.
 
-## Patch / Draft PR foundation (off-main, not a current product feature)
+## Patch / Draft PR foundation (merged on `main`, C/T foundation only — not product usable)
 
-A controlled patch-proposal foundation is stable on branch `feat/future-patch-pr`
-(commit `c97fc46`, later synced to the green main baseline at `64c49ce`):
+The controlled patch-proposal foundation is **merged on `main`** (milestone **M2**, complete):
 
-- Migration `0019`, plus models / store / bundle / generation / approval / writeback /
-  coordinator modules.
-- `ruff` + `mypy` clean; **34 unit tests** and **2 Postgres integration tests** pass.
+- Migration `0019` (`0019_patch_proposals`), plus the patch models / store / bundle /
+  generation / approval / writeback modules and the coordinator, including generation-run
+  **recovery + lease guard** and **trusted writeback**.
+- On merged `main`: `ruff` + `mypy` clean; the patch/review targeted suite (**45 tests**)
+  passes, and the foundation is covered within the green non-integration and Postgres
+  integration baselines above.
 
-It is **not merged into `main`** and has **no API/SDK, no worker jobs, no dispatch outbox, no
-approved/expiry reconciler, and no UI**. Therefore it is **not a current product capability**
-and must not be described as one. Merging it is milestone **M2**.
+This is a **C/T foundation only**. It has **no Patch API/SDK, no worker jobs, no dispatch
+outbox, no approved/expiry reconciler, and no UI** — those remain milestones **M4** (API /
+worker / outbox / reconciler) and **M5** (UI + human approval → Draft PR e2e). Until then the
+patch foundation is **not a usable product scenario (not P)** and must not be described as one.
 
 ## Critical blockers (before any multi-user or production exposure)
 
@@ -117,7 +123,7 @@ and must not be described as one. Merging it is milestone **M2**.
 
 ## Next work
 
-Follow [Roadmap](./ROADMAP.md): M1 (this commit) → M2 Patch Foundation Merge → M3A Runtime DB
+Follow [Roadmap](./ROADMAP.md): M0 and M1 and M2 are complete → **next** M3A Runtime DB
 Role/RLS and M3B Real Sandbox (parallel safety gates) → M4 Patch API/worker/outbox → M5 Patch
 UI + approval → Draft PR e2e → M6 Personal Agent + Calendar → M7 Browser OIDC + admin/review/IM
 UI → M8 Event/lifecycle + erasure closure → M9 Production delivery/scale/OTel/DR.

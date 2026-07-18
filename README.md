@@ -40,7 +40,8 @@ and blockers, and [`docs/ROADMAP.md`](./docs/ROADMAP.md) for the active M0–M9 
 
 ## What works now
 
-Verified on `main` at `810a64c`:
+Verified on `main` at `2ae9dc0` (non-integration 1830 passed / 1 skipped; integration 387/387;
+frontend 116; migration `0019` applied in the standard Compose database):
 
 - FastAPI chat with SSE, tool timeline, and approvals
 - durable sessions/runs/jobs/schedules with cancellation/retry/recovery, and session search
@@ -53,9 +54,11 @@ Verified on `main` at `810a64c`:
   Connectors, Observability), with onboarding, i18n, and Agents/Projects surfaces
 - CLI local runtime with file, shell, and provider tools
 
-A controlled Patch/Draft-PR foundation is stable on branch `feat/future-patch-pr`
-(commit `c97fc46`) but is **not** merged into `main` and has no API/worker/UI — it is not a
-current product feature. See [`docs/STATUS.md`](./docs/STATUS.md).
+The controlled Patch/Draft-PR foundation is **merged on `main`** (migration `0019`, plus
+models/store/bundle/generation/approval with recovery+lease guard/trusted writeback/coordinator),
+but it is a **C/T foundation only** — it has no API/SDK, worker jobs, dispatch outbox,
+reconciler, or UI (those are milestones M4/M5), so it is **not yet product usable**. See
+[`docs/STATUS.md`](./docs/STATUS.md).
 
 Important limits (trusted single-operator local deployment — **not production-safe**): the
 Compose `dev`/`full` stack runs a real authenticated `keel-sandbox` execution boundary (server/
