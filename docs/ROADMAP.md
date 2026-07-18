@@ -1,6 +1,6 @@
 # Keel roadmap
 
-> **Updated:** 2026-07-19 · **Authority:** active execution sequence · **Baseline:** `main` `810a64c`
+> **Updated:** 2026-07-19 · **Authority:** active execution sequence · **Baseline:** `main` `2ae9dc0`
 
 This roadmap sequences **small, independently verifiable milestones**. Each milestone lists
 explicit dependencies and **machine-verifiable exit gates**. No milestone is "implement all
@@ -33,44 +33,45 @@ future plans." Completion evidence lives in [Status](./STATUS.md), not in dated 
 - Frontend: 116 passed. `app` and `web` images build.
 - Git JIT credential bug fixed (`Authorization` header).
 
-### M1 — Truthful Baseline Docs · **This commit**
+### M1 — Truthful Baseline Docs · **Complete**
 
 **Goal:** README/STATUS/ROADMAP describe exactly what `main` is, using the C/T/D/P maturity
 scale, and correct stale claims while preserving the trusted-preview safety contract.
 
 **Dependencies:** M0.
 
-**Exit gates:**
+**Exit gates (met):**
 
 - STATUS/README rate capabilities on C/T/D/P and never promote C/T to P.
 - Stale claims removed/corrected (e.g. "no identity/onboarding", "static stub instead of React
   bundle") while the local-preview safety limits remain stated.
-- The Patch/Draft PR foundation is documented as off-main (branch `feat/future-patch-pr`) and
-  **not** a current product feature.
+- The Patch/Draft PR foundation is documented with its correct merge status and **not** as a
+  usable product feature.
 - Markdown tracked-link check passes and `git diff --check` is clean.
 
-### M2 — Patch Foundation Merge
+### M2 — Patch Foundation Merge · **Complete**
 
-**Goal:** land the patch-proposal foundation (`feat/future-patch-pr`) on `main` behind its full
-regression suite, with no product-surface exposure yet.
+**Goal:** land the patch-proposal foundation on `main` behind its full regression suite, with no
+product-surface exposure yet.
 
 **Dependencies:** M1.
 
-**Exit gates:**
+**Exit gates (met at `2ae9dc0`):**
 
-- Migration `0019` and the patch models/store/bundle/generation/approval/writeback/coordinator
-  modules are on `main`.
-- On `main`: `ruff` + `mypy` clean; the patch unit suite (≥34) and its Postgres integration
-  tests (≥2) pass in CI.
-- The full M0 baseline (readiness, integration, frontend, image builds) still passes
-  post-merge.
-- No patch UI, API, or worker dispatch is enabled yet (foundation only; scope creep rejected).
+- Migration `0019` and the patch models/store/bundle/generation/approval (with generation-run
+  recovery + lease guard)/trusted-writeback/coordinator modules are on `main`; `0019` actually
+  applied in the standard Compose database with readiness/worker/web healthy.
+- On merged `main`: `ruff` + `mypy` + OpenAPI checks clean; the patch/review targeted suite
+  (**45 tests**) passes.
+- The full baseline still passes post-merge: non-integration **1830 passed / 1 skipped**,
+  integration **387 / 387**, frontend **116**, `app`/`web` images build.
+- No patch UI, API, or worker dispatch is enabled (C/T foundation only; those are M4/M5).
 
 ### M3A — Runtime DB Role / RLS  *(safety gate, parallelizable)*
 
 **Goal:** the runtime application role is a **non-owner** with enforced row-level security.
 
-**Dependencies:** M1 (may run parallel to M2/M3B).
+**Dependencies:** M1 (M2 complete; the two safety gates M3A/M3B may run in parallel). **Next active milestone.**
 
 **Exit gates:**
 
@@ -84,7 +85,7 @@ regression suite, with no product-surface exposure yet.
 **Goal:** deploy a real isolated execution backend, replacing `unsafe-local-dev` for
 shell/file execution.
 
-**Dependencies:** M1 (may run parallel to M2/M3A).
+**Dependencies:** M1 (M2 complete; the two safety gates M3A/M3B may run in parallel). **Next active milestone.**
 
 **Exit gates:**
 
@@ -195,5 +196,6 @@ M0 → M1 → M2 → M4 → M5 → ─┐
 
 - [Status](./STATUS.md) supplies completion evidence; dated plans do not.
 - Safety gates (M3A/M3B) cannot be bypassed by product or connector breadth.
-- The Patch foundation is off-main until M2; it is not a current product feature.
+- The Patch foundation is merged on `main` (M2) as a C/T foundation only; it is not product
+  usable until its API/worker (M4) and UI/e2e (M5) close.
 - A milestone completes only on its measurable exit gate, never on merged code alone.
