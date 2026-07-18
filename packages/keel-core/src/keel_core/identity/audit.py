@@ -37,6 +37,8 @@ class AuditAction(StrEnum):
     grant_revoked = "grant.revoked"
     user_provisioned = "user.provisioned"
     user_erased = "user.erased"
+    im_route_claimed = "im.route_claimed"
+    im_route_released = "im.route_released"
 
 
 @dataclass(frozen=True)

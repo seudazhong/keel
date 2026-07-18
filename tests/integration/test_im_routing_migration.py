@@ -27,9 +27,11 @@ from keel_core.im_routing import (
     ImReplyKind,
     ImReplyPolicy,
     PostgresImMappingStore,
+    PostgresImProvisioner,
     PostgresImReplyDispatchIndex,
     PostgresImReplyStore,
     PostgresImRouteIndex,
+    RouteConflictError,
     purge_scope,
     reply_idempotency_key,
     route_key,
@@ -213,3 +215,56 @@ async def test_migration_0018_up_down_up_and_invariants(migrated_db: AsyncEngine
     assert _IM_TABLES & await _im_table_names(engine) == set()
     await asyncio.to_thread(_run_to, url, "head")
     assert _IM_TABLES <= await _im_table_names(engine)
+
+
+async def _seed_two_orgs_two_agents(engine: AsyncEngine) -> None:
+    async with engine.begin() as conn:
+        await conn.execute(text("SET row_security = off"))
+        await conn.execute(
+            text("INSERT INTO users(id,display_name,status) VALUES('u1','U','active')")
+        )
+        for org in ("org-a", "org-b"):
+            await conn.execute(
+                text(
+                    "INSERT INTO organizations(id,slug,display_name,status) "
+                    "VALUES(:id,:slug,:id,'active')"
+                ),
+                {"id": org, "slug": org},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO agents(id,org_id,kind,owner_user_id,name,status,version) "
+                    "VALUES(:a,:o,'personal','u1','Support','active',1)"
+                ),
+                {"a": f"agent-{org}", "o": org},
+            )
+
+
+async def test_provisioner_claim_is_single_winner_and_idempotent(migrated_db: AsyncEngine) -> None:
+    """The transactional provisioner enforces one owner per route; the loser leaves no orphan."""
+    engine = migrated_db
+    await _seed_two_orgs_two_agents(engine)
+    provisioner = PostgresImProvisioner(engine)
+    route = PostgresImRouteIndex(engine)
+
+    created = await provisioner.provision(_mapping("org-a", "agent-org-a"))
+    key = route_key("telegram", "bot-9", "4242")
+    entry = await route.lookup(key)
+    assert entry is not None and entry.org_id == "org-a" and entry.mapping_id == created.id
+
+    # A competing claim by another org for the same chat fails closed and rolls its mapping back.
+    with pytest.raises(RouteConflictError):
+        await provisioner.provision(_mapping("org-b", "agent-org-b"))
+    # The existing owner's route is untouched; the loser left no orphan mapping row.
+    still = await route.lookup(key)
+    assert still is not None and still.org_id == "org-a" and still.mapping_id == created.id
+    async with engine.begin() as conn:
+        await conn.execute(text("SET row_security = off"))
+        orphans = await conn.scalar(
+            text("SELECT count(*) FROM im_channel_mappings WHERE org_id = 'org-b'")
+        )
+    assert orphans == 0
+
+    # Re-claiming the *same* mapping is idempotent (no conflict, refreshes the opaque row).
+    await route.claim(created.route_entry())
+    assert (await route.lookup(key)).mapping_id == created.id  # type: ignore[union-attr]

@@ -1,41 +1,60 @@
 """Authenticated durable IM channel-mapping admin API (WS-E/J, M3.7).
 
 CRUD/list/status/revoke over the **org-owned** OneBot/Telegram channel mappings that bind a
-provider chat identity to an exact persisted Agent + canonical scope + reply policy. Every route
-binds to a request actor and an org the user is an active member of (``X-Keel-Org``); the Agent
-is re-validated through :meth:`IdentityService.select_agent` so a mapping can only ever bind an
-Agent in the caller's *own* org (cross-org binding is impossible — the DB composite FK is the
-final guard). No raw external provider secrets are ever accepted or returned; the mapping policy
-is a plain capability/flag object. Creating/updating a mapping (re)publishes its opaque row in
-the global route index; revoking removes it so the webhook route is invalid immediately.
+provider chat identity to an exact persisted Agent + canonical scope + reply policy.
+
+**Provisioning is platform-admin-only** (route-ownership hardening): *claiming* a global
+``(provider, external_bot_id, external_chat_id)`` route (``POST``) requires a **truly global
+machine admin** credential (or, self-hosted, the open-mode local operator) that explicitly
+selects the target org (``X-Keel-Org``) and Agent (``agent_id``); the claim is audited. An
+ordinary OIDC/org admin can **view and manage** their org's existing mappings (list/get/
+revoke/disable/enable) but can never first-claim an arbitrary chat — closing the first-claim
+theft where any tenant admin could bind a chat they do not control. Self-service webhook chat
+verification is future work.
+
+Route creation is **insert/claim, never last-writer-wins**: a route belongs to exactly one
+org/mapping, and a conflicting claim by a different org fails closed with an opaque ``409``
+(the owning org is never disclosed) without disturbing the existing route. The mapping row and
+its global route claim are committed atomically (Postgres transaction) or compensated safely
+(in-memory), so a concurrent cross-org race yields exactly one winner and the loser leaves no
+orphan. The Agent is re-validated so a mapping can only ever bind an active Agent in the target
+org (the DB composite FK is the final guard). No raw external provider secrets are ever accepted
+or returned; the mapping policy is a plain capability/flag object. Revoking/disabling removes the
+global route row so the webhook route is invalid immediately.
 """
 
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.exc import IntegrityError
 
-from keel_core.errors import PermissionDenied
-from keel_core.identity import IdentityService, NotFoundError
+from keel_core.identity import AuditAction, AuditEvent, IdentityService, NotFoundError
 from keel_core.im_routing import (
     ImChannelMapping,
     ImChatKind,
     ImMappingStatus,
     ImMappingStore,
     ImProvider,
+    ImProvisioner,
     ImReplyPolicy,
     ImRouteIndexStore,
     InMemoryImMappingStore,
+    InMemoryImProvisioner,
     InMemoryImRouteIndex,
     PostgresImMappingStore,
+    PostgresImProvisioner,
     PostgresImRouteIndex,
+    RouteConflictError,
 )
 from keel_core.scoping import derive_agent_scope
-from keel_server.identity_context import ResolvedOrg, require_org
+from keel_server.auth import Role
+from keel_server.identity_context import Actor, ActorKind, ResolvedOrg, require_org, resolve_actor
 
 router = APIRouter(prefix="/v1/im/mappings", tags=["im-routing"])
 
@@ -146,40 +165,116 @@ def _route_index(request: Request) -> ImRouteIndexStore:
     return index
 
 
-async def _require_agent_name(request: Request, org: ResolvedOrg, agent_id: str) -> str:
-    """Resolve + authorize the Agent in the caller's org (cross-org binding rejected)."""
-    try:
-        agent = await _identity(request).select_agent(org.org_id, org.user_id, agent_id)
-    except NotFoundError:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "agent not found") from None
-    except PermissionDenied:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "agent not permitted") from None
-    return agent.name
+def _provisioner(request: Request, org_id: str) -> ImProvisioner:
+    """The transactional (Postgres) / compensating (in-memory) mapping+route provisioner."""
+    engine = getattr(request.app.state, "engine", None)
+    if engine is not None:
+        return PostgresImProvisioner(engine)
+    return InMemoryImProvisioner(_mapping_store(request, org_id), _route_index(request))
+
+
+def _cloud_mode(request: Request) -> bool:
+    return bool(getattr(request.app.state, "auth_required", False))
+
+
+@dataclass(frozen=True)
+class _Provisioner:
+    """A platform-admin actor authorized to claim IM routes for an explicitly selected org."""
+
+    actor: Actor
+    org_ref: str
+
+
+async def require_platform_provisioner(
+    request: Request,
+    actor: Annotated[Actor, Depends(resolve_actor)],
+    x_keel_org: Annotated[str | None, Header(alias="X-Keel-Org")] = None,
+) -> _Provisioner:
+    """Gate route provisioning to a **truly global** machine admin (or open-mode local operator).
+
+    An ordinary OIDC/org admin — even an org owner — is denied here (``403``): they may manage
+    an already-provisioned mapping but can never first-claim an arbitrary chat. A global machine
+    admin credential (``…:admin:global``) must explicitly select the target org via ``X-Keel-Org``.
+    In a self-hosted, non-cloud deployment the single trusted local operator is the platform admin.
+    """
+    is_global_machine = (
+        actor.kind is ActorKind.machine and actor.machine_global and actor.api_role >= Role.admin
+    )
+    is_local_operator = (
+        actor.kind is ActorKind.local and actor.api_role >= Role.admin and not _cloud_mode(request)
+    )
+    if not (is_global_machine or is_local_operator):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "IM channel provisioning requires a platform admin credential",
+        )
+    if not x_keel_org or not x_keel_org.strip():
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "select the target organization via the X-Keel-Org header"
+        )
+    return _Provisioner(actor=actor, org_ref=x_keel_org.strip())
+
+
+def _provision_actor_id(actor: Actor) -> str:
+    """A stable, non-sensitive identifier for the claiming platform admin (for the audit)."""
+    return actor.user_id or f"{actor.kind.value}:{actor.display_name}"
 
 
 @router.post("", response_model=MappingResponse, status_code=status.HTTP_201_CREATED)
 async def create_mapping(
     body: MappingCreateRequest,
     request: Request,
-    org: Annotated[ResolvedOrg, Depends(require_org)],
+    provisioner: Annotated[_Provisioner, Depends(require_platform_provisioner)],
 ) -> MappingResponse:
-    """Create an org-owned channel mapping + publish its opaque global route index row."""
-    await _require_agent_name(request, org, body.agent_id)
+    """Platform-admin-only: claim a global route + create the org-owned channel mapping.
+
+    The target org (``X-Keel-Org``) and Agent (``agent_id``) are resolved as authoritative
+    configuration (no membership) and must both be active. The mapping row and its global route
+    claim are committed atomically; a chat already claimed by another org fails closed with an
+    opaque ``409`` (the owning org is never disclosed). The claim is audited.
+    """
+    identity = _identity(request)
+    try:
+        org, agent = await identity.resolve_machine_binding(provisioner.org_ref, body.agent_id)
+    except NotFoundError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "organization or agent not found") from None
     mapping = ImChannelMapping(
         id=uuid.uuid4().hex,
-        org_id=org.org_id,
+        org_id=org.id,
         provider=body.provider,
         external_bot_id=body.external_bot_id,
         external_chat_id=body.external_chat_id,
         chat_kind=body.chat_kind,
-        agent_id=body.agent_id,
-        scope_id=derive_agent_scope(org.org_id, body.agent_id),
+        agent_id=agent.id,
+        scope_id=derive_agent_scope(org.id, agent.id),
         policy=body.policy.to_policy(),
         status=ImMappingStatus.active,
-        created_by=org.user_id,
+        created_by=_provision_actor_id(provisioner.actor),
     )
-    created = await _mapping_store(request, org.org_id).create(mapping)
-    await _route_index(request).put(created.route_entry())
+    try:
+        created = await _provisioner(request, org.id).provision(mapping)
+    except RouteConflictError:
+        # Opaque: never leak which org already owns the chat.
+        raise HTTPException(status.HTTP_409_CONFLICT, "this chat is already claimed") from None
+    except IntegrityError:
+        # A duplicate (org, provider, bot, chat) mapping or a cross-org Agent FK violation.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "a mapping for this chat already exists"
+        ) from None
+    identity.audit.record(
+        AuditEvent(
+            AuditAction.im_route_claimed,
+            _provision_actor_id(provisioner.actor),
+            org.id,
+            created.id,
+            {
+                "provider": created.provider.value,
+                "chat_kind": created.chat_kind.value,
+                "agent_id": created.agent_id,
+                "route": created.route_key[:12],
+            },
+        )
+    )
     return MappingResponse.of(created)
 
 
@@ -208,15 +303,33 @@ async def _set_status(
     existing = await store.get(mapping_id)
     if existing is None or existing.org_id != org.org_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "mapping not found")
+    index = _route_index(request)
+    if new_status is ImMappingStatus.active:
+        # Re-claim the route *before* flipping status so a chat that was claimed by another org
+        # while this mapping was disabled fails closed (409) and leaves the mapping unchanged —
+        # never a routeless "active" orphan. Re-claiming the same mapping is idempotent.
+        active_entry = replace(existing.route_entry(), status=ImMappingStatus.active)
+        try:
+            await index.claim(active_entry)
+        except RouteConflictError:
+            raise HTTPException(status.HTTP_409_CONFLICT, "this chat is already claimed") from None
     updated = await store.set_status(mapping_id, new_status, actor=org.user_id)
     if updated is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "mapping not found")
-    index = _route_index(request)
-    if new_status is ImMappingStatus.active:
-        await index.put(updated.route_entry())
-    else:
-        # Revoke/disable: drop the global route row so the webhook route is invalid immediately.
+    if new_status is not ImMappingStatus.active:
+        # Revoke/disable: drop the global route row so the webhook route is invalid immediately,
+        # then audit the release. Only the owning org reaches here (RLS + org check above), so a
+        # non-owner can never remove the winner's route.
         await index.remove_for_mapping(mapping_id)
+        _identity(request).audit.record(
+            AuditEvent(
+                AuditAction.im_route_released,
+                org.user_id,
+                org.org_id,
+                mapping_id,
+                {"status": new_status.value, "route": updated.route_key[:12]},
+            )
+        )
     return MappingResponse.of(updated)
 
 

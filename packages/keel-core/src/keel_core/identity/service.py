@@ -85,6 +85,10 @@ class IdentityService:
     def authz(self) -> AuthorizationService:
         return self._authz
 
+    @property
+    def audit(self) -> AuditSink:
+        return self._audit
+
     # --- provisioning ----------------------------------------------------------------
     async def resolve_oidc_user(self, claims: OIDCClaims) -> User:
         """Resolve a verified OIDC subject to a durable user (JIT or explicit-link)."""

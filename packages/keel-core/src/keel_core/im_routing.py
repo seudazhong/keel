@@ -113,6 +113,16 @@ class RevokedMappingError(ImRoutingError):
     """The resolved mapping is revoked/disabled — the run is refused (fail closed)."""
 
 
+class RouteConflictError(ImRoutingError):
+    """A global route is already claimed by a *different* org/mapping (fail closed, opaque).
+
+    Route creation is **insert/claim**, never last-writer-wins: a ``(provider, external_bot_id,
+    external_chat_id)`` route may belong to exactly one org/mapping. Re-claiming the same mapping
+    is idempotent, but a claim by a *different* mapping/org is refused **without** disturbing the
+    existing route — so an ordinary tenant admin can never steal a chat another org already owns.
+    """
+
+
 # --------------------------------------------------------------------------- hashing
 
 
@@ -642,6 +652,8 @@ class ImMappingStore(Protocol):
 
     async def list_for_org(self, org_id: str) -> list[ImChannelMapping]: ...
 
+    async def delete(self, mapping_id: str) -> None: ...
+
     async def set_status(
         self,
         mapping_id: str,
@@ -653,7 +665,9 @@ class ImMappingStore(Protocol):
 
 
 class ImRouteIndexStore(Protocol):
-    """The global opaque route index (no RLS): publish/lookup/remove/purge."""
+    """The global opaque route index (no RLS): claim/publish/lookup/remove/purge."""
+
+    async def claim(self, entry: ImRouteEntry, *, now: datetime | None = None) -> None: ...
 
     async def put(self, entry: ImRouteEntry, *, now: datetime | None = None) -> None: ...
 
@@ -662,6 +676,14 @@ class ImRouteIndexStore(Protocol):
     async def remove_for_mapping(self, mapping_id: str) -> None: ...
 
     async def purge_scope(self, scope_id: ScopeId) -> int: ...
+
+
+class ImProvisioner(Protocol):
+    """Atomically create a mapping **and** claim its global route (single-winner semantics)."""
+
+    async def provision(
+        self, mapping: ImChannelMapping, *, now: datetime | None = None
+    ) -> ImChannelMapping: ...
 
 
 class ImReplyStore(Protocol):
@@ -755,6 +777,9 @@ class InMemoryImMappingStore:
     async def list_for_org(self, org_id: str) -> list[ImChannelMapping]:
         return [m for m in self._rows.values() if m.org_id == org_id]
 
+    async def delete(self, mapping_id: str) -> None:
+        self._rows.pop(mapping_id, None)
+
     async def set_status(
         self,
         mapping_id: str,
@@ -796,8 +821,22 @@ class InMemoryImRouteIndex:
     def __init__(self) -> None:
         self._by_key: dict[str, ImRouteEntry] = {}
 
-    async def put(self, entry: ImRouteEntry, *, now: datetime | None = None) -> None:
+    async def claim(self, entry: ImRouteEntry, *, now: datetime | None = None) -> None:
+        """Insert the route, or idempotently update it iff *this* mapping already owns it.
+
+        A route_key already held by a **different** mapping is refused with
+        :class:`RouteConflictError` and the existing row is left untouched (fail closed) — the
+        one-winner rule that stops a first-claim theft. Re-claiming the same mapping refreshes
+        its opaque row (status/policy) without conflict.
+        """
+        existing = self._by_key.get(entry.route_key)
+        if existing is not None and existing.mapping_id != entry.mapping_id:
+            raise RouteConflictError("chat is already claimed by another mapping")
         self._by_key[entry.route_key] = entry
+
+    async def put(self, entry: ImRouteEntry, *, now: datetime | None = None) -> None:
+        # Backward-compatible publish: identical to :meth:`claim` (never last-writer-wins).
+        await self.claim(entry, now=now)
 
     async def lookup(self, key: str) -> ImRouteEntry | None:
         return self._by_key.get(key)
@@ -809,6 +848,31 @@ class InMemoryImRouteIndex:
         before = len(self._by_key)
         self._by_key = {k: v for k, v in self._by_key.items() if v.scope_id != scope_id}
         return before - len(self._by_key)
+
+
+class InMemoryImProvisioner:
+    """Compensating in-memory provisioner: create the mapping, then claim its global route.
+
+    Mirrors the Postgres transactional provisioner's single-winner semantics without a real
+    transaction: if the route is already owned by another org/mapping the just-created mapping
+    is deleted (compensated) before the conflict propagates, so the loser of a concurrent
+    cross-org race leaves **no** active orphan mapping or index row.
+    """
+
+    def __init__(self, mappings: ImMappingStore, route_index: ImRouteIndexStore) -> None:
+        self._mappings = mappings
+        self._route_index = route_index
+
+    async def provision(
+        self, mapping: ImChannelMapping, *, now: datetime | None = None
+    ) -> ImChannelMapping:
+        created = await self._mappings.create(mapping)
+        try:
+            await self._route_index.claim(created.route_entry(), now=now)
+        except RouteConflictError:
+            await self._mappings.delete(created.id)
+            raise
+        return created
 
 
 class InMemoryImReplyStore:
@@ -1006,6 +1070,71 @@ async def purge_scope(engine: AsyncEngine, scope_id: ScopeId) -> int:
 _SET_ORG = text("SELECT set_config('app.org_id', :org, true)")
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 
+_MAPPING_RETURNING = (
+    "id, org_id, provider, external_bot_id, external_chat_id, chat_kind, agent_id, scope_id, "
+    "policy, status, version, created_by, created_at, updated_at, revoked_by, revoked_at"
+)
+
+_INSERT_MAPPING = text(
+    "INSERT INTO im_channel_mappings "
+    "(id, org_id, provider, external_bot_id, external_chat_id, chat_kind, agent_id, scope_id, "
+    " policy, status, version, created_by, created_at, updated_at) "
+    "VALUES (:id, :org_id, :provider, :bot, :chat, :chat_kind, :agent_id, :scope_id, "
+    " CAST(:policy AS jsonb), :status, :version, :created_by, :created_at, :updated_at) "
+    f"RETURNING {_MAPPING_RETURNING}"
+)
+
+# Insert-or-idempotent claim of a global route: the ``ON CONFLICT ... WHERE`` clause only
+# updates the row when *this* mapping already owns the route_key, so a claim by a **different**
+# mapping/org matches no row (RETURNING is empty) and the caller fails closed with a
+# RouteConflictError — the existing owner's route is never overwritten (no last-writer-wins).
+_CLAIM_ROUTE = text(
+    "INSERT INTO im_route_index "
+    "(route_key, org_id, scope_id, mapping_id, agent_id, chat_kind, status, "
+    " reply_allowed, created_at, updated_at) "
+    "VALUES (:route_key, :org_id, :scope_id, :mapping_id, :agent_id, :chat_kind, "
+    " :status, :reply_allowed, :now, :now) "
+    "ON CONFLICT (route_key) DO UPDATE SET "
+    " org_id = EXCLUDED.org_id, scope_id = EXCLUDED.scope_id, agent_id = EXCLUDED.agent_id, "
+    " chat_kind = EXCLUDED.chat_kind, status = EXCLUDED.status, "
+    " reply_allowed = EXCLUDED.reply_allowed, updated_at = EXCLUDED.updated_at "
+    "WHERE im_route_index.mapping_id = EXCLUDED.mapping_id "
+    "RETURNING route_key"
+)
+
+
+def _mapping_insert_params(mapping: ImChannelMapping) -> dict[str, object]:
+    return {
+        "id": mapping.id,
+        "org_id": mapping.org_id,
+        "provider": mapping.provider.value,
+        "bot": mapping.external_bot_id,
+        "chat": mapping.external_chat_id,
+        "chat_kind": mapping.chat_kind.value,
+        "agent_id": mapping.agent_id,
+        "scope_id": mapping.scope_id,
+        "policy": json.dumps(mapping.policy.to_json()),
+        "status": mapping.status.value,
+        "version": mapping.version,
+        "created_by": mapping.created_by,
+        "created_at": mapping.created_at,
+        "updated_at": mapping.updated_at,
+    }
+
+
+def _route_claim_params(entry: ImRouteEntry, now: datetime) -> dict[str, object]:
+    return {
+        "route_key": entry.route_key,
+        "org_id": entry.org_id,
+        "scope_id": entry.scope_id,
+        "mapping_id": entry.mapping_id,
+        "agent_id": entry.agent_id,
+        "chat_kind": entry.chat_kind.value,
+        "status": entry.status.value,
+        "reply_allowed": entry.reply_allowed,
+        "now": now,
+    }
+
 
 def _mapping_from_row(row: object) -> ImChannelMapping:
     r = row  # sqlalchemy Row is attribute-accessible
@@ -1068,38 +1197,7 @@ class PostgresImMappingStore:
     async def create(self, mapping: ImChannelMapping) -> ImChannelMapping:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_ORG, {"org": self._org_id})
-            row = (
-                await conn.execute(
-                    text(
-                        "INSERT INTO im_channel_mappings "
-                        "(id, org_id, provider, external_bot_id, external_chat_id, chat_kind, "
-                        " agent_id, scope_id, policy, status, version, created_by, "
-                        " created_at, updated_at) "
-                        "VALUES (:id, :org_id, :provider, :bot, :chat, :chat_kind, :agent_id, "
-                        " :scope_id, CAST(:policy AS jsonb), :status, :version, :created_by, "
-                        " :created_at, :updated_at) "
-                        "RETURNING id, org_id, provider, external_bot_id, external_chat_id, "
-                        " chat_kind, agent_id, scope_id, policy, status, version, created_by, "
-                        " created_at, updated_at, revoked_by, revoked_at"
-                    ),
-                    {
-                        "id": mapping.id,
-                        "org_id": mapping.org_id,
-                        "provider": mapping.provider.value,
-                        "bot": mapping.external_bot_id,
-                        "chat": mapping.external_chat_id,
-                        "chat_kind": mapping.chat_kind.value,
-                        "agent_id": mapping.agent_id,
-                        "scope_id": mapping.scope_id,
-                        "policy": json.dumps(mapping.policy.to_json()),
-                        "status": mapping.status.value,
-                        "version": mapping.version,
-                        "created_by": mapping.created_by,
-                        "created_at": mapping.created_at,
-                        "updated_at": mapping.updated_at,
-                    },
-                )
-            ).one()
+            row = (await conn.execute(_INSERT_MAPPING, _mapping_insert_params(mapping))).one()
         return _mapping_from_row(row)
 
     async def get(self, mapping_id: str) -> ImChannelMapping | None:
@@ -1133,6 +1231,20 @@ class PostgresImMappingStore:
                 )
             ).all()
         return [_mapping_from_row(row) for row in rows]
+
+    async def delete(self, mapping_id: str) -> None:
+        """Erase a mapping row (RLS-guarded); its global route row cascades away.
+
+        Used to compensate a failed provision (the mapping was inserted but its route claim lost
+        a cross-org race) so the loser leaves no active orphan mapping. RLS on ``app.org_id``
+        makes this a no-op for any mapping the caller's org does not own.
+        """
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_ORG, {"org": self._org_id})
+            await conn.execute(
+                text("DELETE FROM im_channel_mappings WHERE id = :id"),
+                {"id": mapping_id},
+            )
 
     async def set_status(
         self,
@@ -1176,34 +1288,23 @@ class PostgresImRouteIndex:
     def __init__(self, engine: AsyncEngine) -> None:
         self._engine = engine
 
-    async def put(self, entry: ImRouteEntry, *, now: datetime | None = None) -> None:
+    async def claim(self, entry: ImRouteEntry, *, now: datetime | None = None) -> None:
+        """Insert-or-idempotently-refresh the route iff *this* mapping owns it; else fail closed.
+
+        The ``ON CONFLICT (route_key) DO UPDATE ... WHERE mapping_id = EXCLUDED.mapping_id`` only
+        touches a row already owned by the same mapping, so a claim by a **different** org/mapping
+        matches no row (``RETURNING`` is empty) and raises :class:`RouteConflictError` without
+        disturbing the existing owner's route — never last-writer-wins.
+        """
         now = now or _now()
         async with self._engine.begin() as conn:
-            await conn.execute(
-                text(
-                    "INSERT INTO im_route_index "
-                    "(route_key, org_id, scope_id, mapping_id, agent_id, chat_kind, status, "
-                    " reply_allowed, created_at, updated_at) "
-                    "VALUES (:route_key, :org_id, :scope_id, :mapping_id, :agent_id, :chat_kind, "
-                    " :status, :reply_allowed, :now, :now) "
-                    "ON CONFLICT (route_key) DO UPDATE SET "
-                    " org_id = EXCLUDED.org_id, scope_id = EXCLUDED.scope_id, "
-                    " mapping_id = EXCLUDED.mapping_id, agent_id = EXCLUDED.agent_id, "
-                    " chat_kind = EXCLUDED.chat_kind, status = EXCLUDED.status, "
-                    " reply_allowed = EXCLUDED.reply_allowed, updated_at = EXCLUDED.updated_at"
-                ),
-                {
-                    "route_key": entry.route_key,
-                    "org_id": entry.org_id,
-                    "scope_id": entry.scope_id,
-                    "mapping_id": entry.mapping_id,
-                    "agent_id": entry.agent_id,
-                    "chat_kind": entry.chat_kind.value,
-                    "status": entry.status.value,
-                    "reply_allowed": entry.reply_allowed,
-                    "now": now,
-                },
-            )
+            row = (await conn.execute(_CLAIM_ROUTE, _route_claim_params(entry, now))).first()
+        if row is None:
+            raise RouteConflictError("chat is already claimed by another mapping")
+
+    async def put(self, entry: ImRouteEntry, *, now: datetime | None = None) -> None:
+        # Backward-compatible publish: identical to :meth:`claim` (never last-writer-wins).
+        await self.claim(entry, now=now)
 
     async def lookup(self, key: str) -> ImRouteEntry | None:
         async with self._engine.begin() as conn:
@@ -1243,6 +1344,36 @@ class PostgresImRouteIndex:
                 {"scope": scope_id},
             )
         return result.rowcount or 0
+
+
+class PostgresImProvisioner:
+    """Transactional provisioner: insert the mapping **and** claim its global route atomically.
+
+    The mapping row (RLS-guarded on ``app.org_id``) and the global route claim run in a **single**
+    transaction, so a claim that loses a concurrent cross-org race (the route_key is already owned
+    by another mapping — ``RETURNING`` empty) rolls the whole transaction back: exactly one org
+    wins the chat and the loser leaves **no** orphan mapping or index row. The route_index
+    primary key on ``route_key`` is the serialization point that makes the winner unambiguous.
+    """
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+
+    async def provision(
+        self, mapping: ImChannelMapping, *, now: datetime | None = None
+    ) -> ImChannelMapping:
+        now = now or _now()
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_ORG, {"org": mapping.org_id})
+            row = (await conn.execute(_INSERT_MAPPING, _mapping_insert_params(mapping))).one()
+            created = _mapping_from_row(row)
+            claimed = (
+                await conn.execute(_CLAIM_ROUTE, _route_claim_params(created.route_entry(), now))
+            ).first()
+            if claimed is None:
+                # Another org already owns this chat — abort so the mapping insert rolls back.
+                raise RouteConflictError("chat is already claimed by another mapping")
+        return created
 
 
 class PostgresImReplyStore:
@@ -1516,6 +1647,7 @@ __all__ = [
     "ImMappingStatus",
     "ImMappingStore",
     "ImProvider",
+    "ImProvisioner",
     "ImReplyDispatchIndex",
     "ImReplyIntent",
     "ImReplyKind",
@@ -1526,16 +1658,19 @@ __all__ = [
     "ImRouteIndexStore",
     "ImRoutingError",
     "InMemoryImMappingStore",
+    "InMemoryImProvisioner",
     "InMemoryImReplyDispatchIndex",
     "InMemoryImReplyStore",
     "InMemoryImRouteIndex",
     "PostgresImMappingStore",
+    "PostgresImProvisioner",
     "PostgresImReplyDispatchIndex",
     "PostgresImReplyStore",
     "PostgresImRouteIndex",
     "ReplyDispatchIntent",
     "ReplySender",
     "RevokedMappingError",
+    "RouteConflictError",
     "UnknownMappingError",
     "build_im_safe_agent",
     "decrypt_reply_payload",

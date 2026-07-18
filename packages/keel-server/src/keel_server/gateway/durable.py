@@ -214,11 +214,15 @@ def parse_onebot_inbound(
     chat_id = event.group_id if is_group else event.user_id
     bot = event.self_id if event.self_id is not None else self_id
     raw_message_id = payload.get("message_id")
+    if raw_message_id is None or str(raw_message_id) == "":
+        # No stable per-message id: reject rather than admit with an empty id, which would
+        # collapse unrelated messages onto the same admission idempotency key (dedupe them).
+        return None
     return ImInbound(
         provider=ImProvider.onebot,
         external_bot_id=str(bot) if bot is not None else "",
         external_chat_id=str(chat_id) if chat_id is not None else "",
-        external_message_id=str(raw_message_id) if raw_message_id is not None else "",
+        external_message_id=str(raw_message_id),
         chat_kind=ImChatKind.group if is_group else ImChatKind.personal,
         text=decision.text,
     )
@@ -248,11 +252,15 @@ def parse_telegram_inbound(
         return None
     chat = message.chat
     is_group = chat.type != "private"
+    if not message.message_id:
+        # An id-less update has no stable dedupe key: reject it rather than admit with an empty
+        # message id, which would collapse unrelated messages onto one admission idempotency key.
+        return None
     return ImInbound(
         provider=ImProvider.telegram,
         external_bot_id=bot_id,
         external_chat_id=str(chat.id),
-        external_message_id=str(message.message_id) if message.message_id else "",
+        external_message_id=str(message.message_id),
         chat_kind=ImChatKind.group if is_group else ImChatKind.personal,
         text=woke,
     )
