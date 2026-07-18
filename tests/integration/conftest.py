@@ -119,6 +119,7 @@ async def migrated_db(pg_engine: AsyncEngine) -> AsyncIterator[AsyncEngine]:
                 "run_dispatch_outbox, "
                 "github_webhook_deliveries, github_sync_state, github_repositories, "
                 "github_installations, repo_sync_ledger, project_runs, project_worktrees, "
+                "patch_writeback_ledger, patch_proposals, "
                 "project_quotas, projects, "
                 "erasure_steps, erasure_requests, event_tombstones, retention_policies, "
                 "resource_grants, agents, memberships, oidc_identities, organizations, users"

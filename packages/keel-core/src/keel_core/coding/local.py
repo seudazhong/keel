@@ -1106,6 +1106,270 @@ class LocalCodingStorage:
             marker.unlink(missing_ok=True)
             return existed
 
+    # --- Control-plane patch-writeback plumbing (WS-PP) ------------------------------
+    def resolve_commit(self, project_id: ProjectId, ref: str) -> str:
+        """Resolve a ref/sha to an exact commit sha in the authoritative repo (control plane)."""
+        safe_ref = validate_git_ref(ref)
+        with self._lock(project_id).acquire():
+            repo = self._require_repo(project_id)
+            resolved = self._git_dir(repo, "rev-parse", "--verify", f"{safe_ref}^{{commit}}")
+        return resolved.stdout.strip()
+
+    def commit_tree(self, project_id: ProjectId, commit_sha: str) -> str:
+        """The tree sha of a commit — used to verify a writeback reproduces the approved tree."""
+        sha = _validate_commit_sha(commit_sha)
+        with self._lock(project_id).acquire():
+            repo = self._require_repo(project_id)
+            resolved = self._git_dir(repo, "rev-parse", "--verify", f"{sha}^{{tree}}")
+        return resolved.stdout.strip()
+
+    def ingest_worktree_commit(
+        self,
+        project_id: ProjectId,
+        run_id: CodingRunId,
+        commit_sha: str,
+        *,
+        pin_ref: str,
+    ) -> None:
+        """Persist a commit produced in a disposable worktree into the authoritative repo.
+
+        The generation worktree is anonymous and disposable; the exact proposed commit must
+        survive its removal so the human-approved writeback can push *exactly* that commit. This
+        pushes the commit object graph from the worktree into the authoritative bare repo under a
+        pinned ``refs/keel-patch/<...>`` ref (so it is never garbage-collected before writeback).
+        The pinned ref is control-plane only and never exposed to the sandbox or a remote.
+        """
+        sha = _validate_commit_sha(commit_sha)
+        if not pin_ref.startswith("refs/keel-patch/"):
+            raise InvalidStorageInput("pin_ref must be in the refs/keel-patch/ namespace")
+        safe_pin = validate_git_ref(pin_ref)
+        worktree = _safe_child(self.worktrees_root, str(project_id), str(run_id))
+        with self._lock(project_id).acquire():
+            repo = self._require_repo(project_id)
+            if not worktree.is_dir() or worktree.is_symlink():
+                raise StorageConflict("worktree is not available to ingest from")
+            self.git.run(
+                [
+                    "-c",
+                    "protocol.file.allow=always",
+                    "push",
+                    "--force",
+                    str(repo),
+                    f"{sha}:{safe_pin}",
+                ],
+                cwd=worktree,
+            )
+            probe = self._git_dir(repo, "cat-file", "-e", f"{sha}^{{commit}}", check=False)
+            if probe.returncode != 0:
+                raise StorageConflict("commit was not ingested into the authoritative repo")
+
+    def unpin_commit(self, project_id: ProjectId, pin_ref: str) -> None:
+        """Delete a control-plane pin ref (best-effort cleanup after a terminal proposal)."""
+        if not pin_ref.startswith("refs/keel-patch/"):
+            raise InvalidStorageInput("pin_ref must be in the refs/keel-patch/ namespace")
+        safe_pin = validate_git_ref(pin_ref)
+        with self._lock(project_id).acquire():
+            repo = self._require_repo(project_id)
+            self._git_dir(repo, "update-ref", "-d", safe_pin, check=False)
+
+    def push_commit(
+        self,
+        project_id: ProjectId,
+        remote: str | Path,
+        commit_sha: str,
+        *,
+        target_branch: str,
+        auth_header: str | None = None,
+    ) -> None:
+        """Push exactly one commit to a **dedicated** remote branch (no force, no tags).
+
+        A single explicit refspec ``<sha>:refs/heads/<branch>`` is pushed — never a wildcard,
+        never ``--force``, never a tag or ref deletion, and the caller must have validated
+        ``target_branch`` is a dedicated run branch (never the default branch). The optional
+        ``auth_header`` (a JIT installation token as ``Authorization: <scheme> <credential>``) is
+        handed to Git only through the environment (``GIT_CONFIG_*`` -> ``http.extraHeader``) so the
+        token never appears in a command argument, on-disk config, or a log line. The remote URL is
+        validated/allow-listed (SSRF defense) and redirects are refused. GitHub rejects a
+        non-fast-forward push to an existing branch, so this can never clobber another branch.
+        """
+        sha = _validate_commit_sha(commit_sha)
+        safe_target = validate_git_ref(target_branch)
+        if safe_target == "HEAD" or safe_target.startswith("refs/tags/"):
+            raise InvalidStorageInput("push target must be a branch, never a tag or HEAD")
+        safe_remote = self._validated_remote(remote)
+        extra_env = self._auth_header_env(auth_header) if auth_header else None
+        refspec = f"{sha}:refs/heads/{safe_target}"
+        with self._lock(project_id).acquire():
+            repo = self._require_repo(project_id)
+            self.git.run(
+                [
+                    "--git-dir",
+                    str(repo),
+                    "-c",
+                    "protocol.version=2",
+                    "-c",
+                    "http.followRedirects=false",
+                    "push",
+                    "--atomic",
+                    "--no-tags",
+                    safe_remote,
+                    refspec,
+                ],
+                extra_env=extra_env,
+            )
+
+    def commit_worktree(
+        self,
+        project_id: ProjectId,
+        run_id: CodingRunId,
+        *,
+        message: str,
+        author_name: str = "Keel Patch Bot",
+        author_email: str = "patch-bot@keel.invalid",
+    ) -> str | None:
+        """Stage all changes in a generation worktree and record one deterministic commit.
+
+        Returns the new commit sha, or ``None`` when the working tree has no changes (an empty
+        proposal is never committed). Author/committer identity and dates are pinned so an
+        identical tree yields an identical commit sha (content-addressed, reproducible). Runs
+        entirely on the control plane over the disposable worktree; the sandbox never commits.
+        """
+        worktree = _safe_child(self.worktrees_root, str(project_id), str(run_id))
+        with self._lock(project_id).acquire():
+            if not worktree.is_dir() or worktree.is_symlink():
+                raise StorageConflict("generation worktree is not available")
+            self.git.run(["add", "-A"], cwd=worktree)
+            status = self.git.run(["status", "--porcelain"], cwd=worktree)
+            if not status.stdout.strip():
+                return None
+            commit_env = {
+                "GIT_AUTHOR_NAME": author_name,
+                "GIT_AUTHOR_EMAIL": author_email,
+                "GIT_COMMITTER_NAME": author_name,
+                "GIT_COMMITTER_EMAIL": author_email,
+                "GIT_AUTHOR_DATE": "2000-01-01T00:00:00+00:00",
+                "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+00:00",
+            }
+            self.git.run(
+                ["commit", "--no-verify", "--no-gpg-sign", "-m", message[:4000]],
+                cwd=worktree,
+                extra_env=commit_env,
+            )
+            head = self.git.run(["rev-parse", "--verify", "HEAD^{commit}"], cwd=worktree)
+        return head.stdout.strip()
+
+    def worktree_head_tree(
+        self, project_id: ProjectId, run_id: CodingRunId, commit_sha: str
+    ) -> str:
+        sha = _validate_commit_sha(commit_sha)
+        worktree = _safe_child(self.worktrees_root, str(project_id), str(run_id))
+        with self._lock(project_id).acquire():
+            resolved = self.git.run(["rev-parse", "--verify", f"{sha}^{{tree}}"], cwd=worktree)
+        return resolved.stdout.strip()
+
+    def worktree_changed_files(
+        self,
+        project_id: ProjectId,
+        run_id: CodingRunId,
+        base_sha: str,
+        head_sha: str,
+    ) -> list[dict[str, Any]]:
+        """The changed (path, status, blob sha, size) rows between two commits in a worktree.
+
+        Uses ``git diff --raw`` so the exact new-blob sha of every changed path is captured
+        without re-hashing, plus ``cat-file`` for the blob size. A rename carries its old path.
+        """
+        base = _validate_commit_sha(base_sha)
+        head = _validate_commit_sha(head_sha)
+        worktree = _safe_child(self.worktrees_root, str(project_id), str(run_id))
+        rows: list[dict[str, Any]] = []
+        with self._lock(project_id).acquire():
+            raw = self.git.run(
+                [
+                    "diff",
+                    "--raw",
+                    "--abbrev=40",
+                    "--no-color",
+                    "-M",
+                    "-z",
+                    base,
+                    head,
+                ],
+                cwd=worktree,
+            ).stdout
+            fields = raw.split("\x00")
+            i = 0
+            while i < len(fields):
+                meta = fields[i]
+                if not meta.startswith(":"):
+                    i += 1
+                    continue
+                parts = meta.split(" ")
+                # :old_mode new_mode old_sha new_sha status
+                new_sha = parts[3]
+                status = parts[4]
+                code = status[0]
+                if code in ("R", "C"):
+                    old_path = fields[i + 1]
+                    new_path = fields[i + 2]
+                    i += 3
+                else:
+                    new_path = fields[i + 1]
+                    old_path = ""
+                    i += 2
+                size = 0
+                if code != "D" and new_sha and set(new_sha) != {"0"}:
+                    probe = self.git.run(["cat-file", "-s", new_sha], cwd=worktree, check=False)
+                    if probe.returncode == 0:
+                        size = int(probe.stdout.strip() or "0")
+                rows.append(
+                    {
+                        "status": code,
+                        "path": new_path,
+                        "old_path": old_path,
+                        "blob_sha": "" if code == "D" else new_sha,
+                        "size_bytes": size,
+                    }
+                )
+        return rows
+
+    def worktree_diff(
+        self,
+        project_id: ProjectId,
+        run_id: CodingRunId,
+        base_sha: str,
+        head_sha: str,
+        *,
+        max_bytes: int,
+    ) -> tuple[bytes, bool]:
+        """Return the unified ``base..head`` diff, truncation-flagged at ``max_bytes``."""
+        base = _validate_commit_sha(base_sha)
+        head = _validate_commit_sha(head_sha)
+        worktree = _safe_child(self.worktrees_root, str(project_id), str(run_id))
+        with self._lock(project_id).acquire():
+            result = self.git.run(["diff", "--no-color", "--no-ext-diff", base, head], cwd=worktree)
+        data = result.stdout.encode("utf-8", errors="replace")
+        if len(data) > max_bytes:
+            return data[:max_bytes], True
+        return data, False
+
+    def worktree_blob_is_binary(
+        self, project_id: ProjectId, run_id: CodingRunId, base_sha: str, head_sha: str, path: str
+    ) -> bool:
+        """Whether a changed path is a binary file (rejected by the binary policy)."""
+        base = _validate_commit_sha(base_sha)
+        head = _validate_commit_sha(head_sha)
+        worktree = _safe_child(self.worktrees_root, str(project_id), str(run_id))
+        with self._lock(project_id).acquire():
+            # ``git diff --numstat`` reports ``-\t-`` for binary paths.
+            check = self.git.run(
+                ["diff", "--numstat", "--no-color", base, head, "--", path],
+                cwd=worktree,
+                check=False,
+            )
+        first = check.stdout.strip().split("\n")[0] if check.stdout.strip() else ""
+        return first.startswith("-\t-")
+
     def _reap_workspace(
         self,
         project: ProjectId,
