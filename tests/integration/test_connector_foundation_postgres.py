@@ -112,7 +112,7 @@ async def test_connector_foundation_schema_and_rls(migrated_db: AsyncEngine) -> 
             "error_retryable",
         }
         head = await conn.scalar(text("SELECT version_num FROM alembic_version"))
-        assert head == "0018_im_routing"
+        assert head == "0019_patch_proposals"
 
 
 async def test_repository_scope_isolation_cursor_and_delivery_replay(

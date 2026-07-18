@@ -7,7 +7,11 @@ API in production and be fully exercised in tests without a network. The client:
   redirect to an off-allowlist host can never be chased;
 * retries idempotent GETs and the token-mint POST on transient 5xx / rate-limit responses with
   bounded exponential backoff; and
-* performs **no** remote write / push / PR creation in this phase (read + token-mint only).
+* performs only **controlled, non-idempotent writes** for the human-approved patch-writeback path
+  (create a dedicated branch ref + open a **Draft** PR) — never a force update, tag write, ref
+  deletion, merge, ready-for-review flip, comment, or default-branch push. Writes are never
+  auto-retried (a write is not idempotent under a transport failure); the writeback job reconciles
+  duplicates via :meth:`GitHubClient.get_ref` / :meth:`GitHubClient.list_pull_requests`.
 
 Tokens minted through this client are never logged; callers must keep them control-plane only.
 """
@@ -247,6 +251,105 @@ class GitHubClient:
         self._raise_for_status(response)
         if not isinstance(response.json_body, dict):
             raise GitHubError("unexpected GitHub pull-request payload")
+        return response.json_body
+
+    async def get_ref(self, *, token: str, full_name: str, ref: str) -> dict[str, Any] | None:
+        """GET a single git ref (e.g. ``heads/keel/patch/pp_x``); ``None`` if it does not exist.
+
+        Used by the control-plane writeback for crash-recovery reconciliation: before pushing/PR
+        creation it checks whether the exact dedicated branch already exists so a resumed job
+        never duplicates work. Read-only.
+        """
+        try:
+            response = await self._send(
+                "GET",
+                f"/repos/{full_name}/git/ref/{ref}",
+                headers=self._installation_headers(token),
+            )
+        except GitHubNotFoundError:
+            return None
+        if response.status == 404:
+            return None
+        self._raise_for_status(response)
+        if not isinstance(response.json_body, dict):
+            raise GitHubError("unexpected GitHub ref payload")
+        return response.json_body
+
+    async def create_ref(self, *, token: str, full_name: str, ref: str, sha: str) -> dict[str, Any]:
+        """POST a new git ref (a **branch create only**): ``ref`` must be ``refs/heads/<branch>``.
+
+        A non-fast-forward/force update is impossible here — this endpoint only *creates* a ref and
+        returns 422 if it already exists (the caller reconciles that as idempotent). Never retried
+        automatically (a write is not idempotent under a transport failure). The caller must have
+        already validated ``ref`` is a dedicated run branch (never the default branch), and the
+        namespace/refspec are validated in :mod:`keel_core.patch.models`.
+        """
+        if not ref.startswith("refs/heads/"):
+            raise GitHubError("create_ref only creates branch refs (refs/heads/...)")
+        response = await self._send(
+            "POST",
+            f"/repos/{full_name}/git/refs",
+            headers=self._installation_headers(token),
+            json={"ref": ref, "sha": sha},
+            retry=False,
+        )
+        self._raise_for_status(response)
+        if not isinstance(response.json_body, dict):
+            raise GitHubError("unexpected GitHub create-ref payload")
+        return response.json_body
+
+    async def list_pull_requests(
+        self, *, token: str, full_name: str, head: str, state: str = "all"
+    ) -> list[dict[str, Any]]:
+        """GET open/closed PRs whose head branch matches ``head`` (``owner:branch``).
+
+        Used for idempotent Draft-PR reconciliation: after a crash between push and PR creation the
+        writeback looks up an existing PR for the exact dedicated head before creating one. Read.
+        """
+        response = await self._send(
+            "GET",
+            f"/repos/{full_name}/pulls?state={state}&head={head}",
+            headers=self._installation_headers(token),
+        )
+        self._raise_for_status(response)
+        body = response.json_body
+        if isinstance(body, list):
+            return [pr for pr in body if isinstance(pr, dict)]
+        raise GitHubError("unexpected GitHub pull-request list payload")
+
+    async def create_pull_request(
+        self,
+        *,
+        token: str,
+        full_name: str,
+        title: str,
+        head: str,
+        base: str,
+        body: str,
+        draft: bool = True,
+    ) -> dict[str, Any]:
+        """POST a **Draft** pull request (``draft=True`` by default; never a ready-for-review PR).
+
+        The control plane only ever opens a *draft* PR from a dedicated run branch into the
+        approved base branch. It never merges, marks ready, comments, or pushes the default branch.
+        Not retried automatically; the caller reconciles duplicates via :meth:`list_pull_requests`.
+        """
+        response = await self._send(
+            "POST",
+            f"/repos/{full_name}/pulls",
+            headers=self._installation_headers(token),
+            json={
+                "title": title,
+                "head": head,
+                "base": base,
+                "body": body,
+                "draft": bool(draft),
+            },
+            retry=False,
+        )
+        self._raise_for_status(response)
+        if not isinstance(response.json_body, dict):
+            raise GitHubError("unexpected GitHub create-pull-request payload")
         return response.json_body
 
     @staticmethod
