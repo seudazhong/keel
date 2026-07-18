@@ -83,6 +83,8 @@ class Settings(BaseSettings):
     job_progress_message_max_chars: int = Field(default=1_000, gt=0)
     job_result_message_max_chars: int = Field(default=8_000, gt=0)
     job_error_message_max_chars: int = Field(default=2_000, gt=0)
+    connector_schedule_batch_size: int = Field(default=50, gt=0, le=100)
+    connector_schedule_lease_seconds: int = Field(default=120, gt=0)
 
     # RBAC (B3): comma-separated ``key:role`` pairs (roles: viewer|operator|admin).
     # Keys are hashed at rest (never compared in plaintext) and verified in constant

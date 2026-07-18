@@ -25,6 +25,7 @@ from keel_core.api import HealthResponse, ReadinessResponse
 from keel_core.approvals import InMemoryApprovalStore, PostgresApprovalStore
 from keel_core.coding import LocalActiveGitStore, LocalCodingStorage, LocalWorktreeStore
 from keel_core.config import Settings, get_settings, load_env_file
+from keel_core.connector_credentials import ConnectorCredentialStore
 from keel_core.db import make_async_engine, make_redis
 from keel_core.embeddings import Embedder
 from keel_core.identity import (
@@ -77,11 +78,11 @@ from keel_core.run_dispatch import PostgresRunDispatchOutbox
 from keel_core.runs import InMemoryRunStore, PostgresRunStore
 from keel_core.tools import build_service_execution_environment
 from keel_core.webhooks import InMemoryWebhookReplayStore, PostgresWebhookReplayStore
+from keel_server.api import connectors as connectors_api
 from keel_server.api import gateway as gateway_api
 from keel_server.api import identity as identity_api
 from keel_server.api import knowledge as knowledge_api
 from keel_server.api import lifecycle as lifecycle_api
-from keel_server.api import oauth as oauth_api
 from keel_server.api import projects as projects_api
 from keel_server.api import v1
 from keel_server.auth import parse_api_keys
@@ -415,6 +416,150 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # ingest/delete job is actually dispatched to a worker (else the reconciler heals it). Readiness
     # surfaces this so a load balancer can drain an instance that would silently orphan documents.
     app.state.knowledge_mutation_enabled = engine is not None
+
+    # Per-scope connector factory (M3.6 routing integration). The connector foundation (main's
+    # 0016) was built single-scope (``web:local``); this factory derives every connector
+    # collaborator — repository, encrypted credential store, job store, durable change sink, and
+    # typed-target validator — from an arbitrary canonical scope so an authenticated connector
+    # management call binds to the caller's ``agent:<org>/<agent>`` scope (via ``auth.scope_id``)
+    # rather than the shared app-global ``web:local`` singleton. All stores share the process
+    # engine, so a per-request service is cheap; scope-partitioned RLS keeps a foreign scope's
+    # bindings/credentials invisible. The unauthenticated webhook ingress path binds the app's
+    # ``durable_scope`` (``web:local``), matching main's single-tenant ingress.
+    from keel_core.connector_contracts import ConnectorTargetKind
+    from keel_core.connector_registry import get_connector_registry
+    from keel_core.connector_repository import (
+        InMemoryConnectorRepository,
+        PostgresConnectorRepository,
+    )
+    from keel_core.connector_service import (
+        ConnectorService,
+        DurableConnectorChangeSink,
+    )
+    from keel_core.errors import DuplicateEventError
+    from keel_core.knowledge.models import KnowledgeBaseStatus
+    from keel_core.loop import admit_external
+    from keel_core.outbox import purge_connector as _purge_outbound_connector
+    from keel_core.secrets import SecretsError, keyring_from_settings
+    from keel_core.state import InMemoryEventStore, PostgresEventStore, session_exists
+    from keel_core.tokens import PostgresTokenStore, delete_token
+
+    connector_registry = getattr(app.state, "connector_registry", None) or get_connector_registry()
+    app.state.connector_registry = connector_registry
+
+    def _connector_credentials(scope_id: str) -> Any:
+        if engine is None or (not settings.secret_key and not settings.secret_keys):
+            return None
+        try:
+            token_store = PostgresTokenStore(engine, scope_id, keyring_from_settings(settings))
+        except SecretsError:
+            return None
+        return ConnectorCredentialStore(token_store)
+
+    def _build_connector_service(scope_id: str) -> ConnectorService:
+        repository = (
+            PostgresConnectorRepository(engine, scope_id)
+            if engine is not None
+            else InMemoryConnectorRepository(scope_id)
+        )
+        event_store = (
+            PostgresEventStore(engine, scope_id) if engine is not None else InMemoryEventStore()
+        )
+        knowledge_service = _knowledge_factory(scope_id)
+
+        async def _admit_connector_event(session_id: str, content: str, run_id: str) -> None:
+            try:
+                await admit_external(event_store, session_id, scope_id, content, run_id)
+            except DuplicateEventError:
+                pass
+
+        async def _validate_connector_target(kind: ConnectorTargetKind, target_id: str) -> bool:
+            if kind is ConnectorTargetKind.knowledge:
+                if knowledge_service is None:
+                    return False
+                base = await knowledge_service.get_base(target_id)
+                return base is not None and base.status is KnowledgeBaseStatus.active
+            if kind is ConnectorTargetKind.trigger_session and engine is not None:
+                return await session_exists(engine, scope_id, target_id)
+            if kind is ConnectorTargetKind.trigger_session:
+                return cast(InMemoryEventStore, event_store).has_session(target_id, scope_id)
+            if engine is None:
+                return False
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("SELECT set_config('app.scope_id', :scope, true)"),
+                    {"scope": scope_id},
+                )
+                return bool(
+                    await conn.scalar(
+                        text(
+                            "SELECT EXISTS(SELECT 1 FROM schedules "
+                            "WHERE scope_id = :scope AND id = :routine)"
+                        ),
+                        {"scope": scope_id, "routine": target_id},
+                    )
+                )
+
+        async def _resolve_connector_trigger(kind: ConnectorTargetKind, target_id: str) -> str:
+            if kind is ConnectorTargetKind.trigger_session:
+                return target_id
+            if engine is None:
+                raise RuntimeError("connector trigger routine resolver is unavailable")
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("SELECT set_config('app.scope_id', :scope, true)"),
+                    {"scope": scope_id},
+                )
+                session_id = await conn.scalar(
+                    text(
+                        "SELECT session_id FROM schedules WHERE scope_id = :scope AND id = :routine"
+                    ),
+                    {"scope": scope_id, "routine": target_id},
+                )
+            if session_id is None:
+                raise RuntimeError("connector trigger routine target is unavailable")
+            return str(session_id)
+
+        async def _dispatch(dispatch_scope: str, job_id: str) -> None:
+            enqueue = getattr(app.state, "enqueue", None)
+            if enqueue is not None:
+                await enqueue("run_job", dispatch_scope, job_id)
+
+        async def _delete_credential(connector_id: str) -> bool:
+            if engine is None:
+                return False
+            return await delete_token(engine, scope_id, connector_id)
+
+        async def _purge_outbound(connector_id: str) -> int:
+            if engine is None:
+                return 0
+            return await _purge_outbound_connector(engine, scope_id, connector_id)
+
+        return ConnectorService(
+            connector_registry,
+            repository,
+            credentials=_connector_credentials(scope_id),
+            jobs=_build_job_store(engine, scope_id, settings),
+            dispatch_job=_dispatch,
+            change_sink=DurableConnectorChangeSink(
+                repository,
+                knowledge=knowledge_service,
+                admit_event=_admit_connector_event,
+                resolve_trigger=_resolve_connector_trigger,
+            ),
+            target_validator=_validate_connector_target,
+            delete_credential=_delete_credential,
+            purge_outbound=_purge_outbound,
+        )
+
+    app.state.connector_scope_factory = _build_connector_service
+    # Default-scope repository for the unauthenticated webhook ingress path and any code that
+    # reads the app-global connector repository directly (single-tenant ``web:local`` parity).
+    app.state.connector_repository = (
+        PostgresConnectorRepository(engine, _DURABLE_SCOPE)
+        if engine is not None
+        else InMemoryConnectorRepository(_DURABLE_SCOPE)
+    )
     app.state.erasure = _build_erasure_service(
         engine,
         _DURABLE_SCOPE,
@@ -575,7 +720,7 @@ def create_app() -> FastAPI:
     app.include_router(projects_api.router)
     app.include_router(knowledge_api.router)
     app.include_router(lifecycle_api.router)
-    app.include_router(oauth_api.router)
+    app.include_router(connectors_api.router)
     app.include_router(gateway_api.router)
     app.include_router(pages_router)
 

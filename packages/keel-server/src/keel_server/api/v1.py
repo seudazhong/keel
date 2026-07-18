@@ -43,7 +43,6 @@ from keel_core.consolidation import (
 )
 from keel_core.errors import CrossScopeError
 from keel_core.events import EventType
-from keel_core.gmail import GMAIL_CONNECTOR_ID, GMAIL_SCOPES
 from keel_core.identity import NotFoundError
 from keel_core.jobs import JobStatus, JobStore, JobValidationError
 from keel_core.loop import admit
@@ -60,7 +59,6 @@ from keel_core.runs import (
 from keel_core.scoping import LOCAL_PREVIEW_SCOPE
 from keel_core.search import hybrid_search_sessions
 from keel_core.state import InMemoryEventStore, PostgresEventStore, list_sessions
-from keel_core.tokens import delete_token, list_connected
 from keel_core.types import PermissionDecision, ScopeId
 from keel_server.auth import Role, require_role
 from keel_server.endpoint_auth import (
@@ -893,54 +891,6 @@ async def reject_durable(
     auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
 ) -> dict[str, bool]:
     return await _resolve_durable(request, approval_id, "denied", auth)
-
-
-def _short_scope(scope: str) -> str:
-    return scope.rsplit("/", 1)[-1]
-
-
-# Static catalog of known connectors; connection status is joined per-scope at request time.
-CONNECTOR_CATALOG: list[dict[str, object]] = [
-    {
-        "id": GMAIL_CONNECTOR_ID,
-        "name": "Gmail",
-        "icon": "✉️",
-        "kind": "oauth",
-        "scopes": [_short_scope(s) for s in GMAIL_SCOPES],
-    },
-]
-
-
-@router.get("/connectors", summary="List connectors and connection status for the scope")
-async def list_connectors(
-    request: Request,
-    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
-) -> list[dict[str, object]]:
-    """Known connectors joined with the derived-scope connection status (no token decryption)."""
-    engine = getattr(request.app.state, "engine", None)
-    connected: dict[str, str | None] = {}
-    if engine is not None:
-        for info in await list_connected(engine, auth.scope_id):
-            connected[info.connector_id] = info.updated_at.isoformat() if info.updated_at else None
-    return [
-        {**c, "connected": str(c["id"]) in connected, "updated_at": connected.get(str(c["id"]))}
-        for c in CONNECTOR_CATALOG
-    ]
-
-
-@router.delete(
-    "/connectors/{connector_id}",
-    summary="Revoke a connector's stored token",
-)
-async def revoke_connector(
-    connector_id: str,
-    request: Request,
-    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
-) -> dict[str, bool]:
-    """Delete the derived scope's stored token for a connector (revoke access)."""
-    engine = getattr(request.app.state, "engine", None)
-    revoked = engine is not None and await delete_token(engine, auth.scope_id, connector_id)
-    return {"ok": bool(revoked)}
 
 
 @router.get("/sessions", summary="List the scope's sessions (newest first)")

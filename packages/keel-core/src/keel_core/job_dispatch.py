@@ -10,7 +10,7 @@ next_attempt_at)`` plus a fenced reconciler lease.
 The outbox carries **no** document content / payload / prompt / embedding — only the routing key a
 worker needs to discover which scopes currently have dispatchable jobs. The scope-bound authority
 (the job row + its payload) stays behind RLS; the outbox is only a dispatch pointer, so it is safe
-for the non-owner runtime role to read/lease/delete (see migration ``0016_web_routing_isolation``).
+for the non-owner runtime role to read/lease/delete (see migration ``0017_web_routing_isolation``).
 
 This mirrors :mod:`keel_core.run_dispatch` for durable jobs.
 """

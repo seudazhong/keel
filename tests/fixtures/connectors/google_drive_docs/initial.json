@@ -1,0 +1,83 @@
+{
+  "start_page_token": "cursor-1",
+  "files": [
+    {
+      "id": "root",
+      "name": "Team Knowledge",
+      "mime_type": "application/vnd.google-apps.folder",
+      "parents": [],
+      "source_url": "https://drive.google.com/drive/folders/root",
+      "modified_time": "2026-07-01T00:00:00Z",
+      "version": "1"
+    },
+    {
+      "id": "nested",
+      "name": "Nested",
+      "mime_type": "application/vnd.google-apps.folder",
+      "parents": ["root"],
+      "source_url": "https://drive.google.com/drive/folders/nested",
+      "modified_time": "2026-07-01T00:00:00Z",
+      "version": "1"
+    },
+    {
+      "id": "doc-1",
+      "name": "Roadmap",
+      "mime_type": "application/vnd.google-apps.document",
+      "parents": ["root"],
+      "source_url": "https://docs.google.com/document/d/doc-1/edit",
+      "modified_time": "2026-07-10T10:00:00Z",
+      "version": "7"
+    },
+    {
+      "id": "md-1",
+      "name": "Runbook.md",
+      "mime_type": "text/markdown",
+      "parents": ["nested"],
+      "source_url": "https://drive.google.com/file/d/md-1/view",
+      "modified_time": "2026-07-11T11:00:00Z",
+      "version": "3"
+    },
+    {
+      "id": "txt-1",
+      "name": "Notes.txt",
+      "mime_type": "text/plain",
+      "parents": ["root"],
+      "source_url": "https://drive.google.com/file/d/txt-1/view",
+      "modified_time": "2026-07-12T12:00:00Z",
+      "version": "2"
+    },
+    {
+      "id": "pdf-1",
+      "name": "Excluded.pdf",
+      "mime_type": "application/pdf",
+      "parents": ["root"],
+      "source_url": "https://drive.google.com/file/d/pdf-1/view",
+      "modified_time": "2026-07-12T12:00:00Z",
+      "version": "2"
+    },
+    {
+      "id": "office-1",
+      "name": "Excluded.docx",
+      "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "parents": ["root"],
+      "source_url": "https://drive.google.com/file/d/office-1/view",
+      "modified_time": "2026-07-12T12:00:00Z",
+      "version": "2"
+    },
+    {
+      "id": "outside",
+      "name": "Outside.txt",
+      "mime_type": "text/plain",
+      "parents": ["other-root"],
+      "source_url": "https://drive.google.com/file/d/outside/view",
+      "modified_time": "2026-07-12T12:00:00Z",
+      "version": "1"
+    }
+  ],
+  "content": {
+    "doc-1": "Roadmap body\r\nSecond line",
+    "md-1": "# Runbook\n\nSafe operations.",
+    "txt-1": "Plain notes",
+    "outside": "Not selected"
+  }
+}

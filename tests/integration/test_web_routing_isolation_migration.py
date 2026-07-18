@@ -1,7 +1,7 @@
-"""Live-Postgres verification of migration 0016 up/down (web-routing rollback compatibility).
+"""Live-Postgres verification of migration 0017 up/down (web-routing rollback compatibility).
 
-0016 makes session identity composite ``(scope_id, id)`` so two scopes may own the *same*
-external session id. Its ``downgrade`` restores the pre-0016 *global* session namespace, which
+0017 makes session identity composite ``(scope_id, id)`` so two scopes may own the *same*
+external session id. Its ``downgrade`` restores the pre-0017 *global* session namespace, which
 cannot represent such a collision — so before restoring the global constraints it must
 deterministically remap every non-canonical scoped session to a stable, collision-free id and
 repoint all referencing rows in lock-step, with no data loss.
@@ -35,8 +35,8 @@ from keel_core.runs import (
 pytestmark = pytest.mark.integration
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-_HEAD = "0016_web_routing_isolation"
-_PREV = "0015_projects_github"
+_HEAD = "0017_web_routing_isolation"
+_PREV = "0016_connector_foundation"
 
 _SCOPE_A = "agent:acme/support"
 _SCOPE_B = "agent:globex/support"
@@ -64,7 +64,7 @@ def _run_to(url: str, revision: str) -> None:
 
 
 def _expected_remap(scope_id: str, old_id: str) -> str:
-    """Mirror the deterministic derivation in 0016.downgrade for assertion."""
+    """Mirror the deterministic derivation in 0017.downgrade for assertion."""
     base = old_id[:180]
     digest = hashlib.md5(f"{scope_id}|{old_id}".encode()).hexdigest()  # noqa: S324
     return f"{base}.scope-{digest}"

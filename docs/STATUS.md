@@ -221,7 +221,7 @@ Review-finding hardening (this increment):
   `/settings/model` updates the process model in local preview only and fails closed in cloud
   mode (never a silent success the worker ignores).
 
-Second-pass review findings (this increment, migration `0016_web_routing_isolation`):
+Second-pass review findings (this increment, migration `0017_web_routing_isolation`):
 
 - **Scoped machine API credentials.** The configured machine-principal syntax is extended
   (backward compatible) to `key:role[:org=…:agent=…|:global]`: a scoped credential binds one

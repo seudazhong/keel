@@ -235,6 +235,29 @@ async def admit(store: EventStore, session_id: SessionId, scope_id: ScopeId, con
     )
 
 
+async def admit_external(
+    store: EventStore,
+    session_id: SessionId,
+    scope_id: ScopeId,
+    content: str,
+    idempotency_key: str,
+) -> None:
+    """Durably admit tainted external input exactly once."""
+    await _emit(
+        store,
+        EventType.message_token,
+        session_id,
+        scope_id,
+        None,
+        {
+            "role": "user",
+            "text": content,
+            "taint": str(ContentTaint.tainted),
+            "dedup_key": idempotency_key,
+        },
+    )
+
+
 async def admit_run(
     store: EventStore,
     session_id: SessionId,

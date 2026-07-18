@@ -10,7 +10,7 @@ The outbox carries **no** prompt / content / tool / argument payload — only th
 worker needs to discover which scopes currently have open work. The scope-bound authority (the
 run row, events, approvals) stays behind RLS; the outbox is only a dispatch pointer, so it is
 safe for the non-owner runtime role to read/lease/delete (see migration
-``0016_web_routing_isolation``).
+``0017_web_routing_isolation``).
 """
 
 from __future__ import annotations

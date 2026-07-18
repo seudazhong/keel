@@ -1,7 +1,7 @@
 """global run-dispatch outbox for cross-scope reconciliation.
 
-Revision ID: 0016_web_routing_isolation
-Revises: 0015_projects_github
+Revision ID: 0017_web_routing_isolation
+Revises: 0016_connector_foundation
 Create Date: 2026-07-18
 
 M3.6 durable Web routing review findings 2 (composite session tenant identity), 3 (per-scope
@@ -44,8 +44,8 @@ from collections.abc import Sequence
 import sqlalchemy as sa
 from alembic import op
 
-revision: str = "0016_web_routing_isolation"
-down_revision: str | None = "0015_projects_github"
+revision: str = "0017_web_routing_isolation"
+down_revision: str | None = "0016_connector_foundation"
 branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 

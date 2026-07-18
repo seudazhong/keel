@@ -136,6 +136,33 @@
         "title": "ArchiveAgentRequest",
         "type": "object"
       },
+      "AssociateRunRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "run_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id"
+        ],
+        "title": "AssociateRunRequest",
+        "type": "object"
+      },
       "CancelMode": {
         "enum": [
           "immediate",
@@ -167,6 +194,20 @@
           "role"
         ],
         "title": "ChangeRoleRequest",
+        "type": "object"
+      },
+      "ConnectUrlResponse": {
+        "description": "The provider consent URL for the browser to open in a new tab/window.",
+        "properties": {
+          "url": {
+            "title": "Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "url"
+        ],
+        "title": "ConnectUrlResponse",
         "type": "object"
       },
       "CreateAgentRequest": {
@@ -389,6 +430,40 @@
           "display_name"
         ],
         "title": "CreateOrganizationRequest",
+        "type": "object"
+      },
+      "CreateProjectRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "default_branch": {
+            "default": "main",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Default Branch",
+            "type": "string"
+          },
+          "display_name": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Display Name",
+            "type": "string"
+          },
+          "slug": {
+            "maxLength": 40,
+            "minLength": 3,
+            "title": "Slug",
+            "type": "string"
+          },
+          "visibility": {
+            "$ref": "#/components/schemas/ProjectVisibility",
+            "default": "private"
+          }
+        },
+        "required": [
+          "slug",
+          "display_name"
+        ],
+        "title": "CreateProjectRequest",
         "type": "object"
       },
       "ErasureRequestBody": {
@@ -635,6 +710,26 @@
         "title": "ErasureTargetKind",
         "type": "string"
       },
+      "GrantProjectRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "capability": {
+            "$ref": "#/components/schemas/Capability"
+          }
+        },
+        "required": [
+          "agent_id",
+          "capability"
+        ],
+        "title": "GrantProjectRequest",
+        "type": "object"
+      },
       "GrantResponse": {
         "additionalProperties": false,
         "properties": {
@@ -744,6 +839,86 @@
           "version"
         ],
         "title": "HealthResponse",
+        "type": "object"
+      },
+      "ImportProjectRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "display_name": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Display Name",
+            "type": "string"
+          },
+          "installation_id": {
+            "minimum": 1.0,
+            "title": "Installation Id",
+            "type": "integer"
+          },
+          "repo_full_name": {
+            "maxLength": 255,
+            "minLength": 3,
+            "title": "Repo Full Name",
+            "type": "string"
+          },
+          "slug": {
+            "maxLength": 40,
+            "minLength": 3,
+            "title": "Slug",
+            "type": "string"
+          }
+        },
+        "required": [
+          "slug",
+          "display_name",
+          "installation_id",
+          "repo_full_name"
+        ],
+        "title": "ImportProjectRequest",
+        "type": "object"
+      },
+      "InstallationResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "account_login": {
+            "title": "Account Login",
+            "type": "string"
+          },
+          "account_type": {
+            "title": "Account Type",
+            "type": "string"
+          },
+          "app_id": {
+            "title": "App Id",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "installation_id": {
+            "title": "Installation Id",
+            "type": "integer"
+          },
+          "org_id": {
+            "title": "Org Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "org_id",
+          "installation_id",
+          "app_id",
+          "account_login",
+          "account_type",
+          "status"
+        ],
+        "title": "InstallationResponse",
         "type": "object"
       },
       "JobResponse": {
@@ -1605,6 +1780,74 @@
         "title": "KnowledgeVersionStatus",
         "type": "string"
       },
+      "LinkInstallationRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "account_login": {
+            "maxLength": 100,
+            "minLength": 1,
+            "title": "Account Login",
+            "type": "string"
+          },
+          "account_type": {
+            "default": "Organization",
+            "maxLength": 40,
+            "title": "Account Type",
+            "type": "string"
+          },
+          "app_id": {
+            "minimum": 1.0,
+            "title": "App Id",
+            "type": "integer"
+          },
+          "installation_id": {
+            "minimum": 1.0,
+            "title": "Installation Id",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "installation_id",
+          "app_id",
+          "account_login"
+        ],
+        "title": "LinkInstallationRequest",
+        "type": "object"
+      },
+      "MaterializeWorktreeRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "git_ref": {
+            "default": "HEAD",
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Git Ref",
+            "type": "string"
+          },
+          "run_id": {
+            "maxLength": 255,
+            "minLength": 1,
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id"
+        ],
+        "title": "MaterializeWorktreeRequest",
+        "type": "object"
+      },
       "MeResponse": {
         "additionalProperties": false,
         "properties": {
@@ -1778,6 +2021,150 @@
         "title": "PermissionDecision",
         "type": "string"
       },
+      "ProjectGrantResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "capability": {
+            "title": "Capability",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "org_id": {
+            "title": "Org Id",
+            "type": "string"
+          },
+          "resource_id": {
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "resource_type": {
+            "title": "Resource Type",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "org_id",
+          "agent_id",
+          "resource_type",
+          "resource_id",
+          "capability",
+          "status"
+        ],
+        "title": "ProjectGrantResponse",
+        "type": "object"
+      },
+      "ProjectResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "default_branch": {
+            "title": "Default Branch",
+            "type": "string"
+          },
+          "display_name": {
+            "title": "Display Name",
+            "type": "string"
+          },
+          "github_repository_id": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Github Repository Id"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "org_id": {
+            "title": "Org Id",
+            "type": "string"
+          },
+          "slug": {
+            "title": "Slug",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          },
+          "visibility": {
+            "title": "Visibility",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "org_id",
+          "slug",
+          "display_name",
+          "source",
+          "visibility",
+          "status",
+          "default_branch",
+          "github_repository_id",
+          "version",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "ProjectResponse",
+        "type": "object"
+      },
+      "ProjectVisibility": {
+        "enum": [
+          "private",
+          "internal"
+        ],
+        "title": "ProjectVisibility",
+        "type": "string"
+      },
       "ReadinessResponse": {
         "description": "Readiness payload with per-dependency checks.",
         "properties": {
@@ -1817,11 +2204,200 @@
         "title": "ReindexKnowledgeDocumentCommand",
         "type": "object"
       },
+      "ResourceSelectionRequest": {
+        "properties": {
+          "external_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "External Ids",
+            "type": "array"
+          }
+        },
+        "title": "ResourceSelectionRequest",
+        "type": "object"
+      },
+      "RunAssociationResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "created": {
+            "title": "Created",
+            "type": "boolean"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "created"
+        ],
+        "title": "RunAssociationResponse",
+        "type": "object"
+      },
       "RunId": {
         "type": "string"
       },
+      "RunListResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "run_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Run Ids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "run_ids"
+        ],
+        "title": "RunListResponse",
+        "type": "object"
+      },
       "SessionId": {
         "type": "string"
+      },
+      "SetupRequest": {
+        "properties": {
+          "values": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Values",
+            "type": "object"
+          }
+        },
+        "title": "SetupRequest",
+        "type": "object"
+      },
+      "SyncEntryResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "after_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "After Sha"
+          },
+          "before_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Before Sha"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "delivery_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Delivery Id"
+          },
+          "git_ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Git Ref"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "kind",
+          "status",
+          "git_ref",
+          "before_sha",
+          "after_sha",
+          "delivery_id",
+          "created_at"
+        ],
+        "title": "SyncEntryResponse",
+        "type": "object"
+      },
+      "SyncRequest": {
+        "properties": {
+          "idempotency_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Idempotency Key"
+          }
+        },
+        "title": "SyncRequest",
+        "type": "object"
+      },
+      "TargetConfigurationRequest": {
+        "properties": {
+          "targets": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "title": "Targets",
+            "type": "object"
+          }
+        },
+        "title": "TargetConfigurationRequest",
+        "type": "object"
       },
       "UpdateAgentRequest": {
         "additionalProperties": false,
@@ -1909,6 +2485,57 @@
           "content"
         ],
         "title": "UpdateKnowledgeDocumentCommand",
+        "type": "object"
+      },
+      "UpdateProjectRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "default_branch": {
+            "anyOf": [
+              {
+                "maxLength": 255,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Branch"
+          },
+          "display_name": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          },
+          "visibility": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProjectVisibility"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "expected_version"
+        ],
+        "title": "UpdateProjectRequest",
         "type": "object"
       },
       "UserResponse": {
@@ -2011,6 +2638,85 @@
           "type"
         ],
         "title": "ValidationError",
+        "type": "object"
+      },
+      "VersionedRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "minimum": 1.0,
+            "title": "Expected Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "expected_version"
+        ],
+        "title": "VersionedRequest",
+        "type": "object"
+      },
+      "WorktreeResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "commit_sha": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit Sha"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "git_ref": {
+            "title": "Git Ref",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "org_id": {
+            "title": "Org Id",
+            "type": "string"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "org_id",
+          "project_id",
+          "run_id",
+          "git_ref",
+          "commit_sha",
+          "status",
+          "created_at"
+        ],
+        "title": "WorktreeResponse",
         "type": "object"
       }
     }
@@ -2378,7 +3084,6 @@
     },
     "/v1/connectors": {
       "get": {
-        "description": "Known connectors joined with the derived-scope connection status (no token decryption).",
         "operationId": "list_connectors_v1_connectors_get",
         "parameters": [
           {
@@ -2441,92 +3146,14 @@
             "description": "Validation Error"
           }
         },
-        "summary": "List connectors and connection status for the scope",
+        "summary": "List connector manifests and scope status",
         "tags": [
-          "v1"
-        ]
-      }
-    },
-    "/v1/connectors/gmail/callback": {
-      "get": {
-        "description": "Exchange the authorization code and store the connector token for the scope.\n\nIntentionally unauthenticated: the browser returning from Google carries no API key.\nTrust is instead anchored in the ``state`` \u2014 an unguessable, single-use, expiring\ntoken that only the **operator-authenticated** ``/connect`` above could have created\nand persisted (durable :class:`~keel_core.oauth_state.PostgresOAuthStateStore`).\n:meth:`consume` deletes the row as it validates it, so a stolen/replayed ``state`` is\nrejected. Without a matching live ``state`` the request is refused before any token\nexchange, so the callback cannot be driven by an anonymous caller.",
-        "operationId": "gmail_oauth_callback_v1_connectors_gmail_callback_get",
-        "parameters": [
-          {
-            "in": "query",
-            "name": "state",
-            "required": true,
-            "schema": {
-              "title": "State",
-              "type": "string"
-            }
-          },
-          {
-            "in": "query",
-            "name": "code",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Code"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "OAuth callback: store the token",
-        "tags": [
-          "oauth"
-        ]
-      }
-    },
-    "/v1/connectors/gmail/connect": {
-      "get": {
-        "description": "Redirect the browser to Google's consent screen (server callback registered).\n\nRequires at least **operator** auth when API keys are configured: initiating a\nconnect flow mints the durable one-time CSRF ``state`` that the (necessarily\nunauthenticated) callback consumes, so this endpoint is the trust anchor of the\nflow and must not be reachable by an unauthenticated/insufficient-role caller.",
-        "operationId": "gmail_oauth_connect_v1_connectors_gmail_connect_get",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {}
-              }
-            },
-            "description": "Successful Response"
-          }
-        },
-        "summary": "Start the Gmail in-browser OAuth connect flow",
-        "tags": [
-          "oauth"
+          "connectors"
         ]
       }
     },
     "/v1/connectors/{connector_id}": {
       "delete": {
-        "description": "Delete the derived scope's stored token for a connector (revoke access).",
         "operationId": "revoke_connector_v1_connectors__connector_id__delete",
         "parameters": [
           {
@@ -2597,9 +3224,1063 @@
             "description": "Validation Error"
           }
         },
-        "summary": "Revoke a connector's stored token",
+        "summary": "Revoke connector credentials and binding",
         "tags": [
-          "v1"
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/callback": {
+      "get": {
+        "operationId": "connector_callback_v1_connectors__connector_id__callback_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": true,
+            "schema": {
+              "title": "State",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete browser-based connector authorization",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/connect": {
+      "get": {
+        "description": "Redirect the browser to the provider consent screen (local-preview single operator only).\n\nIn **cloud mode** this GET fails closed: a browser navigation cannot carry the auth headers\nthat bind the connect to a specific org/Agent, so honoring it would either be unauthenticated\nor silently bind to the wrong (ambient) scope. Cloud callers must use the authenticated\n``POST /connect-url`` above and open the returned URL. The GET remains only for the non-cloud\nlocal-preview single operator, where there is one tenant and no header-borne scope selection.",
+        "operationId": "connector_connect_v1_connectors__connector_id__connect_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start browser-based connector authorization (local preview only)",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/connect-url": {
+      "post": {
+        "description": "Return only the provider consent URL after minting a one-time, scope-bound CSRF state.\n\nThis is the cloud-correct entry point: a browser cannot attach ``Authorization`` /\n``X-API-Key`` / ``X-Keel-Org`` / ``X-Keel-Agent`` headers to a top-level navigation, so the\nauthenticated ``GET /connect`` redirect below is unusable in a cloud deployment. Instead the\nSPA calls this endpoint with its auth headers (``fetch``), receives the consent URL, and opens\nit with ``window.open`` \u2014 the interactive redirect to the provider then happens client-side\nwhile the trust decision (mint the state) stays behind full endpoint auth. The callback\nremains state-bound and unauthenticated.",
+        "operationId": "connector_connect_url_v1_connectors__connector_id__connect_url_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectUrlResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create the connector consent URL (authenticated JSON; browser opens it)",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/health": {
+      "get": {
+        "operationId": "connector_health_v1_connectors__connector_id__health_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Connector Health V1 Connectors  Connector Id  Health Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check connector health",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/local": {
+      "delete": {
+        "operationId": "forget_local_connector_v1_connectors__connector_id__local_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Forget Local Connector V1 Connectors  Connector Id  Local Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Forget local connector credentials and binding without remote revoke",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/purge": {
+      "delete": {
+        "operationId": "revoke_and_purge_connector_v1_connectors__connector_id__purge_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Revoke And Purge Connector V1 Connectors  Connector Id  Purge Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke and purge connector-owned state",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/purge/local": {
+      "delete": {
+        "operationId": "force_local_purge_connector_v1_connectors__connector_id__purge_local_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Force Local Purge Connector V1 Connectors  Connector Id  Purge Local Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Force local purge without loading or revoking the remote provider",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/resources": {
+      "get": {
+        "operationId": "connector_resources_v1_connectors__connector_id__resources_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "default": true,
+              "title": "Refresh",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response Connector Resources V1 Connectors  Connector Id  Resources Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List selectable connector resources",
+        "tags": [
+          "connectors"
+        ]
+      },
+      "put": {
+        "operationId": "select_connector_resources_v1_connectors__connector_id__resources_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ResourceSelectionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Select Connector Resources V1 Connectors  Connector Id  Resources Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Select connector resources",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/setup": {
+      "post": {
+        "operationId": "connector_setup_v1_connectors__connector_id__setup_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetupRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Connector Setup V1 Connectors  Connector Id  Setup Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Run manifest-declared connector setup",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/sync": {
+      "post": {
+        "operationId": "sync_connector_v1_connectors__connector_id__sync_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SyncRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Sync Connector V1 Connectors  Connector Id  Sync Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Queue a durable connector sync",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/targets": {
+      "put": {
+        "operationId": "configure_connector_targets_v1_connectors__connector_id__targets_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TargetConfigurationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Configure Connector Targets V1 Connectors  Connector Id  Targets Put",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Configure typed connector destination and trigger targets",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/webhook": {
+      "get": {
+        "operationId": "connector_webhook_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verify a provider webhook",
+        "tags": [
+          "connectors"
+        ]
+      },
+      "post": {
+        "operationId": "connector_webhook_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dispatch a provider webhook delivery",
+        "tags": [
+          "connectors"
+        ]
+      },
+      "put": {
+        "operationId": "connector_webhook_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dispatch a provider webhook delivery",
+        "tags": [
+          "connectors"
         ]
       }
     },
@@ -3968,6 +5649,40 @@
     "/v1/knowledge-bases": {
       "get": {
         "operationId": "list_bases_v1_knowledge_bases_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -3982,6 +5697,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Bases",
@@ -3999,6 +5724,38 @@
             "schema": {
               "title": "Idempotency-Key",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4061,6 +5818,38 @@
               "title": "Idempotency-Key",
               "type": "string"
             }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
           }
         ],
         "responses": {
@@ -4100,6 +5889,38 @@
             "schema": {
               "title": "Kb Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4142,6 +5963,38 @@
             "schema": {
               "title": "Kb Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4195,6 +6048,38 @@
             "schema": {
               "title": "Idempotency-Key",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4266,6 +6151,38 @@
               "title": "Idempotency-Key",
               "type": "string"
             }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
           }
         ],
         "responses": {
@@ -4314,6 +6231,38 @@
             "schema": {
               "title": "Document Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4372,6 +6321,38 @@
             "schema": {
               "title": "Idempotency-Key",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4442,6 +6423,38 @@
             "schema": {
               "title": "Idempotency-Key",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4517,6 +6530,38 @@
               "minimum": 1,
               "title": "K",
               "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -4848,6 +6893,1219 @@
         "summary": "Reject a proposal (no change to core memory)",
         "tags": [
           "v1"
+        ]
+      }
+    },
+    "/v1/projects": {
+      "get": {
+        "operationId": "list_projects_v1_projects_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_inactive",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Inactive",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProjectResponse"
+                  },
+                  "title": "Response List Projects V1 Projects Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Projects",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "operationId": "create_project_v1_projects_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/github/installations": {
+      "get": {
+        "operationId": "list_installations_v1_projects_github_installations_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/InstallationResponse"
+                  },
+                  "title": "Response List Installations V1 Projects Github Installations Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Installations",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "operationId": "link_installation_v1_projects_github_installations_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LinkInstallationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstallationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Link Installation",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/github/webhook": {
+      "post": {
+        "operationId": "github_webhook_v1_projects_github_webhook_post",
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "string"
+                      }
+                    ]
+                  },
+                  "title": "Response Github Webhook V1 Projects Github Webhook Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Github Webhook",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/import": {
+      "post": {
+        "operationId": "import_project_v1_projects_import_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Import Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}": {
+      "get": {
+        "operationId": "get_project_v1_projects__project_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project",
+        "tags": [
+          "projects"
+        ]
+      },
+      "patch": {
+        "operationId": "update_project_v1_projects__project_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/archive": {
+      "post": {
+        "operationId": "archive_project_v1_projects__project_id__archive_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VersionedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Archive Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/delete": {
+      "post": {
+        "operationId": "delete_project_v1_projects__project_id__delete_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VersionedRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Project",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/grants": {
+      "get": {
+        "operationId": "list_grants_v1_projects__project_id__grants_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ProjectGrantResponse"
+                  },
+                  "title": "Response List Grants V1 Projects  Project Id  Grants Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Grants",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "operationId": "create_grant_v1_projects__project_id__grants_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GrantProjectRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectGrantResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Grant",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/grants/{grant_id}": {
+      "delete": {
+        "operationId": "revoke_grant_v1_projects__project_id__grants__grant_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "grant_id",
+            "required": true,
+            "schema": {
+              "title": "Grant Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectGrantResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Grant",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/runs": {
+      "get": {
+        "operationId": "list_runs_v1_projects__project_id__runs_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Runs",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "operationId": "associate_run_v1_projects__project_id__runs_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AssociateRunRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RunAssociationResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Associate Run",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/sync": {
+      "get": {
+        "operationId": "list_sync_v1_projects__project_id__sync_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/SyncEntryResponse"
+                  },
+                  "title": "Response List Sync V1 Projects  Project Id  Sync Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Sync",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "operationId": "request_sync_v1_projects__project_id__sync_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SyncEntryResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Request Sync",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/worktrees": {
+      "get": {
+        "operationId": "list_worktrees_v1_projects__project_id__worktrees_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/WorktreeResponse"
+                  },
+                  "title": "Response List Worktrees V1 Projects  Project Id  Worktrees Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Worktrees",
+        "tags": [
+          "projects"
+        ]
+      },
+      "post": {
+        "operationId": "materialize_worktree_v1_projects__project_id__worktrees_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MaterializeWorktreeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorktreeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Materialize Worktree",
+        "tags": [
+          "projects"
+        ]
+      }
+    },
+    "/v1/projects/{project_id}/worktrees/{run_id}": {
+      "delete": {
+        "operationId": "reclaim_worktree_v1_projects__project_id__worktrees__run_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "title": "Run Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorktreeResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reclaim Worktree",
+        "tags": [
+          "projects"
         ]
       }
     },
@@ -5380,7 +8638,7 @@
     },
     "/v1/sessions/{session_id}/events": {
       "get": {
-        "description": "Server-Sent Events: replay from ``after`` then follow the run live.\n\nThe stream is bound to the caller's derived data-plane scope: a session id from another\norg/Agent's scope has no events here and answers 404 (no cross-scope read). The local\nsingle-operator preview streams live via the in-process runtime fan-out; an authenticated\nper-Agent scope replays its isolated durable event log.",
+        "description": "Server-Sent Events: durable replay from the cursor, then tail the live run.\n\nThe stream is bound to the caller's derived data-plane scope: a session id from another\norg/Agent's scope has no events here and answers 404 (no cross-scope read). The local\nsingle-operator preview streams live via the in-process runtime fan-out; an authenticated\nper-Agent scope replays its isolated durable event log **and then keeps the connection open**,\ntailing new worker-produced events via bounded durable polling until the run ends or the\nclient disconnects \u2014 it must not close immediately after replay.\n\nThe replay cursor is the SSE ``Last-Event-ID`` header (sent automatically by the browser on\nreconnect) when present, else the ``after`` query parameter. Only events with ``seq`` beyond\nthe cursor are emitted, so a reconnect neither misses nor duplicates events.",
         "operationId": "stream_events_v1_sessions__session_id__events_get",
         "parameters": [
           {
