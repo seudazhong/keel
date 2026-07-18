@@ -26,6 +26,7 @@ class TelegramChat(BaseModel):
 
 
 class TelegramMessage(BaseModel):
+    message_id: int = 0
     text: str = ""
     chat: TelegramChat = Field(default_factory=TelegramChat)
 

@@ -25,21 +25,28 @@ from keel_core.webhooks import (
     verify_telegram_secret,
 )
 from keel_server.gateway import OneBotGateway, TelegramGateway
+from keel_server.gateway.durable import (
+    DurableImIngress,
+    parse_onebot_inbound,
+    parse_telegram_inbound,
+)
 
 router = APIRouter(prefix="/v1/gateway", tags=["gateway"])
 
 
-def _gateway(request: Request) -> OneBotGateway:
+def _durable_ingress(request: Request) -> DurableImIngress | None:
+    """The durable IM ingress, wired only when a Postgres substrate + route index exist."""
+    ingress = getattr(request.app.state, "im_ingress", None)
+    return ingress if isinstance(ingress, DurableImIngress) else None
+
+
+def _gateway(request: Request) -> OneBotGateway | None:
     gateway: OneBotGateway | None = getattr(request.app.state, "onebot_gateway", None)
-    if gateway is None:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "IM gateway not configured")
     return gateway
 
 
-def _telegram_gateway(request: Request) -> TelegramGateway:
+def _telegram_gateway(request: Request) -> TelegramGateway | None:
     gateway: TelegramGateway | None = getattr(request.app.state, "telegram_gateway", None)
-    if gateway is None:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "IM gateway not configured")
     return gateway
 
 
@@ -51,12 +58,24 @@ def _replay_store(request: Request) -> WebhookReplayStore:
     return store
 
 
+_WAKE_PREFIXES = ("/keel",)
+
+
 @router.post("/onebot", status_code=status.HTTP_202_ACCEPTED, summary="OneBot v11 event webhook")
 async def onebot_webhook(
     payload: dict[str, Any], request: Request, background: BackgroundTasks
 ) -> dict[str, bool]:
-    """Verify the signature + replay, ack, then process the event in the background."""
+    """Verify the signature + replay, ack, then admit the event durably (or via the gateway).
+
+    Provider auth (HMAC-SHA1 body signature) + the durable replay check run **before** any
+    mapping is resolved. When the durable IM substrate is wired the event is resolved through
+    the global route index and admitted as a durable ``surface="im"`` run (fail-closed on an
+    unknown/revoked mapping); otherwise it falls back to the in-process gateway (local preview).
+    """
+    ingress = _durable_ingress(request)
     gateway = _gateway(request)
+    if ingress is None and gateway is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "IM gateway not configured")
     settings = get_settings()
     raw = await request.body()
     secret = settings.onebot_signing_secret
@@ -71,7 +90,14 @@ async def onebot_webhook(
         )
     if await _replay_store(request).seen_before("onebot", onebot_delivery_id(raw)):
         return {"accepted": False}  # replay: drop silently
-    background.add_task(gateway.handle, payload)
+    if ingress is not None:
+        inbound = parse_onebot_inbound(
+            payload, self_id=settings.onebot_self_id or None, prefixes=_WAKE_PREFIXES
+        )
+        if inbound is not None:
+            background.add_task(ingress.admit, inbound)
+    elif gateway is not None:
+        background.add_task(gateway.handle, payload)
     return {"accepted": True}
 
 
@@ -79,8 +105,11 @@ async def onebot_webhook(
 async def telegram_webhook(
     payload: dict[str, Any], request: Request, background: BackgroundTasks
 ) -> dict[str, bool]:
-    """Verify the secret header + replay, ack, then process the update in the background."""
+    """Verify the secret header + replay, ack, then admit the update durably (or via gateway)."""
+    ingress = _durable_ingress(request)
     gateway = _telegram_gateway(request)
+    if ingress is None and gateway is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "IM gateway not configured")
     settings = get_settings()
     secret = settings.telegram_webhook_secret
     if secret:
@@ -97,7 +126,18 @@ async def telegram_webhook(
         "telegram", delivery_id
     ):
         return {"accepted": False}  # replay: drop silently
-    background.add_task(gateway.handle, payload)
+    if ingress is not None:
+        bot_id = settings.telegram_bot_username or "default"
+        inbound = parse_telegram_inbound(
+            payload,
+            bot_id=bot_id,
+            bot_username=settings.telegram_bot_username or None,
+            prefixes=_WAKE_PREFIXES,
+        )
+        if inbound is not None:
+            background.add_task(ingress.admit, inbound)
+    elif gateway is not None:
+        background.add_task(gateway.handle, payload)
     return {"accepted": True}
 
 
