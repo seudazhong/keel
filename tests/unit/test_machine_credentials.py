@@ -133,6 +133,59 @@ def test_unbound_machine_credential_denied_in_cloud() -> None:
     assert resp.status_code == 403  # no ambient cross-tenant access
 
 
+def test_legacy_credential_binds_to_configured_default() -> None:
+    # Migration finding 5: an explicit KEEL_LEGACY_MACHINE_ORG_ID/AGENT_ID pair lets a bare
+    # pre-identity ``key:role`` credential keep working in cloud mode, pinned to that one tenant.
+    svc, ids = _seed_two_orgs()
+    client, runs, enqueued = _client(svc, "plain:operator")
+    client.app.state.legacy_machine_binding = (ids["org_a"], ids["agent_a"])
+    resp = client.post(
+        "/v1/sessions/s1/messages",
+        json={"content": "hi"},
+        headers={"X-API-Key": "plain"},
+    )
+    assert resp.status_code == 202
+    record = _run(runs.get(resp.json()["run_id"]))
+    assert record is not None
+    assert record.scope_id == derive_agent_scope(ids["org_a"], ids["agent_a"])
+    assert record.org_id == ids["org_a"] and record.agent_id == ids["agent_a"]
+    assert enqueued and enqueued[0][0] == "run_interactive"
+
+
+def test_legacy_credential_rejects_spoofed_header() -> None:
+    # The migration binding is still one fixed tenant: a header selecting a different org/Agent
+    # is rejected as a spoof (no ambient widening).
+    svc, ids = _seed_two_orgs()
+    client, _runs, _enqueued = _client(svc, "plain:operator")
+    client.app.state.legacy_machine_binding = (ids["org_a"], ids["agent_a"])
+    resp = client.post(
+        "/v1/sessions/s1/messages",
+        json={"content": "hi"},
+        headers={"X-API-Key": "plain", "X-Keel-Org": ids["org_b"]},
+    )
+    assert resp.status_code == 403
+
+
+def test_legacy_binding_matching_header_is_allowed() -> None:
+    # A header that re-states the configured tenant is fine (it does not re-point the binding).
+    svc, ids = _seed_two_orgs()
+    client, runs, _enqueued = _client(svc, "plain:operator")
+    client.app.state.legacy_machine_binding = (ids["org_a"], ids["agent_a"])
+    resp = client.post(
+        "/v1/sessions/s1/messages",
+        json={"content": "hi"},
+        headers={
+            "X-API-Key": "plain",
+            "X-Keel-Org": ids["org_a"],
+            "X-Keel-Agent": ids["agent_a"],
+        },
+    )
+    assert resp.status_code == 202
+    record = _run(runs.get(resp.json()["run_id"]))
+    assert record is not None
+    assert record.scope_id == derive_agent_scope(ids["org_a"], ids["agent_a"])
+
+
 def test_cross_org_credentials_are_isolated() -> None:
     svc, ids = _seed_two_orgs()
     keys = (

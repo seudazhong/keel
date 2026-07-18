@@ -3152,6 +3152,193 @@
         ]
       }
     },
+    "/v1/connectors/gmail/callback": {
+      "get": {
+        "description": "Exchange the authorization code and store the connector token for the scope.\n\nIntentionally unauthenticated: the browser returning from Google carries no API key.\nTrust is instead anchored in the ``state`` \u2014 an unguessable, single-use, expiring\ntoken that only the **operator-authenticated** ``/connect`` above could have created\nand persisted (durable :class:`~keel_core.oauth_state.PostgresOAuthStateStore`).\n:meth:`consume` deletes the row as it validates it, so a stolen/replayed ``state`` is\nrejected. Without a matching live ``state`` the request is refused before any token\nexchange, so the callback cannot be driven by an anonymous caller.",
+        "operationId": "gmail_oauth_callback_v1_connectors_gmail_callback_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "state",
+            "required": true,
+            "schema": {
+              "title": "State",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "code",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Code"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "OAuth callback: store the token",
+        "tags": [
+          "oauth"
+        ]
+      }
+    },
+    "/v1/connectors/gmail/connect": {
+      "get": {
+        "description": "Redirect the browser to Google's consent screen (local-preview single operator only).\n\nRequires at least **operator** privilege via the unified endpoint auth: initiating a\nconnect flow mints the durable one-time CSRF ``state`` that the (necessarily\nunauthenticated) callback consumes, so this endpoint is the trust anchor of the flow and\nmust not be reachable by an unauthenticated/insufficient-role caller.\n\nIn **cloud mode** this GET fails closed: a browser navigation cannot carry the auth headers\nthat bind the connect to a specific org/Agent, so honoring it would either be unauthenticated\nor silently bind to the wrong (ambient) scope. Cloud callers must use the authenticated\n``POST /connect-url`` above and open the returned URL. The GET remains only for the non-cloud\nlocal-preview single operator, where there is one tenant and no header-borne scope selection.",
+        "operationId": "gmail_oauth_connect_v1_connectors_gmail_connect_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start the Gmail in-browser OAuth connect flow (local preview only)",
+        "tags": [
+          "oauth"
+        ]
+      }
+    },
+    "/v1/connectors/gmail/connect-url": {
+      "post": {
+        "description": "Return only the Google consent URL after minting a one-time, scope-bound CSRF state.\n\nThis is the cloud-correct entry point: a browser cannot attach ``Authorization`` /\n``X-API-Key`` / ``X-Keel-Org`` / ``X-Keel-Agent`` headers to a top-level navigation, so the\nauthenticated ``GET /connect`` redirect below is unusable in a cloud deployment. Instead the\nSPA calls this endpoint with its auth headers (``fetch``), receives the consent URL, and\nopens it with ``window.open`` \u2014 the interactive redirect to Google then happens client-side\nwhile the trust decision (mint the state) stays behind full endpoint auth. The callback\nremains state-bound and unauthenticated.",
+        "operationId": "gmail_oauth_connect_url_v1_connectors_gmail_connect_url_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectUrlResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create the Gmail OAuth consent URL (authenticated JSON; browser opens it)",
+        "tags": [
+          "oauth"
+        ]
+      }
+    },
     "/v1/connectors/{connector_id}": {
       "delete": {
         "operationId": "revoke_connector_v1_connectors__connector_id__delete",
@@ -3732,6 +3919,207 @@
           }
         },
         "summary": "Force local purge without loading or revoking the remote provider",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/r/{route_token}/callback": {
+      "get": {
+        "operationId": "connector_routed_callback_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "route_token",
+            "required": true,
+            "schema": {
+              "title": "Route Token",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "state",
+            "required": true,
+            "schema": {
+              "title": "State",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete browser-based connector authorization (scope-routed alias)",
+        "tags": [
+          "connectors"
+        ]
+      }
+    },
+    "/v1/connectors/{connector_id}/r/{route_token}/webhook": {
+      "get": {
+        "operationId": "connector_routed_webhook_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "route_token",
+            "required": true,
+            "schema": {
+              "title": "Route Token",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Verify a scope-routed provider webhook",
+        "tags": [
+          "connectors"
+        ]
+      },
+      "post": {
+        "operationId": "connector_routed_webhook_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "route_token",
+            "required": true,
+            "schema": {
+              "title": "Route Token",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dispatch a scope-routed provider webhook delivery",
+        "tags": [
+          "connectors"
+        ]
+      },
+      "put": {
+        "operationId": "connector_routed_webhook_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "connector_id",
+            "required": true,
+            "schema": {
+              "title": "Connector Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "route_token",
+            "required": true,
+            "schema": {
+              "title": "Route Token",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Dispatch a scope-routed provider webhook delivery",
         "tags": [
           "connectors"
         ]

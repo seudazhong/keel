@@ -199,3 +199,28 @@ async def test_connect_url_requires_operator(
     assert missing.status_code == 401
     viewer = await client.post("/v1/connectors/gmail/connect-url", headers={"X-API-Key": "vw-key"})
     assert viewer.status_code == 403
+
+
+def test_full_app_exposes_both_gmail_alias_and_generic_connector_routes() -> None:
+    """Blocker 4: the published Gmail aliases and the generic connector routes coexist.
+
+    Old clients keep their concrete ``/v1/connectors/gmail/connect`` + ``/callback`` operations
+    (original operation ids), while the generic manifest-driven routes and the authenticated
+    ``POST /connect-url`` remain the forward-looking surface.
+    """
+    from keel_server.app import create_app
+
+    schema = create_app().openapi()
+    paths = schema["paths"]
+    # Published Gmail aliases with their original operation ids.
+    assert (
+        paths["/v1/connectors/gmail/connect"]["get"]["operationId"]
+        == "gmail_oauth_connect_v1_connectors_gmail_connect_get"
+    )
+    assert (
+        paths["/v1/connectors/gmail/callback"]["get"]["operationId"]
+        == "gmail_oauth_callback_v1_connectors_gmail_callback_get"
+    )
+    # Generic manifest-driven routes retained, including the authenticated JSON connect-url.
+    assert "/v1/connectors/{connector_id}/connect" in paths
+    assert "post" in paths["/v1/connectors/{connector_id}/connect-url"]

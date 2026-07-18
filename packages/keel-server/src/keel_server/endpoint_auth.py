@@ -198,6 +198,55 @@ async def _resolve_machine_scope(
     )
 
 
+async def _resolve_legacy_machine_scope(
+    request: Request,
+    actor: Actor,
+    org_ref: str | None,
+    agent_ref: str | None,
+    binding: tuple[str, str],
+) -> EndpointAuth:
+    """Bind a legacy (unbound, non-global) ``key:role`` credential to the configured default.
+
+    This is the explicit, cloud-only migration path (review finding 5): with no ``org=``/
+    ``agent=`` binding a pre-identity API key carries no tenant, so instead of an ambient scope
+    it is pinned to the one configured default org+Agent. It is treated exactly like a scoped
+    credential bound to that pair — a client-supplied ``X-Keel-Org``/``X-Keel-Agent`` that tries
+    to select a *different* tenant is rejected as a spoof (never widened), and the derived scope
+    is the same per-Agent data plane. Every use is audited so operators can track remaining
+    unmigrated keys.
+    """
+    service = _identity_service(request)
+    bound_org, bound_agent = binding
+    if org_ref and org_ref.strip() and org_ref.strip() != bound_org:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "org header does not match credential")
+    if agent_ref and agent_ref.strip() and agent_ref.strip() != bound_agent:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "agent header does not match credential")
+    try:
+        org, agent = await service.resolve_machine_binding(bound_org, bound_agent)
+    except NotFoundError:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, "legacy migration org or agent not found"
+        ) from None
+    try:
+        scope_id = derive_agent_scope(org.id, agent.id)
+    except ScopeValidationError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from None
+    privilege = _API_ROLE_PRIVILEGE.get(actor.api_role, EndpointPrivilege.viewer)
+    logger.warning(
+        "legacy machine credential %s bound to migration default org=%s agent=%s",
+        actor.display_name,
+        org.id,
+        agent.id,
+    )
+    return EndpointAuth(
+        actor=actor,
+        privilege=privilege,
+        scope_id=scope_id,
+        org_id=org.id,
+        agent_id=agent.id,
+    )
+
+
 async def resolve_endpoint_auth(
     request: Request,
     actor: Annotated[Actor, Depends(resolve_actor)],
@@ -221,6 +270,15 @@ async def resolve_endpoint_auth(
     if actor.machine_org_ref or actor.machine_global:
         return await _resolve_machine_scope(request, actor, x_keel_org, x_keel_agent)
     if _cloud_mode(request):
+        # Legacy API-key migration (review finding 5): an explicit, cloud-only default
+        # org+Agent lets pre-identity bare ``key:role`` credentials keep working during
+        # migration, pinned to exactly that one tenant (never an ambient scope). Absent the
+        # configured pair, an unbound non-global credential still fails closed.
+        legacy_binding = getattr(request.app.state, "legacy_machine_binding", None)
+        if legacy_binding is not None:
+            return await _resolve_legacy_machine_scope(
+                request, actor, x_keel_org, x_keel_agent, legacy_binding
+            )
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
             "this operation requires an authenticated user with a selected org and Agent",

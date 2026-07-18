@@ -70,7 +70,34 @@ durable enqueue, and uses stable due-time idempotency keys so crash reclamation 
 job. Dispatch failures back off explicitly and update connector health. Provider enablement and
 manifest cadence are consulted dynamically; configured, authorizing, revoked, and disabled
 bindings never execute recurring provider work. RSS/Atom polling and expiring watch renewal remain
-provider-local manifest/operation implementations.
+provider-local manifest/operation implementations. Recurring reconciliation and durable sync/renew
+jobs are **scope-agnostic**: a connector connected under any per-Agent scope registers that scope in
+the global `connector_active_scopes` index and its sync/renew jobs record an intent in the global
+`job_dispatch_outbox`, so a single worker fires and dispatches them across every scope (never pinned
+to `web:local`).
+
+### Webhook scope routing
+
+An inbound provider webhook carries no Keel auth headers, so it cannot name the org/Agent it
+belongs to. Each webhook-capable connector therefore mints a **high-entropy route token** at setup
+and hands the provider a webhook URL that embeds it:
+`/v1/connectors/{connector_id}/r/{route_token}/webhook`. The token maps — in the global,
+non-RLS `connector_webhook_routes` capability table — to the exact `(scope_id, connector_id,
+binding_id, status)`; the table holds only routing metadata, never a signing secret or credential.
+
+On delivery the ingress resolves the token globally, builds the connector service bound to that
+scope, and runs the existing provider-specific signature / endpoint-token / replay verification
+against that scope's credential — the token selects *which* scope handles the delivery and is never
+itself an authorization. An unknown token, or a token whose connector does not match the request
+path (a cross-provider / cross-scope mismatch), fails closed with an opaque `404` so valid scopes
+stay non-enumerable. Revoking a binding (or lifecycle erasure) removes its route, so a delivery for
+a disconnected connector also fails closed.
+
+The legacy tokenless `/v1/connectors/{connector_id}/webhook` path is retained for **local-preview
+single-tenant** deployments (it binds to `web:local`). In **cloud mode** it fails closed (opaque
+`404`): a cloud deployment must use the routed capability so a delivery lands in the correct
+per-Agent scope.
+
 
 URL/feed providers use the shared pinned transport. Every initial and redirected address is
 validated once and pinned while retaining the original Host and TLS SNI. Private, loopback,

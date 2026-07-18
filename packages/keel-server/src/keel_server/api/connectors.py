@@ -144,6 +144,9 @@ def _service(request: Request, scope: str) -> ConnectorService:
         credentials=_credential_store(request, scope),
         jobs=getattr(request.app.state, "jobs", None),
         dispatch_job=dispatch,
+        dispatch_outbox=getattr(request.app.state, "job_dispatch_outbox", None),
+        schedule_index=getattr(request.app.state, "connector_schedule_index", None),
+        webhook_route_store=getattr(request.app.state, "connector_webhook_route_store", None),
         change_sink=getattr(request.app.state, "connector_change_sink", None),
         target_validator=getattr(request.app.state, "connector_target_validator", None),
         delete_credential=delete_credential,
@@ -622,7 +625,18 @@ async def force_local_purge_connector(
         ) from exc
 
 
-async def _dispatch_connector_webhook(connector_id: str, request: Request) -> Response:
+def _webhook_route_store(request: Request) -> Any:
+    return getattr(request.app.state, "connector_webhook_route_store", None)
+
+
+async def _ingress_in_scope(connector_id: str, request: Request, scope: str) -> Response:
+    """Run the provider webhook ingress bound to the resolved ``scope``.
+
+    The provider-specific signature / endpoint-token / replay verification runs inside
+    ``service.ingress`` against ``scope``'s bound credential, so resolving the route token only
+    selects *which* scope's connector service handles the delivery — it is never itself an
+    authorization.
+    """
     _provider(connector_id, request)
     body = await request.body()
     if len(body) > 1_048_576:
@@ -631,7 +645,7 @@ async def _dispatch_connector_webhook(connector_id: str, request: Request) -> Re
         query: dict[str, tuple[str, ...]] = {
             key: tuple(request.query_params.getlist(key)) for key in request.query_params
         }
-        outcome = await _service(request, _default_scope(request)).ingress(
+        outcome = await _service(request, scope).ingress(
             connector_id,
             ConnectorIngressRequest(
                 method=request.method,
@@ -657,6 +671,39 @@ async def _dispatch_connector_webhook(connector_id: str, request: Request) -> Re
             "Content-Type": outcome.response.content_type,
         },
     )
+
+
+async def _dispatch_connector_webhook(connector_id: str, request: Request) -> Response:
+    """Legacy, tokenless webhook ingress bound to the single-tenant ``web:local`` scope.
+
+    Retained for backward compatibility with local-preview single-tenant deployments (documented).
+    In **cloud mode** it fails closed with an opaque 404: a delivery carries no scope, so honoring
+    it would either be scopeless or silently bind to ``web:local`` — cloud callers must use the
+    routed ``/webhook/r/{route_token}`` capability minted at setup instead.
+    """
+    if _cloud_mode(request):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown connector webhook route")
+    return await _ingress_in_scope(connector_id, request, _default_scope(request))
+
+
+async def _dispatch_routed_webhook(
+    connector_id: str, route_token: str, request: Request
+) -> Response:
+    """Resolve a high-entropy webhook route token globally, then ingress in its bound scope.
+
+    The token maps to ``(scope_id, connector_id, binding_id)`` in the global routing capability
+    table. An unknown token, or a token whose connector does not match the request path (a
+    cross-provider / cross-scope mismatch), fails closed with an opaque 404 so a valid scope is not
+    enumerable. The bound scope's connector service then performs the provider-specific
+    verification.
+    """
+    store = _webhook_route_store(request)
+    if store is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown connector webhook route")
+    route = await store.resolve(route_token)
+    if route is None or route.connector_id != connector_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown connector webhook route")
+    return await _ingress_in_scope(connector_id, request, route.scope_id)
 
 
 # The provider webhook accepts GET (verification challenges), POST, and PUT (deliveries). These
@@ -690,6 +737,60 @@ async def connector_webhook_post(connector_id: str, request: Request) -> Respons
 )
 async def connector_webhook_put(connector_id: str, request: Request) -> Response:
     return await _dispatch_connector_webhook(connector_id, request)
+
+
+# Routed (scope-bound) webhook: the URL handed to the provider at setup embeds a high-entropy
+# route token so an auth-headerless delivery resolves to the exact org/Agent scope + binding. The
+# ``r/{route_token}`` segment mirrors the ``callback_base_url`` the service threads into providers
+# (which build ``{callback_base_url}/webhook``), so the delivered path is
+# ``/v1/connectors/{connector_id}/r/{route_token}/webhook``.
+@router.get(
+    "/{connector_id}/r/{route_token}/webhook",
+    name="connector_routed_webhook",
+    summary="Verify a scope-routed provider webhook",
+    operation_id="connector_routed_webhook_get",
+)
+async def connector_routed_webhook_get(
+    connector_id: str, route_token: str, request: Request
+) -> Response:
+    return await _dispatch_routed_webhook(connector_id, route_token, request)
+
+
+@router.post(
+    "/{connector_id}/r/{route_token}/webhook",
+    summary="Dispatch a scope-routed provider webhook delivery",
+    operation_id="connector_routed_webhook_post",
+)
+async def connector_routed_webhook_post(
+    connector_id: str, route_token: str, request: Request
+) -> Response:
+    return await _dispatch_routed_webhook(connector_id, route_token, request)
+
+
+@router.put(
+    "/{connector_id}/r/{route_token}/webhook",
+    summary="Dispatch a scope-routed provider webhook delivery",
+    operation_id="connector_routed_webhook_put",
+)
+async def connector_routed_webhook_put(
+    connector_id: str, route_token: str, request: Request
+) -> Response:
+    return await _dispatch_routed_webhook(connector_id, route_token, request)
+
+
+# Some providers (e.g. a GitHub App manifest) register both a webhook and a post-install callback
+# derived from the same routed ``callback_base_url``; the callback still anchors trust in the
+# one-time OAuth state, so this routed alias delegates to the standard callback handler.
+@router.get(
+    "/{connector_id}/r/{route_token}/callback",
+    name="connector_routed_callback",
+    summary="Complete browser-based connector authorization (scope-routed alias)",
+    operation_id="connector_routed_callback_get",
+)
+async def connector_routed_callback(
+    connector_id: str, route_token: str, request: Request, state: str = Query(...)
+) -> HTMLResponse:
+    return await connector_callback(connector_id, request, state)
 
 
 def _artifact_html(artifact: ConnectorSetupArtifact) -> str:

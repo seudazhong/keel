@@ -167,7 +167,26 @@ API key, or an Agent's persona/instruction text.
 | `KEEL_OIDC_JWKS_MIN_REFRESH_INTERVAL_SECONDS` | `60` | Min interval between unknown-`kid` JWKS refreshes (anti-amplification). |
 | `KEEL_OIDC_JWKS_FAILURE_COOLDOWN_SECONDS` | `30` | Cooldown after a failed/degenerate JWKS fetch before a retry (negative provider cache). |
 | `KEEL_IDENTITY_ALLOW_JIT_PROVISIONING` | `false` | JIT-provision a first-seen verified subject. |
+| `KEEL_LEGACY_MACHINE_ORG_ID` | — | Migration only: default org (id or slug) a bare `key:role` credential binds to in cloud mode. Must be set together with `KEEL_LEGACY_MACHINE_AGENT_ID`. |
+| `KEEL_LEGACY_MACHINE_AGENT_ID` | — | Migration only: default Agent id paired with `KEEL_LEGACY_MACHINE_ORG_ID`. |
 | `KEEL_MAINTENANCE_DATABASE_URL` | — | Dedicated least-privilege maintenance login (member of only `keel_maintenance_exec`) for identity erasure. Fails closed when unset; in cloud mode must differ from `KEEL_DATABASE_URL`. |
+
+### Migrating legacy `key:role` API keys
+
+Before the identity model, API keys were bare `key:role` pairs with no tenant binding. In cloud
+mode (`KEEL_CLOUD_MODE=1`) such an unbound credential now **fails closed** (403) because honoring
+it would grant an ambient, cross-tenant scope. Two supported paths keep existing deployments
+working:
+
+1. **Preferred — scope each key.** Rewrite each entry to `key:role:org=<id-or-slug>:agent=<id>`
+   (or `key:role:global` for an explicit cross-tenant admin that selects org/Agent per request).
+   The credential then derives its own per-Agent data plane with no ambient access.
+2. **Transitional — a default mapping.** Set **both** `KEEL_LEGACY_MACHINE_ORG_ID` and
+   `KEEL_LEGACY_MACHINE_AGENT_ID` to a real org+Agent. Every remaining bare `key:role` credential
+   binds to exactly that one tenant (never an ambient scope). A client-supplied
+   `X-Keel-Org`/`X-Keel-Agent` that selects a *different* tenant is rejected as a spoof, and each
+   use is audited. Setting only one of the pair is a hard startup misconfiguration. Remove the
+   mapping once every key has been migrated to the scoped form.
 
 With OIDC disabled, only the API-key and local-operator actor paths are available; outside
 cloud mode the local operator can still use the identity APIs.

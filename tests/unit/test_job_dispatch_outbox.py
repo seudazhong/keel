@@ -330,6 +330,9 @@ async def test_two_worker_reconcile_is_idempotent() -> None:
     # per tick, and re-dispatch is idempotent (deduped by the job claim) even if both ran.
     jobs = InMemoryJobStore(_SCOPE_A)
     outbox = InMemoryJobDispatchOutbox()
+    # Record the intent and claim it against the *same* fixed clock so the intent's
+    # ``next_attempt_at`` is deterministically due at claim time (independent of wall-clock).
+    now = datetime(2026, 7, 18, tzinfo=UTC)
     job, _ = await jobs.enqueue_once_with_dispatch_intent(
         kind=KNOWLEDGE_INGEST_KIND,
         payload={"kb": "x"},
@@ -338,8 +341,8 @@ async def test_two_worker_reconcile_is_idempotent() -> None:
         max_attempts=3,
         outbox=outbox,
         cancel_mode=CancelMode.cooperative,
+        now=now,
     )
-    now = datetime(2026, 7, 18, tzinfo=UTC)
     first = await outbox.claim_due(worker_id="w1", now=now)
     second = await outbox.claim_due(worker_id="w2", now=now + timedelta(seconds=1))
     assert [i.job_id for i in first] == [job.id]

@@ -26,6 +26,11 @@ from keel_core.approvals import InMemoryApprovalStore, PostgresApprovalStore
 from keel_core.coding import LocalActiveGitStore, LocalCodingStorage, LocalWorktreeStore
 from keel_core.config import Settings, get_settings, load_env_file
 from keel_core.connector_credentials import ConnectorCredentialStore
+from keel_core.connector_schedule_index import PostgresConnectorScheduleIndex
+from keel_core.connector_webhook_routes import (
+    InMemoryConnectorWebhookRouteStore,
+    PostgresConnectorWebhookRouteStore,
+)
 from keel_core.db import make_async_engine, make_redis
 from keel_core.embeddings import Embedder
 from keel_core.identity import (
@@ -83,6 +88,7 @@ from keel_server.api import gateway as gateway_api
 from keel_server.api import identity as identity_api
 from keel_server.api import knowledge as knowledge_api
 from keel_server.api import lifecycle as lifecycle_api
+from keel_server.api import oauth as oauth_api
 from keel_server.api import projects as projects_api
 from keel_server.api import v1
 from keel_server.auth import parse_api_keys
@@ -288,6 +294,20 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.job_dispatch_outbox = (
         PostgresJobDispatchOutbox(engine) if engine is not None else None
     )
+    # Global connector schedule index (finding 1): a binding that arms a recurring sync/renewal
+    # registers its scope here so the worker's cross-scope recurring reconciler fires it. None
+    # (in-memory/lite) keeps the single-tenant behavior.
+    app.state.connector_schedule_index = (
+        PostgresConnectorScheduleIndex(engine) if engine is not None else None
+    )
+    # Global connector webhook routing capability (webhook scope routing): a webhook-capable
+    # connector mints a high-entropy route token at setup so an auth-headerless delivery resolves
+    # back to its exact org/Agent scope + binding, never the app-global ``web:local`` scope.
+    app.state.connector_webhook_route_store = (
+        PostgresConnectorWebhookRouteStore(engine)
+        if engine is not None
+        else InMemoryConnectorWebhookRouteStore()
+    )
     app.state.jobs = _build_job_store(engine, _DURABLE_SCOPE, settings)
     execution_environment = build_service_execution_environment(
         settings,
@@ -318,6 +338,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Cloud mode fails closed: with no API keys the auth layer rejects every request
     # instead of falling back to implicit-admin open mode.
     app.state.auth_required = settings.cloud_mode
+    # Legacy API-key migration mapping (review finding 5): an explicit, cloud-only default
+    # org+Agent that pre-identity ``key:role`` credentials bind to during migration. ``None``
+    # (the default) keeps unbound bare keys failing closed in cloud mode.
+    app.state.legacy_machine_binding = settings.legacy_machine_binding
     # Durable, expiring, one-time OAuth CSRF state + webhook replay protection (M3.3).
     app.state.oauth_state_store = (
         PostgresOAuthStateStore(engine, ttl_seconds=settings.oauth_state_ttl_seconds)
@@ -541,6 +565,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             credentials=_connector_credentials(scope_id),
             jobs=_build_job_store(engine, scope_id, settings),
             dispatch_job=_dispatch,
+            dispatch_outbox=getattr(app.state, "job_dispatch_outbox", None),
+            schedule_index=getattr(app.state, "connector_schedule_index", None),
+            webhook_route_store=getattr(app.state, "connector_webhook_route_store", None),
             change_sink=DurableConnectorChangeSink(
                 repository,
                 knowledge=knowledge_service,
@@ -721,6 +748,11 @@ def create_app() -> FastAPI:
     app.include_router(knowledge_api.router)
     app.include_router(lifecycle_api.router)
     app.include_router(connectors_api.router)
+    # Backward-compatible concrete Gmail OAuth routes (published operation ids
+    # ``gmail_oauth_connect``/``gmail_oauth_callback``) for old clients. Registered after the
+    # generic connector routes so those richer manifest-driven handlers serve ``/v1/connectors/
+    # gmail/*`` at runtime, while these concrete routes keep the published ``/v1`` contract intact.
+    app.include_router(oauth_api.router)
     app.include_router(gateway_api.router)
     app.include_router(pages_router)
 

@@ -191,7 +191,6 @@ async def test_outbox_leases_across_scopes_and_fences_duplicate_worker(
     migrated_db: AsyncEngine,
 ) -> None:
     outbox = PostgresJobDispatchOutbox(migrated_db)
-    now = datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
     # The outbox FKs jobs(id), so create real jobs (in their own scopes) before the intents.
     service_a = _service(migrated_db, "agent:orga/agta", outbox, [])
     service_b = _service(migrated_db, "agent:orgb/agtb", outbox, [])
@@ -201,6 +200,10 @@ async def test_outbox_leases_across_scopes_and_fences_duplicate_worker(
     job_b = (await service_b.create_document(kb_b, _doc(), "db")).job.id
     assert await outbox.active_scopes() == {"agent:orga/agta", "agent:orgb/agtb"}
 
+    # Anchor the claim clock to (real) now *after* the intents were recorded so the intents are
+    # always due at claim time — the enqueue (create_document) and claim share one monotonic
+    # clock, rather than pairing a real-now intent with a wall-clock-dependent fixed claim time.
+    now = datetime.now(UTC)
     first = await outbox.claim_due(worker_id="w1", now=now, lease_seconds=60)
     assert {i.job_id for i in first} == {job_a, job_b}
     # A second worker is fenced out while the lease is live (SKIP LOCKED + lease window).
@@ -243,7 +246,8 @@ async def test_two_worker_reconcile_claims_once(migrated_db: AsyncEngine) -> Non
     service = _service(migrated_db, scope, outbox, [], enqueue_ok=False)
     kb_id = await _create_base(service, key="base-t")
     job_id = (await service.create_document(kb_id, _doc(), "doc-t")).job.id
-    now = datetime(2026, 7, 18, 9, 0, tzinfo=UTC)
+    # Anchor to now *after* recording the intent so the claim clock matches the enqueue clock.
+    now = datetime.now(UTC)
     first = await outbox.claim_due(worker_id="w1", now=now)
     second = await outbox.claim_due(worker_id="w2", now=now + timedelta(seconds=1))
     assert [i.job_id for i in first] == [job_id]
@@ -256,7 +260,8 @@ async def test_crash_after_claim_reclaims_after_lease(migrated_db: AsyncEngine) 
     service = _service(migrated_db, scope, outbox, [], enqueue_ok=False)
     kb_id = await _create_base(service, key="base-k")
     job_id = (await service.create_document(kb_id, _doc(), "doc-k")).job.id
-    now = datetime(2026, 7, 18, 10, 0, tzinfo=UTC)
+    # Anchor to now *after* recording the intent so the claim clock matches the enqueue clock.
+    now = datetime.now(UTC)
     claimed = await outbox.claim_due(worker_id="w1", now=now, lease_seconds=60)
     assert [i.job_id for i in claimed] == [job_id]
     # Worker w1 "crashes" without acking. Before the lease expires no one else can claim it.

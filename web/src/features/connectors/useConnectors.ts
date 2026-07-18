@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { api } from "../../lib/api";
+import { api, ApiError } from "../../lib/api";
+import { isAuthError } from "../auth/authState";
 import type {
   Connector,
   ConnectorResource,
@@ -44,6 +45,33 @@ export function useSetupConnector() {
   }
 
   return { submit, isPending, error };
+}
+
+class PopupBlockedError extends Error {
+  constructor() {
+    super("The authorization window was blocked. Allow popups for this site and try again.");
+    this.name = "PopupBlockedError";
+  }
+}
+
+export function useConnectUrl(id: string) {
+  const mutation = useMutation({
+    mutationFn: async () => {
+      const { url } = await api.post<{ url: string }>(`/v1/connectors/${id}/connect-url`);
+      let opened: Window | null;
+      try {
+        opened = window.open(url, "_blank", "noopener,noreferrer");
+      } catch {
+        throw new PopupBlockedError();
+      }
+      if (opened === null) throw new PopupBlockedError();
+    },
+  });
+  const error =
+    mutation.error instanceof ApiError && isAuthError(mutation.error.status)
+      ? null
+      : mutation.error;
+  return { ...mutation, error };
 }
 
 export function useConfigureConnectorTargets(id: string) {

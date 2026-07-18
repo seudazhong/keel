@@ -15,6 +15,10 @@ from pathlib import Path
 from time import perf_counter
 from typing import Any, TypeVar, cast
 
+from keel_core.connector_service import (
+    CONNECTOR_RENEW_JOB_KIND,
+    CONNECTOR_SYNC_JOB_KIND,
+)
 from keel_core.job_dispatch import JobDispatchOutbox
 from keel_core.jobs import (
     CancelMode,
@@ -45,11 +49,19 @@ _PG_INTEGER_MAX = 2**31 - 1
 _WORKER_ID = f"{socket.gethostname()}:{uuid.uuid4().hex[:8]}"
 
 # The durable job kinds that may be dispatched across per-Agent scopes via the global
-# job-dispatch outbox. Only Knowledge indexing/deletion is created under a per-Agent scope; every
-# other durable job (erasure, project sync) stays pinned to the process ``durable_scope``. The
-# reconciler and cross-scope ``run_job`` both revalidate an intent's kind against this set so a
-# spoofed/foreign job kind can never be dispatched into another tenant's scope (finding 3).
-_CROSS_SCOPE_JOB_KINDS = frozenset({KNOWLEDGE_INGEST_KIND, KNOWLEDGE_DELETE_KIND})
+# job-dispatch outbox. Knowledge indexing/deletion and connector sync/renewal are all created
+# under a per-Agent scope; every other durable job (erasure, project sync) stays pinned to the
+# process ``durable_scope``. The reconciler and cross-scope ``run_job`` both revalidate an
+# intent's kind against this set so a spoofed/foreign job kind can never be dispatched into
+# another tenant's scope (findings 1 + 3).
+_CROSS_SCOPE_JOB_KINDS = frozenset(
+    {
+        KNOWLEDGE_INGEST_KIND,
+        KNOWLEDGE_DELETE_KIND,
+        CONNECTOR_SYNC_JOB_KIND,
+        CONNECTOR_RENEW_JOB_KIND,
+    }
+)
 
 _TERMINAL_JOB_STATUSES = frozenset({JobStatus.succeeded, JobStatus.failed, JobStatus.cancelled})
 
@@ -427,6 +439,17 @@ def _scoped_job_execution(
         document_max_bytes=settings.knowledge_document_max_bytes,
     )
     registry = knowledge_job_registry(cast(KnowledgeStore, knowledge_store), embedder, settings)
+    # Register scope-bound connector sync/renew handlers alongside Knowledge so an Agent-scoped
+    # ``connector.sync``/``connector.renew`` job dispatched cross-scope actually runs against its
+    # own scope's connector service (finding 1) — never the process-wide ``durable_scope`` and
+    # never a ``web:local`` fallback. Without a connector factory the registry stays Knowledge-only
+    # and a connector kind fails closed as an unknown kind.
+    factory = ctx.get("connector_scope_factory")
+    if factory is not None:
+        # Lazy import avoids a worker.connectors <-> worker.jobs import cycle.
+        from keel_worker.connectors import register_connector_jobs
+
+        register_connector_jobs(registry, factory(scope_id), settings)
     job_store = PostgresJobStore(engine, scope_id, limits=JobLimits.from_settings(settings))
     return job_store, registry
 

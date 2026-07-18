@@ -46,6 +46,9 @@ from keel_core.connector_repository import (
     ConnectorScheduleLeaseLostError,
     next_schedule_time,
 )
+from keel_core.connector_schedule_index import ConnectorScheduleIndex
+from keel_core.connector_webhook_routes import ConnectorWebhookRouteStore, mint_route_token
+from keel_core.job_dispatch import JobDispatchOutbox
 from keel_core.jobs import CancelMode, JobRecord, JobStore, retry_delay_seconds
 from keel_core.knowledge.models import (
     CreateKnowledgeDocumentCommand,
@@ -326,6 +329,9 @@ class ConnectorService:
         credentials: ConnectorCredentialStore | None = None,
         jobs: JobStore | None = None,
         dispatch_job: Callable[[str, str], Awaitable[None]] | None = None,
+        dispatch_outbox: JobDispatchOutbox | None = None,
+        schedule_index: ConnectorScheduleIndex | None = None,
+        webhook_route_store: ConnectorWebhookRouteStore | None = None,
         change_sink: ConnectorChangeSink | None = None,
         purge_sink: ConnectorPurgeSink | None = None,
         target_validator: TargetValidator | None = None,
@@ -339,6 +345,9 @@ class ConnectorService:
         self.credentials = credentials
         self.jobs = jobs
         self._dispatch_job = dispatch_job
+        self._dispatch_outbox = dispatch_outbox
+        self._schedule_index = schedule_index
+        self._webhook_route_store = webhook_route_store
         self._change_sink = change_sink or CallbackConnectorChangeSink()
         self._purge_sink = (
             purge_sink
@@ -528,7 +537,7 @@ class ConnectorService:
             if stored_version is None:
                 raise RuntimeError("connector credentials changed during setup")
         try:
-            return await self.repository.upsert_binding(
+            binding = await self.repository.upsert_binding(
                 connector_id,
                 result.binding,
                 result.status,
@@ -542,6 +551,14 @@ class ConnectorService:
             if stored_version is not None:
                 await self._rollback_credential(connector_id, operation, stored_version, exc)
             raise
+        # A binding that arms a recurring sync/renewal schedule registers its scope in the global
+        # schedule index so the cross-scope recurring reconciler discovers and fires it (finding
+        # 1); without this a connector connected under a per-Agent scope would never sync/renew.
+        if self._schedule_index is not None and (
+            binding.next_sync_at is not None or binding.next_renewal_at is not None
+        ):
+            await self._schedule_index.record(self.repository.scope_id)
+        return binding
 
     async def setup(
         self,
@@ -562,15 +579,35 @@ class ConnectorService:
         ]
         if missing:
             raise ValueError(f"missing connector setup fields: {', '.join(sorted(missing))}")
+        # Webhook-capable connectors mint a high-entropy route token and register a webhook URL
+        # that embeds it, so an inbound (auth-headerless) delivery resolves back to this exact
+        # scope+binding rather than the app-global ``web:local`` scope. The token is threaded into
+        # ``callback_base_url`` (which providers use to build their webhook URL); the route is
+        # persisted after the binding is created so it points at a real binding.
+        route_token: str | None = None
+        if (
+            self._webhook_route_store is not None
+            and callback_base_url is not None
+            and ConnectorCapability.webhook in provider.manifest.capabilities
+        ):
+            route_token = mint_route_token()
+            callback_base_url = f"{callback_base_url.rstrip('/')}/r/{route_token}"
         context = await self._operation_context(
             connector_id,
             callback_base_url=callback_base_url,
         )
         result = await provider.setup(context, dict(values))
-        return ConnectorSetupOutcome(
-            await self.save_setup(connector_id, result, context=context),
-            result.artifacts,
-        )
+        binding = await self.save_setup(connector_id, result, context=context)
+        if route_token is not None:
+            assert self._webhook_route_store is not None
+            await self._webhook_route_store.put(
+                route_token,
+                self.repository.scope_id,
+                connector_id,
+                binding.id,
+                binding.status.value,
+            )
+        return ConnectorSetupOutcome(binding, result.artifacts)
 
     async def configure_targets(
         self, connector_id: str, values: dict[str, str | None]
@@ -641,6 +678,43 @@ class ConnectorService:
             raise ValueError(f"unknown connector resources: {', '.join(sorted(unknown))}")
         return await self.repository.select_resources(connector_id, external_ids)
 
+    async def _enqueue_connector_job_once(
+        self,
+        *,
+        kind: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+        max_attempts: int,
+    ) -> tuple[JobRecord, bool]:
+        """Enqueue a durable connector job, atomically recording a cross-scope dispatch intent.
+
+        When a dispatch outbox is wired (durable Postgres substrate) the job insert and the
+        global ``job_dispatch_outbox`` intent commit in ONE transaction, so a committed connector
+        sync/renew job always carries a discoverable dispatch pointer that the worker's
+        cross-scope reconciler can recover after a lost enqueue — an Agent-scoped connector job is
+        never orphaned (finding 1). Without an outbox (in-memory/lite profile) it falls back to
+        the plain enqueue.
+        """
+        assert self.jobs is not None
+        if self._dispatch_outbox is not None:
+            return await self.jobs.enqueue_once_with_dispatch_intent(
+                kind=kind,
+                payload=payload,
+                target_session_id=None,
+                idempotency_key=idempotency_key,
+                max_attempts=max_attempts,
+                outbox=self._dispatch_outbox,
+                cancel_mode=CancelMode.cooperative,
+            )
+        return await self.jobs.enqueue_once(
+            kind=kind,
+            payload=payload,
+            target_session_id=None,
+            idempotency_key=idempotency_key,
+            max_attempts=max_attempts,
+            cancel_mode=CancelMode.cooperative,
+        )
+
     async def enqueue_sync(
         self, connector_id: str, *, idempotency_key: str | None = None
     ) -> JobRecord:
@@ -653,13 +727,11 @@ class ConnectorService:
         if self.jobs is None:
             raise RuntimeError("durable connector jobs are unavailable")
         key = idempotency_key.strip() if idempotency_key else uuid.uuid4().hex
-        job, created = await self.jobs.enqueue_once(
+        job, created = await self._enqueue_connector_job_once(
             kind=CONNECTOR_SYNC_JOB_KIND,
             payload={"connector_id": connector_id, "binding_id": binding.id},
-            target_session_id=None,
             idempotency_key=f"{connector_id}:{key}",
             max_attempts=CONNECTOR_SYNC_MAX_ATTEMPTS,
-            cancel_mode=CancelMode.cooperative,
         )
         if created and self._dispatch_job is not None:
             await self._dispatch_job(self.repository.scope_id, job.id)
@@ -748,19 +820,21 @@ class ConnectorService:
                 raise ValueError("connector no longer declares recurring renewal")
             kind = CONNECTOR_RENEW_JOB_KIND
             max_attempts = CONNECTOR_RENEW_MAX_ATTEMPTS
-        job, _ = await self.jobs.enqueue_once(
+        job, created = await self._enqueue_connector_job_once(
             kind=kind,
             payload={
                 "connector_id": lease.connector_id,
                 "binding_id": lease.binding_id,
             },
-            target_session_id=None,
             idempotency_key=(
                 f"recurring:{lease.operation.value}:{lease.binding_id}:{lease.due_at.isoformat()}"
             ),
             max_attempts=max_attempts,
-            cancel_mode=CancelMode.cooperative,
         )
+        # A recurring job runs in this lease's own scope: dispatch it immediately and (via the
+        # dispatch outbox recorded above) let the cross-scope reconciler recover a lost enqueue.
+        if created and self._dispatch_job is not None:
+            await self._dispatch_job(self.repository.scope_id, job.id)
         return job
 
     async def reconcile_recurring(
@@ -954,6 +1028,20 @@ class ConnectorService:
         elif self._delete_credential is not None:
             deleted = await self._delete_credential(connector_id)
         removed = await self.repository.delete_connector(connector_id)
+        # Remove the webhook routing capability so a delivery for a revoked connector fails closed
+        # (binding delete / lifecycle erasure removes the route).
+        if self._webhook_route_store is not None:
+            await self._webhook_route_store.delete_for_connector(
+                self.repository.scope_id, connector_id
+            )
+        # If this scope has no more bindings with a recurring schedule, drop it from the global
+        # schedule index so the cross-scope reconciler stops binding an idle scope (self-healing).
+        if self._schedule_index is not None:
+            remaining = await self.repository.list_bindings()
+            if not any(
+                b.next_sync_at is not None or b.next_renewal_at is not None for b in remaining
+            ):
+                await self._schedule_index.discard(self.repository.scope_id)
         return deleted or removed > 0 or outbound > 0 or purged > 0 or binding is not None
 
     async def _required_binding(self, connector_id: str) -> ConnectorBinding:

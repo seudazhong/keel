@@ -24,6 +24,7 @@ from keel_core.connector_contracts import (
     ConnectorRenewalPolicy,
     ConnectorRenewalResult,
     ConnectorScheduleOperation,
+    ConnectorSetupResult,
     ConnectorSyncResult,
 )
 from keel_core.connector_registry import ConnectorRegistration, ConnectorRegistry
@@ -32,15 +33,17 @@ from keel_core.connector_repository import (
     ConnectorScheduleLeaseLostError,
     InMemoryConnectorRepository,
 )
+from keel_core.connector_schedule_index import InMemoryConnectorScheduleIndex
 from keel_core.connector_service import (
     CONNECTOR_RENEW_JOB_KIND,
     CONNECTOR_SYNC_JOB_KIND,
     ConnectorService,
 )
-from keel_core.jobs import InMemoryJobStore
+from keel_core.job_dispatch import InMemoryJobDispatchOutbox
+from keel_core.jobs import InMemoryJobStore, JobStatus
 from keel_core.protocols import ToolContext
 from keel_worker.connectors import reconcile_connectors_tick, register_connector_jobs
-from keel_worker.jobs import JobRegistry
+from keel_worker.jobs import JobRegistry, reconcile_job_dispatch_tick, run_job
 from keel_worker.main import _connector_actions
 
 ACTION = ConnectorActionManifest(
@@ -485,3 +488,217 @@ async def test_renewal_expiry_behavior_revokes_before_dispatch() -> None:
     assert expired is not None
     assert expired.status is ConnectorBindingStatus.revoked
     assert expired.error_code == "connector_renewal_expired"
+
+
+# --- Agent-scoped connector jobs + cross-scope reconciliation (review finding 1) -------------
+
+_SYNC_SCOPE_A = "agent:orga/ag1"
+_SYNC_SCOPE_B = "agent:orgb/ag2"
+
+
+def _sync_registry() -> ConnectorRegistry:
+    return ConnectorRegistry(
+        (ConnectorRegistration(Provider.manifest, Provider, "tests.worker_fixture"),)
+    )
+
+
+async def _connected_service(
+    scope: str,
+    *,
+    outbox: InMemoryJobDispatchOutbox | None = None,
+    schedule_index: InMemoryConnectorScheduleIndex | None = None,
+    dispatched: list[tuple[str, str]] | None = None,
+) -> ConnectorService:
+    repository = InMemoryConnectorRepository(scope)
+    await repository.upsert_binding(
+        "worker_fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+
+    async def _dispatch(dispatch_scope: str, job_id: str) -> None:
+        if dispatched is not None:
+            dispatched.append((dispatch_scope, job_id))
+
+    return ConnectorService(
+        _sync_registry(),
+        repository,
+        jobs=InMemoryJobStore(scope),
+        dispatch_job=_dispatch,
+        dispatch_outbox=outbox,
+        schedule_index=schedule_index,
+    )
+
+
+async def test_agent_scoped_sync_records_dispatch_intent() -> None:
+    # Finding 1: a connector sync enqueued under a per-Agent scope records a global dispatch
+    # intent keyed by that scope (never web:local) so the cross-scope reconciler can recover it.
+    outbox = InMemoryJobDispatchOutbox()
+    dispatched: list[tuple[str, str]] = []
+    service = await _connected_service(_SYNC_SCOPE_A, outbox=outbox, dispatched=dispatched)
+    job = await service.enqueue_sync("worker_fixture")
+    intents = await outbox.claim_due(worker_id="w1")
+    assert [(i.job_id, i.scope_id, i.kind) for i in intents] == [
+        (job.id, _SYNC_SCOPE_A, CONNECTOR_SYNC_JOB_KIND)
+    ]
+    assert dispatched[-1] == (_SYNC_SCOPE_A, job.id)
+
+
+async def test_run_job_executes_agent_scoped_connector_sync() -> None:
+    # run_job binds the job's own per-Agent scope and runs connector.sync there (no web:local).
+    scope = _SYNC_SCOPE_A
+    service = await _connected_service(scope)
+    job = await service.enqueue_sync("worker_fixture")
+    registry = JobRegistry()
+    register_connector_jobs(registry, service, Settings())
+    enqueued: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def _enqueue(name: str, *args: object, **_o: object) -> None:
+        enqueued.append((name, args))
+
+    ctx: dict[str, Any] = {
+        "durable_scope": "web:local",
+        "job_settings": Settings(),
+        "jobs": service.jobs,
+        "job_registry": registry,
+        "enqueue": _enqueue,
+    }
+    assert await run_job(ctx, scope, job.id) == JobStatus.succeeded.value
+
+
+async def test_lost_connector_enqueue_is_recovered_by_reconciler() -> None:
+    # Crash/retry: a lost immediate dispatch leaves the intent, and the cross-scope job reconciler
+    # re-dispatches run_job with the job's own scope (finding 1).
+    scope = _SYNC_SCOPE_A
+    outbox = InMemoryJobDispatchOutbox()
+
+    async def _failing_dispatch(dispatch_scope: str, job_id: str) -> None:
+        raise RuntimeError("queue down")
+
+    repository = InMemoryConnectorRepository(scope)
+    await repository.upsert_binding(
+        "worker_fixture", ConnectorBindingDraft(), ConnectorBindingStatus.connected
+    )
+    jobs = InMemoryJobStore(scope)
+    service = ConnectorService(
+        _sync_registry(),
+        repository,
+        jobs=jobs,
+        dispatch_job=_failing_dispatch,
+        dispatch_outbox=outbox,
+    )
+    try:
+        job = await service.enqueue_sync("worker_fixture")
+    except RuntimeError:
+        job = (await jobs.list())[0]
+    # The intent survived the failed enqueue.
+    assert scope in await outbox.active_scopes()
+
+    enqueued: list[tuple[str, tuple[Any, ...]]] = []
+
+    async def _enqueue(name: str, *args: object, **_o: object) -> None:
+        enqueued.append((name, args))
+
+    ctx: dict[str, Any] = {
+        "durable_scope": "web:local",
+        "job_dispatch_outbox": outbox,
+        "jobs": jobs,
+        "enqueue": _enqueue,
+        "job_settings": Settings(),
+    }
+    dispatched = await reconcile_job_dispatch_tick(ctx)
+    assert dispatched == 1
+    assert ("run_job", (scope, job.id)) in enqueued
+
+
+async def test_reconcile_connectors_enumerates_two_scopes_from_index() -> None:
+    # Finding 1: the recurring reconciler fires due schedules across every scope in the global
+    # schedule index — not just the pinned durable_scope.
+    manifest = ConnectorManifest(
+        id="recurring",
+        name="Recurring",
+        description="recurring fixture",
+        auth_kind=ConnectorAuthKind.url,
+        capabilities=(ConnectorCapability.sync,),
+        default_sync_cadence_seconds=60,
+    )
+
+    class RecurringProvider(BaseConnectorProvider):
+        async def sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult:
+            return ConnectorSyncResult()
+
+    RecurringProvider.manifest = manifest
+    registry = ConnectorRegistry(
+        (ConnectorRegistration(manifest, RecurringProvider, "tests.recurring"),)
+    )
+    index = InMemoryConnectorScheduleIndex()
+    services: dict[str, ConnectorService] = {}
+    due_times: list[datetime] = []
+    for scope in (_SYNC_SCOPE_A, _SYNC_SCOPE_B):
+        repository = InMemoryConnectorRepository(scope)
+        binding = await repository.upsert_binding(
+            "recurring",
+            ConnectorBindingDraft(),
+            ConnectorBindingStatus.connected,
+            sync_cadence_seconds=manifest.default_sync_cadence_seconds,
+        )
+        assert binding.next_sync_at is not None
+        due_times.append(binding.next_sync_at)
+        services[scope] = ConnectorService(
+            registry, repository, jobs=InMemoryJobStore(scope), schedule_index=index
+        )
+        await index.record(scope)
+
+    assert await index.active_scopes() == {_SYNC_SCOPE_A, _SYNC_SCOPE_B}
+    now = max(due_times)
+    ctx: dict[str, Any] = {
+        "job_settings": Settings(),
+        "connector_clock": lambda: now,
+        "connector_schedule_index": index,
+        "connector_scope_factory": lambda scope: services[scope],
+    }
+    # One due sync schedule fires in each of the two scopes.
+    assert await reconcile_connectors_tick(ctx) == 2
+    for scope in (_SYNC_SCOPE_A, _SYNC_SCOPE_B):
+        service_jobs = services[scope].jobs
+        assert service_jobs is not None
+        queued = await service_jobs.list()
+        assert [job.kind for job in queued] == [CONNECTOR_SYNC_JOB_KIND]
+
+
+async def test_setup_registers_scope_and_revoke_discards_it() -> None:
+    # A binding that arms a recurring schedule registers its scope in the global index; revoking
+    # the last scheduled binding discards it (self-healing).
+    manifest = ConnectorManifest(
+        id="recurring",
+        name="Recurring",
+        description="recurring fixture",
+        auth_kind=ConnectorAuthKind.url,
+        capabilities=(ConnectorCapability.sync,),
+        default_sync_cadence_seconds=60,
+    )
+
+    class RecurringProvider(BaseConnectorProvider):
+        async def sync(self, context: ConnectorOperationContext) -> ConnectorSyncResult:
+            return ConnectorSyncResult()
+
+        async def revoke(self, context: ConnectorOperationContext) -> None:
+            return None
+
+    RecurringProvider.manifest = manifest
+    registry = ConnectorRegistry(
+        (ConnectorRegistration(manifest, RecurringProvider, "tests.recurring"),)
+    )
+    index = InMemoryConnectorScheduleIndex()
+    repository = InMemoryConnectorRepository(_SYNC_SCOPE_A)
+    service = ConnectorService(
+        registry, repository, jobs=InMemoryJobStore(_SYNC_SCOPE_A), schedule_index=index
+    )
+    await service.save_setup(
+        "recurring",
+        ConnectorSetupResult(
+            binding=ConnectorBindingDraft(),
+            status=ConnectorBindingStatus.connected,
+        ),
+    )
+    assert await index.active_scopes() == {_SYNC_SCOPE_A}
+    await service.revoke("recurring")
+    assert await index.active_scopes() == set()

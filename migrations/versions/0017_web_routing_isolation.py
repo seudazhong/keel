@@ -322,6 +322,83 @@ def upgrade() -> None:
         """
     )
 
+    # --- Global connector schedule index (review finding 1) --------------------------------
+    # Connector recurring schedules live on ``connector_bindings`` (0016), which is under
+    # ``FORCE ROW LEVEL SECURITY`` keyed by ``app.scope_id`` — so a worker bound to one scope
+    # cannot see another scope's due sync/renewal work, and the recurring reconciler was pinned to
+    # the single ``web:local`` scope. A connector connected under any per-Agent scope therefore
+    # never synced/renewed. ``connector_active_scopes`` is the minimal, non-sensitive, global set
+    # of scopes that currently have a recurring connector schedule — only the scope routing key,
+    # no binding id/credential/cadence/payload. The worker enumerates it, binds each scope, and
+    # runs that scope's RLS-scoped ``reconcile_recurring``. Like the dispatch outboxes it is not
+    # under RLS (it is read across scopes) and exposes nothing beyond scope routing keys.
+    op.execute(
+        """
+        CREATE TABLE connector_active_scopes (
+            scope_id text PRIMARY KEY,
+            updated_at timestamptz NOT NULL DEFAULT now()
+        )
+        """
+    )
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'keel_runtime') THEN
+                BEGIN
+                    GRANT SELECT, INSERT, UPDATE, DELETE ON connector_active_scopes
+                        TO keel_runtime;
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'keel_runtime connector scope index grants skipped '
+                        '(insufficient privilege)';
+                END;
+            END IF;
+        END $$;
+        """
+    )
+
+    # --- Global connector webhook routing capability (review finding — webhook routing) -----
+    # An inbound provider webhook carries no Keel auth headers, so before this table the ingress
+    # resolved to the app-global ``web:local`` scope and a delivery for one Agent's connector could
+    # never reach that Agent's scope in a multi-tenant deployment. ``connector_webhook_routes`` maps
+    # a high-entropy, unguessable route token (embedded in the webhook URL handed to the provider at
+    # setup) to the ``(scope_id, connector_id, binding_id, status)`` the delivery belongs to. It
+    # carries NO credential/signing secret/token payload — only routing metadata — so it is safe for
+    # the non-owner runtime role to read across scopes; the ingress still runs the provider-specific
+    # signature/endpoint-token/replay verification against that scope's bound credential after
+    # resolving the route. It is intentionally not under RLS (the one table read across scopes).
+    op.execute(
+        """
+        CREATE TABLE connector_webhook_routes (
+            route_token text PRIMARY KEY,
+            scope_id text NOT NULL,
+            connector_id text NOT NULL,
+            binding_id text NOT NULL,
+            status text NOT NULL,
+            created_at timestamptz NOT NULL DEFAULT now(),
+            updated_at timestamptz NOT NULL DEFAULT now(),
+            -- At most one active route per connector per scope; setup replaces the prior token.
+            UNIQUE (scope_id, connector_id)
+        )
+        """
+    )
+    op.execute(
+        """
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'keel_runtime') THEN
+                BEGIN
+                    GRANT SELECT, INSERT, UPDATE, DELETE ON connector_webhook_routes
+                        TO keel_runtime;
+                EXCEPTION WHEN insufficient_privilege THEN
+                    RAISE NOTICE 'keel_runtime connector webhook route grants skipped '
+                        '(insufficient privilege)';
+                END;
+            END IF;
+        END $$;
+        """
+    )
+
     # --- Composite session tenant identity (review finding 2) -----------------------------
     # Before this migration ``sessions.id`` was a *global* primary key and ``events`` was
     # unique on ``(session_id, seq)``, so a session id could exist in only one scope — two orgs
@@ -418,5 +495,7 @@ def downgrade() -> None:
     op.execute("ALTER TABLE sessions DROP CONSTRAINT sessions_pkey")
     op.execute("ALTER TABLE sessions ADD PRIMARY KEY (id)")
 
+    op.execute("DROP TABLE IF EXISTS connector_webhook_routes CASCADE")
+    op.execute("DROP TABLE IF EXISTS connector_active_scopes CASCADE")
     op.execute("DROP TABLE IF EXISTS job_dispatch_outbox CASCADE")
     op.execute("DROP TABLE IF EXISTS run_dispatch_outbox CASCADE")

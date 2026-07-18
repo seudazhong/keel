@@ -525,6 +525,9 @@ export const handlers = [
       artifacts: [],
     });
   }),
+  http.post("/v1/connectors/:id/connect-url", ({ params }) =>
+    HttpResponse.json({ url: `https://provider.example/${String(params.id)}/consent` }),
+  ),
   http.post("/v1/connectors/:id/sync", ({ params }) =>
     HttpResponse.json({ ok: true, job_id: `${String(params.id)}-job`, status: "queued" }),
   ),

@@ -1,10 +1,16 @@
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
-import { expect, test, vi } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
+import { emptyAuth, setAuthSnapshot } from "../auth/authState";
 import { makeConnectorFixture } from "../../test/connectorFixtures";
 import { server } from "../../test/setup";
 import { renderWithClient } from "../../test/utils";
 import { ConnectorsPage } from "./ConnectorsPage";
+
+afterEach(() => {
+  setAuthSnapshot(emptyAuth);
+  vi.restoreAllMocks();
+});
 
 test("renders a connected manifest with scope chips and taint guidance", async () => {
   renderWithClient(<ConnectorsPage />);
@@ -14,16 +20,54 @@ test("renders a connected manifest with scope chips and taint guidance", async (
   expect(screen.getByText("healthy")).toBeInTheDocument();
 });
 
-test("a not-connected oauth connector offers an in-browser connect", async () => {
-  const open = vi.spyOn(window, "open").mockImplementation(() => null);
+test("a not-connected oauth connector requests an authenticated connect URL and opens it", async () => {
+  let connectRequest: Request | undefined;
+  let legacyConnectGetUsed = false;
+  setAuthSnapshot({
+    credential: { kind: "api-key", secret: "connector-key" },
+    org: "test-org",
+    agent: "test-agent",
+  });
+  server.use(
+    http.get("/v1/connectors/:id/connect", () => {
+      legacyConnectGetUsed = true;
+      return HttpResponse.json({ detail: "Legacy route must not be used" }, { status: 500 });
+    }),
+    http.post("/v1/connectors/:id/connect-url", ({ request }) => {
+      connectRequest = request;
+      return HttpResponse.json({ url: "https://provider.example/consent" });
+    }),
+  );
+  const open = vi.spyOn(window, "open").mockReturnValue({} as Window);
   renderWithClient(<ConnectorsPage />);
   await screen.findByText("gmail.readonly");
   expect(screen.getByText("OAuth fixture")).toBeInTheDocument();
   const btn = screen.getByRole("button", { name: "Connect" });
   expect(btn).not.toBeDisabled();
   fireEvent.click(btn);
-  expect(open).toHaveBeenCalledWith("/v1/connectors/oauth-fixture/connect", "_blank");
-  open.mockRestore();
+  await waitFor(() =>
+    expect(open).toHaveBeenCalledWith(
+      "https://provider.example/consent",
+      "_blank",
+      "noopener,noreferrer",
+    ),
+  );
+  expect(connectRequest?.method).toBe("POST");
+  expect(new URL(connectRequest!.url).pathname).toBe("/v1/connectors/oauth-fixture/connect-url");
+  expect(connectRequest?.headers.get("X-API-Key")).toBe("connector-key");
+  expect(connectRequest?.headers.get("X-Keel-Org")).toBe("test-org");
+  expect(connectRequest?.headers.get("X-Keel-Agent")).toBe("test-agent");
+  expect(legacyConnectGetUsed).toBe(false);
+});
+
+test("a blocked connector authorization popup shows an actionable error", async () => {
+  vi.spyOn(window, "open").mockReturnValue(null);
+  renderWithClient(<ConnectorsPage />);
+  await screen.findByText("OAuth fixture");
+  fireEvent.click(screen.getByRole("button", { name: "Connect" }));
+  expect(
+    await screen.findByText(/authorization window was blocked.*Allow popups.*try again/i),
+  ).toBeInTheDocument();
 });
 
 test("configured staged connector keeps setup and authorization controls visible", async () => {

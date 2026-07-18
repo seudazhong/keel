@@ -9,7 +9,7 @@ import { ConnectorResources } from "./ConnectorResources";
 import { ConnectorSetupList } from "./ConnectorSetup";
 import { ConnectorTargets } from "./ConnectorTargets";
 import type { Connector } from "./types";
-import { useConnectors, useRevokeConnector, useSyncConnector } from "./useConnectors";
+import { useConnectors, useConnectUrl, useRevokeConnector, useSyncConnector } from "./useConnectors";
 
 function fmtDate(iso: string | null): string {
   if (!iso) return "—";
@@ -30,6 +30,7 @@ function ConnectedConnector({ connector }: { connector: Connector }) {
   const forget = useRevokeConnector(false, true);
   const forcePurge = useRevokeConnector(true, true);
   const sync = useSyncConnector();
+  const connect = useConnectUrl(connector.id);
 
   return (
     <Card className="p-4">
@@ -71,8 +72,8 @@ function ConnectedConnector({ connector }: { connector: Connector }) {
           </Button>
         )}
         {connector.auth_action && (
-          <Button onClick={() => window.open(`/v1/connectors/${connector.id}/connect`, "_blank")}>
-            Reconnect
+          <Button onClick={() => connect.mutate()} disabled={connect.isPending}>
+            {connect.isPending ? "Opening…" : "Reconnect"}
           </Button>
         )}
         <Button variant="danger" onClick={() => revoke.mutate(connector.id)} disabled={revoke.isPending}>
@@ -112,9 +113,9 @@ function ConnectedConnector({ connector }: { connector: Connector }) {
           Force local purge
         </Button>
       </div>
-      {(revoke.isError || purge.isError || forget.isError || forcePurge.isError || sync.isError) && (
+      {(connect.error || revoke.isError || purge.isError || forget.isError || forcePurge.isError || sync.isError) && (
         <p className="mt-2 text-xs text-red">
-          {(revoke.error ?? purge.error ?? forget.error ?? forcePurge.error ?? sync.error)?.message}
+          {(connect.error ?? revoke.error ?? purge.error ?? forget.error ?? forcePurge.error ?? sync.error)?.message}
         </p>
       )}
     </Card>

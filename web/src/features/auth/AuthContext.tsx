@@ -18,6 +18,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -77,10 +78,12 @@ function persist(snapshot: AuthSnapshot): void {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [snapshot, setSnapshot] = useState<AuthSnapshot>(() => loadPersisted());
+  const snapshotRef = useRef(snapshot);
   const [needsAuth, setNeedsAuth] = useState(false);
 
   // Keep the framework-agnostic fetch layer in sync with the live snapshot.
   useEffect(() => {
+    snapshotRef.current = snapshot;
     setAuthSnapshot(snapshot);
     persist(snapshot);
   }, [snapshot]);
@@ -88,7 +91,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // Surface the sign-in/context screen when the server rejects a request for auth.
   useEffect(() => {
     onAuthError((status) => {
-      if (status === 401 || status === 403) setNeedsAuth(true);
+      if (status === 401 || status === 403) {
+        const cleared = { ...snapshotRef.current, credential: null };
+        snapshotRef.current = cleared;
+        setAuthSnapshot(cleared);
+        persist(cleared);
+        setSnapshot(cleared);
+        setNeedsAuth(true);
+      }
     });
     return () => onAuthError(null);
   }, []);

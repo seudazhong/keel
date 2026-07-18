@@ -375,7 +375,9 @@ async def startup(ctx: dict[str, Any]) -> None:
     from keel_core.connector_credentials import ConnectorCredentialStore
     from keel_core.connector_registry import get_connector_registry
     from keel_core.connector_repository import PostgresConnectorRepository
+    from keel_core.connector_schedule_index import PostgresConnectorScheduleIndex
     from keel_core.connector_service import ConnectorService, DurableConnectorChangeSink
+    from keel_core.connector_webhook_routes import PostgresConnectorWebhookRouteStore
     from keel_core.errors import DuplicateEventError
     from keel_core.knowledge.models import KnowledgeBaseStatus
     from keel_core.knowledge.service import KnowledgeService
@@ -384,88 +386,126 @@ async def startup(ctx: dict[str, Any]) -> None:
     from keel_core.state import session_exists
     from keel_core.tokens import PostgresTokenStore
 
-    connector_credentials = None
-    connector_action_credentials = None
-    if settings.secret_key or settings.secret_keys:
-        connector_action_credentials = PostgresTokenStore(
-            engine, _DURABLE_SCOPE, keyring_from_settings(settings)
-        )
-        connector_credentials = ConnectorCredentialStore(connector_action_credentials)
-    connector_repository = PostgresConnectorRepository(engine, _DURABLE_SCOPE)
-    ctx["connector_repository"] = connector_repository
-    connector_knowledge = KnowledgeService(
-        cast(KnowledgeStore, knowledge),
-        ctx["jobs"],
-        settings,
-        embedding_model=embedder.model,
-        embedding_dim=embedder.dim,
-    )
     connector_registry = get_connector_registry()
     ctx["connector_registry"] = connector_registry
+    keyring = (
+        keyring_from_settings(settings) if (settings.secret_key or settings.secret_keys) else None
+    )
+    connector_schedule_index = PostgresConnectorScheduleIndex(engine)
+    ctx["connector_schedule_index"] = connector_schedule_index
+    connector_webhook_route_store = PostgresConnectorWebhookRouteStore(engine)
+    ctx["connector_webhook_route_store"] = connector_webhook_route_store
+
+    async def _dispatch_connector_job(dispatch_scope: str, job_id: str) -> None:
+        enqueue_fn = ctx.get("enqueue")
+        if enqueue_fn is not None:
+            await enqueue_fn("run_job", dispatch_scope, job_id)
+
+    def build_connector_service(scope_id: str) -> ConnectorService:
+        """Build a fully scope-bound connector service for ``scope_id`` (no ``web:local`` fallback).
+
+        Used both to reconcile recurring schedules across every active scope and by ``run_job`` to
+        execute an Agent-scoped ``connector.sync``/``connector.renew`` job against its own scope's
+        repository, credentials, and change sink (finding 1).
+        """
+        repository = PostgresConnectorRepository(engine, scope_id)
+        credentials = (
+            ConnectorCredentialStore(PostgresTokenStore(engine, scope_id, keyring))
+            if keyring is not None
+            else None
+        )
+        scope_knowledge = KnowledgeService(
+            cast(
+                KnowledgeStore,
+                PostgresKnowledgeStore(
+                    engine,
+                    scope_id,
+                    document_max_bytes=settings.knowledge_document_max_bytes,
+                ),
+            ),
+            PostgresJobStore(engine, scope_id, limits=JobLimits.from_settings(settings)),
+            settings,
+            embedding_model=embedder.model,
+            embedding_dim=embedder.dim,
+        )
+
+        async def _validate_target(kind: ConnectorTargetKind, target_id: str) -> bool:
+            if kind is ConnectorTargetKind.knowledge:
+                base = await scope_knowledge.get_base(target_id)
+                return base is not None and base.status is KnowledgeBaseStatus.active
+            if kind is ConnectorTargetKind.trigger_session:
+                return await session_exists(engine, scope_id, target_id)
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("SELECT set_config('app.scope_id', :scope, true)"),
+                    {"scope": scope_id},
+                )
+                return bool(
+                    await conn.scalar(
+                        text(
+                            "SELECT EXISTS(SELECT 1 FROM schedules "
+                            "WHERE scope_id = :scope AND id = :routine)"
+                        ),
+                        {"scope": scope_id, "routine": target_id},
+                    )
+                )
+
+        async def _resolve_trigger(kind: ConnectorTargetKind, target_id: str) -> str:
+            if kind is ConnectorTargetKind.trigger_session:
+                return target_id
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("SELECT set_config('app.scope_id', :scope, true)"),
+                    {"scope": scope_id},
+                )
+                session_id = await conn.scalar(
+                    text(
+                        "SELECT session_id FROM schedules WHERE scope_id = :scope AND id = :routine"
+                    ),
+                    {"scope": scope_id, "routine": target_id},
+                )
+            if session_id is None:
+                raise RuntimeError("connector trigger routine target is unavailable")
+            return str(session_id)
+
+        async def _admit_event(session_id: str, content: str, run_id: str) -> None:
+            try:
+                await admit_external(
+                    PostgresEventStore(engine, scope_id), session_id, scope_id, content, run_id
+                )
+            except DuplicateEventError:
+                pass
+
+        return ConnectorService(
+            connector_registry,
+            repository,
+            credentials=credentials,
+            jobs=PostgresJobStore(engine, scope_id, limits=JobLimits.from_settings(settings)),
+            dispatch_job=_dispatch_connector_job,
+            dispatch_outbox=ctx["job_dispatch_outbox"],
+            schedule_index=connector_schedule_index,
+            webhook_route_store=connector_webhook_route_store,
+            change_sink=DurableConnectorChangeSink(
+                repository,
+                knowledge=scope_knowledge,
+                admit_event=_admit_event,
+                resolve_trigger=_resolve_trigger,
+            ),
+            target_validator=_validate_target,
+        )
+
+    ctx["connector_scope_factory"] = build_connector_service
+
+    # The durable-scope (``web:local``) connector action credentials + repository are read by the
+    # per-scope digest/agent tool actions (``_connector_actions``); keep them wired.
+    connector_action_credentials = None
+    if keyring is not None:
+        connector_action_credentials = PostgresTokenStore(engine, _DURABLE_SCOPE, keyring)
+    connector_repository = PostgresConnectorRepository(engine, _DURABLE_SCOPE)
+    ctx["connector_repository"] = connector_repository
     ctx["connector_action_credentials"] = connector_action_credentials
 
-    async def validate_connector_target(kind: ConnectorTargetKind, target_id: str) -> bool:
-        if kind is ConnectorTargetKind.knowledge:
-            base = await connector_knowledge.get_base(target_id)
-            return base is not None and base.status is KnowledgeBaseStatus.active
-        if kind is ConnectorTargetKind.trigger_session:
-            return await session_exists(engine, _DURABLE_SCOPE, target_id)
-        async with engine.begin() as conn:
-            await conn.execute(
-                text("SELECT set_config('app.scope_id', :scope, true)"),
-                {"scope": _DURABLE_SCOPE},
-            )
-            return bool(
-                await conn.scalar(
-                    text(
-                        "SELECT EXISTS(SELECT 1 FROM schedules "
-                        "WHERE scope_id = :scope AND id = :routine)"
-                    ),
-                    {"scope": _DURABLE_SCOPE, "routine": target_id},
-                )
-            )
-
-    async def resolve_connector_trigger(kind: ConnectorTargetKind, target_id: str) -> str:
-        if kind is ConnectorTargetKind.trigger_session:
-            return target_id
-        async with engine.begin() as conn:
-            await conn.execute(
-                text("SELECT set_config('app.scope_id', :scope, true)"),
-                {"scope": _DURABLE_SCOPE},
-            )
-            session_id = await conn.scalar(
-                text("SELECT session_id FROM schedules WHERE scope_id = :scope AND id = :routine"),
-                {"scope": _DURABLE_SCOPE, "routine": target_id},
-            )
-        if session_id is None:
-            raise RuntimeError("connector trigger routine target is unavailable")
-        return str(session_id)
-
-    async def admit_connector_event(session_id: str, content: str, run_id: str) -> None:
-        try:
-            await admit_external(
-                ctx["store"],
-                session_id,
-                _DURABLE_SCOPE,
-                content,
-                run_id,
-            )
-        except DuplicateEventError:
-            pass
-
-    connector_service = ConnectorService(
-        connector_registry,
-        connector_repository,
-        credentials=connector_credentials,
-        jobs=ctx["jobs"],
-        change_sink=DurableConnectorChangeSink(
-            connector_repository,
-            knowledge=connector_knowledge,
-            admit_event=admit_connector_event,
-            resolve_trigger=resolve_connector_trigger,
-        ),
-        target_validator=validate_connector_target,
-    )
+    connector_service = build_connector_service(_DURABLE_SCOPE)
     ctx["connector_sync_service"] = connector_service
     register_connector_jobs(job_registry, connector_service, settings)
 

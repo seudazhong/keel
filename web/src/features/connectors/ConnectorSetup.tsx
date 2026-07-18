@@ -2,7 +2,7 @@ import { useRef, useState } from "react";
 import { Button } from "../../components/ui/button";
 import { Card } from "../../components/ui/card";
 import type { Connector, ConnectorSetupArtifact } from "./types";
-import { useSetupConnector } from "./useConnectors";
+import { useConnectUrl, useSetupConnector } from "./useConnectors";
 
 function safeUrl(value: string): string | null {
   try {
@@ -38,14 +38,11 @@ function Artifacts({ artifacts }: { artifacts: ConnectorSetupArtifact[] }) {
 
 export function ConnectorSetup({ connector, compact = false }: { connector: Connector; compact?: boolean }) {
   const setup = useSetupConnector();
+  const connect = useConnectUrl(connector.id);
   const [saved, setSaved] = useState(false);
   const [artifacts, setArtifacts] = useState<ConnectorSetupArtifact[]>([]);
   const form = useRef<HTMLFormElement>(null);
   const secretHost = useRef<HTMLDivElement>(null);
-
-  function connect() {
-    window.open(`/v1/connectors/${connector.id}/connect`, "_blank");
-  }
 
   async function submit() {
     const current = form.current;
@@ -104,15 +101,17 @@ export function ConnectorSetup({ connector, compact = false }: { connector: Conn
       {connector.auth_action && (
         <Button
           className="w-full"
-          onClick={connect}
+          onClick={() => connect.mutate()}
           disabled={
+            connect.isPending ||
             !connector.available ||
             (connector.auth_action.requires_setup && !connector.configured)
           }
         >
-          {connector.auth_action.label}
+          {connect.isPending ? "Opening…" : connector.auth_action.label}
         </Button>
       )}
+      {connect.error && <p role="alert" className="text-xs text-red">{connect.error.message}</p>}
       {(!connector.auth_action || connector.setup_fields.length > 0) && (
         <form
           className="space-y-2"

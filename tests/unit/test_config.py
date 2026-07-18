@@ -270,3 +270,41 @@ def test_knowledge_settings_reject_overlap_at_or_above_target(overlap: int) -> N
 
     with pytest.raises(ValidationError):
         Settings(knowledge_chunk_target_chars=100, knowledge_chunk_overlap_chars=overlap)
+
+
+def test_legacy_machine_binding_defaults_none() -> None:
+    from keel_core.config import Settings
+
+    settings = Settings()
+    assert settings.legacy_machine_org_id == ""
+    assert settings.legacy_machine_agent_id == ""
+    assert settings.legacy_machine_binding is None
+
+
+def test_legacy_machine_binding_pair_resolves() -> None:
+    from keel_core.config import Settings
+
+    settings = Settings(legacy_machine_org_id="acme", legacy_machine_agent_id="agent-1")
+    assert settings.legacy_machine_binding == ("acme", "agent-1")
+
+
+@pytest.mark.parametrize(
+    ("org", "agent"),
+    [("acme", ""), ("", "agent-1")],
+)
+def test_legacy_machine_binding_half_pair_rejected(org: str, agent: str) -> None:
+    from pydantic import ValidationError
+
+    from keel_core.config import Settings
+
+    with pytest.raises(ValidationError):
+        Settings(legacy_machine_org_id=org, legacy_machine_agent_id=agent)
+
+
+def test_legacy_machine_binding_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KEEL_LEGACY_MACHINE_ORG_ID", "org-xyz")
+    monkeypatch.setenv("KEEL_LEGACY_MACHINE_AGENT_ID", "agent-xyz")
+
+    from keel_core.config import Settings
+
+    assert Settings().legacy_machine_binding == ("org-xyz", "agent-xyz")

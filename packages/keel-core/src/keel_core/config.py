@@ -97,6 +97,19 @@ class Settings(BaseSettings):
     # implicit-admin open mode. Leave false only for local/self-hosted single-user use.
     cloud_mode: bool = False
 
+    # Legacy API-key migration mapping (M3.6 review finding 5). A pre-identity API key of the
+    # bare ``key:role`` form (no ``org=``/``agent=`` binding) carries no tenant, so in cloud
+    # mode it fails closed — there is no ambient data-plane scope. To let an existing cloud
+    # deployment keep working while operators migrate those keys to scoped ``key:role:org=..:
+    # agent=..`` credentials, set BOTH of these to a real org id/slug and Agent id: every
+    # unbound, non-global machine credential then binds to exactly that one org+Agent (never an
+    # ambient scope, and a spoofed ``X-Keel-Org``/``X-Keel-Agent`` that selects a different
+    # tenant is still rejected). This is an explicit, cloud-only migration aid: leave both empty
+    # (the default) to keep bare keys failing closed. Setting only one is a hard misconfiguration
+    # (see ``_validate_legacy_machine_binding``): the mapping must be a complete org+Agent pair.
+    legacy_machine_org_id: str = ""
+    legacy_machine_agent_id: str = ""
+
     # OIDC identity (M3.6). Human users authenticate with a provider-issued bearer JWT that
     # the server verifies against the issuer's JWKS. Disabled -> only the API-key/local
     # actor paths are available (identity APIs then require the local single-operator user
@@ -242,6 +255,33 @@ class Settings(BaseSettings):
         if self.knowledge_chunk_overlap_chars >= self.knowledge_chunk_target_chars:
             raise ValueError("knowledge_chunk_overlap_chars must be less than target")
         return self
+
+    @model_validator(mode="after")
+    def _validate_legacy_machine_binding(self) -> Self:
+        """The legacy migration mapping must be a complete org+Agent pair (or both empty).
+
+        Binding pre-identity ``key:role`` credentials to only an org (without an Agent) — or
+        vice versa — cannot derive a data-plane scope, so a half-configured pair is a silent
+        no-op that would leave those credentials failing closed while looking configured. Reject
+        it explicitly instead so the misconfiguration surfaces at startup.
+        """
+        org = self.legacy_machine_org_id.strip()
+        agent = self.legacy_machine_agent_id.strip()
+        if bool(org) != bool(agent):
+            raise ValueError(
+                "KEEL_LEGACY_MACHINE_ORG_ID and KEEL_LEGACY_MACHINE_AGENT_ID must be set "
+                "together (a complete org+Agent pair) or both left empty"
+            )
+        return self
+
+    @property
+    def legacy_machine_binding(self) -> tuple[str, str] | None:
+        """The configured legacy org+Agent migration binding, or ``None`` when unset."""
+        org = self.legacy_machine_org_id.strip()
+        agent = self.legacy_machine_agent_id.strip()
+        if org and agent:
+            return org, agent
+        return None
 
     @property
     def sync_database_url(self) -> str:
