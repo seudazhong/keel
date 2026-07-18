@@ -121,16 +121,6 @@ def _snippet_complete_at(file_text: str, line_start: int, line_end: int, snippet
     return all(line in window for line in lines)
 
 
-def _range_overlaps(line_start: int, line_end: int, reviewed: frozenset[int]) -> bool:
-    """Arithmetic overlap of ``[line_start, line_end]`` with the reviewed lines.
-
-    Iterates the (diff-bounded) reviewed set rather than materializing the finding's range —
-    a finding is bounded to a small span, but this keeps the check O(reviewed) and never
-    allocates a range set even if an upstream bound were ever loosened.
-    """
-    return any(line_start <= line <= line_end for line in reviewed)
-
-
 class EvidenceVerifier:
     """Verify each finding's cited file+line+snippet against the reviewed diff and worktree."""
 
@@ -184,9 +174,12 @@ class EvidenceVerifier:
             return finding.downgraded(confidence=Confidence.low, note=note)
 
         reviewed = diff_file.reviewed_lines
-        overlaps = _range_overlaps(finding.line_start, finding.line_end, reviewed)
+        # The ENTIRE cited range must lie within one reviewed hunk's new-file bounds. A single
+        # overlapping line is not enough — a finding that cites a broad range straddling the
+        # hunk boundary (to pull an unchanged line into its evidence window) is not confirmed.
+        within = diff_file.range_within_hunk(finding.line_start, finding.line_end)
 
-        if exact and reviewed and overlaps:
+        if exact and reviewed and within:
             return finding.as_verified("file, line, and snippet verified against the reviewed diff")
         if not reviewed:
             # Binary or metadata-only change: no new-file line evidence to confirm.
@@ -194,10 +187,10 @@ class EvidenceVerifier:
                 confidence=Confidence.low,
                 note="no textual diff lines to confirm the cited range",
             )
-        if not overlaps:
+        if not within:
             return finding.downgraded(
                 confidence=Confidence.low,
-                note="cited line is outside the reviewed hunks for this file",
+                note="cited range is not fully within the reviewed hunks for this file",
             )
         return finding.downgraded(
             confidence=Confidence.low,

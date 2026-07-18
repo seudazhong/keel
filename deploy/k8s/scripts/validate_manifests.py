@@ -433,6 +433,108 @@ def check_workspace_is_not_readonly_app(findings: list[Finding]) -> None:
         )
 
 
+def _pvc_mount_path(deployment_text: str, claim_name: str) -> str | None:
+    """The container mountPath that a Deployment mounts ``claim_name`` at, or ``None``."""
+    if yaml is None:
+        return None
+    data = yaml.safe_load(deployment_text) or {}
+    pod_spec = data.get("spec", {}).get("template", {}).get("spec", {})
+    volume_name: str | None = None
+    for volume in pod_spec.get("volumes", []) or []:
+        claim = (volume or {}).get("persistentVolumeClaim") or {}
+        if claim.get("claimName") == claim_name:
+            volume_name = volume.get("name")
+    if volume_name is None:
+        return None
+    for container in pod_spec.get("containers", []) or []:
+        for mount in container.get("volumeMounts", []) or []:
+            if mount.get("name") == volume_name:
+                return str(mount.get("mountPath"))
+    return None
+
+
+PROJECT_STORAGE_CLAIM = "keel-project-storage"
+
+
+def check_project_storage_shared_mount(findings: list[Finding]) -> None:
+    """keel-server and keel-worker must share ONE RWX project-storage volume at ONE path.
+
+    A read-only review runs on keel-worker and writes its content-addressed report artifact to
+    ``KEEL_PROJECT_STORAGE_ROOT``; the keel-server report APIs read it back from the same volume.
+    If the two mounted different storage (or different paths), a completed review's report would
+    be invisible to the API. This check enforces: an active ``ReadWriteMany`` PVC exists, both
+    workloads mount it at the *same* path, and that path equals the configmap's
+    ``KEEL_PROJECT_STORAGE_ROOT``.
+    """
+    if yaml is None:
+        findings.append(
+            Finding("SKIPPED: PyYAML not available; project-storage shared-mount check skipped")
+        )
+        return
+    pvc_path = K8S_ROOT / "base/datastores/project-storage-pvc.yaml"
+    if not pvc_path.exists():
+        findings.append(
+            Finding("base/datastores/project-storage-pvc.yaml: shared project-storage PVC missing")
+        )
+        return
+    if pvc_path.resolve() not in _active_resource_files():
+        findings.append(
+            Finding(
+                "base/datastores/project-storage-pvc.yaml: must be listed in a kustomization "
+                "`resources:` (an active volume, not a dormant example)"
+            )
+        )
+    pvc = yaml.safe_load(read(pvc_path)) or {}
+    if (
+        pvc.get("kind") != "PersistentVolumeClaim"
+        or pvc.get("metadata", {}).get("name") != PROJECT_STORAGE_CLAIM
+    ):
+        findings.append(
+            Finding(
+                f"project-storage-pvc.yaml: must define a PersistentVolumeClaim named "
+                f"{PROJECT_STORAGE_CLAIM}"
+            )
+        )
+    if "ReadWriteMany" not in (pvc.get("spec", {}).get("accessModes", []) or []):
+        findings.append(
+            Finding(
+                "project-storage-pvc.yaml: must be ReadWriteMany — keel-server and multiple "
+                "keel-worker replicas mount it concurrently (RWO would fail to co-mount)"
+            )
+        )
+
+    server_text = read(K8S_ROOT / "base/server/deployment.yaml")
+    worker_text = read(K8S_ROOT / "base/worker/deployment.yaml")
+    server_path = _pvc_mount_path(server_text, PROJECT_STORAGE_CLAIM)
+    worker_path = _pvc_mount_path(worker_text, PROJECT_STORAGE_CLAIM)
+    if server_path is None:
+        findings.append(
+            Finding("base/server/deployment.yaml: must mount the keel-project-storage PVC")
+        )
+    if worker_path is None:
+        findings.append(
+            Finding("base/worker/deployment.yaml: must mount the keel-project-storage PVC")
+        )
+    if server_path and worker_path and server_path != worker_path:
+        findings.append(
+            Finding(
+                "keel-server and keel-worker must mount keel-project-storage at the SAME path "
+                f"(server={server_path!r}, worker={worker_path!r})"
+            )
+        )
+    configmap = yaml.safe_load(read(K8S_ROOT / "base/configmap-app.yaml")) or {}
+    root = (configmap.get("data", {}) or {}).get("KEEL_PROJECT_STORAGE_ROOT")
+    if not root:
+        findings.append(Finding("base/configmap-app.yaml: KEEL_PROJECT_STORAGE_ROOT must be set"))
+    elif server_path and root != server_path:
+        findings.append(
+            Finding(
+                f"KEEL_PROJECT_STORAGE_ROOT ({root!r}) must equal the shared project-storage "
+                f"mountPath ({server_path!r})"
+            )
+        )
+
+
 def check_auth_secret_required(findings: list[Finding]) -> None:
     """Auth must come from an externally supplied, non-empty, syntactically valid
     `KEEL_API_KEYS`, and every active config must force fail-closed cloud mode.
@@ -584,6 +686,13 @@ def check_sandbox_isolation(findings: list[Finding]) -> None:
             Finding(
                 f"{job_path.relative_to(REPO_ROOT)}: sandbox Job must never mount the "
                 "durable Git PVC (keel-git-storage)"
+            )
+        )
+    if "keel-project-storage" in job_text:
+        findings.append(
+            Finding(
+                f"{job_path.relative_to(REPO_ROOT)}: sandbox Job must never mount the shared "
+                "control-plane project-storage PVC (keel-project-storage)"
             )
         )
     # runtimeClassName must stay commented/opt-in, never uncommented as a hard requirement.
@@ -934,6 +1043,7 @@ def run_all_checks() -> list[Finding]:
     check_server_single_instance_rollout(findings)
     check_no_active_rbac(findings)
     check_workspace_is_not_readonly_app(findings)
+    check_project_storage_shared_mount(findings)
     check_auth_secret_required(findings)
     check_sandbox_rpc_secret_required(findings)
     check_sandbox_isolation(findings)

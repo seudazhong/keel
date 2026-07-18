@@ -9,12 +9,15 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Self
+from typing import TYPE_CHECKING, Self
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from keel_core.errors import MaintenanceDatabaseNotConfigured
+
+if TYPE_CHECKING:
+    from keel_core.review.pricing import PriceBook as ReviewPriceBook
 
 
 class Settings(BaseSettings):
@@ -224,6 +227,12 @@ class Settings(BaseSettings):
     review_max_provider_attempts: int = Field(default=2, ge=1, le=4)
     # Explicit retention window (days) for review report artifacts — never indefinite.
     review_report_retention_days: int = Field(default=90, ge=1, le=3650)
+    # Authoritative per-model review pricing for the cost ceiling. Format:
+    # ``model=input/output`` (USD per 1,000,000 tokens), comma-separated, e.g.
+    # ``gpt-4o=2.5/10,my-model=1.0/3.0``. A review model that is neither in this override map
+    # nor in the built-in known price map is rejected at admission (fail closed) so a cloud
+    # review never runs under an unenforceable budget.
+    review_model_prices: str = ""
 
     # psycopg3 driver works for both sync (Alembic) and async (app) engines.
     database_url: str = "postgresql+psycopg://keel:keel@localhost:5432/keel"
@@ -349,6 +358,23 @@ class Settings(BaseSettings):
         allowed = {m.strip() for m in self.review_model_allowlist.split(",") if m.strip()}
         allowed.add(self.default_model)
         return frozenset(allowed)
+
+    @property
+    def review_price_book(self) -> ReviewPriceBook:
+        """Authoritative review price book (``KEEL_REVIEW_MODEL_PRICES`` overrides + known map)."""
+        from keel_core.review.pricing import PriceBook
+
+        return PriceBook.from_settings(self.review_model_prices)
+
+    def review_priced_models(self) -> frozenset[str]:
+        """Allowed review models that also have an authoritative price (fail closed otherwise).
+
+        A model may be on the allowlist yet lack a price; such a model is *not* usable for a
+        review because its cost ceiling could not be enforced. Callers reject a requested model
+        that is not in this set (especially in cloud).
+        """
+        book = self.review_price_book
+        return frozenset(m for m in self.review_allowed_models if book.is_priced(m))
 
 
 @lru_cache

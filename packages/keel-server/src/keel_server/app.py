@@ -329,6 +329,7 @@ def _build_review_coordinator(
         worktrees=LocalWorktreeStore(coding),
         artifacts=LocalArtifactStore(coding),
         provider=LiteLLMGateway(),
+        price_book=settings.review_price_book,
         report_retention_days=settings.review_report_retention_days,
     )
     return ReviewCoordinator(
@@ -703,13 +704,28 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     async def _enqueue_review(payload: dict[str, Any], idempotency_key: str) -> None:
         jobs = app.state.jobs
-        job, _created = await jobs.enqueue_once(
-            kind="review.run",
-            payload=payload,
-            target_session_id=None,
-            idempotency_key=idempotency_key,
-            max_attempts=REVIEW_RUN_MAX_ATTEMPTS,
-        )
+        outbox = getattr(app.state, "job_dispatch_outbox", None)
+        if outbox is not None:
+            # Record the cross-scope dispatch intent atomically with the job insert so a
+            # committed durable review job always has a discoverable dispatch pointer: the
+            # worker's job reconciler can dispatch ``review.run`` from any scope, and a lost
+            # in-line dispatch can never strand an admitted run.
+            job, _created = await jobs.enqueue_once_with_dispatch_intent(
+                kind="review.run",
+                payload=payload,
+                target_session_id=None,
+                idempotency_key=idempotency_key,
+                max_attempts=REVIEW_RUN_MAX_ATTEMPTS,
+                outbox=outbox,
+            )
+        else:
+            job, _created = await jobs.enqueue_once(
+                kind="review.run",
+                payload=payload,
+                target_session_id=None,
+                idempotency_key=idempotency_key,
+                max_attempts=REVIEW_RUN_MAX_ATTEMPTS,
+            )
         await _dispatch_knowledge_job(jobs.scope_id, job.id)
 
     app.state.enqueue_review = _enqueue_review
@@ -831,6 +847,22 @@ def create_app() -> FastAPI:
             )
             checks["knowledge_dispatch"] = "ready" if dispatcher_ready else "degraded"
             if not dispatcher_ready:
+                ready = False
+
+        # Read-only review serves its reports from the SAME shared project-storage volume the
+        # worker writes them to. In cloud a durable substrate means reviews are offered; if the
+        # shared root was unavailable/unwritable at startup the coordinator is absent, so report
+        # reads (and admission) would fail. Report degraded so a load balancer drains this
+        # instance instead of accepting reviews whose reports it can never serve (WS-R, F1).
+        if settings.cloud_mode and engine is not None:
+            storage_root = getattr(app.state, "project_storage_root", None)
+            review_ready = (
+                getattr(app.state, "review_coordinator", None) is not None
+                and storage_root is not None
+            )
+            checks["project_storage"] = "ok" if storage_root is not None else "unavailable"
+            checks["review"] = "ready" if review_ready else "degraded"
+            if not review_ready:
                 ready = False
 
         body = ReadinessResponse(ready=ready, checks=checks)

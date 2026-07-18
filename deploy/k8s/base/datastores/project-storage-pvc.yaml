@@ -1,0 +1,39 @@
+# Shared, durable project/coding storage for read-only managed-code review (WS-R).
+#
+# ACTIVE, DEPLOYABLE resource: unlike datastores/git-pvc.example.yaml (dormant), this PVC IS
+# consumed — keel-server and keel-worker both mount it at the SAME path
+# (`/var/lib/keel/projects`, i.e. `KEEL_PROJECT_STORAGE_ROOT` in ../configmap-app.yaml). That
+# shared mount is a hard requirement: a review job runs on keel-worker and writes its
+# content-addressed report artifact here; the keel-server report APIs read it back from the same
+# volume. If the two ever resolved different storage, a completed review's report would be
+# invisible to the API (and both services now fail their readiness/startup checks when the root
+# is missing or not writable — see packages/keel-*/.../storage_root.py).
+#
+# `ReadWriteMany` is REQUIRED as shipped: keel-worker runs `replicas: 2` and keel-server also
+# mounts the same claim, so more than one Pod writes/reads concurrently. Provision an RWX-capable
+# volume — a NAS/NFS-backed StorageClass, AWS EFS, GCP Filestore, or Azure Files — and either:
+#   * bind this claim to a pre-provisioned RWX PersistentVolume (the "external-claim" pattern:
+#     `storageClassName: ""` disables dynamic provisioning so the claim binds only to a PV you
+#     created and control), or
+#   * set `storageClassName` to your cluster's RWX StorageClass via an overlay patch (see
+#     ../../overlays/) to provision it dynamically.
+# Do NOT point this at a `ReadWriteOnce` block volume: the second worker replica (or the server)
+# would fail to mount it. See ../../docs/storage-topology.md for the durability/backup story.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: keel-project-storage
+  labels:
+    app.kubernetes.io/part-of: keel
+    app.kubernetes.io/component: control-plane-storage
+spec:
+  accessModes:
+    - ReadWriteMany
+  # Empty string = external-claim pattern: bind to an operator-provisioned RWX PersistentVolume
+  # rather than dynamically provisioning from the cluster default class (whose durability/backup
+  # story is unknown). Override to your own RWX StorageClass via an overlay patch to provision
+  # dynamically instead.
+  storageClassName: ""
+  resources:
+    requests:
+      storage: 50Gi

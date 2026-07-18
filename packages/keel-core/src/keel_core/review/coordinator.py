@@ -271,10 +271,6 @@ class ReviewCoordinator:
             raise ReviewNotFound(f"review run not found: {run_id}")
         if record.is_terminal:
             return None
-        # Re-authorize at claim time: access revoked since request fails closed.
-        project = await self._projects.authorize_review(
-            record.org_id, record.actor, request.project_id, agent_id=request.agent_id
-        )
         await self._runs.mark_queued(run_id, now=self._clock())
         lease = await self._runs.claim(
             run_id,
@@ -283,7 +279,41 @@ class ReviewCoordinator:
             lease_seconds=self._lease_seconds,
         )
         if lease is None:
-            return None
+            # Could not claim: either the run raced to terminal (genuine no-op) or another
+            # worker holds the lease. Contention is NEVER reported as an ``already_terminal``
+            # success — it is a busy/retry so the durable job re-attempts once the fence frees.
+            latest = await self._runs.get(run_id)
+            if latest is not None and latest.is_terminal:
+                return None
+            raise ReviewLeaseLost(
+                f"review run is contended; another worker holds the lease: {run_id}"
+            )
+        # Re-authorize at claim time UNDER the lease: access revoked since admission fails closed.
+        # A revocation must terminalize the run durably (cancelled) before the job fails
+        # permanently, so the run never lingers admitted until its TTL and no reclaim can run it.
+        try:
+            project = await self._projects.authorize_review(
+                record.org_id, record.actor, request.project_id, agent_id=request.agent_id
+            )
+        except PermissionDenied as exc:
+            await self._runs.terminalize(
+                lease,
+                status=RunStatus.cancelled,
+                stop_reason="authorization_revoked",
+                now=self._clock(),
+                error_kind="authorization_revoked",
+                error_message=_safe_error_message(exc),
+            )
+            self._audit.record(
+                ReviewAuditEvent(
+                    ReviewAuditAction.review_failed,
+                    record.actor,
+                    record.org_id,
+                    run_id,
+                    {"project_id": request.project_id, "error_kind": "authorization_revoked"},
+                )
+            )
+            raise
         handle = project.active_git_handle or project.id
         coding_run_id = worktree_storage_id(run_id)
         self._audit.record(
@@ -385,14 +415,20 @@ class ReviewCoordinator:
         return outcome
 
     async def _release(self, lease: RunLease) -> None:
-        """Best-effort release so a retryable run is promptly reclaimable (never masks error)."""
+        """Transition a retryable run back to ``queued`` and clear/fence its lease.
+
+        On a retryable (transient) failure the run must not stay ``running`` under a stale
+        fence: releasing it explicitly to ``queued`` (worker_id/lease_token cleared, version
+        bumped) makes it promptly reclaimable by the next attempt. Best-effort: if the lease was
+        already lost/superseded the release simply no-ops (the lease also expires on its own).
+        """
         release = getattr(self._runs, "release", None)
         if release is None:
             return
         try:
-            await release(lease, now=self._clock())
+            await release(lease, to_status=RunStatus.queued, now=self._clock())
         except Exception:  # noqa: BLE001 — release is best-effort; the lease also expires
-            pass
+            logger.debug("review lease release to queued failed run=%s", lease.run_id)
 
     # --- read path -------------------------------------------------------------------
     async def get_run(self, run_id: str) -> RunRecord:

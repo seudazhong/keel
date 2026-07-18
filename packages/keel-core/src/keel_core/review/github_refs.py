@@ -15,9 +15,8 @@ Binding is verified two ways before any SHA is trusted:
 from __future__ import annotations
 
 import re
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from keel_core.projects.service import GitHubIntegration, ProjectService
 
@@ -26,9 +25,28 @@ from .refs import ResolvedPullRequest
 
 _SHA = re.compile(r"\A[0-9a-f]{40}\Z")
 
-# Optional control-plane hook to make the resolved SHAs fetchable in the authoritative repo
-# (e.g. a token-authenticated ref fetch). It runs entirely on the control plane.
-EnsureRefs = Callable[[str, str, str], Awaitable[None]]
+
+@runtime_checkable
+class RefMaterializer(Protocol):
+    """Control-plane hook that fetches a PR's exact commit SHAs into the authoritative repo.
+
+    It runs entirely on the control plane and is responsible for keeping the JIT installation
+    token off the review sandbox/worktree/logs. A PR head that lives in a fork is fetchable from
+    the base repository (GitHub exposes the PR head commit there), so both SHAs are fetched from
+    the project's bound repository.
+    """
+
+    async def ensure_commits(
+        self,
+        *,
+        org_id: str,
+        project_id: str,
+        installation_id: int,
+        repo_full_name: str,
+        clone_url: str,
+        base_sha: str,
+        head_sha: str,
+    ) -> None: ...
 
 
 def _endpoint_sha(payload: dict[str, Any], side: str) -> str:
@@ -54,7 +72,7 @@ class GitHubPullRequestResolver:
 
     projects: ProjectService
     github: GitHubIntegration
-    ensure_refs: EnsureRefs | None = None
+    ensure_refs: RefMaterializer | None = None
 
     async def resolve(
         self, *, org_id: str, project_id: str, agent_id: str | None, pr_number: int
@@ -81,12 +99,22 @@ class GitHubPullRequestResolver:
             raise ReviewValidationError(
                 "pull-request base repository does not match the project's bound repository"
             )
-        # Make the resolved SHAs materializable in the authoritative repo (control plane).
+        # Make the resolved SHAs materializable in the authoritative repo (control plane). The
+        # JIT token used here never leaves the control plane — it is passed to git only via an
+        # environment-supplied ``http.extraHeader`` and is never handed to the review sandbox.
         if self.ensure_refs is not None:
-            await self.ensure_refs(project_id, base_sha, head_sha)
+            await self.ensure_refs.ensure_commits(
+                org_id=org_id,
+                project_id=project_id,
+                installation_id=repo.installation_id,
+                repo_full_name=repo.full_name,
+                clone_url=repo.clone_url,
+                base_sha=base_sha,
+                head_sha=head_sha,
+            )
         return ResolvedPullRequest(
             base_sha=base_sha, head_sha=head_sha, repo_full_name=repo.full_name
         )
 
 
-__all__ = ["EnsureRefs", "GitHubPullRequestResolver"]
+__all__ = ["GitHubPullRequestResolver", "RefMaterializer"]

@@ -85,7 +85,9 @@ class GitRunner:
         self.executable = executable
         self.timeout_seconds = timeout_seconds
 
-    def _command_and_env(self, args: Sequence[str]) -> tuple[list[str], dict[str, str]]:
+    def _command_and_env(
+        self, args: Sequence[str], *, extra_env: Mapping[str, str] | None = None
+    ) -> tuple[list[str], dict[str, str]]:
         validated: list[str] = []
         for arg in args:
             value = os.fspath(arg)
@@ -104,6 +106,14 @@ class GitRunner:
             "SSH_ASKPASS": "",
             "LC_ALL": "C",
         }
+        if extra_env:
+            # Additional, caller-supplied environment (e.g. GIT_CONFIG_* carrying an auth header).
+            # A credential is deliberately passed here — never as a command argument — so it stays
+            # out of the process argument list, logs, and on-disk repository config.
+            for key, value in extra_env.items():
+                if "\x00" in key or "\x00" in value or "\r" in key or "\n" in key:
+                    raise InvalidStorageInput("Git environment may not contain control characters")
+                env[key] = value
         return [self.executable, *validated], env
 
     def run(
@@ -112,8 +122,9 @@ class GitRunner:
         *,
         cwd: Path | None = None,
         check: bool = True,
+        extra_env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
-        command, env = self._command_and_env(args)
+        command, env = self._command_and_env(args, extra_env=extra_env)
         result = subprocess.run(
             command,
             cwd=cwd,
@@ -140,12 +151,13 @@ class GitRunner:
         cwd: Path | None = None,
         check: bool = True,
         poll_interval_seconds: float = 0.01,
+        extra_env: Mapping[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         """Run Git while continuously enforcing a destination byte ceiling."""
 
         if max_bytes <= 0:
             raise StorageQuotaExceeded("destination byte quota is exhausted")
-        command, env = self._command_and_env(args)
+        command, env = self._command_and_env(args, extra_env=extra_env)
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -323,6 +335,13 @@ def _validate_hash(value: str) -> str:
     if len(value) != _SHA256_LENGTH or any(c not in "0123456789abcdef" for c in value):
         raise InvalidStorageInput("content hash must be a lowercase SHA-256 digest")
     return value
+
+
+def _validate_commit_sha(value: str) -> str:
+    normalized = value.strip().lower()
+    if len(normalized) != 40 or any(c not in "0123456789abcdef" for c in normalized):
+        raise InvalidStorageInput("commit sha must be a 40-character lowercase hex object name")
+    return normalized
 
 
 def _safe_child(base: Path, *parts: str) -> Path:
@@ -814,6 +833,74 @@ class LocalCodingStorage:
     def get_project(self, project_id: ProjectId) -> ProjectRecord:
         project = self._project(project_id)
         return self._record(project, self._require_repo(project))
+
+    def fetch_commits(
+        self,
+        project_id: ProjectId,
+        remote: str | Path,
+        commit_shas: Sequence[str],
+        *,
+        auth_header: str | None = None,
+    ) -> None:
+        """Fetch specific commit SHAs into the authoritative repo, pinned under review refs.
+
+        The read-only review PR path uses this to make a PR's exact base/head commits
+        materializable **without** ever treating a PR number as a Git ref. The optional
+        ``auth_header`` (an ``Authorization: <scheme> <credential>`` value) is handed to Git only
+        through the environment (``GIT_CONFIG_*`` → ``http.extraHeader``), so a JIT installation
+        token never appears in a command argument, in on-disk repository config, or in a log
+        line. Each requested object is confirmed present afterwards (fail closed if the server
+        withheld it). The remote URL is validated/allow-listed (SSRF defense) and redirects are
+        refused.
+        """
+        shas = [_validate_commit_sha(sha) for sha in commit_shas]
+        if not shas:
+            return
+        safe_remote = self._validated_remote(remote)
+        extra_env = self._auth_header_env(auth_header) if auth_header else None
+        with self._lock(project_id).acquire():
+            repo = self._require_repo(project_id)
+            refspecs = [f"{sha}:refs/keel-review/{sha}" for sha in shas]
+            self.git.run_bounded(
+                [
+                    "--git-dir",
+                    str(repo),
+                    "-c",
+                    "protocol.file.allow=always",
+                    "-c",
+                    "protocol.version=2",
+                    "-c",
+                    "http.followRedirects=false",
+                    "fetch",
+                    "--no-tags",
+                    "--no-write-fetch-head",
+                    "--force",
+                    safe_remote,
+                    *refspecs,
+                ],
+                monitored_path=repo,
+                max_bytes=self.quotas.max_repository_bytes,
+                extra_env=extra_env,
+            )
+            for sha in shas:
+                probe = self.git.run(
+                    ["--git-dir", str(repo), "cat-file", "-e", f"{sha}^{{commit}}"],
+                    check=False,
+                )
+                if probe.returncode != 0:
+                    raise StorageConflict(f"requested commit was not fetched from remote: {sha}")
+
+    @staticmethod
+    def _auth_header_env(auth_header: str) -> dict[str, str]:
+        """Env carrying an ``http.extraHeader`` so a credential never enters argv/config/logs."""
+        header = auth_header.strip()
+        if not header or "\r" in header or "\n" in header or "\x00" in header:
+            raise InvalidStorageInput("invalid authorization header")
+        return {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.extraHeader",
+            "GIT_CONFIG_VALUE_0": header,
+        }
 
     def create_snapshot(self, project_id: ProjectId) -> SnapshotRecord:
         project = self._project(project_id)

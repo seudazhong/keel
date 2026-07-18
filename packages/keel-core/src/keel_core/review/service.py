@@ -40,6 +40,7 @@ from .models import (
     new_review_id,
     sort_findings,
 )
+from .pricing import PriceBook
 from .prompts import build_messages
 from .refs import MaterializationPlan
 from .report import ReviewArtifactWriter, StoredReport
@@ -87,6 +88,9 @@ class ReviewService:
     provider: ProviderGateway
     diff_computer: GitDiffComputer | None = None
     max_repairs: int = 1
+    # Authoritative pricing for cost enforcement (never trust a provider's self-reported cost).
+    # When ``None`` (local/dev), cost falls back to the provider-reported value.
+    price_book: PriceBook | None = None
     # Explicit retention window for report artifacts (never indefinite implicit retention):
     # reports are stored ``retained`` with a concrete ``retained_until`` so the artifact reaper
     # reclaims them on schedule like any other retained artifact.
@@ -128,7 +132,9 @@ class ReviewService:
             base_sha = self._resolve_base(computer, worktree_path, plan, head_sha)
 
             diff = computer.compute(worktree_path, base_sha, head_sha)
-            engine = ReviewEngine(self.provider, max_repairs=self.max_repairs)
+            engine = ReviewEngine(
+                self.provider, max_repairs=self.max_repairs, price_book=self.price_book
+            )
             metadata = self._metadata(request)
             messages = build_messages(
                 diff,

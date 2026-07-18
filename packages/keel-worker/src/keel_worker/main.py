@@ -53,6 +53,7 @@ from keel_scheduler.store import ScheduleRow, due_tick
 from keel_worker.connectors import reconcile_connectors_tick, register_connector_jobs
 from keel_worker.jobs import dispatch_jobs, reconcile_job_dispatch_tick, run_job
 from keel_worker.knowledge import knowledge_job_registry
+from keel_worker.review import review_artifact_reaper_tick
 from keel_worker.runs import reconcile_dispatch_tick, reconcile_runs_tick, run_interactive
 
 logger = logging.getLogger("keel.worker")
@@ -589,11 +590,13 @@ async def startup(ctx: dict[str, Any]) -> None:
     if _review_coding is not None:
         from keel_core.projects.github_factory import build_github_integration
         from keel_core.review.github_refs import GitHubPullRequestResolver
+        from keel_core.review.ref_materializer import GitHubRefMaterializer
 
         _review_service = ReviewService(
             worktrees=_ReviewWorktreeStore(_review_coding),
             artifacts=_ReviewArtifactStore(_review_coding),
             provider=ctx["provider"],
+            price_book=settings.review_price_book,
             report_retention_days=settings.review_report_retention_days,
         )
         _review_project_service = _ReviewProjectService(
@@ -601,11 +604,18 @@ async def startup(ctx: dict[str, Any]) -> None:
         )
         # PR review resolves exact base/head SHAs on the control plane (GitHub App). When the
         # App is unconfigured the resolver is absent and a PR review fails explicitly (a PR
-        # number is never used as a Git ref).
+        # number is never used as a Git ref). The ref materializer fetches those exact commits
+        # into the authoritative repo with the JIT token kept off the sandbox/worktree/logs.
         _review_github = build_github_integration(settings)
         _pr_resolver = (
             GitHubPullRequestResolver(
-                projects=_review_project_service, github=_review_github
+                projects=_review_project_service,
+                github=_review_github,
+                ensure_refs=GitHubRefMaterializer(
+                    projects=_review_project_service,
+                    github=_review_github,
+                    storage=_review_coding,
+                ),
             )
             if _review_github is not None
             else None
@@ -620,6 +630,8 @@ async def startup(ctx: dict[str, Any]) -> None:
             pr_resolver=_pr_resolver,
         )
         ctx["review_coordinator"] = review_coordinator
+        # Shared ArtifactStore for the scheduled retention reaper (retained_until/TTL).
+        ctx["review_artifacts"] = _ReviewArtifactStore(_review_coding)
         register_review_jobs(job_registry, review_coordinator, settings)
     ctx["job_registry"] = job_registry
 
@@ -656,6 +668,7 @@ class WorkerSettings:
         reconcile_runs_tick,
         reconcile_dispatch_tick,
         reconcile_job_dispatch_tick,
+        review_artifact_reaper_tick,
         func(
             run_job,
             timeout=get_settings().job_execution_timeout_seconds,
@@ -670,6 +683,7 @@ class WorkerSettings:
         cron(reconcile_runs_tick, second={0, 30}),
         cron(reconcile_dispatch_tick, second={0, 30}),
         cron(reconcile_job_dispatch_tick, second={0, 30}),
+        cron(review_artifact_reaper_tick, minute={0}),
     ]
     on_startup = startup
     on_shutdown = shutdown

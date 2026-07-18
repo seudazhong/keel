@@ -25,6 +25,7 @@ namespace: keel
 resources:
   - namespace.yaml
   - configmap-app.yaml
+  - datastores/project-storage-pvc.yaml
   - server/deployment.yaml
   - server/service.yaml
   - worker/deployment.yaml

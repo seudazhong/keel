@@ -37,6 +37,12 @@ data:
   # this scaffold does not ship a stock in-cluster database (see ../docs/storage-topology.md).
   KEEL_DATABASE_HOST: "keel-postgres.keel.svc.cluster.local"
   KEEL_REDIS_HOST: "keel-redis.keel.svc.cluster.local"
+  # Shared, durable project/coding storage root (WS-R). keel-server and keel-worker both mount
+  # the `keel-project-storage` PVC (../datastores/project-storage-pvc.yaml) at THIS path, so a
+  # review report written by the worker is readable by the server's report APIs. It must be a
+  # shared RWX volume; both services fail readiness/startup when it is missing or not writable
+  # (never a container-local default in cloud). See ../docs/storage-topology.md.
+  KEEL_PROJECT_STORAGE_ROOT: "/var/lib/keel/projects"
   # Optional stronger-isolation sandbox runtime (gVisor/Kata/microVM). Empty by default: the
   # control plane must not silently require one. Set to "gvisor" | "kata" | "microvm" only
   # after applying the matching RuntimeClass (../sandbox/runtimeclass.example.yaml) and

@@ -621,9 +621,7 @@ class ProjectService:
         )
         return project
 
-    async def get_project_repository(
-        self, org_id: str, project_id: str
-    ) -> GitHubRepository | None:
+    async def get_project_repository(self, org_id: str, project_id: str) -> GitHubRepository | None:
         """The GitHub repository bound to a project (its installation/full_name), or ``None``.
 
         Used by the read-only review PR resolver to verify the project↔repo binding and mint a
@@ -633,6 +631,18 @@ class ProjectService:
             if repo.project_id == project_id:
                 return repo
         return None
+
+    async def get_active_git_handle(self, org_id: str, project_id: str) -> str | None:
+        """The project's authoritative coding-storage handle (``active_git_handle`` or its id).
+
+        Used by the review PR ref materializer to fetch a PR's exact commits into the *same*
+        authoritative repository the worktree is later materialized from. Returns ``None`` when
+        the project does not exist.
+        """
+        project = await self._store.get_project(org_id, project_id)
+        if project is None:
+            return None
+        return project.active_git_handle or project.id
 
     async def associate_run(
         self,

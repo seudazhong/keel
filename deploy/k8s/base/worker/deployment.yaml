@@ -52,6 +52,8 @@ spec:
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            - name: project-storage
+              mountPath: /var/lib/keel/projects
           resources:
             requests:
               cpu: "250m"
@@ -62,3 +64,6 @@ spec:
       volumes:
         - name: tmp
           emptyDir: {}
+        - name: project-storage
+          persistentVolumeClaim:
+            claimName: keel-project-storage

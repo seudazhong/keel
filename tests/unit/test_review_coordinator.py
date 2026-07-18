@@ -315,9 +315,42 @@ async def test_projection_requires_metadata_or_report(tmp_path: Path) -> None:
         await bare.build_review_record(run)
 
 
+async def test_contention_is_retryable_not_already_terminal(tmp_path: Path) -> None:
+    from keel_core.review.errors import ReviewLeaseLost
+
+    env = await _bootstrap(tmp_path, _good_provider())
+    handle = await env.coordinator.request_review(_request(env), actor=env.actor)
+    # Another worker holds a live (non-expired) lease on the run.
+    await env.runs.mark_queued(handle.run_id)
+    lease = await env.runs.claim(
+        handle.run_id, worker_id="other", now=datetime.now(UTC), lease_seconds=300
+    )
+    assert lease is not None
+    # Contention must surface as a retryable lease-loss, NEVER an ``already_terminal`` no-op.
+    with pytest.raises(ReviewLeaseLost):
+        await env.coordinator.execute_review(_request(env), run_id=handle.run_id)
+    run = await env.runs.get(handle.run_id)
+    assert run is not None and not run.is_terminal
+
+
+async def test_claim_time_auth_revocation_cancels_run(tmp_path: Path) -> None:
+    env = await _bootstrap(tmp_path, _good_provider())
+    handle = await env.coordinator.request_review(_request(env), actor=env.actor)
+
+    async def _revoked(*_a: object, **_k: object) -> None:
+        raise PermissionDenied("access revoked since admission")
+
+    # Access revoked between admission and claim: fail closed AND terminalize durably.
+    env.coordinator._projects.authorize_review = _revoked  # type: ignore[attr-defined]
+    with pytest.raises(PermissionDenied):
+        await env.coordinator.execute_review(_request(env), run_id=handle.run_id)
+    run = await env.runs.get(handle.run_id)
+    assert run is not None
+    assert run.status is RunStatus.cancelled
+    assert run.error_kind == "authorization_revoked"
+
+
 # --- job handler ------------------------------------------------------------------
-
-
 @dataclass
 class _JobCtx:
     scope_id: str = "scope-1"

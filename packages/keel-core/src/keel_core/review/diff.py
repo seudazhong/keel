@@ -68,6 +68,32 @@ class DiffFile:
             result |= hunk.new_lines
         return frozenset(result)
 
+    @property
+    def hunk_intervals(self) -> tuple[tuple[int, int], ...]:
+        """Contiguous new-file ``[start, end]`` line intervals, one per hunk (new-file numbering).
+
+        A hunk covers the inclusive new-file range ``new_start .. new_start + new_count - 1``
+        (context + added lines; deletions consume no new-file line number). Pure-deletion hunks
+        (``new_count == 0``) contribute no interval.
+        """
+        intervals: list[tuple[int, int]] = []
+        for hunk in self.hunks:
+            if hunk.new_count > 0:
+                intervals.append((hunk.new_start, hunk.new_start + hunk.new_count - 1))
+        return tuple(intervals)
+
+    def range_within_hunk(self, line_start: int, line_end: int) -> bool:
+        """Whether ``[line_start, line_end]`` fits ENTIRELY within a single reviewed hunk.
+
+        A one-line overlap with a hunk is deliberately NOT sufficient: a finding that cites a
+        broad range spilling outside the changed hunk (e.g. to smuggle an unchanged line into
+        an evidence window) is rejected. The whole cited span must lie inside one hunk's
+        new-file bounds.
+        """
+        if line_start > line_end:
+            return False
+        return any(start <= line_start and line_end <= end for start, end in self.hunk_intervals)
+
 
 @dataclass(frozen=True, slots=True)
 class ReviewDiff:

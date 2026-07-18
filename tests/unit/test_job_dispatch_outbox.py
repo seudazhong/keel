@@ -280,6 +280,29 @@ async def test_reconcile_redispatches_agent_scoped_job() -> None:
     assert await outbox.active_scopes() == {_SCOPE_A}
 
 
+async def test_reconcile_redispatches_review_run_job() -> None:
+    # A review admitted on the durable scope with a lost in-line dispatch is recovered by the
+    # cross-scope reconciler: review.run is dispatchable, so its intent yields a run_job enqueue.
+    from keel_core.review.jobs import REVIEW_RUN_KIND
+
+    jobs = InMemoryJobStore(_SCOPE_A)
+    outbox = InMemoryJobDispatchOutbox()
+    job, _ = await jobs.enqueue_once_with_dispatch_intent(
+        kind=REVIEW_RUN_KIND,
+        payload={"run_id": "rev_1"},
+        target_session_id=None,
+        idempotency_key="review.run:rev_1",
+        max_attempts=3,
+        outbox=outbox,
+    )
+    ctx, enqueued = _ctx(jobs, outbox)
+    dispatched = await reconcile_job_dispatch_tick(ctx)
+    assert dispatched == 1
+    assert ("run_job", (_SCOPE_A, job.id)) in enqueued
+    # The job is still queued, so its intent is deferred (not retired) for a later re-dispatch.
+    assert await outbox.active_scopes() == {_SCOPE_A}
+
+
 async def test_reconcile_removes_terminal_intent() -> None:
     jobs = InMemoryJobStore(_SCOPE_A)
     outbox = InMemoryJobDispatchOutbox()

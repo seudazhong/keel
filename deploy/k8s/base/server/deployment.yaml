@@ -107,6 +107,8 @@ spec:
               mountPath: /tmp
             - name: workspace
               mountPath: /workspace
+            - name: project-storage
+              mountPath: /var/lib/keel/projects
           resources:
             requests:
               cpu: "250m"
@@ -132,3 +134,6 @@ spec:
         - name: workspace
           emptyDir:
             sizeLimit: 2Gi
+        - name: project-storage
+          persistentVolumeClaim:
+            claimName: keel-project-storage

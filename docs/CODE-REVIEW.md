@@ -102,14 +102,22 @@ to a shared volume path mounted identically into both:
 
 * **Docker Compose** mounts a named `projectdata` volume at `/var/lib/keel/projects` into both
   `keel-server` and `keel-worker`.
-* **Kubernetes / multi-host**: back that path with an **RWX** volume (e.g. NFS/EFS/Azure Files)
-  so the server and worker pods share it, *or* run an external Git service integration. There is
+* **Kubernetes / multi-host**: the base kustomization ships an **active** `keel-project-storage`
+  PersistentVolumeClaim (`deploy/k8s/base/datastores/project-storage-pvc.yaml`) mounted at the
+  identical `KEEL_PROJECT_STORAGE_ROOT` (`/var/lib/keel/projects`) in **both** the server and
+  worker deployments. It is **`ReadWriteMany`** because `keel-worker` runs multiple replicas and
+  the server also mounts it — provision an RWX volume (NFS/EFS/Filestore/Azure Files) and either
+  bind the claim to a pre-provisioned RWX PV (the `storageClassName: ""` external-claim pattern)
+  or set an RWX `storageClassName` via an overlay patch. `deploy/k8s/scripts/validate_manifests.py`
+  asserts the PVC is active + RWX and that both workloads mount it at the same path as the
+  configmap's `KEEL_PROJECT_STORAGE_ROOT`. There is
   **no** container-local `.keel/projects` default in cloud: when the root is unset (or unwritable)
   outside a local/dev environment, startup fails closed and managed projects + review are
-  disabled (readiness reflects it) rather than silently splitting server/worker storage. A
+  disabled (server **readiness** reports `review: degraded` / `project_storage: unavailable`, and
+  the worker disables the review job) rather than silently splitting server/worker storage. A
   container-local default is accepted only for single-host local development.
 
-## Model & budget policy
+## Model, budget & pricing policy
 
 The review model comes from an **authorized allowlist** (`KEEL_REVIEW_MODEL_ALLOWLIST`, with
 `KEEL_DEFAULT_MODEL` always permitted), never an arbitrary caller string — a request for an
@@ -117,6 +125,14 @@ un-allowlisted model is rejected (`422`). Every review runs under an **explicit,
 budget**: `KEEL_REVIEW_TOKEN_BUDGET`, `KEEL_REVIEW_OUTPUT_MAX_TOKENS` (a hard per-turn output
 cap passed to the provider), `KEEL_REVIEW_COST_CEILING_USD`, and `KEEL_REVIEW_MAX_PROVIDER_ATTEMPTS`
 (total provider turns including the repair). Token/cost usage is propagated onto the durable run.
+
+Cost is enforced against an **authoritative price** — never a provider's self-reported `cost_usd`
+(which is often `0`). A model must be priced by the built-in known-model map **or** an explicit
+`KEEL_REVIEW_MODEL_PRICES` override (`model=input/output`, USD per 1,000,000 tokens). An
+allowed-but-**unpriced** model is rejected at admission (`422`) and fails closed in the engine, so
+a review — especially in cloud — never runs under an unenforceable cost ceiling. The engine
+computes cumulative cost from token usage across the repair turn and aborts the moment the token
+budget or cost ceiling is exceeded.
 
 ## Durability, idempotency, and lifecycle
 
@@ -129,18 +145,24 @@ cap passed to the provider), `KEEL_REVIEW_COST_CEILING_USD`, and `KEEL_REVIEW_MA
   and starts clean. Transient provider failures (transport/timeout/rate limit) retry; a permanent
   error or authorization revocation terminalizes safely.
 * **Explicit retention & erasure** — report artifacts are stored `retained` with a concrete
-  `retained_until` TTL (`KEEL_REVIEW_REPORT_RETENTION_DAYS`), never indefinitely. Review worktrees
-  and report artifacts live under the shared project coding storage, so project/scope erasure
-  purges them via the coding-artifact cleaner wired into the erasure coordinator (idempotently);
-  run metadata is purged with the `runs` table.
+  `retained_until` TTL (`KEEL_REVIEW_REPORT_RETENTION_DAYS`), never indefinitely. A **scheduled,
+  single-owner** worker tick (`review_artifact_reaper_tick`, cron hourly, fenced by a Redis lock)
+  reaps artifacts whose `retained_until` has elapsed over the shared `ArtifactStore`, logging only
+  aggregate counts. Review worktrees and report artifacts live under the shared project coding
+  storage, so project/scope erasure purges them **immediately** via the coding-artifact cleaner
+  wired into the erasure coordinator (idempotently); run metadata is purged with the `runs` table.
 
 ## Known limitations (this MVP)
 
 * **PR ref fetch.** PR resolution obtains exact base/head SHAs and verifies the installation +
-  project binding on the control plane (token isolated). The optional `ensure_refs` hook that
-  performs a token-authenticated fetch of PR refs into the authoritative repo is a seam left for
-  the deployment to wire; when a resolved SHA is not yet present in the materialized repo the
-  review fails explicitly (a PR number is never used as a Git ref regardless).
+  project binding on the control plane, then the worker's wired `ensure_refs` materializer fetches
+  those exact commits (base + head, including a **fork** head, which GitHub exposes from the base
+  repo) into the authoritative repository before materialization. The JIT installation token is
+  handed to `git` **only** via an environment-supplied `http.extraHeader` (never a command
+  argument, on-disk config, or a log line), the remote URL is normalized + host-allow-listed
+  (SSRF defense) with redirects refused, and each requested object is confirmed present afterward
+  (fail closed). A PR number is never used as a Git ref; when GitHub is unavailable the review
+  fails explicitly.
 * Findings are advisory model output. Even a verified finding only proves the cited
   file/line/snippet exists in the reviewed change — a human validates whether the issue is real.
 

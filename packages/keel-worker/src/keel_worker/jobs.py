@@ -40,6 +40,7 @@ from keel_core.jobs import (
 )
 from keel_core.knowledge.jobs import KNOWLEDGE_DELETE_KIND, KNOWLEDGE_INGEST_KIND
 from keel_core.observability import get_tracer
+from keel_core.review.jobs import REVIEW_RUN_KIND
 from keel_core.scoping import ScopeValidationError, validate_scope_id
 
 logger = logging.getLogger("keel.worker.jobs")
@@ -50,16 +51,18 @@ _WORKER_ID = f"{socket.gethostname()}:{uuid.uuid4().hex[:8]}"
 
 # The durable job kinds that may be dispatched across per-Agent scopes via the global
 # job-dispatch outbox. Knowledge indexing/deletion and connector sync/renewal are all created
-# under a per-Agent scope; every other durable job (erasure, project sync) stays pinned to the
-# process ``durable_scope``. The reconciler and cross-scope ``run_job`` both revalidate an
-# intent's kind against this set so a spoofed/foreign job kind can never be dispatched into
-# another tenant's scope (findings 1 + 3).
+# under a per-Agent scope; read-only reviews are admitted on the durable review scope but record
+# a dispatch intent so a lost in-line dispatch is recovered idempotently. Every other durable job
+# (erasure, project sync) stays pinned to the process ``durable_scope``. The reconciler and
+# cross-scope ``run_job`` both revalidate an intent's kind against this set so a spoofed/foreign
+# job kind can never be dispatched into another tenant's scope (findings 1 + 3).
 _CROSS_SCOPE_JOB_KINDS = frozenset(
     {
         KNOWLEDGE_INGEST_KIND,
         KNOWLEDGE_DELETE_KIND,
         CONNECTOR_SYNC_JOB_KIND,
         CONNECTOR_RENEW_JOB_KIND,
+        REVIEW_RUN_KIND,
     }
 )
 

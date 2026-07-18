@@ -28,6 +28,7 @@ from .models import (
     ReviewBudget,
     ReviewFinding,
 )
+from .pricing import PriceBook
 from .prompts import REPAIR_INSTRUCTION
 
 DEFAULT_MAX_REPAIRS = 1
@@ -131,6 +132,10 @@ class ReviewEngine:
 
     provider: ProviderGateway
     max_repairs: int = DEFAULT_MAX_REPAIRS
+    # Authoritative pricing. When set, the review's cost is computed from token usage and this
+    # price book (not the provider's self-reported ``cost_usd``), so the cost ceiling is always
+    # enforceable. An allowed-but-unpriced model fails closed inside :meth:`_authoritative_cost`.
+    price_book: PriceBook | None = None
 
     async def run(
         self,
@@ -149,7 +154,7 @@ class ReviewEngine:
         for attempt in range(attempts):
             self._enforce_budget(total_usage, budget)
             text, usage = await self._one_turn(model=model, messages=conversation, budget=budget)
-            total_usage = total_usage + usage
+            total_usage = self._with_authoritative_cost(total_usage + usage, model)
             self._enforce_budget(total_usage, budget)
             try:
                 summary, findings, limitations = _parse_result(text, max_findings=max_findings)
@@ -172,6 +177,17 @@ class ReviewEngine:
         raise ReviewProviderError(
             f"provider did not return a valid review after {attempts} attempt(s): {last_error}"
         )
+
+    def _with_authoritative_cost(self, usage: Usage, model: str) -> Usage:
+        """Replace the provider-reported cost with a price-book cost when one is configured.
+
+        Fails closed (``ReviewValidationError``) for an allowed-but-unpriced model rather than
+        trusting a possibly-zero provider cost that would silently disable the ceiling.
+        """
+        if self.price_book is None:
+            return usage
+        cost = self.price_book.cost_for(model, usage.prompt_tokens, usage.completion_tokens)
+        return usage.model_copy(update={"cost_usd": cost})
 
     @staticmethod
     def _enforce_budget(usage: Usage, budget: ReviewBudget) -> None:

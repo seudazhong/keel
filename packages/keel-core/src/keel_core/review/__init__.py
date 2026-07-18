@@ -40,7 +40,7 @@ from .errors import (
     ReviewValidationError,
 )
 from .evidence import EvidenceVerifier, RejectedFinding, VerificationOutcome
-from .github_refs import GitHubPullRequestResolver
+from .github_refs import GitHubPullRequestResolver, RefMaterializer
 from .jobs import (
     REVIEW_RUN_KIND,
     REVIEW_RUN_MAX_ATTEMPTS,
@@ -61,6 +61,8 @@ from .models import (
     Severity,
     new_review_id,
 )
+from .pricing import KNOWN_MODEL_PRICES, ModelPrice, PriceBook, parse_price_overrides
+from .ref_materializer import GitHubRefMaterializer
 from .refs import (
     MaterializationPlan,
     PullRequestResolver,
@@ -79,15 +81,20 @@ __all__ = [
     "REVIEW_RUN_KIND",
     "REVIEW_RUN_MAX_ATTEMPTS",
     "REVIEW_SURFACE",
+    "KNOWN_MODEL_PRICES",
     "Confidence",
     "DiffFile",
     "DiffHunk",
     "EvidenceVerifier",
     "GitDiffComputer",
     "GitHubPullRequestResolver",
+    "GitHubRefMaterializer",
     "LoggingReviewAuditSink",
     "MaterializationPlan",
+    "ModelPrice",
+    "PriceBook",
     "PullRequestResolver",
+    "RefMaterializer",
     "RejectedFinding",
     "ReviewArtifactWriter",
     "ReviewAuditAction",
@@ -124,6 +131,7 @@ __all__ = [
     "VerificationOutcome",
     "build_materialization_plan",
     "new_review_id",
+    "parse_price_overrides",
     "parse_unified_diff",
     "render_json_bytes",
     "render_markdown",

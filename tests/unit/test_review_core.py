@@ -437,6 +437,7 @@ class _FakeRepo:
     installation_id = 5
     full_name = "acme/app"
     project_id = "proj"
+    clone_url = "https://github.com/acme/app.git"
 
 
 class _FakeProjects:
@@ -455,18 +456,42 @@ async def test_github_pr_resolver_resolves_and_verifies_binding() -> None:
                 "head": {"sha": "b" * 40, "repo": {"full_name": "fork/app"}},
             }
 
-    fetched: list[tuple[str, str, str]] = []
+    fetched: list[tuple[str, str, int, str, str, str, str]] = []
 
-    async def _ensure(pid: str, base: str, head: str) -> None:
-        fetched.append((pid, base, head))
+    class _Materializer:
+        async def ensure_commits(
+            self,
+            *,
+            org_id: str,
+            project_id: str,
+            installation_id: int,
+            repo_full_name: str,
+            clone_url: str,
+            base_sha: str,
+            head_sha: str,
+        ) -> None:
+            fetched.append(
+                (
+                    org_id,
+                    project_id,
+                    installation_id,
+                    repo_full_name,
+                    clone_url,
+                    base_sha,
+                    head_sha,
+                )
+            )
 
     resolver = GitHubPullRequestResolver(
-        projects=_FakeProjects(), github=_GH(), ensure_refs=_ensure
+        projects=_FakeProjects(), github=_GH(), ensure_refs=_Materializer()
     )
     resolved = await resolver.resolve(org_id="o", project_id="proj", agent_id=None, pr_number=7)
     assert resolved.base_sha == "a" * 40
     assert resolved.head_sha == "b" * 40
-    assert fetched == [("proj", "a" * 40, "b" * 40)]
+    # The fork head + base SHAs are both fetched into the authoritative repo for the bound repo.
+    assert fetched == [
+        ("o", "proj", 5, "acme/app", "https://github.com/acme/app.git", "a" * 40, "b" * 40)
+    ]
 
 
 async def test_github_pr_resolver_rejects_cross_repo_base() -> None:

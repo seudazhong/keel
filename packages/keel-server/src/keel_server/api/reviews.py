@@ -103,15 +103,27 @@ def _resolve_model(request: Request, requested: str | None) -> str:
     settings = getattr(request.app.state, "settings", None)
     default_model = getattr(settings, "default_model", "gpt-4o-mini")
     if requested is None or not requested.strip():
-        return default_model
-    requested = requested.strip()
-    allowed = settings.review_allowed_models if settings is not None else frozenset({default_model})
-    if requested not in allowed:
+        resolved = default_model
+    else:
+        requested = requested.strip()
+        allowed = (
+            settings.review_allowed_models if settings is not None else frozenset({default_model})
+        )
+        if requested not in allowed:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_CONTENT,
+                "requested model is not permitted for reviews",
+            )
+        resolved = requested
+    # Fail closed on an unpriced model: without an authoritative price the cost ceiling cannot
+    # be enforced, so an allowed-but-unpriced model (especially in cloud) is rejected rather than
+    # run under an unbounded budget. Set KEEL_REVIEW_MODEL_PRICES or use a known-priced model.
+    if settings is not None and not settings.review_price_book.is_priced(resolved):
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_CONTENT,
-            "requested model is not permitted for reviews",
+            "requested model has no authoritative price and cannot be used for reviews",
         )
-    return requested
+    return resolved
 
 
 @dataclass(frozen=True)
