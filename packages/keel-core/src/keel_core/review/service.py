@@ -21,7 +21,8 @@ is a pure, deterministic unit that the coordinator drives.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from keel_core.coding.models import CodingRunId, ProjectId
 from keel_core.coding.protocols import ArtifactStore, WorktreeStore
@@ -40,7 +41,28 @@ from .models import (
     sort_findings,
 )
 from .prompts import build_messages
+from .refs import MaterializationPlan
 from .report import ReviewArtifactWriter, StoredReport
+
+
+def _default_plan(request: ReviewRequest) -> MaterializationPlan:
+    """A plan for a locally-resolvable request (branch/commit). PR must be pre-resolved.
+
+    A pull-request request that reaches here without a control-plane plan is a bug: it would
+    otherwise treat the PR number as a Git ref. Fail closed.
+    """
+    from .errors import ReviewValidationError
+
+    if request.source is ReviewSource.pull_request:
+        raise ReviewValidationError(
+            "pull-request review must be resolved on the control plane before materialization"
+        )
+    return MaterializationPlan(
+        materialize_ref=request.head,
+        base_ref=request.base,
+        default_branch=None,
+        derive_base_from_default=(request.base is None and request.source is ReviewSource.branch),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +87,10 @@ class ReviewService:
     provider: ProviderGateway
     diff_computer: GitDiffComputer | None = None
     max_repairs: int = 1
+    # Explicit retention window for report artifacts (never indefinite implicit retention):
+    # reports are stored ``retained`` with a concrete ``retained_until`` so the artifact reaper
+    # reclaims them on schedule like any other retained artifact.
+    report_retention_days: int = 90
 
     async def review(
         self,
@@ -75,6 +101,7 @@ class ReviewService:
         project_handle: str,
         review_id: str | None = None,
         now: datetime | None = None,
+        plan: MaterializationPlan | None = None,
     ) -> ReviewOutcome:
         review_id = review_id or new_review_id()
         created_at = now or datetime.now(UTC)
@@ -82,7 +109,11 @@ class ReviewService:
         pid = ProjectId(project_handle)
         crid = CodingRunId(coding_run_id)
 
-        head_ref = request.head
+        # Resolve the change set to EXACT commit shas. A pull-request review is always
+        # pre-resolved on the control plane (its ``materialize_ref`` is the head sha, never the
+        # PR number); a raw PR number never reaches worktree materialization.
+        plan = plan or _default_plan(request)
+        head_ref = plan.materialize_ref
         # A crash mid-review can leave a stale worktree; a retry must start clean (idempotent).
         try:
             self.worktrees.remove(pid, crid)
@@ -91,11 +122,10 @@ class ReviewService:
         worktree = self.worktrees.materialize(pid, crid, ref=head_ref)
         try:
             worktree_path = worktree.path
-            head_sha = computer.resolve(worktree_path, head_ref, field_name="head")
-            if request.base is not None:
-                base_sha = computer.resolve(worktree_path, request.base, field_name="base")
-            else:
-                base_sha = computer.parent_of(worktree_path, head_sha)
+            head_sha = plan.head_sha_hint or computer.resolve(
+                worktree_path, head_ref, field_name="head"
+            )
+            base_sha = self._resolve_base(computer, worktree_path, plan, head_sha)
 
             diff = computer.compute(worktree_path, base_sha, head_sha)
             engine = ReviewEngine(self.provider, max_repairs=self.max_repairs)
@@ -109,7 +139,10 @@ class ReviewService:
                 metadata=metadata,
             )
             engine_result = await engine.run(
-                model=request.model, messages=messages, max_findings=request.max_findings
+                model=request.model,
+                messages=messages,
+                max_findings=request.max_findings,
+                budget=request.budget(),
             )
 
             verifier = EvidenceVerifier(worktree_path, diff)
@@ -138,7 +171,9 @@ class ReviewService:
                 files_reviewed=len(diff.files),
                 truncated=diff.truncated,
             )
-            stored = self._store_report(report, request, coding_run_id, engine_result.summary)
+            stored = self._store_report(
+                report, request, coding_run_id, engine_result.summary, created_at
+            )
             return ReviewOutcome(
                 review_id=review_id,
                 report=stored.report,
@@ -157,19 +192,50 @@ class ReviewService:
             except Exception:  # noqa: BLE001 — cleanup is best-effort and must not mask errors
                 pass
 
+    def _resolve_base(
+        self,
+        computer: GitDiffComputer,
+        worktree_path: Path,
+        plan: MaterializationPlan,
+        head_sha: str,
+    ) -> str:
+        """Resolve the exact base sha per the plan (PR sha, explicit ref, or derived base)."""
+        if plan.base_sha_hint is not None:
+            # Pull-request path: the base sha was resolved on the control plane.
+            return plan.base_sha_hint
+        if plan.base_ref is not None:
+            return computer.resolve(worktree_path, plan.base_ref, field_name="base")
+        if plan.derive_base_from_default and plan.default_branch:
+            # A branch review diffs from where the branch diverged from the default branch. But
+            # if the head *is* the default branch (same ref, or the default is an ancestor of
+            # head so the merge-base is head itself), there is no divergence to diff against —
+            # fall back to the first-parent so we review the tip commit, not an empty range.
+            if plan.materialize_ref != plan.default_branch:
+                default_sha = computer.resolve(
+                    worktree_path, plan.default_branch, field_name="default_branch"
+                )
+                merged = computer.merge_base(worktree_path, default_sha, head_sha)
+                if merged != head_sha:
+                    return merged
+        # Commit review (or branch that is/at the default): first parent / empty tree.
+        return computer.parent_of(worktree_path, head_sha)
+
     def _store_report(
         self,
         report: ReviewReport,
         request: ReviewRequest,
         coding_run_id: str,
         summary: str,
+        created_at: datetime,
     ) -> StoredReport:
         writer = ReviewArtifactWriter(self.artifacts)
+        retained_until = created_at + timedelta(days=self.report_retention_days)
         return writer.store(
             report,
             project_id=request.project_id,
             coding_run_id=coding_run_id,
             summary=summary,
+            retained_until=retained_until,
         )
 
     @staticmethod

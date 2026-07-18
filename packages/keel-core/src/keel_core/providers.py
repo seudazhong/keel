@@ -213,6 +213,8 @@ class LiteLLMGateway:
         }
         if request.tools:
             kwargs["tools"] = _to_responses_tools(request.tools)
+        if request.max_output_tokens is not None:
+            kwargs["max_output_tokens"] = request.max_output_tokens
 
         response = await self._responses(**kwargs)
         # item_id -> accumulating {call_id, name, arguments}; order preserves call order.
@@ -269,6 +271,8 @@ class LiteLLMGateway:
             kwargs["tools"] = request.tools
         if request.prompt_cache_key is not None:
             kwargs["prompt_cache_key"] = request.prompt_cache_key
+        if request.max_output_tokens is not None:
+            kwargs["max_tokens"] = request.max_output_tokens
 
         response = await self._completion(**kwargs)
         tool_fragments: dict[int, dict[str, str]] = {}

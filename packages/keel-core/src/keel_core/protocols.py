@@ -66,6 +66,10 @@ class ProviderRequest(BaseModel):
     messages: list[dict[str, Any]] = Field(default_factory=list)
     tools: list[dict[str, Any]] = Field(default_factory=list)
     prompt_cache_key: str | None = None
+    # Optional hard cap on generated (output) tokens for this turn. ``None`` leaves the
+    # provider default in place; a caller that must bound generation (e.g. the read-only
+    # review engine) sets it so an unbounded completion can never be requested.
+    max_output_tokens: int | None = None
 
 
 class ToolCall(BaseModel):

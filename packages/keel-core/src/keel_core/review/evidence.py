@@ -42,6 +42,14 @@ def _normalize(text: str) -> str:
     return " ".join(text.split())
 
 
+# Number of context lines to include on each side of a cited range when confirming that a
+# snippet actually appears at the location a finding claims (tolerates small off-by-a-few
+# citations without accepting a snippet from a completely different part of the file).
+_LINE_CONTEXT = 3
+# The shortest normalized snippet line worth matching (skips trivial "{"/"}" style noise).
+_MIN_LINE_CHARS = 4
+
+
 def _safe_read(worktree: Path, rel_path: str) -> str | None:
     """Read a repo-relative file from the worktree, refusing traversal/symlink escape."""
     try:
@@ -67,23 +75,60 @@ def _safe_read(worktree: Path, rel_path: str) -> str | None:
     return data.decode("utf-8", errors="replace")
 
 
-def _snippet_supported(snippet: str, *, diff_text: str, file_text: str | None) -> bool:
-    """Whether the snippet's substance appears in the diff or the file (not fabricated)."""
-    normalized_diff = _normalize(diff_text)
-    normalized_file = _normalize(file_text) if file_text is not None else ""
-    candidate_lines = [
-        _normalize(line) for line in snippet.splitlines() if len(_normalize(line)) >= 4
+def _substantive_lines(snippet: str) -> list[str]:
+    return [
+        norm for line in snippet.splitlines() if len(norm := _normalize(line)) >= _MIN_LINE_CHARS
     ]
-    if not candidate_lines:
-        # Snippet is trivially short/blank; require the whole normalized snippet to appear.
+
+
+def _snippet_present_in(text: str, snippet: str) -> bool:
+    """Whether *any* substantive snippet line appears anywhere in ``text``.
+
+    Used only to tell a *moved* finding (its snippet exists in the cited file, just not at the
+    cited line → downgrade) apart from a *fabricated* one (its snippet is nowhere in the cited
+    file → reject). ``text`` is always scoped to the cited file, never the whole diff.
+    """
+    haystack = _normalize(text)
+    if not haystack:
+        return False
+    lines = _substantive_lines(snippet)
+    if not lines:
         whole = _normalize(snippet)
-        if not whole:
-            return False
-        return whole in normalized_diff or (bool(normalized_file) and whole in normalized_file)
-    for line in candidate_lines:
-        if line in normalized_diff or (normalized_file and line in normalized_file):
-            return True
-    return False
+        return bool(whole) and whole in haystack
+    return any(line in haystack for line in lines)
+
+
+def _snippet_complete_at(file_text: str, line_start: int, line_end: int, snippet: str) -> bool:
+    """Whether the *complete* normalized snippet appears at the cited line window.
+
+    The window is the cited ``line_start..line_end`` range (1-based, new-file numbering) padded
+    by :data:`_LINE_CONTEXT` lines. Every substantive snippet line must be present in it — this
+    is the exact-location check that stops a snippet from a different part of the file (or a
+    different file entirely) from satisfying a finding.
+    """
+    file_lines = file_text.splitlines()
+    if line_start > len(file_lines):
+        return False
+    lo = max(0, line_start - 1 - _LINE_CONTEXT)
+    hi = min(len(file_lines), line_end + _LINE_CONTEXT)
+    window = _normalize("\n".join(file_lines[lo:hi]))
+    if not window:
+        return False
+    lines = _substantive_lines(snippet)
+    if not lines:
+        whole = _normalize(snippet)
+        return bool(whole) and whole in window
+    return all(line in window for line in lines)
+
+
+def _range_overlaps(line_start: int, line_end: int, reviewed: frozenset[int]) -> bool:
+    """Arithmetic overlap of ``[line_start, line_end]`` with the reviewed lines.
+
+    Iterates the (diff-bounded) reviewed set rather than materializing the finding's range —
+    a finding is bounded to a small span, but this keeps the check O(reviewed) and never
+    allocates a range set even if an upstream bound were ever loosened.
+    """
+    return any(line_start <= line <= line_end for line in reviewed)
 
 
 class EvidenceVerifier:
@@ -109,38 +154,54 @@ class EvidenceVerifier:
         diff_file = self._by_path.get(finding.file_path)
         file_text = _safe_read(self._worktree, finding.file_path)
 
-        if diff_file is None:
-            if file_text is None:
-                return RejectedFinding(
-                    finding, "cited file is not in the diff and does not exist in the worktree"
-                )
-            # Real file, but not part of this change set: keep, but do not vouch for it.
-            if not _snippet_supported(
-                finding.snippet, diff_text=self._diff.raw_text, file_text=file_text
-            ):
-                return RejectedFinding(finding, "snippet not found in cited file")
-            return finding.downgraded(
-                confidence=Confidence.low, note="file is outside the reviewed diff"
+        if diff_file is None and file_text is None:
+            return RejectedFinding(
+                finding, "cited file is not in the diff and does not exist in the worktree"
             )
 
-        if not _snippet_supported(
-            finding.snippet, diff_text=self._diff.raw_text, file_text=file_text
-        ):
-            return RejectedFinding(finding, "snippet not found in the reviewed diff or file")
+        # Snippet confirmation is scoped strictly to the cited file: the file's head content
+        # (if present) and its own diff section — never the whole diff. A snippet lifted from a
+        # different file therefore cannot satisfy this finding.
+        scoped: list[str] = []
+        if file_text is not None:
+            scoped.append(file_text)
+        if diff_file is not None and diff_file.body:
+            scoped.append(diff_file.body)
+        if not any(_snippet_present_in(text, finding.snippet) for text in scoped):
+            return RejectedFinding(finding, "snippet not found in the cited file")
+
+        exact = file_text is not None and _snippet_complete_at(
+            file_text, finding.line_start, finding.line_end, finding.snippet
+        )
+
+        if diff_file is None:
+            # A real file, but outside this change set: keep, but never vouch for it.
+            note = (
+                "file is outside the reviewed diff"
+                if exact
+                else "file is outside the reviewed diff and the snippet is not at the cited line"
+            )
+            return finding.downgraded(confidence=Confidence.low, note=note)
 
         reviewed = diff_file.reviewed_lines
-        finding_lines = set(range(finding.line_start, finding.line_end + 1))
-        if reviewed and finding_lines & reviewed:
-            return finding.as_verified("file and line verified against the reviewed diff")
+        overlaps = _range_overlaps(finding.line_start, finding.line_end, reviewed)
+
+        if exact and reviewed and overlaps:
+            return finding.as_verified("file, line, and snippet verified against the reviewed diff")
         if not reviewed:
-            # Binary or metadata-only change: no line evidence to confirm.
+            # Binary or metadata-only change: no new-file line evidence to confirm.
             return finding.downgraded(
                 confidence=Confidence.low,
                 note="no textual diff lines to confirm the cited range",
             )
+        if not overlaps:
+            return finding.downgraded(
+                confidence=Confidence.low,
+                note="cited line is outside the reviewed hunks for this file",
+            )
         return finding.downgraded(
             confidence=Confidence.low,
-            note="cited line is outside the reviewed hunks for this file",
+            note="cited snippet could not be confirmed at the cited line",
         )
 
 

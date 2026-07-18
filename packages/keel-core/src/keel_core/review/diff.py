@@ -55,6 +55,10 @@ class DiffFile:
     kind: FileChangeKind
     is_binary: bool
     hunks: tuple[DiffHunk, ...] = ()
+    # The raw unified-diff text of *this file only* (its ``diff --git`` section). Evidence
+    # verification scopes snippet confirmation to this body so a snippet lifted from another
+    # file's hunk can never satisfy a finding cited against this path.
+    body: str = ""
 
     @property
     def reviewed_lines(self) -> frozenset[int]:
@@ -113,9 +117,11 @@ def parse_unified_diff(text: str) -> tuple[DiffFile, ...]:
         kind: FileChangeKind,
         is_binary: bool,
         hunks: list[DiffHunk],
+        end_index: int,
     ) -> None:
         if path is None:
             return
+        body = "\n".join(lines[current_start:end_index]) if current_start is not None else ""
         files.append(
             DiffFile(
                 path=path,
@@ -123,6 +129,7 @@ def parse_unified_diff(text: str) -> tuple[DiffFile, ...]:
                 kind=kind,
                 is_binary=is_binary,
                 hunks=tuple(hunks),
+                body=body,
             )
         )
 
@@ -131,17 +138,19 @@ def parse_unified_diff(text: str) -> tuple[DiffFile, ...]:
     current_kind = FileChangeKind.modified
     current_binary = False
     current_hunks: list[DiffHunk] = []
+    current_start: int | None = None
 
     while index < total:
         line = lines[index]
         git_header = _DIFF_GIT.match(line)
         if git_header is not None:
-            flush(current_path, current_old, current_kind, current_binary, current_hunks)
+            flush(current_path, current_old, current_kind, current_binary, current_hunks, index)
             current_old = _strip_prefix(git_header.group(1))
             current_path = _strip_prefix(git_header.group(2))
             current_kind = FileChangeKind.modified
             current_binary = False
             current_hunks = []
+            current_start = index
             index += 1
             continue
         if current_path is None:
@@ -174,7 +183,7 @@ def parse_unified_diff(text: str) -> tuple[DiffFile, ...]:
                 continue
         index += 1
 
-    flush(current_path, current_old, current_kind, current_binary, current_hunks)
+    flush(current_path, current_old, current_kind, current_binary, current_hunks, total)
     return tuple(files)
 
 
@@ -264,6 +273,27 @@ class GitDiffComputer:
             # Root commit: diff against the empty tree so the whole commit is "added".
             return _EMPTY_TREE
         return parent
+
+    def merge_base(self, worktree: Path, base_sha: str, head_sha: str) -> str:
+        """The merge-base of ``base_sha`` and ``head_sha`` (the review base for a branch).
+
+        A branch review with an omitted base diffs from where the branch *diverged* from the
+        project default branch — never the raw tip of the default branch — so the review shows
+        exactly the branch's own changes. Falls back to the empty tree only when the two commits
+        share no history (an unrelated/new branch), so the whole branch is "added".
+        """
+        for token in (base_sha, head_sha):
+            if token != _EMPTY_TREE and not re.fullmatch(r"[0-9a-f]{40}", token):
+                raise ReviewValidationError("merge_base requires resolved commit shas")
+        result = self.git.run(
+            ["merge-base", base_sha, head_sha],
+            cwd=worktree,
+            check=False,
+        )
+        base = result.stdout.strip()
+        if result.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", base):
+            return _EMPTY_TREE
+        return base
 
     def compute(self, worktree: Path, base: str, head: str) -> ReviewDiff:
         """Produce the bounded ``base..head`` unified diff for the worktree."""

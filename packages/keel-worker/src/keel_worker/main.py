@@ -509,25 +509,6 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["connector_sync_service"] = connector_service
     register_connector_jobs(job_registry, connector_service, settings)
 
-    # Durable data-erasure coordinator + job (M3.5). Bounded Redis stream cleanup uses the
-    # worker's Redis connection; external provider/telemetry deletion has no API and is
-    # recorded as an incomplete step so a request finishes 'partial', never 'completed'.
-    from keel_core.lifecycle.coordinator import ErasureCoordinator, UnsupportedExternalStep
-    from keel_core.lifecycle.redis import RedisLifecycleCleaner
-    from keel_core.lifecycle.store import PostgresErasureStore
-    from keel_worker.lifecycle import register_erasure_jobs
-
-    erasure_coordinator = ErasureCoordinator(
-        engine,
-        PostgresErasureStore(engine, _DURABLE_SCOPE),
-        redis_cleaner=RedisLifecycleCleaner(redis),
-        external_steps=[UnsupportedExternalStep("provider_telemetry")],
-    )
-    ctx["erasure_coordinator"] = erasure_coordinator
-    register_erasure_jobs(
-        job_registry, erasure_coordinator, lease_seconds=settings.job_lease_seconds
-    )
-
     # Read-only managed-code review (WS-R): a durable ``review.run`` job that materializes an
     # isolated worktree from the project's coding storage, reviews the diff through the shared
     # provider (no tools), verifies evidence, and stores content-addressed report artifacts.
@@ -540,34 +521,106 @@ async def startup(ctx: dict[str, Any]) -> None:
     from keel_core.coding import (
         LocalWorktreeStore as _ReviewWorktreeStore,
     )
+    from keel_core.coding.storage_root import (
+        SharedStorageUnavailable,
+        resolve_project_storage_root,
+        verify_shared_storage,
+    )
     from keel_core.projects import PostgresProjectStore as _ReviewProjectStore
     from keel_core.projects import ProjectService as _ReviewProjectService
     from keel_core.review import ReviewCoordinator, ReviewService
+    from keel_core.state import PostgresEventStore as _ReviewEventStore
     from keel_worker.review import register_review_jobs
 
-    _review_hosts = tuple(
-        h.strip().lower() for h in settings.github_allowed_hosts.split(",") if h.strip()
+    # Server and worker MUST resolve the SAME storage root so a worker-written review artifact
+    # is readable by the server's report APIs (shared/RWX volume in cloud). Fail closed when it
+    # is unavailable rather than silently splitting storage.
+    _review_coding: _ReviewCodingStorage | None = None
+    try:
+        _coding_root = resolve_project_storage_root(
+            settings.project_storage_root, app_env=settings.app_env
+        )
+        verify_shared_storage(_coding_root)
+        _review_hosts = tuple(
+            h.strip().lower() for h in settings.github_allowed_hosts.split(",") if h.strip()
+        )
+        _review_coding = _ReviewCodingStorage(_coding_root, allowed_https_hosts=_review_hosts)
+    except SharedStorageUnavailable:
+        logger.warning("shared project storage root unavailable; review job disabled")
+
+    # Durable data-erasure coordinator + job (M3.5). Bounded Redis stream cleanup uses the
+    # worker's Redis connection; external provider/telemetry deletion has no API and is
+    # recorded as an incomplete step so a request finishes 'partial', never 'completed'. The
+    # coding artifact cleaner removes review/coding worktrees + report artifacts on project
+    # erasure over the SAME shared storage the review job writes to.
+    from keel_core.lifecycle.coding import CodingArtifactCleaner
+    from keel_core.lifecycle.coordinator import ErasureCoordinator, UnsupportedExternalStep
+    from keel_core.lifecycle.redis import RedisLifecycleCleaner
+    from keel_core.lifecycle.store import PostgresErasureStore
+    from keel_worker.lifecycle import register_erasure_jobs
+
+    _coding_cleaner: CodingArtifactCleaner | None = None
+    if _review_coding is not None:
+        from keel_core.coding.models import ProjectId as _CleanerProjectId
+
+        class _CodingProjectPurger:
+            """Adapt ``LocalCodingStorage.purge_project`` to the ``ProjectPurger`` seam."""
+
+            def __init__(self, storage: _ReviewCodingStorage) -> None:
+                self._storage = storage
+
+            def purge_project(self, project_id: str) -> bool:
+                return self._storage.purge_project(_CleanerProjectId(project_id))
+
+        _coding_cleaner = CodingArtifactCleaner(_CodingProjectPurger(_review_coding))
+
+    erasure_coordinator = ErasureCoordinator(
+        engine,
+        PostgresErasureStore(engine, _DURABLE_SCOPE),
+        redis_cleaner=RedisLifecycleCleaner(redis),
+        external_steps=[UnsupportedExternalStep("provider_telemetry")],
+        coding_cleaner=_coding_cleaner,
     )
-    _review_coding = _ReviewCodingStorage(
-        Path.cwd() / ".keel" / "projects", allowed_https_hosts=_review_hosts
+    ctx["erasure_coordinator"] = erasure_coordinator
+    register_erasure_jobs(
+        job_registry, erasure_coordinator, lease_seconds=settings.job_lease_seconds
     )
-    _review_service = ReviewService(
-        worktrees=_ReviewWorktreeStore(_review_coding),
-        artifacts=_ReviewArtifactStore(_review_coding),
-        provider=ctx["provider"],
-    )
-    _review_project_service = _ReviewProjectService(
-        _ReviewProjectStore(engine), ctx["identity"].store
-    )
-    review_coordinator = ReviewCoordinator(
-        projects=_review_project_service,
-        runs=ctx["runs"],
-        review_service=_review_service,
-        artifacts=_ReviewArtifactStore(_review_coding),
-        scope_id=_DURABLE_SCOPE,
-    )
-    ctx["review_coordinator"] = review_coordinator
-    register_review_jobs(job_registry, review_coordinator, settings)
+
+    if _review_coding is not None:
+        from keel_core.projects.github_factory import build_github_integration
+        from keel_core.review.github_refs import GitHubPullRequestResolver
+
+        _review_service = ReviewService(
+            worktrees=_ReviewWorktreeStore(_review_coding),
+            artifacts=_ReviewArtifactStore(_review_coding),
+            provider=ctx["provider"],
+            report_retention_days=settings.review_report_retention_days,
+        )
+        _review_project_service = _ReviewProjectService(
+            _ReviewProjectStore(engine), ctx["identity"].store
+        )
+        # PR review resolves exact base/head SHAs on the control plane (GitHub App). When the
+        # App is unconfigured the resolver is absent and a PR review fails explicitly (a PR
+        # number is never used as a Git ref).
+        _review_github = build_github_integration(settings)
+        _pr_resolver = (
+            GitHubPullRequestResolver(
+                projects=_review_project_service, github=_review_github
+            )
+            if _review_github is not None
+            else None
+        )
+        review_coordinator = ReviewCoordinator(
+            projects=_review_project_service,
+            runs=ctx["runs"],
+            review_service=_review_service,
+            artifacts=_ReviewArtifactStore(_review_coding),
+            scope_id=_DURABLE_SCOPE,
+            events=_ReviewEventStore(engine, _DURABLE_SCOPE),
+            pr_resolver=_pr_resolver,
+        )
+        ctx["review_coordinator"] = review_coordinator
+        register_review_jobs(job_registry, review_coordinator, settings)
     ctx["job_registry"] = job_registry
 
     async def enqueue(name: str, *args: object, **options: object) -> None:

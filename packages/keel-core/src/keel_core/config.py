@@ -208,6 +208,23 @@ class Settings(BaseSettings):
     # GitHub's ~1h token lifetime) and never persisted; this is the in-process cache horizon.
     github_token_cache_seconds: int = Field(default=300, ge=0)
 
+    # Shared durable project/coding storage root (WS-R). Server and worker MUST resolve the
+    # SAME filesystem path (a shared/RWX volume in cloud) so a worker-written review artifact is
+    # readable by the server's report APIs. Empty -> a container-local ``./.keel/projects``
+    # default that is ONLY valid for single-host local development (readiness fails in cloud).
+    project_storage_root: str = ""
+
+    # Read-only code review (WS-R). The model MUST come from this allowlist, never an arbitrary
+    # caller string; ``default_model`` is always allowed. Budgets are always enforced and are
+    # never unlimited (fail closed).
+    review_model_allowlist: str = ""
+    review_token_budget: int = Field(default=200_000, gt=0, le=2_000_000)
+    review_output_max_tokens: int = Field(default=8_000, gt=0, le=32_000)
+    review_cost_ceiling_usd: float = Field(default=1.0, gt=0.0, le=50.0)
+    review_max_provider_attempts: int = Field(default=2, ge=1, le=4)
+    # Explicit retention window (days) for review report artifacts — never indefinite.
+    review_report_retention_days: int = Field(default=90, ge=1, le=3650)
+
     # psycopg3 driver works for both sync (Alembic) and async (app) engines.
     database_url: str = "postgresql+psycopg://keel:keel@localhost:5432/keel"
     redis_url: str = "redis://localhost:6379/0"
@@ -320,6 +337,18 @@ class Settings(BaseSettings):
     def fallback_model_list(self) -> list[str]:
         """Parsed, de-blanked ``fallback_models`` (order preserved)."""
         return [m.strip() for m in self.fallback_models.split(",") if m.strip()]
+
+    @property
+    def review_allowed_models(self) -> frozenset[str]:
+        """Models a caller may request for a review — the allowlist plus ``default_model``.
+
+        The default model is always permitted so a minimally-configured deployment still works;
+        any additional models must be explicitly allowlisted. A caller-supplied model outside
+        this set is rejected (never passed through to the provider).
+        """
+        allowed = {m.strip() for m in self.review_model_allowlist.split(",") if m.strip()}
+        allowed.add(self.default_model)
+        return frozenset(allowed)
 
 
 @lru_cache

@@ -26,6 +26,24 @@ class ReviewProviderError(ReviewError):
     """The provider failed, or returned output that could not be repaired into a contract."""
 
 
+class ReviewProviderUnavailable(ReviewError):
+    """A *transient* provider failure (transport, timeout, rate limit, 5xx) — safe to retry.
+
+    Distinct from :class:`ReviewProviderError`: a contract violation that survives the bounded
+    repair loop is permanent, but a transport/timeout/rate-limit failure must NOT terminalize
+    the run — the durable job retries until it succeeds or attempts are exhausted.
+    """
+
+
+class ReviewLeaseLost(ReviewError):
+    """The run lease was lost mid-execution (reclaimed/expired) — abort and allow reclaim.
+
+    Losing the lease means another worker may already own the run: the current worker must
+    abandon all provider/artifact effects without terminalizing (contention is never a terminal
+    success), leaving the run reclaimable.
+    """
+
+
 class ReviewEvidenceError(ReviewError):
     """A finding's cited evidence could not be verified against the reviewed diff/file."""
 
@@ -38,7 +56,9 @@ __all__ = [
     "ReviewBoundsExceeded",
     "ReviewError",
     "ReviewEvidenceError",
+    "ReviewLeaseLost",
     "ReviewNotFound",
     "ReviewProviderError",
+    "ReviewProviderUnavailable",
     "ReviewValidationError",
 ]

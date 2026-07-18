@@ -16,15 +16,47 @@ from typing import Any
 
 from keel_core.protocols import ProviderGateway, ProviderRequest, Usage
 
-from .errors import ReviewBoundsExceeded, ReviewProviderError, ReviewValidationError
+from .errors import (
+    ReviewBoundsExceeded,
+    ReviewProviderError,
+    ReviewProviderUnavailable,
+    ReviewValidationError,
+)
 from .models import (
     MAX_LIMITATION_CHARS,
     MAX_LIMITATIONS,
+    ReviewBudget,
     ReviewFinding,
 )
 from .prompts import REPAIR_INSTRUCTION
 
 DEFAULT_MAX_REPAIRS = 1
+
+# Provider exception class-name fragments that indicate a *transient* failure (transport,
+# timeout, rate limit, upstream 5xx) — safe to retry rather than terminalize the run.
+_TRANSIENT_PROVIDER_MARKERS = (
+    "timeout",
+    "ratelimit",
+    "rate_limit",
+    "serviceunavailable",
+    "service_unavailable",
+    "apiconnection",
+    "connection",
+    "internalservererror",
+    "overloaded",
+    "temporar",
+    "unavailable",
+    "badgateway",
+    "gateway",
+)
+
+
+def _is_transient_provider_error(exc: Exception) -> bool:
+    name = f"{exc.__class__.__module__}.{exc.__class__.__name__}".lower()
+    status_code = getattr(exc, "status_code", None)
+    if isinstance(status_code, int) and status_code in (408, 425, 429, 500, 502, 503, 504):
+        return True
+    return any(marker in name for marker in _TRANSIENT_PROVIDER_MARKERS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,7 +93,7 @@ def _parse_result(
     if not isinstance(payload, Mapping):
         raise ReviewProviderError("provider response JSON was not an object")
 
-    raw_findings = payload.get("findings", [])
+    raw_findings = payload.get("findings", None)
     if not isinstance(raw_findings, Sequence) or isinstance(raw_findings, str | bytes):
         raise ReviewProviderError("`findings` must be a JSON array")
     if len(raw_findings) > max_findings:
@@ -75,16 +107,21 @@ def _parse_result(
         except (ReviewValidationError, ReviewBoundsExceeded) as exc:
             raise ReviewProviderError(f"invalid finding in provider response: {exc}") from exc
 
-    summary_raw = payload.get("summary", "")
-    summary = summary_raw.strip() if isinstance(summary_raw, str) else ""
-    summary = summary[: MAX_LIMITATION_CHARS * 4]
+    # A structured review MUST carry a non-empty summary. An empty object, a bare refusal, or a
+    # ``{}``/``null`` summary is a contract violation that fails closed (the engine's bounded
+    # repair loop gets one chance to correct it before the review is failed).
+    summary_raw = payload.get("summary", None)
+    if not isinstance(summary_raw, str) or not summary_raw.strip():
+        raise ReviewProviderError("provider response is missing a non-empty `summary`")
+    summary = summary_raw.strip()[: MAX_LIMITATION_CHARS * 4]
 
     raw_limitations = payload.get("limitations", [])
+    if not isinstance(raw_limitations, Sequence) or isinstance(raw_limitations, str | bytes):
+        raise ReviewProviderError("`limitations` must be a JSON array")
     limitations: list[str] = []
-    if isinstance(raw_limitations, Sequence) and not isinstance(raw_limitations, str | bytes):
-        for entry in list(raw_limitations)[:MAX_LIMITATIONS]:
-            if isinstance(entry, str) and entry.strip():
-                limitations.append(entry.strip()[:MAX_LIMITATION_CHARS])
+    for entry in list(raw_limitations)[:MAX_LIMITATIONS]:
+        if isinstance(entry, str) and entry.strip():
+            limitations.append(entry.strip()[:MAX_LIMITATION_CHARS])
     return summary, tuple(findings), tuple(limitations)
 
 
@@ -96,15 +133,24 @@ class ReviewEngine:
     max_repairs: int = DEFAULT_MAX_REPAIRS
 
     async def run(
-        self, *, model: str, messages: list[dict[str, Any]], max_findings: int
+        self,
+        *,
+        model: str,
+        messages: list[dict[str, Any]],
+        max_findings: int,
+        budget: ReviewBudget | None = None,
     ) -> ReviewEngineResult:
+        # A review always runs under an explicit, bounded budget — never unlimited.
+        budget = budget or ReviewBudget()
         conversation = list(messages)
         total_usage = Usage()
         last_error: Exception | None = None
-        attempts = self.max_repairs + 1
+        attempts = budget.max_provider_attempts
         for attempt in range(attempts):
-            text, usage = await self._one_turn(model=model, messages=conversation)
+            self._enforce_budget(total_usage, budget)
+            text, usage = await self._one_turn(model=model, messages=conversation, budget=budget)
             total_usage = total_usage + usage
+            self._enforce_budget(total_usage, budget)
             try:
                 summary, findings, limitations = _parse_result(text, max_findings=max_findings)
             except (ReviewProviderError, ReviewBoundsExceeded) as exc:
@@ -127,8 +173,28 @@ class ReviewEngine:
             f"provider did not return a valid review after {attempts} attempt(s): {last_error}"
         )
 
-    async def _one_turn(self, *, model: str, messages: list[dict[str, Any]]) -> tuple[str, Usage]:
-        request = ProviderRequest(model=model, messages=messages, tools=[])
+    @staticmethod
+    def _enforce_budget(usage: Usage, budget: ReviewBudget) -> None:
+        """Fail closed the moment cumulative tokens or cost exceed the review's envelope."""
+        total_tokens = usage.prompt_tokens + usage.completion_tokens
+        if total_tokens > budget.token_budget:
+            raise ReviewBoundsExceeded(
+                f"review exceeded its {budget.token_budget}-token budget ({total_tokens} used)"
+            )
+        if usage.cost_usd > budget.cost_ceiling_usd:
+            raise ReviewBoundsExceeded(
+                f"review exceeded its ${budget.cost_ceiling_usd} cost ceiling"
+            )
+
+    async def _one_turn(
+        self, *, model: str, messages: list[dict[str, Any]], budget: ReviewBudget
+    ) -> tuple[str, Usage]:
+        request = ProviderRequest(
+            model=model,
+            messages=messages,
+            tools=[],
+            max_output_tokens=budget.output_max_tokens,
+        )
         chunks: list[str] = []
         usage = Usage()
         try:
@@ -140,6 +206,11 @@ class ReviewEngine:
         except ReviewProviderError:
             raise
         except Exception as exc:  # noqa: BLE001 — provider transport failures fail closed
+            if _is_transient_provider_error(exc):
+                # Transport/timeout/rate-limit: retryable, do NOT terminalize the run.
+                raise ReviewProviderUnavailable(
+                    f"provider temporarily unavailable: {exc.__class__.__name__}"
+                ) from exc
             raise ReviewProviderError(f"provider call failed: {exc.__class__.__name__}") from exc
         return "".join(chunks), usage
 

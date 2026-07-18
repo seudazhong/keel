@@ -33,11 +33,14 @@ from .errors import (
     ReviewBoundsExceeded,
     ReviewError,
     ReviewEvidenceError,
+    ReviewLeaseLost,
     ReviewNotFound,
     ReviewProviderError,
+    ReviewProviderUnavailable,
     ReviewValidationError,
 )
 from .evidence import EvidenceVerifier, RejectedFinding, VerificationOutcome
+from .github_refs import GitHubPullRequestResolver
 from .jobs import (
     REVIEW_RUN_KIND,
     REVIEW_RUN_MAX_ATTEMPTS,
@@ -47,6 +50,7 @@ from .jobs import (
 )
 from .models import (
     Confidence,
+    ReviewBudget,
     ReviewFinding,
     ReviewId,
     ReviewRecord,
@@ -56,6 +60,12 @@ from .models import (
     ReviewStatus,
     Severity,
     new_review_id,
+)
+from .refs import (
+    MaterializationPlan,
+    PullRequestResolver,
+    ResolvedPullRequest,
+    build_materialization_plan,
 )
 from .report import (
     ReviewArtifactWriter,
@@ -74,13 +84,17 @@ __all__ = [
     "DiffHunk",
     "EvidenceVerifier",
     "GitDiffComputer",
+    "GitHubPullRequestResolver",
     "LoggingReviewAuditSink",
+    "MaterializationPlan",
+    "PullRequestResolver",
     "RejectedFinding",
     "ReviewArtifactWriter",
     "ReviewAuditAction",
     "ReviewAuditEvent",
     "ReviewAuditSink",
     "ReviewBoundsExceeded",
+    "ReviewBudget",
     "ReviewCoordinator",
     "ReviewDiff",
     "ReviewEngine",
@@ -92,9 +106,11 @@ __all__ = [
     "ReviewId",
     "ReviewJobHandlers",
     "ReviewJobPayload",
+    "ReviewLeaseLost",
     "ReviewNotFound",
     "ReviewOutcome",
     "ReviewProviderError",
+    "ReviewProviderUnavailable",
     "ReviewRecord",
     "ReviewReport",
     "ReviewRequest",
@@ -102,9 +118,11 @@ __all__ = [
     "ReviewSource",
     "ReviewStatus",
     "ReviewValidationError",
+    "ResolvedPullRequest",
     "Severity",
     "StoredReport",
     "VerificationOutcome",
+    "build_materialization_plan",
     "new_review_id",
     "parse_unified_diff",
     "render_json_bytes",

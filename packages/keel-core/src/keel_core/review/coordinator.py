@@ -18,19 +18,25 @@ The GitHub App JIT token used to fetch PR metadata/diff lives entirely on the co
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from keel_core.coding.models import CodingRunId, ProjectId
 from keel_core.coding.protocols import ArtifactStore
+from keel_core.errors import DuplicateEventError, PermissionDenied
+from keel_core.events import Event, EventType
 from keel_core.projects.service import ProjectService
 from keel_core.projects.storage import worktree_storage_id
+from keel_core.protocols import EventStore
 from keel_core.runs import (
     RunBudgetSpec,
     RunCost,
+    RunLease,
     RunRecord,
     RunStatus,
     RunStore,
@@ -38,7 +44,16 @@ from keel_core.runs import (
 from keel_core.types import ScopeId
 
 from .audit import LoggingReviewAuditSink, ReviewAuditAction, ReviewAuditEvent, ReviewAuditSink
-from .errors import ReviewError, ReviewNotFound
+from .errors import (
+    ReviewBoundsExceeded,
+    ReviewError,
+    ReviewEvidenceError,
+    ReviewLeaseLost,
+    ReviewNotFound,
+    ReviewProviderError,
+    ReviewProviderUnavailable,
+    ReviewValidationError,
+)
 from .models import (
     ReviewId,
     ReviewRecord,
@@ -48,12 +63,20 @@ from .models import (
     ReviewStatus,
     new_review_id,
 )
+from .refs import PullRequestResolver, build_materialization_plan
 from .service import ReviewOutcome, ReviewService
+
+logger = logging.getLogger("keel.review.coordinator")
 
 REVIEW_SURFACE = "review"
 DEFAULT_REVIEW_AGENT_ID = "review"
 DEFAULT_REVIEW_TTL_SECONDS = 3600
 DEFAULT_REVIEW_LEASE_SECONDS = 900
+# Payload marker under which the immutable review request metadata is durably recorded on the
+# run's event log at admission. Projections (pending/running/failed/list) reconstruct the
+# request from this marker so they stay truthful across a process restart — the report artifact
+# only exists once a review completes.
+REVIEW_REQUEST_MARKER = "review_request"
 
 _STATUS_MAP: dict[RunStatus, ReviewStatus] = {
     RunStatus.admitted: ReviewStatus.pending,
@@ -104,6 +127,8 @@ class ReviewCoordinator:
         review_service: ReviewService,
         artifacts: ArtifactStore,
         scope_id: ScopeId,
+        events: EventStore | None = None,
+        pr_resolver: PullRequestResolver | None = None,
         audit: ReviewAuditSink | None = None,
         worker_id: str = "review-worker",
         ttl_seconds: int = DEFAULT_REVIEW_TTL_SECONDS,
@@ -115,6 +140,8 @@ class ReviewCoordinator:
         self._reviews = review_service
         self._artifacts = artifacts
         self._scope_id = scope_id
+        self._events = events
+        self._pr_resolver = pr_resolver
         self._audit = audit or LoggingReviewAuditSink()
         self._worker_id = worker_id
         self._ttl_seconds = ttl_seconds
@@ -147,6 +174,7 @@ class ReviewCoordinator:
             request.org_id, actor, request.project_id, record.id, agent_id=request.agent_id
         )
         if created:
+            await self._persist_request_metadata(record.id, request)
             self._audit.record(
                 ReviewAuditEvent(
                     ReviewAuditAction.review_requested,
@@ -166,6 +194,74 @@ class ReviewCoordinator:
             status=_STATUS_MAP[record.status],
             created=created,
         )
+
+    async def _persist_request_metadata(self, run_id: str, request: ReviewRequest) -> None:
+        """Durably record the immutable review request metadata on the run's event log.
+
+        No schema migration: the metadata lives in the append-only ``events`` payload keyed by
+        the run id (mirroring the durable-admission marker pattern). A duplicate append (retry /
+        idempotent re-request) is ignored. When no event store is wired the coordinator degrades
+        to report-only projections (completed reviews stay truthful via their report artifact).
+        """
+        if self._events is None:
+            return
+        event = Event(
+            type=EventType.run_started,
+            seq=0,
+            session_id=run_id,
+            scope_id=self._scope_id,
+            run_id=run_id,
+            ts=self._clock(),
+            payload={
+                REVIEW_REQUEST_MARKER: {
+                    "org_id": request.org_id,
+                    "project_id": request.project_id,
+                    "source": request.source.value,
+                    "head": request.head,
+                    "base": request.base,
+                    "model": request.model,
+                    "agent_id": request.agent_id,
+                    "max_findings": request.max_findings,
+                    "max_diff_bytes": request.max_diff_bytes,
+                },
+                "dedup_key": f"review-meta:{run_id}",
+            },
+        )
+        try:
+            await self._events.append(event)
+        except DuplicateEventError:
+            pass
+
+    async def load_request_metadata(self, run_id: str) -> ReviewRequest | None:
+        """Reconstruct the durably-persisted review request for ``run_id`` (or ``None``)."""
+        if self._events is None:
+            return None
+        async for event in self._events.read(run_id):
+            meta = event.payload.get(REVIEW_REQUEST_MARKER)
+            if isinstance(meta, dict):
+                try:
+                    return ReviewRequest(
+                        org_id=str(meta["org_id"]),
+                        project_id=str(meta["project_id"]),
+                        source=ReviewSource(str(meta["source"])),
+                        head=str(meta["head"]),
+                        base=str(meta["base"]) if meta.get("base") is not None else None,
+                        model=str(meta["model"]),
+                        idempotency_key=f"review-meta:{run_id}",
+                        agent_id=str(meta["agent_id"]) if meta.get("agent_id") else None,
+                        max_findings=int(meta.get("max_findings", 0)) or 1,
+                        max_diff_bytes=int(meta.get("max_diff_bytes", 0)) or 1,
+                    )
+                except (KeyError, ValueError, ReviewError):
+                    return None
+        return None
+
+    async def build_review_record(
+        self, record: RunRecord, *, report: ReviewReport | None = None
+    ) -> ReviewRecord:
+        """A truthful status projection: report (completed) or persisted request metadata."""
+        request = None if report is not None else await self.load_request_metadata(record.id)
+        return self.build_record(record, request=request, report=report)
 
     # --- execution path (worker) -----------------------------------------------------
     async def execute_review(self, request: ReviewRequest, *, run_id: str) -> ReviewOutcome | None:
@@ -199,49 +295,80 @@ class ReviewCoordinator:
                 {"project_id": request.project_id, "source": request.source.value},
             )
         )
+        # Renew the lease well before expiry so a long review keeps its fence; a lost renewal
+        # trips ``keeper.lost`` and the run is abandoned without terminalizing (reclaimable).
+        keeper = _LeaseKeeper(
+            run_store=self._runs,
+            lease=lease,
+            interval_seconds=max(1.0, self._lease_seconds / 3),
+        )
+        keeper.start()
         try:
-            outcome = await self._reviews.review(
-                request,
-                run_id=run_id,
-                coding_run_id=coding_run_id,
-                project_handle=handle,
-                review_id=run_id,
-                now=self._clock(),
+            try:
+                plan = await build_materialization_plan(
+                    request,
+                    default_branch=getattr(project, "default_branch", None),
+                    pr_resolver=self._pr_resolver,
+                )
+                outcome = await self._reviews.review(
+                    request,
+                    run_id=run_id,
+                    coding_run_id=coding_run_id,
+                    project_handle=handle,
+                    review_id=run_id,
+                    now=self._clock(),
+                    plan=plan,
+                )
+            except Exception as exc:
+                if keeper.lost:
+                    # Lease lost mid-flight: another worker may own the run. Abort all effects
+                    # WITHOUT terminalizing (contention is never a terminal success).
+                    raise ReviewLeaseLost(f"review lease lost during execution: {run_id}") from exc
+                if _is_retryable(exc):
+                    # Transient provider/infra failure: do NOT terminalize; the durable job
+                    # retries until success or attempts are exhausted. Release the lease so the
+                    # run is promptly reclaimable.
+                    await self._release(lease)
+                    raise
+                error_kind = _error_kind(exc)
+                await self._runs.terminalize(
+                    lease,
+                    status=RunStatus.failed,
+                    stop_reason=error_kind,
+                    now=self._clock(),
+                    error_kind=error_kind,
+                    error_message=_safe_error_message(exc),
+                )
+                self._audit.record(
+                    ReviewAuditEvent(
+                        ReviewAuditAction.review_failed,
+                        record.actor,
+                        record.org_id,
+                        run_id,
+                        {"project_id": request.project_id, "error_kind": error_kind},
+                    )
+                )
+                raise
+            if keeper.lost:
+                # The review produced a result but our fence was superseded: do not claim
+                # completion (the reclaiming worker owns the terminal write).
+                raise ReviewLeaseLost(f"review lease lost before terminalization: {run_id}")
+            cost = RunCost(
+                prompt_tokens=outcome.usage.prompt_tokens,
+                completion_tokens=outcome.usage.completion_tokens,
+                cost_usd=outcome.usage.cost_usd,
+                iterations=1,
             )
-        except Exception as exc:
-            error_kind = _error_kind(exc)
             await self._runs.terminalize(
                 lease,
-                status=RunStatus.failed,
-                stop_reason=error_kind,
+                status=RunStatus.completed,
+                stop_reason="completed",
                 now=self._clock(),
-                error_kind=error_kind,
-                error_message=_safe_error_message(exc),
+                cost=cost,
+                result_ref=outcome.json_sha256,
             )
-            self._audit.record(
-                ReviewAuditEvent(
-                    ReviewAuditAction.review_failed,
-                    record.actor,
-                    record.org_id,
-                    run_id,
-                    {"project_id": request.project_id, "error_kind": error_kind},
-                )
-            )
-            raise
-        cost = RunCost(
-            prompt_tokens=outcome.usage.prompt_tokens,
-            completion_tokens=outcome.usage.completion_tokens,
-            cost_usd=outcome.usage.cost_usd,
-            iterations=1,
-        )
-        await self._runs.terminalize(
-            lease,
-            status=RunStatus.completed,
-            stop_reason="completed",
-            now=self._clock(),
-            cost=cost,
-            result_ref=outcome.json_sha256,
-        )
+        finally:
+            await keeper.stop()
         self._audit.record(
             ReviewAuditEvent(
                 ReviewAuditAction.review_completed,
@@ -256,6 +383,16 @@ class ReviewCoordinator:
             )
         )
         return outcome
+
+    async def _release(self, lease: RunLease) -> None:
+        """Best-effort release so a retryable run is promptly reclaimable (never masks error)."""
+        release = getattr(self._runs, "release", None)
+        if release is None:
+            return
+        try:
+            await release(lease, now=self._clock())
+        except Exception:  # noqa: BLE001 — release is best-effort; the lease also expires
+            pass
 
     # --- read path -------------------------------------------------------------------
     async def get_run(self, run_id: str) -> RunRecord:
@@ -292,6 +429,12 @@ class ReviewCoordinator:
         report: ReviewReport | None = None,
     ) -> ReviewRecord:
         status = _STATUS_MAP[record.status]
+        if report is None and request is None:
+            # Fail closed rather than fabricate source/head/model defaults: a truthful
+            # projection requires either a completed report or the persisted request metadata.
+            raise ReviewNotFound(
+                f"review metadata for {record.id} is not available; cannot project a record"
+            )
         source = report.source if report else (request.source if request else ReviewSource.branch)
         head = report.head_sha if report else (request.head if request else "")
         base = report.base_sha if report else (request.base if request else None)
@@ -324,6 +467,81 @@ def _error_kind(exc: BaseException) -> str:
     if isinstance(exc, ReviewError):
         return exc.__class__.__name__
     return "review_execution_error"
+
+
+_PERMANENT_ERRORS = (
+    ReviewValidationError,
+    ReviewBoundsExceeded,
+    ReviewEvidenceError,
+    ReviewProviderError,
+    ReviewNotFound,
+    PermissionDenied,
+)
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Whether ``exc`` is a transient failure that must NOT terminalize the run.
+
+    Transport/timeout/rate-limit provider failures and lease loss are retryable; a validation,
+    bounds, evidence, contract, or authorization-revocation error is permanent. An unexpected
+    (infra) error is treated as transient — the durable run's TTL/reconciler is the terminal
+    safety net rather than an eager, possibly-spurious failure.
+    """
+    if isinstance(exc, ReviewProviderUnavailable | ReviewLeaseLost):
+        return True
+    if isinstance(exc, _PERMANENT_ERRORS):
+        return False
+    return True
+
+
+@dataclass
+class _LeaseKeeper:
+    """Renews a run lease before expiry; flags the lease lost on any failed renewal.
+
+    Mirrors the interactive run keeper: a ``False`` return (reclaimed) or any exception marks
+    the lease lost so the review is abandoned without a terminal write under a stale fence.
+    """
+
+    run_store: RunStore
+    lease: RunLease
+    interval_seconds: float
+    lost: bool = False
+    _task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._loop())
+
+    async def _loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self.interval_seconds)
+                try:
+                    renewed = await self.run_store.renew(
+                        self.lease, lease_seconds=self.lease.lease_seconds
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001 — any renew failure is a lost lease (fail closed)
+                    logger.warning(
+                        "review lease renewal raised; lease lost run=%s", self.lease.run_id
+                    )
+                    self.lost = True
+                    return
+                if not renewed:
+                    self.lost = True
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 — keeper cleanup must not mask the primary outcome
+                logger.warning("review lease keeper cleanup error suppressed")
 
 
 def _safe_error_message(exc: BaseException) -> str:

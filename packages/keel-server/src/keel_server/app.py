@@ -29,6 +29,11 @@ from keel_core.coding import (
     LocalCodingStorage,
     LocalWorktreeStore,
 )
+from keel_core.coding.storage_root import (
+    SharedStorageUnavailable,
+    resolve_project_storage_root,
+    verify_shared_storage,
+)
 from keel_core.config import Settings, get_settings, load_env_file
 from keel_core.connector_credentials import ConnectorCredentialStore
 from keel_core.connector_schedule_index import PostgresConnectorScheduleIndex
@@ -260,15 +265,15 @@ def _build_project_service(
     settings: Settings,
     identity_store: Any,
     enqueue_sync: Any,
+    coding_root: Path | None,
 ) -> ProjectService:
     """Build the managed-project service (durable when an engine is configured)."""
     store: Any = PostgresProjectStore(engine) if engine is not None else InMemoryProjectStore()
     storage: ProjectStorage | None = None
-    if engine is not None:
+    if engine is not None and coding_root is not None:
         hosts = tuple(
             h.strip().lower() for h in settings.github_allowed_hosts.split(",") if h.strip()
         )
-        coding_root = Path.cwd() / ".keel" / "projects"
         coding = LocalCodingStorage(coding_root, allowed_https_hosts=hosts)
         storage = LocalProjectStorage(LocalActiveGitStore(coding), LocalWorktreeStore(coding))
     return ProjectService(
@@ -280,27 +285,51 @@ def _build_project_service(
     )
 
 
+def _resolve_coding_root(settings: Settings) -> Path | None:
+    """Resolve the shared project/coding storage root, verifying it is usable (fail closed).
+
+    Returns ``None`` when the root cannot be provisioned (cloud without
+    ``KEEL_PROJECT_STORAGE_ROOT``, or an unwritable volume) so project storage + review degrade
+    to unavailable and readiness reflects it, instead of silently splitting server/worker
+    storage.
+    """
+    try:
+        root = resolve_project_storage_root(settings.project_storage_root, app_env=settings.app_env)
+        verify_shared_storage(root)
+        return root
+    except SharedStorageUnavailable:
+        logging.getLogger("keel.server").warning(
+            "shared project storage root unavailable; managed projects + review disabled",
+            exc_info=True,
+        )
+        return None
+
+
 def _build_review_coordinator(
     engine: AsyncEngine | None,
     settings: Settings,
     projects: ProjectService,
+    coding_root: Path | None,
 ) -> ReviewCoordinator | None:
-    """Build the read-only review coordinator over the same coding storage as projects.
+    """Build the read-only review coordinator over the shared project/coding storage root.
 
-    Requires a durable Postgres substrate (a separate worker process claims the review run).
-    Reuses the project coding storage handle space so review worktrees/artifacts are purged by
-    the same project/scope lifecycle. The provider is the shared ``LiteLLMGateway`` (the same
-    provider path the agent loop uses) — no second, policy-bypassing provider route.
+    Requires a durable Postgres substrate (a separate worker process claims the review run) and
+    the SAME storage root the worker uses, so a worker-written review artifact is readable by
+    the server's report APIs. The provider is the shared ``LiteLLMGateway`` (the same provider
+    path the agent loop uses) — no second, policy-bypassing provider route. Request metadata is
+    durably recorded on the review scope's event log so status projections survive a restart.
     """
-    if engine is None:
+    if engine is None or coding_root is None:
         return None
+    from keel_core.state import PostgresEventStore
+
     hosts = tuple(h.strip().lower() for h in settings.github_allowed_hosts.split(",") if h.strip())
-    coding_root = Path.cwd() / ".keel" / "projects"
     coding = LocalCodingStorage(coding_root, allowed_https_hosts=hosts)
     review_service = ReviewService(
         worktrees=LocalWorktreeStore(coding),
         artifacts=LocalArtifactStore(coding),
         provider=LiteLLMGateway(),
+        report_retention_days=settings.review_report_retention_days,
     )
     return ReviewCoordinator(
         projects=projects,
@@ -308,6 +337,7 @@ def _build_review_coordinator(
         review_service=review_service,
         artifacts=LocalArtifactStore(coding),
         scope_id=_DURABLE_SCOPE,
+        events=PostgresEventStore(engine, _DURABLE_SCOPE),
     )
 
 
@@ -659,13 +689,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         await _dispatch_knowledge_job(jobs.scope_id, job.id)
 
+    coding_root = _resolve_coding_root(settings) if engine is not None else None
+    app.state.project_storage_root = str(coding_root) if coding_root is not None else None
     app.state.projects = _build_project_service(
-        engine, settings, identity_service.store, _enqueue_project_sync
+        engine, settings, identity_service.store, _enqueue_project_sync, coding_root
     )
 
     # Read-only managed-code review (WS-R): a durable ``review.run`` job on the existing
     # jobs/outbox substrate, keyed by the review's idempotency key (duplicate = no-op).
-    app.state.review_coordinator = _build_review_coordinator(engine, settings, app.state.projects)
+    app.state.review_coordinator = _build_review_coordinator(
+        engine, settings, app.state.projects, coding_root
+    )
 
     async def _enqueue_review(payload: dict[str, Any], idempotency_key: str) -> None:
         jobs = app.state.jobs

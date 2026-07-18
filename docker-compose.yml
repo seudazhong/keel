@@ -15,6 +15,9 @@ x-app: &app
 x-app-env: &app-env
   KEEL_DATABASE_URL: postgresql+psycopg://keel:keel@postgres:5432/keel
   KEEL_REDIS_URL: redis://redis:6379/0
+  # Shared project/coding storage root: server and worker MUST mount the SAME volume
+  # here so a worker-written review artifact is readable by the server report APIs (WS-R).
+  KEEL_PROJECT_STORAGE_ROOT: /var/lib/keel/projects
 
 services:
   postgres:
@@ -57,6 +60,7 @@ services:
   keel-server:
     <<: *app
     command: ["keel-server"]
+    volumes: ["projectdata:/var/lib/keel/projects"]
     environment:
       <<: *app-env
       KEEL_SERVER_HOST: 0.0.0.0
@@ -88,6 +92,7 @@ services:
   keel-worker:
     <<: *app
     command: ["arq", "keel_worker.main.WorkerSettings"]
+    volumes: ["projectdata:/var/lib/keel/projects"]
     deploy:
       replicas: 1  # override with `--scale keel-worker=N`; scale-out is CAS-safe
     environment:
@@ -148,3 +153,6 @@ services:
 volumes:
   pgdata:
   ollama:
+  # Shared managed-project/coding storage (server + worker). In a multi-host cloud
+  # deployment replace this with an RWX volume (e.g. NFS/EFS) so BOTH pods share it.
+  projectdata:

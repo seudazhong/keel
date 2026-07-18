@@ -78,6 +78,19 @@ class GitHubIntegration:
         token = await self.tokens.get_token(installation_id)
         return await self.client.get_repository(token=token.token, full_name=full_name)
 
+    async def resolve_pull_request(
+        self, installation_id: int, full_name: str, number: int
+    ) -> dict[str, object]:
+        """Mint a JIT installation token and read pull-request metadata (control-plane only).
+
+        The token exists only for this control-plane call and is never handed to the review
+        service, the worktree, or the model.
+        """
+        token = await self.tokens.get_token(installation_id)
+        return await self.client.get_pull_request(
+            token=token.token, full_name=full_name, number=number
+        )
+
     def safe_clone_url(self, clone_url: str, full_name: str) -> str:
         """Normalize + pin a clone URL to the expected repo on an allow-listed host."""
         return normalize_clone_url(
@@ -607,6 +620,19 @@ class ProjectService:
             org_id, actor_user_id, project, capability, agent_id=agent_id
         )
         return project
+
+    async def get_project_repository(
+        self, org_id: str, project_id: str
+    ) -> GitHubRepository | None:
+        """The GitHub repository bound to a project (its installation/full_name), or ``None``.
+
+        Used by the read-only review PR resolver to verify the project↔repo binding and mint a
+        JIT token for the correct installation before resolving a PR's exact SHAs.
+        """
+        for repo in await self._store.list_repositories(org_id):
+            if repo.project_id == project_id:
+                return repo
+        return None
 
     async def associate_run(
         self,

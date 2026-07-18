@@ -53,6 +53,24 @@ MAX_MODEL_CHARS = 128
 # the omission is recorded as an explicit report limitation (never silently dropped).
 DEFAULT_MAX_DIFF_BYTES = 1_000_000
 MAX_LINE_NUMBER = 100_000_000
+# A single finding may only cite a small, contiguous span. This is a hard fail-closed bound:
+# it stops a model from citing a 1..100_000_000 "range" (which would make line-overlap checks
+# allocate an enormous set) and forces evidence to point at a specific, reviewable location.
+MAX_FINDING_LINE_SPAN = 100
+
+# --- Budget policy (fail closed; never unlimited) ------------------------------------
+# Every review runs under an explicit, bounded budget. There is no "unlimited" default: a
+# token budget, per-turn output cap, cost ceiling, and provider-attempt cap are always set and
+# enforced (see :mod:`keel_core.review.engine`). Callers may lower these but never remove them.
+DEFAULT_REVIEW_TOKEN_BUDGET = 200_000
+MAX_REVIEW_TOKEN_BUDGET = 2_000_000
+DEFAULT_REVIEW_OUTPUT_MAX_TOKENS = 8_000
+MAX_REVIEW_OUTPUT_MAX_TOKENS = 32_000
+DEFAULT_REVIEW_COST_CEILING_USD = 1.0
+MAX_REVIEW_COST_CEILING_USD = 50.0
+# Total provider turns permitted, INCLUDING the bounded structured-output repair turn.
+DEFAULT_REVIEW_MAX_PROVIDER_ATTEMPTS = 2
+MAX_REVIEW_PROVIDER_ATTEMPTS = 4
 
 
 # --- Ordered enums -------------------------------------------------------------------
@@ -191,6 +209,10 @@ class ReviewFinding:
     def __post_init__(self) -> None:
         if self.line_end < self.line_start:
             raise ReviewValidationError("line_end must be >= line_start")
+        if self.line_end - self.line_start + 1 > MAX_FINDING_LINE_SPAN:
+            raise ReviewBoundsExceeded(
+                f"a finding may cite at most {MAX_FINDING_LINE_SPAN} contiguous lines"
+            )
         if self.snippet_sha256 != snippet_hash(self.snippet):
             raise ReviewValidationError("snippet_sha256 does not match snippet")
 
@@ -278,6 +300,32 @@ class ReviewFinding:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewBudget:
+    """The bounded, always-enforced resource envelope for one review (never unlimited)."""
+
+    token_budget: int = DEFAULT_REVIEW_TOKEN_BUDGET
+    output_max_tokens: int = DEFAULT_REVIEW_OUTPUT_MAX_TOKENS
+    cost_ceiling_usd: float = DEFAULT_REVIEW_COST_CEILING_USD
+    max_provider_attempts: int = DEFAULT_REVIEW_MAX_PROVIDER_ATTEMPTS
+
+    def __post_init__(self) -> None:
+        if not (1 <= self.token_budget <= MAX_REVIEW_TOKEN_BUDGET):
+            raise ReviewBoundsExceeded(f"token_budget must be 1..{MAX_REVIEW_TOKEN_BUDGET}")
+        if not (1 <= self.output_max_tokens <= MAX_REVIEW_OUTPUT_MAX_TOKENS):
+            raise ReviewBoundsExceeded(
+                f"output_max_tokens must be 1..{MAX_REVIEW_OUTPUT_MAX_TOKENS}"
+            )
+        if not (0.0 < self.cost_ceiling_usd <= MAX_REVIEW_COST_CEILING_USD):
+            raise ReviewBoundsExceeded(
+                f"cost_ceiling_usd must be >0 and <= {MAX_REVIEW_COST_CEILING_USD}"
+            )
+        if not (1 <= self.max_provider_attempts <= MAX_REVIEW_PROVIDER_ATTEMPTS):
+            raise ReviewBoundsExceeded(
+                f"max_provider_attempts must be 1..{MAX_REVIEW_PROVIDER_ATTEMPTS}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class ReviewRequest:
     """An authorized request to review one project change set."""
 
@@ -291,6 +339,10 @@ class ReviewRequest:
     agent_id: str | None = None
     max_findings: int = MAX_FINDINGS
     max_diff_bytes: int = DEFAULT_MAX_DIFF_BYTES
+    token_budget: int = DEFAULT_REVIEW_TOKEN_BUDGET
+    output_max_tokens: int = DEFAULT_REVIEW_OUTPUT_MAX_TOKENS
+    cost_ceiling_usd: float = DEFAULT_REVIEW_COST_CEILING_USD
+    max_provider_attempts: int = DEFAULT_REVIEW_MAX_PROVIDER_ATTEMPTS
 
     def __post_init__(self) -> None:
         if not self.org_id or not self.project_id:
@@ -305,6 +357,17 @@ class ReviewRequest:
             _bounded_text(self.base, field_name="base", max_chars=MAX_REF_CHARS)
         if self.source is ReviewSource.pull_request and not self.head.isdigit():
             raise ReviewValidationError("pull_request head must be the PR number")
+        # Validate the budget envelope (rejects any unlimited / non-positive value).
+        self.budget()
+
+    def budget(self) -> ReviewBudget:
+        """The strict, always-enforced resource envelope derived from this request."""
+        return ReviewBudget(
+            token_budget=self.token_budget,
+            output_max_tokens=self.output_max_tokens,
+            cost_ceiling_usd=self.cost_ceiling_usd,
+            max_provider_attempts=self.max_provider_attempts,
+        )
 
 
 # --- Report --------------------------------------------------------------------------
@@ -488,10 +551,20 @@ def sort_findings(findings: Sequence[ReviewFinding]) -> tuple[ReviewFinding, ...
 
 __all__ = [
     "DEFAULT_MAX_DIFF_BYTES",
+    "DEFAULT_REVIEW_COST_CEILING_USD",
+    "DEFAULT_REVIEW_MAX_PROVIDER_ATTEMPTS",
+    "DEFAULT_REVIEW_OUTPUT_MAX_TOKENS",
+    "DEFAULT_REVIEW_TOKEN_BUDGET",
     "MAX_FINDINGS",
+    "MAX_FINDING_LINE_SPAN",
     "MAX_LIMITATIONS",
+    "MAX_REVIEW_COST_CEILING_USD",
+    "MAX_REVIEW_OUTPUT_MAX_TOKENS",
+    "MAX_REVIEW_PROVIDER_ATTEMPTS",
+    "MAX_REVIEW_TOKEN_BUDGET",
     "REPORT_SCHEMA_VERSION",
     "Confidence",
+    "ReviewBudget",
     "ReviewFinding",
     "ReviewId",
     "ReviewRecord",

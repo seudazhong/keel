@@ -215,3 +215,139 @@ async def test_project_purge_removes_review_artifacts(tmp_path: Path) -> None:
     assert storage.purge_project(ProjectId("proj")) is False
     with pytest.raises(StorageNotFound):
         artifacts.read(ProjectId("proj"), CodingRunId("rrun1"), outcome.json_sha256)
+
+
+# --- ref resolution (WS-R finding 2) ---------------------------------------------
+
+
+def _build_feature_branch_repo(tmp_path: Path):
+    """A repo whose ``feature`` branch diverged from ``main`` (which then advanced)."""
+    from review_support import git as _git
+
+    src = tmp_path / "source"
+    src.mkdir(parents=True)
+    _git(src, "init", "--initial-branch=main", ".")
+    (src / "app.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-m", "base")
+    fork_sha = _git(src, "rev-parse", "HEAD")
+    _git(src, "checkout", "-b", "feature")
+    (src / "app.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-m", "c1")
+    (src / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-m", "c2")
+    head_sha = _git(src, "rev-parse", "HEAD")
+    # main advances after the divergence — the merge-base, not the main tip, must be the base.
+    _git(src, "checkout", "main")
+    (src / "unrelated.py").write_text("Z = 9\n", encoding="utf-8")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-m", "main2")
+    return src, fork_sha, head_sha
+
+
+async def test_numeric_branch_is_not_a_pr(tmp_path: Path) -> None:
+    """A branch literally named ``123`` is reviewed as a branch, never as PR #123."""
+    from review_support import git as _git
+
+    src = tmp_path / "source"
+    src.mkdir(parents=True)
+    _git(src, "init", "--initial-branch=main", ".")
+    (src / "app.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-m", "base")
+    _git(src, "checkout", "-b", "123")
+    (src / "app.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-m", "change")
+    storage = import_into_storage(tmp_path, src)
+    provider = CapturingProvider(
+        responses=[
+            finding_json(file_path="app.py", line_start=2, line_end=2, snippet="return a - b")
+        ]
+    )
+    outcome = await _run(
+        storage, provider, request=_request(source=ReviewSource.branch, head="123")
+    )
+    assert len(outcome.report.findings) == 1
+    assert outcome.report.findings[0].verified
+
+
+async def test_branch_omitted_base_uses_merge_base(tmp_path: Path) -> None:
+    from keel_core.review.refs import build_materialization_plan
+
+    src, fork_sha, head_sha = _build_feature_branch_repo(tmp_path)
+    storage = import_into_storage(tmp_path, src)
+    provider = CapturingProvider(
+        responses=[
+            finding_json(file_path="app.py", line_start=2, line_end=2, snippet="return a - b")
+        ]
+    )
+    service = _service(storage, provider)
+    request = _request(source=ReviewSource.branch, head="feature", base=None)
+    plan = await build_materialization_plan(request, default_branch="main", pr_resolver=None)
+    outcome = await service.review(
+        request, run_id="rev_1", coding_run_id="rrun1", project_handle="proj", plan=plan
+    )
+    # Base is the divergence point (merge-base), not the advanced main tip.
+    assert outcome.base_sha == fork_sha
+    assert outcome.head_sha == head_sha
+    # The branch's own changes (app.py + mod.py) are reviewed; main's later change is not.
+    assert outcome.report.files_reviewed == 2
+    paths = {f.file_path for f in outcome.report.findings}
+    assert "app.py" in paths
+
+
+async def test_pull_request_without_resolver_fails(tmp_path: Path) -> None:
+    from keel_core.review.errors import ReviewValidationError
+
+    build_source_repo(tmp_path)
+    storage = import_into_storage(tmp_path, tmp_path / "source")
+    provider = CapturingProvider(responses=["{}"])
+    service = _service(storage, provider)
+    # No control-plane plan: a PR request must fail closed (PR number never used as a ref).
+    with pytest.raises(ReviewValidationError):
+        await service.review(
+            _request(source=ReviewSource.pull_request, head="7"),
+            run_id="rev_1",
+            coding_run_id="rrun1",
+            project_handle="proj",
+        )
+
+
+async def test_pull_request_reviews_resolved_shas(tmp_path: Path) -> None:
+    from keel_core.review.refs import MaterializationPlan
+
+    repo = build_source_repo(tmp_path)  # base_sha, head_sha on main
+    storage = import_into_storage(tmp_path, tmp_path / "source")
+    provider = CapturingProvider(
+        responses=[
+            finding_json(
+                file_path="app.py",
+                line_start=2,
+                line_end=2,
+                snippet="return a - b  # BUG: subtraction",
+            )
+        ]
+    )
+    service = _service(storage, provider)
+    # Simulate a control-plane-resolved PR: exact base/head SHAs, materialize at the head sha.
+    plan = MaterializationPlan(
+        materialize_ref=repo.head_sha,
+        base_ref=repo.base_sha,
+        default_branch="main",
+        derive_base_from_default=False,
+        base_sha_hint=repo.base_sha,
+        head_sha_hint=repo.head_sha,
+    )
+    outcome = await service.review(
+        _request(source=ReviewSource.pull_request, head="7"),
+        run_id="rev_1",
+        coding_run_id="rrun1",
+        project_handle="proj",
+        plan=plan,
+    )
+    assert outcome.base_sha == repo.base_sha
+    assert outcome.head_sha == repo.head_sha
+    assert len(outcome.report.findings) == 1

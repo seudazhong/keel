@@ -21,6 +21,7 @@ from pydantic import (
     field_validator,
 )
 
+from keel_core.errors import PermissionDenied
 from keel_core.jobs import JobResult, PermanentJobError, RetryableJobError
 
 from .coordinator import ReviewCoordinator
@@ -33,6 +34,10 @@ from .errors import (
 )
 from .models import (
     DEFAULT_MAX_DIFF_BYTES,
+    DEFAULT_REVIEW_COST_CEILING_USD,
+    DEFAULT_REVIEW_MAX_PROVIDER_ATTEMPTS,
+    DEFAULT_REVIEW_OUTPUT_MAX_TOKENS,
+    DEFAULT_REVIEW_TOKEN_BUDGET,
     MAX_FINDINGS,
     ReviewRequest,
     ReviewSource,
@@ -63,6 +68,10 @@ class ReviewJobPayload(BaseModel):
     idempotency_key: StrictStr
     max_findings: StrictInt = Field(default=MAX_FINDINGS)
     max_diff_bytes: StrictInt = Field(default=DEFAULT_MAX_DIFF_BYTES)
+    token_budget: StrictInt = Field(default=DEFAULT_REVIEW_TOKEN_BUDGET)
+    output_max_tokens: StrictInt = Field(default=DEFAULT_REVIEW_OUTPUT_MAX_TOKENS)
+    cost_ceiling_usd: float = Field(default=DEFAULT_REVIEW_COST_CEILING_USD)
+    max_provider_attempts: StrictInt = Field(default=DEFAULT_REVIEW_MAX_PROVIDER_ATTEMPTS)
 
     @field_validator("source")
     @classmethod
@@ -83,6 +92,10 @@ class ReviewJobPayload(BaseModel):
             idempotency_key=self.idempotency_key,
             max_findings=self.max_findings,
             max_diff_bytes=self.max_diff_bytes,
+            token_budget=self.token_budget,
+            output_max_tokens=self.output_max_tokens,
+            cost_ceiling_usd=self.cost_ceiling_usd,
+            max_provider_attempts=self.max_provider_attempts,
         )
 
     @classmethod
@@ -99,6 +112,10 @@ class ReviewJobPayload(BaseModel):
             idempotency_key=request.idempotency_key,
             max_findings=request.max_findings,
             max_diff_bytes=request.max_diff_bytes,
+            token_budget=request.token_budget,
+            output_max_tokens=request.output_max_tokens,
+            cost_ceiling_usd=request.cost_ceiling_usd,
+            max_provider_attempts=request.max_provider_attempts,
         )
 
 
@@ -115,13 +132,16 @@ class ReviewJobContext(Protocol):
     async def checkpoint(self) -> None: ...
 
 
-# Errors that mean "this review can never succeed" — terminal, no retry.
+# Errors that mean "this review can never succeed" — terminal, no retry. Provider *transport*
+# failures (ReviewProviderUnavailable) and lease loss (ReviewLeaseLost) are intentionally NOT
+# here: they fall through to the retryable path so the durable job retries them.
 _PERMANENT = (
     ReviewValidationError,
     ReviewBoundsExceeded,
     ReviewEvidenceError,
     ReviewProviderError,
     ReviewNotFound,
+    PermissionDenied,
 )
 
 

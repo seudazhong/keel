@@ -11,6 +11,7 @@ GitHub comment — reads return the immutable, evidence-verified report artifact
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, status
@@ -93,9 +94,43 @@ def _projects(request: Request) -> ProjectService:
     return service
 
 
-def _default_model(request: Request) -> str:
+def _resolve_model(request: Request, requested: str | None) -> str:
+    """Resolve + authorize the review model against the configured allowlist (never arbitrary).
+
+    ``default_model`` is always allowed; any other model must be explicitly allowlisted. A
+    caller-supplied model outside the allowlist is rejected before it can reach the provider.
+    """
     settings = getattr(request.app.state, "settings", None)
-    return getattr(settings, "default_model", "gpt-4o-mini")
+    default_model = getattr(settings, "default_model", "gpt-4o-mini")
+    if requested is None or not requested.strip():
+        return default_model
+    requested = requested.strip()
+    allowed = settings.review_allowed_models if settings is not None else frozenset({default_model})
+    if requested not in allowed:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            "requested model is not permitted for reviews",
+        )
+    return requested
+
+
+@dataclass(frozen=True)
+class _Budget:
+    token_budget: int
+    output_max_tokens: int
+    cost_ceiling_usd: float
+    max_provider_attempts: int
+
+
+def _review_budget(request: Request) -> _Budget:
+    """The enforced, non-unlimited budget envelope from settings (fail-closed defaults)."""
+    settings = getattr(request.app.state, "settings", None)
+    return _Budget(
+        token_budget=int(getattr(settings, "review_token_budget", 200_000)),
+        output_max_tokens=int(getattr(settings, "review_output_max_tokens", 8_000)),
+        cost_ceiling_usd=float(getattr(settings, "review_cost_ceiling_usd", 1.0)),
+        max_provider_attempts=int(getattr(settings, "review_max_provider_attempts", 2)),
+    )
 
 
 def _idempotency_key(request: Request, body: CreateReviewRequest) -> str:
@@ -116,25 +151,36 @@ async def create_review(
 ) -> CreateReviewResponse:
     coordinator = _coordinator(request)
     idempotency_key = _idempotency_key(request, body)
+    budget = _review_budget(request)
     review_request = ReviewRequest(
         org_id=org.org_id,
         project_id=project_id,
         source=body.source,
         head=body.head,
         base=body.base,
-        model=body.model or _default_model(request),
+        model=_resolve_model(request, body.model),
         agent_id=body.agent_id,
         idempotency_key=idempotency_key,
         max_findings=body.max_findings,
+        token_budget=budget.token_budget,
+        output_max_tokens=budget.output_max_tokens,
+        cost_ceiling_usd=budget.cost_ceiling_usd,
+        max_provider_attempts=budget.max_provider_attempts,
     )
     handle = await coordinator.request_review(review_request, actor=org.user_id)
-    if handle.created:
-        payload = ReviewJobPayload.from_request(review_request, run_id=handle.run_id).model_dump(
-            mode="json"
-        )
-        enqueue = getattr(request.app.state, "enqueue_review", None)
-        if enqueue is not None:
+    # Idempotently (re-)enqueue on EVERY request, not only first admission: a duplicate request
+    # or a retried call re-drives dispatch (enqueue_once dedupes), so a run can never be
+    # stranded by a lost enqueue. Enqueue failure does not fail the request — the run is durably
+    # admitted and a subsequent request / reconcile re-enqueues it.
+    payload = ReviewJobPayload.from_request(review_request, run_id=handle.run_id).model_dump(
+        mode="json"
+    )
+    enqueue = getattr(request.app.state, "enqueue_review", None)
+    if enqueue is not None:
+        try:
             await enqueue(payload, review_idempotency_key(handle.run_id))
+        except Exception:  # noqa: BLE001 — admission already durable; do not strand on enqueue
+            pass
     return CreateReviewResponse(
         review_id=handle.review_id,
         run_id=handle.run_id,
@@ -148,6 +194,19 @@ async def _authorize_read(request: Request, org: ResolvedOrg, project_id: str) -
     await _projects(request).authorize_review(
         org.org_id, org.user_id, project_id, capability=Capability.read
     )
+
+
+async def _require_review_in_project(
+    request: Request, org: ResolvedOrg, project_id: str, review_id: str
+) -> None:
+    """404 unless ``review_id`` is a review run associated with *this* route's project.
+
+    Prevents reading a review of project A through project B's route even when the caller can
+    read both: the review must belong to the project named in the path (project_runs binding).
+    """
+    run_ids = await _projects(request).list_project_runs(org.org_id, org.user_id, project_id)
+    if review_id not in run_ids:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "review not found")
 
 
 @router.get("", response_model=list[ReviewStatusResponse])
@@ -164,7 +223,12 @@ async def list_reviews(
         run = await coordinator.get_run_optional(run_id)
         if run is None:
             continue
-        record = coordinator.build_record(run)
+        try:
+            record = await coordinator.build_review_record(run)
+        except ReviewNotFound:
+            # A review whose durable metadata is not (yet) available is omitted rather than
+            # projected with fabricated defaults.
+            continue
         responses.append(ReviewStatusResponse.model_validate(record.to_dict()))
     return responses
 
@@ -177,6 +241,7 @@ async def get_review(
     org: Annotated[ResolvedOrg, Depends(require_org)],
 ) -> ReviewStatusResponse:
     await _authorize_read(request, org, project_id)
+    await _require_review_in_project(request, org, project_id, review_id)
     coordinator = _coordinator(request)
     run = await coordinator.get_run(review_id)
     if run.org_id != org.org_id:
@@ -190,7 +255,7 @@ async def get_review(
         report = coordinator.read_report(
             project_handle=handle, run_id=review_id, json_sha256=run.result_ref
         )
-    record = coordinator.build_record(run, report=report)
+    record = await coordinator.build_review_record(run, report=report)
     return ReviewStatusResponse.model_validate(record.to_dict())
 
 
@@ -201,6 +266,8 @@ async def get_review_report(
     request: Request,
     org: Annotated[ResolvedOrg, Depends(require_org)],
 ) -> JSONResponse:
+    await _authorize_read(request, org, project_id)
+    await _require_review_in_project(request, org, project_id, review_id)
     coordinator = _coordinator(request)
     run = await coordinator.get_run(review_id)
     if run.org_id != org.org_id:
@@ -224,6 +291,8 @@ async def get_review_report_markdown(
     request: Request,
     org: Annotated[ResolvedOrg, Depends(require_org)],
 ) -> Response:
+    await _authorize_read(request, org, project_id)
+    await _require_review_in_project(request, org, project_id, review_id)
     coordinator = _coordinator(request)
     run = await coordinator.get_run(review_id)
     if run.org_id != org.org_id:

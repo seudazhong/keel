@@ -133,12 +133,15 @@ async def _setup(engine: AsyncEngine, tmp_path: Path, provider: _Provider) -> _E
         provider=provider,
     )
     runs = PostgresRunStore(engine, _SCOPE)
+    from keel_core.state import PostgresEventStore
+
     coordinator = ReviewCoordinator(
         projects=projects,
         runs=runs,
         review_service=review_service,
         artifacts=LocalArtifactStore(coding),
         scope_id=_SCOPE,
+        events=PostgresEventStore(engine, _SCOPE),
     )
     env = _Env(
         coordinator=coordinator,
@@ -232,3 +235,29 @@ async def test_execute_is_restart_safe_in_postgres(
     # A retried job on an already-terminal run is a durable no-op.
     second = await env.coordinator.execute_review(env.request, run_id=handle.run_id)
     assert second is None
+
+
+async def test_pending_projection_truthful_after_restart_in_postgres(
+    migrated_db: AsyncEngine, tmp_path: Path
+) -> None:
+    await _clean(migrated_db)
+    env = await _setup(migrated_db, tmp_path, _Provider([_finding_json()]))
+    handle = await env.coordinator.request_review(env.request, actor=env.actor)
+
+    # A fresh coordinator (process restart) over the same durable run + event stores projects
+    # the pending review truthfully from the durably-persisted request metadata.
+    from keel_core.state import PostgresEventStore
+
+    restarted = ReviewCoordinator(
+        projects=env.coordinator._projects,  # type: ignore[attr-defined]
+        runs=env.runs,
+        review_service=env.coordinator._reviews,  # type: ignore[attr-defined]
+        artifacts=env.coordinator._artifacts,  # type: ignore[attr-defined]
+        scope_id=_SCOPE,
+        events=PostgresEventStore(migrated_db, _SCOPE),
+    )
+    run = await restarted.get_run(handle.run_id)
+    record = await restarted.build_review_record(run)
+    assert record.source is ReviewSource.branch
+    assert record.head == "main"
+    assert record.model == "test-model"

@@ -267,6 +267,59 @@ async def test_engine_provider_outage_fails_closed() -> None:
         await engine.run(model="m", messages=[{"role": "user", "content": "x"}], max_findings=5)
 
 
+async def test_engine_enforces_token_budget() -> None:
+    from keel_core.protocols import Usage
+    from keel_core.review.models import ReviewBudget
+
+    good = finding_json(file_path="app.py", line_start=2, line_end=2, snippet="return a - b")
+    provider = CapturingProvider(
+        responses=[good], usage=Usage(prompt_tokens=5_000, completion_tokens=5_000, cost_usd=0.0)
+    )
+    engine = ReviewEngine(provider)
+    with pytest.raises(ReviewBoundsExceeded):
+        await engine.run(
+            model="m",
+            messages=[{"role": "user", "content": "x"}],
+            max_findings=5,
+            budget=ReviewBudget(token_budget=100),
+        )
+
+
+async def test_engine_passes_output_cap_to_provider() -> None:
+    from keel_core.review.models import ReviewBudget
+
+    good = finding_json(file_path="app.py", line_start=2, line_end=2, snippet="return a - b")
+    provider = CapturingProvider(responses=[good])
+    engine = ReviewEngine(provider)
+    await engine.run(
+        model="m",
+        messages=[{"role": "user", "content": "x"}],
+        max_findings=5,
+        budget=ReviewBudget(output_max_tokens=1234),
+    )
+    assert provider.requests[0].max_output_tokens == 1234
+
+
+async def test_engine_rejects_empty_object_summary() -> None:
+    provider = CapturingProvider(responses=["{}", "{}"])
+    engine = ReviewEngine(provider)
+    with pytest.raises(ReviewProviderError):
+        await engine.run(model="m", messages=[{"role": "user", "content": "x"}], max_findings=5)
+
+
+def test_review_budget_rejects_unlimited() -> None:
+    from keel_core.review.models import ReviewBudget
+
+    for bad in (
+        {"token_budget": 0},
+        {"output_max_tokens": 0},
+        {"cost_ceiling_usd": 0.0},
+        {"max_provider_attempts": 0},
+    ):
+        with pytest.raises(ReviewBoundsExceeded):
+            ReviewBudget(**bad)
+
+
 def test_parse_result_bounds_findings() -> None:
     findings = [
         {
@@ -339,7 +392,127 @@ def test_evidence_downgrades_line_outside_diff(tmp_path: Path) -> None:
     assert not outcome.kept[0].verified
 
 
-# --- report rendering -------------------------------------------------------------
+def test_evidence_rejects_cross_file_snippet(tmp_path: Path) -> None:
+    """A snippet lifted from a *different* changed file cannot satisfy this finding."""
+    src = tmp_path / "source"
+    src.mkdir(parents=True)
+    _git = __import__("review_support", fromlist=["git"]).git
+    _git(src, "init", "--initial-branch=main", ".")
+    (src / "app.py").write_text("def add(a, b):\n    return a + b\n", encoding="utf-8")
+    (src / "other.py").write_text("SECRET = 'unrelated-marker-1234'\n", encoding="utf-8")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-m", "base")
+    (src / "app.py").write_text("def add(a, b):\n    return a - b\n", encoding="utf-8")
+    (src / "other.py").write_text("SECRET = 'changed-marker-9876'\n", encoding="utf-8")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-m", "change")
+    computer = GitDiffComputer()
+    head = computer.resolve(src, "HEAD", field_name="head")
+    base = computer.parent_of(src, head)
+    diff = computer.compute(src, base, head)
+    # Cite app.py but quote other.py's changed line — present in the diff globally, but not in
+    # the cited file. It must be rejected, not accepted via a global diff match.
+    finding = _finding(
+        file_path="app.py",
+        line_start=2,
+        line_end=2,
+        snippet="SECRET = 'changed-marker-9876'",
+    )
+    outcome = EvidenceVerifier(src, diff).verify((finding,))
+    assert not outcome.kept
+    assert len(outcome.rejected) == 1
+    assert "snippet" in outcome.rejected[0].reason
+
+
+def test_finding_rejects_enormous_line_span() -> None:
+    """A 1..100_000_000 "range" is rejected at construction (never reaches evidence)."""
+    with pytest.raises(ReviewBoundsExceeded):
+        _finding(line_start=1, line_end=100_000_000, snippet="return a - b")
+
+
+# --- PR ref resolution (WS-R finding 2) -------------------------------------------
+
+
+class _FakeRepo:
+    installation_id = 5
+    full_name = "acme/app"
+    project_id = "proj"
+
+
+class _FakeProjects:
+    async def get_project_repository(self, org_id: str, project_id: str):
+        return _FakeRepo() if project_id == "proj" else None
+
+
+async def test_github_pr_resolver_resolves_and_verifies_binding() -> None:
+    from keel_core.review.github_refs import GitHubPullRequestResolver
+
+    class _GH:
+        async def resolve_pull_request(self, installation_id, full_name, number):
+            assert (installation_id, full_name, number) == (5, "acme/app", 7)
+            return {
+                "base": {"sha": "a" * 40, "repo": {"full_name": "acme/app"}},
+                "head": {"sha": "b" * 40, "repo": {"full_name": "fork/app"}},
+            }
+
+    fetched: list[tuple[str, str, str]] = []
+
+    async def _ensure(pid: str, base: str, head: str) -> None:
+        fetched.append((pid, base, head))
+
+    resolver = GitHubPullRequestResolver(
+        projects=_FakeProjects(), github=_GH(), ensure_refs=_ensure
+    )
+    resolved = await resolver.resolve(org_id="o", project_id="proj", agent_id=None, pr_number=7)
+    assert resolved.base_sha == "a" * 40
+    assert resolved.head_sha == "b" * 40
+    assert fetched == [("proj", "a" * 40, "b" * 40)]
+
+
+async def test_github_pr_resolver_rejects_cross_repo_base() -> None:
+    from keel_core.review.github_refs import GitHubPullRequestResolver
+
+    class _GHWrong:
+        async def resolve_pull_request(self, *a, **k):
+            return {
+                "base": {"sha": "a" * 40, "repo": {"full_name": "evil/other"}},
+                "head": {"sha": "b" * 40, "repo": {"full_name": "acme/app"}},
+            }
+
+    resolver = GitHubPullRequestResolver(projects=_FakeProjects(), github=_GHWrong())
+    with pytest.raises(ReviewValidationError):
+        await resolver.resolve(org_id="o", project_id="proj", agent_id=None, pr_number=7)
+
+
+async def test_github_pr_resolver_requires_binding() -> None:
+    from keel_core.review.github_refs import GitHubPullRequestResolver
+
+    class _NoProjects:
+        async def get_project_repository(self, *a, **k):
+            return None
+
+    class _GH:
+        async def resolve_pull_request(self, *a, **k):  # pragma: no cover - never reached
+            raise AssertionError("must not resolve without a binding")
+
+    resolver = GitHubPullRequestResolver(projects=_NoProjects(), github=_GH())
+    with pytest.raises(ReviewValidationError):
+        await resolver.resolve(org_id="o", project_id="proj", agent_id=None, pr_number=7)
+
+
+async def test_build_plan_pr_requires_resolver() -> None:
+    from keel_core.review.refs import build_materialization_plan
+
+    request = ReviewRequest(
+        org_id="o",
+        project_id="p",
+        source=ReviewSource.pull_request,
+        head="7",
+        idempotency_key="k",
+        model="m",
+    )
+    with pytest.raises(ReviewValidationError):
+        await build_materialization_plan(request, default_branch="main", pr_resolver=None)
 
 
 def test_markdown_states_read_only_boundary() -> None:

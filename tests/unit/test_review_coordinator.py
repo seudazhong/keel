@@ -42,6 +42,7 @@ from keel_core.review.jobs import (
     review_idempotency_key,
 )
 from keel_core.runs import InMemoryRunStore, RunStatus
+from keel_core.state import InMemoryEventStore
 
 
 @dataclass
@@ -55,6 +56,8 @@ class Env:
     actor: str
     stranger: str
     project_id: str
+    events: InMemoryEventStore
+    artifacts: LocalArtifactStore
     scope_id: str = "scope-1"
 
 
@@ -80,16 +83,20 @@ async def _bootstrap(tmp_path: Path, provider: CapturingProvider) -> Env:
         artifacts=LocalArtifactStore(storage),
         provider=provider,
     )
+    events = InMemoryEventStore()
+    artifacts = LocalArtifactStore(storage)
+    runs = InMemoryRunStore()
     coordinator = ReviewCoordinator(
         projects=svc,
-        runs=InMemoryRunStore(),
+        runs=runs,
         review_service=review_service,
-        artifacts=LocalArtifactStore(storage),
+        artifacts=artifacts,
         scope_id="scope-1",
+        events=events,
     )
     return Env(
         coordinator=coordinator,
-        runs=coordinator._runs,  # type: ignore[attr-defined]
+        runs=runs,
         provider=provider,
         storage=storage,
         svc=svc,
@@ -97,6 +104,8 @@ async def _bootstrap(tmp_path: Path, provider: CapturingProvider) -> Env:
         actor=admin.id,
         stranger=stranger.id,
         project_id=project.id,
+        events=events,
+        artifacts=artifacts,
     )
 
 
@@ -205,6 +214,48 @@ async def test_execute_failure_marks_run_failed(tmp_path: Path) -> None:
     assert run.error_kind == "ReviewProviderError"
 
 
+async def test_transient_provider_error_does_not_terminalize(tmp_path: Path) -> None:
+    from collections.abc import AsyncIterator
+
+    from keel_core.protocols import ProviderChunk, ProviderRequest
+    from keel_core.review.errors import ReviewProviderUnavailable
+
+    class _TimeoutProvider:
+        def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
+            raise TimeoutError("upstream timed out")
+
+    env = await _bootstrap(tmp_path, _good_provider())
+    # Swap in a transient-failing provider on the review service.
+    env.coordinator._reviews.provider = _TimeoutProvider()  # type: ignore[attr-defined]
+    handle = await env.coordinator.request_review(_request(env), actor=env.actor)
+    with pytest.raises(ReviewProviderUnavailable):
+        await env.coordinator.execute_review(_request(env), run_id=handle.run_id)
+    run = await env.runs.get(handle.run_id)
+    # The run is NOT terminalized as failed — it stays retryable.
+    assert run is not None
+    assert run.status is not RunStatus.completed
+    assert not run.is_terminal
+
+
+async def test_job_handler_retries_transient(tmp_path: Path) -> None:
+    from collections.abc import AsyncIterator
+
+    from keel_core.jobs import RetryableJobError
+    from keel_core.protocols import ProviderChunk, ProviderRequest
+
+    class _TimeoutProvider:
+        def stream(self, request: ProviderRequest) -> AsyncIterator[ProviderChunk]:
+            raise TimeoutError("upstream timed out")
+
+    env = await _bootstrap(tmp_path, _good_provider())
+    env.coordinator._reviews.provider = _TimeoutProvider()  # type: ignore[attr-defined]
+    handle = await env.coordinator.request_review(_request(env), actor=env.actor)
+    payload = ReviewJobPayload.from_request(_request(env), run_id=handle.run_id)
+    handlers = ReviewJobHandlers(env.coordinator)
+    with pytest.raises(RetryableJobError):
+        await handlers.run(_JobCtx(), payload.model_dump(mode="json"))
+
+
 async def test_github_token_never_reaches_provider(tmp_path: Path) -> None:
     env = await _bootstrap(tmp_path, _good_provider())
     handle = await env.coordinator.request_review(_request(env), actor=env.actor)
@@ -214,6 +265,54 @@ async def test_github_token_never_reaches_provider(tmp_path: Path) -> None:
     blob = json.dumps([req.model_dump() for req in env.provider.requests])
     for marker in ("ghs_", "Authorization", "Bearer", "x-access-token", "private_key"):
         assert marker not in blob
+
+
+async def test_projection_is_truthful_after_restart(tmp_path: Path) -> None:
+    env = await _bootstrap(tmp_path, _good_provider())
+    request = _request(env, source=ReviewSource.branch, head="main", base=None, model="test-model")
+    handle = await env.coordinator.request_review(request, actor=env.actor)
+
+    # A fresh coordinator (process restart) over the SAME durable run + event stores must
+    # project the pending review truthfully from the persisted metadata — never fabricated.
+    review_service = ReviewService(
+        worktrees=LocalWorktreeStore(env.storage),
+        artifacts=env.artifacts,
+        provider=env.provider,
+    )
+    restarted = ReviewCoordinator(
+        projects=env.svc,
+        runs=env.runs,
+        review_service=review_service,
+        artifacts=env.artifacts,
+        scope_id=env.scope_id,
+        events=env.events,
+    )
+    run = await restarted.get_run(handle.run_id)
+    record = await restarted.build_review_record(run)
+    assert record.status is ReviewStatus.pending
+    assert record.source is ReviewSource.branch
+    assert record.head == "main"
+    assert record.model == "test-model"
+
+
+async def test_projection_requires_metadata_or_report(tmp_path: Path) -> None:
+    env = await _bootstrap(tmp_path, _good_provider())
+    handle = await env.coordinator.request_review(_request(env), actor=env.actor)
+    run = await env.runs.get(handle.run_id)
+    assert run is not None
+    # With no persisted metadata and no report, projection fails closed (no fabrication).
+    from keel_core.review.errors import ReviewNotFound
+
+    bare = ReviewCoordinator(
+        projects=env.svc,
+        runs=env.runs,
+        review_service=env.coordinator._reviews,  # type: ignore[attr-defined]
+        artifacts=env.artifacts,
+        scope_id=env.scope_id,
+        events=None,
+    )
+    with pytest.raises(ReviewNotFound):
+        await bare.build_review_record(run)
 
 
 # --- job handler ------------------------------------------------------------------

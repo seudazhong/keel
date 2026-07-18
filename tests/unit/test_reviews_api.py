@@ -21,6 +21,7 @@ from keel_core.projects import InMemoryProjectStore, ProjectService
 from keel_core.review import ReviewCoordinator, ReviewService
 from keel_core.review.jobs import ReviewJobPayload
 from keel_core.runs import InMemoryRunStore
+from keel_core.state import InMemoryEventStore
 from keel_server.app import create_app
 
 _ISSUER = "https://issuer.example"
@@ -97,6 +98,7 @@ def env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         review_service=review_service,
         artifacts=LocalArtifactStore(storage),
         scope_id="web:local",
+        events=InMemoryEventStore(),
     )
     app.state.review_coordinator = coordinator
 
@@ -174,3 +176,33 @@ def test_non_member_denied(env) -> None:
         json={"head": "main"},
     )
     assert resp.status_code in (403, 404)
+
+
+def test_disallowed_model_rejected(env) -> None:
+    client, org, project_id = env
+    resp = client.post(
+        f"/v1/projects/{project_id}/reviews",
+        headers=_auth("alice", org),
+        json={"head": "main", "model": "totally-unlisted-model"},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_review_of_other_project_is_404(env) -> None:
+    client, org, project_id = env
+    # Trigger a review under the real project.
+    review_id = client.post(
+        f"/v1/projects/{project_id}/reviews",
+        headers={**_auth("alice", org), "Idempotency-Key": "xp-1"},
+        json={"head": "main"},
+    ).json()["review_id"]
+    # Create a second project and try to read the first project's review through it.
+    other = client.post(
+        "/v1/projects",
+        headers=_auth("alice", org),
+        json={"slug": "proj-y", "display_name": "Y"},
+    ).json()["id"]
+    resp = client.get(
+        f"/v1/projects/{other}/reviews/{review_id}", headers=_auth("alice", org)
+    )
+    assert resp.status_code == 404, resp.text

@@ -180,6 +180,24 @@ class GitHubClient:
             return [r for r in body["repositories"] if isinstance(r, dict)]
         raise GitHubError("unexpected GitHub repositories payload")
 
+    async def get_pull_request(
+        self, *, token: str, full_name: str, number: int
+    ) -> dict[str, Any]:
+        """GET one pull request's metadata (read-only): exact base/head SHAs + repos.
+
+        Read-only control-plane call. The returned ``base.sha``/``head.sha`` are the exact
+        commits the review must run against — a PR number is never used as a Git ref.
+        """
+        response = await self._send(
+            "GET",
+            f"/repos/{full_name}/pulls/{int(number)}",
+            headers=self._installation_headers(token),
+        )
+        self._raise_for_status(response)
+        if not isinstance(response.json_body, dict):
+            raise GitHubError("unexpected GitHub pull-request payload")
+        return response.json_body
+
     @staticmethod
     def _installation_headers(token: str) -> dict[str, str]:
         return {
