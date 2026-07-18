@@ -11,6 +11,7 @@ from keel_sdk.models import (
     AssociateRunRequest,
     CreateAgentRequest,
     CreateGrantRequest,
+    CreateImMappingRequest,
     CreateMessageRequest,
     CreateMessageResponse,
     CreateOrganizationRequest,
@@ -19,6 +20,7 @@ from keel_sdk.models import (
     CreateReviewResponse,
     GrantProjectRequest,
     GrantSummary,
+    ImMappingSummary,
     ImportProjectRequest,
     InstallationSummary,
     InterruptRunResponse,
@@ -386,3 +388,54 @@ class KeelClient:
         )
         response.raise_for_status()
         return response.text
+
+    # --- Durable IM (OneBot/Telegram) channel mappings (M3.7) — additive methods -----
+    async def list_im_mappings(self, org: str) -> list[ImMappingSummary]:
+        """List the org's durable IM channel mappings."""
+        response = await self._client.get("/v1/im/mappings", headers=self._org_headers(org))
+        response.raise_for_status()
+        return [ImMappingSummary.model_validate(item) for item in response.json()]
+
+    async def create_im_mapping(
+        self, org: str, request: CreateImMappingRequest
+    ) -> ImMappingSummary:
+        """Create an org-owned IM channel mapping (binds a chat to an Agent + scope + policy)."""
+        response = await self._client.post(
+            "/v1/im/mappings",
+            json=request.model_dump(),
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return ImMappingSummary.model_validate(response.json())
+
+    async def get_im_mapping(self, org: str, mapping_id: str) -> ImMappingSummary:
+        """Fetch one durable IM channel mapping."""
+        response = await self._client.get(
+            f"/v1/im/mappings/{mapping_id}", headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        return ImMappingSummary.model_validate(response.json())
+
+    async def revoke_im_mapping(self, org: str, mapping_id: str) -> ImMappingSummary:
+        """Revoke an IM channel mapping (its webhook route is invalidated immediately)."""
+        response = await self._client.post(
+            f"/v1/im/mappings/{mapping_id}/revoke", headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        return ImMappingSummary.model_validate(response.json())
+
+    async def disable_im_mapping(self, org: str, mapping_id: str) -> ImMappingSummary:
+        """Disable an IM channel mapping (route removed; re-enable to restore)."""
+        response = await self._client.post(
+            f"/v1/im/mappings/{mapping_id}/disable", headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        return ImMappingSummary.model_validate(response.json())
+
+    async def enable_im_mapping(self, org: str, mapping_id: str) -> ImMappingSummary:
+        """Re-enable a disabled IM channel mapping (republishes its route)."""
+        response = await self._client.post(
+            f"/v1/im/mappings/{mapping_id}/enable", headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        return ImMappingSummary.model_validate(response.json())

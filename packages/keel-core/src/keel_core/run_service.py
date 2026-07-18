@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
@@ -299,6 +299,7 @@ class DurableRunService:
         ttl_seconds: int | None = None,
         run_id: RunId | None = None,
         model: str | None = None,
+        admission_extra: Mapping[str, object] | None = None,
         now: datetime | None = None,
     ) -> AdmitResult:
         """Idempotently admit a run and complete admission with crash-safe repair.
@@ -371,7 +372,7 @@ class DurableRunService:
         # 1) Persist the user turn *before* any dispatch (invariant I2), exactly once — a
         #    concurrent/duplicate admitter loses the durable-append race (DuplicateEventError)
         #    and observes the winner's turn rather than appending a second prompt.
-        await self._ensure_prompt(record.id, session_id, content, model)
+        await self._ensure_prompt(record.id, session_id, content, model, admission_extra)
         # 2) admitted -> queued is an atomic, single-winner transition; only the caller that
         #    wins it dispatches, so N concurrent admitters enqueue the worker job exactly once
         #    (a lost enqueue after this point is repaired by the reconciler, not re-sent here).
@@ -419,7 +420,12 @@ class DurableRunService:
         return AdmitResult(run_id=record.id, created=created, dispatch_pending=dispatch_pending)
 
     async def _ensure_prompt(
-        self, run_id: RunId, session_id: SessionId, content: str, model: str | None = None
+        self,
+        run_id: RunId,
+        session_id: SessionId,
+        content: str,
+        model: str | None = None,
+        admission_extra: Mapping[str, object] | None = None,
     ) -> None:
         """Append the admission user turn exactly once (crash- and concurrency-safe).
 
@@ -432,7 +438,15 @@ class DurableRunService:
             await self._runs.mark_prompt_persisted(run_id)
             return
         try:
-            await admit_run(self._events, session_id, self._scope_id, content, run_id, model=model)
+            await admit_run(
+                self._events,
+                session_id,
+                self._scope_id,
+                content,
+                run_id,
+                model=model,
+                extra=admission_extra,
+            )
         except DuplicateEventError:
             pass  # a concurrent admitter won the durable append; observe, never duplicate
         await self._runs.mark_prompt_persisted(run_id)

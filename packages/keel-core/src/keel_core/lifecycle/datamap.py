@@ -276,6 +276,23 @@ DATA_MAP: tuple[DataMapEntry, ...] = (
         ErasureTreatment.scope_bound,
         "Durable interrupt/cancel/steering requests against a run.",
     ),
+    # --- Durable IM (OneBot/Telegram) routing ----------------------------------------
+    DataMapEntry(
+        "im_reply_intents",
+        "table",
+        policies.RUN,
+        "scope_id",
+        ErasureTreatment.scope_bound,
+        "Durable encrypted IM reply outbox; erased on scope erasure (cascades reply dispatch).",
+    ),
+    DataMapEntry(
+        "im_channel_mappings",
+        "table",
+        policies.IDENTITY,
+        "org_id",
+        ErasureTreatment.org_scoped,
+        "Org-owned IM channel mappings; erased on organization erasure (FK cascade).",
+    ),
     # --- Filesystem ------------------------------------------------------------------
     DataMapEntry(
         "coding_artifacts",

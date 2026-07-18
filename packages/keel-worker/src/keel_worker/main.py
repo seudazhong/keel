@@ -54,7 +54,12 @@ from keel_worker.connectors import reconcile_connectors_tick, register_connector
 from keel_worker.jobs import dispatch_jobs, reconcile_job_dispatch_tick, run_job
 from keel_worker.knowledge import knowledge_job_registry
 from keel_worker.review import reconcile_stranded_reviews_tick, review_artifact_reaper_tick
-from keel_worker.runs import reconcile_dispatch_tick, reconcile_runs_tick, run_interactive
+from keel_worker.runs import (
+    reconcile_dispatch_tick,
+    reconcile_runs_tick,
+    run_interactive,
+    send_im_replies_tick,
+)
 
 logger = logging.getLogger("keel.worker")
 
@@ -335,6 +340,14 @@ async def startup(ctx: dict[str, Any]) -> None:
     from keel_core.run_dispatch import PostgresRunDispatchOutbox
 
     ctx["dispatch_outbox"] = PostgresRunDispatchOutbox(engine)
+    # Durable IM (OneBot/Telegram) reply outbox dispatch: the restart-safe reply sender leases
+    # due reply pointers across every scope from this global index and delivers each through the
+    # mapped provider adapter (see send_im_replies_tick).
+    from keel_core.im_routing import PostgresImReplyDispatchIndex
+    from keel_worker.im_replies import build_im_senders
+
+    ctx["im_reply_dispatch"] = PostgresImReplyDispatchIndex(engine)
+    ctx["im_senders"] = build_im_senders(settings)
     # Global cross-scope Knowledge/durable-job dispatch index: the job reconciler dispatches
     # Knowledge indexing/deletion jobs across every per-Agent scope from here (finding 3), not just
     # the pinned _DURABLE_SCOPE — see reconcile_job_dispatch_tick.
@@ -392,6 +405,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     keyring = (
         keyring_from_settings(settings) if (settings.secret_key or settings.secret_keys) else None
     )
+    ctx["keyring"] = keyring
     connector_schedule_index = PostgresConnectorScheduleIndex(engine)
     ctx["connector_schedule_index"] = connector_schedule_index
     connector_webhook_route_store = PostgresConnectorWebhookRouteStore(engine)
@@ -666,6 +680,7 @@ class WorkerSettings:
         reconcile_job_dispatch_tick,
         review_artifact_reaper_tick,
         reconcile_stranded_reviews_tick,
+        send_im_replies_tick,
         func(
             run_job,
             timeout=get_settings().job_execution_timeout_seconds,
@@ -682,6 +697,7 @@ class WorkerSettings:
         cron(reconcile_job_dispatch_tick, second={0, 30}),
         cron(reconcile_stranded_reviews_tick, second={0, 30}),
         cron(review_artifact_reaper_tick, minute={0}),
+        cron(send_im_replies_tick, second={0, 15, 30, 45}),
     ]
     on_startup = startup
     on_shutdown = shutdown

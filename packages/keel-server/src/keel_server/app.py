@@ -95,6 +95,7 @@ from keel_core.webhooks import InMemoryWebhookReplayStore, PostgresWebhookReplay
 from keel_server.api import connectors as connectors_api
 from keel_server.api import gateway as gateway_api
 from keel_server.api import identity as identity_api
+from keel_server.api import im_routing as im_routing_api
 from keel_server.api import knowledge as knowledge_api
 from keel_server.api import lifecycle as lifecycle_api
 from keel_server.api import oauth as oauth_api
@@ -732,6 +733,48 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             model=settings.default_model,
             rate_limiter=RateLimiter(limit=settings.im_rate_limit),
         )
+    # Durable IM routing (M3.7): when a Postgres substrate is wired, OneBot/Telegram webhooks
+    # resolve the inbound chat through the global route index and admit a durable ``surface="im"``
+    # run (worker-owned, safe Agent, durable encrypted reply) instead of the in-process gateway.
+    if engine is not None:
+        from keel_core.approvals import PostgresApprovalStore as _PgApprovals
+        from keel_core.im_routing import PostgresImMappingStore as _PgMappingStore
+        from keel_core.im_routing import PostgresImRouteIndex as _PgRouteIndex
+        from keel_core.loop import admit as _loop_admit
+        from keel_core.run_service import DurableRunService as _DurableRunService
+        from keel_core.runs import PostgresRunStore as _PgRunStore
+        from keel_core.state import PostgresEventStore as _PgEventStore
+        from keel_server.gateway.durable import DurableImIngress
+
+        _im_engine = engine
+
+        def _im_mapping_store(org_id: str) -> _PgMappingStore:
+            return _PgMappingStore(_im_engine, org_id)
+
+        def _im_run_service(scope_id: str) -> _DurableRunService:
+            async def _enqueue(run_id: str) -> None:
+                enq = getattr(app.state, "enqueue", None)
+                if enq is not None:
+                    await enq("run_interactive", run_id, scope_id)
+
+            return _DurableRunService(
+                run_store=_PgRunStore(_im_engine, scope_id),
+                event_store=_PgEventStore(_im_engine, scope_id),
+                approvals=_PgApprovals(_im_engine, scope_id),
+                scope_id=scope_id,
+                enqueue=_enqueue,
+                admit_fn=_loop_admit,
+                dispatch_outbox=getattr(app.state, "dispatch_outbox", None),
+            )
+
+        app.state.im_route_index = _PgRouteIndex(engine)
+        app.state.im_ingress = DurableImIngress(
+            route_index=app.state.im_route_index,
+            mapping_store_factory=_im_mapping_store,
+            run_service_factory=_im_run_service,
+            cloud_mode=settings.cloud_mode,
+            default_model=settings.default_model,
+        )
     try:
         yield
     finally:
@@ -856,6 +899,7 @@ def create_app() -> FastAPI:
     app.include_router(knowledge_api.router)
     app.include_router(lifecycle_api.router)
     app.include_router(connectors_api.router)
+    app.include_router(im_routing_api.router)
     # Backward-compatible concrete Gmail OAuth routes (published operation ids
     # ``gmail_oauth_connect``/``gmail_oauth_callback``) for old clients. Registered after the
     # generic connector routes so those richer manifest-driven handlers serve ``/v1/connectors/

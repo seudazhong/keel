@@ -85,6 +85,10 @@ class IdentityService:
     def authz(self) -> AuthorizationService:
         return self._authz
 
+    @property
+    def audit(self) -> AuditSink:
+        return self._audit
+
     # --- provisioning ----------------------------------------------------------------
     async def resolve_oidc_user(self, claims: OIDCClaims) -> User:
         """Resolve a verified OIDC subject to a durable user (JIT or explicit-link)."""
@@ -425,6 +429,27 @@ class IdentityService:
         if agent is None or not agent.is_active:
             raise NotFoundError("agent not found")
         return org, agent
+
+    async def authorize_im_run_as(
+        self, org: Organization, agent: Agent, run_as_user_id: str
+    ) -> Membership:
+        """Validate the *run-as* org member a platform admin selected for an IM channel mapping.
+
+        The IM run executes under ``run_as_user_id`` (never the platform admin that provisions the
+        mapping), so that user must be an **active member** of ``org`` and independently authorized
+        to *use* the selected Agent: a **personal** Agent requires its owner, a **team** Agent
+        requires the member's ``use`` capability. Fails closed with :class:`PermissionDenied` (a
+        non-member, revoked member, or an unauthorized member) or :class:`NotFoundError` — so a
+        mapping can only ever run as a member entitled to the Agent, and a later revocation /
+        member removal makes the worker's re-check fail the run closed.
+        """
+        membership = await self._store.get_membership(org.id, run_as_user_id)
+        if membership is None or not membership.is_active:
+            raise PermissionDenied("run-as user is not an active member of the organization")
+        decision = self._authz.can_use_agent(run_as_user_id, membership, agent)
+        if not decision:
+            raise PermissionDenied(decision.reason)
+        return membership
 
     # --- grants ----------------------------------------------------------------------
     async def grant_resource(

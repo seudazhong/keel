@@ -46,6 +46,7 @@ _ENTRY_TO_STEP = {
     "jobs": "jobs",
     "runs": "runs",
     "run_control": "runs",
+    "im_reply_intents": "im_routing",
     "coding_artifacts": "coding_artifacts",
     "tool_spill": "tool_spill",
     "redis_event_streams": "redis_streams",

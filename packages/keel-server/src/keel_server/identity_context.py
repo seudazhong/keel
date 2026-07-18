@@ -27,6 +27,7 @@ from fastapi import Depends, Header, HTTPException, Request, status
 
 from keel_core.errors import PermissionDenied
 from keel_core.identity import (
+    Capability,
     ConflictError,
     IdentityService,
     IdentityValidationError,
@@ -250,6 +251,24 @@ async def require_org(
     return ResolvedOrg(actor=actor, context=context)
 
 
+async def require_org_manage(
+    org: Annotated[ResolvedOrg, Depends(require_org)],
+) -> ResolvedOrg:
+    """Require the selected org membership to hold the ``manage`` capability (else ``403``).
+
+    Mutating org-owned resources (e.g. IM channel-mapping disable/revoke/enable) requires the
+    ``manage`` capability, not mere membership: a viewer/member without ``manage`` is refused with
+    ``403`` while an owner/admin (or an explicitly manage-granted role) passes. Read paths keep
+    using :func:`require_org` (membership + ``read``).
+    """
+    if Capability.manage not in org.context.capabilities:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "this operation requires the 'manage' capability in the selected organization",
+        )
+    return org
+
+
 def identity_http_status(exc: Exception) -> int:
     """Map an identity-domain error to its HTTP status (fail closed to 403/422)."""
     if isinstance(exc, NotFoundError):
@@ -269,6 +288,7 @@ __all__ = [
     "ResolvedOrg",
     "identity_http_status",
     "require_org",
+    "require_org_manage",
     "require_user",
     "resolve_actor",
 ]

@@ -202,7 +202,5 @@ def test_review_of_other_project_is_404(env) -> None:
         headers=_auth("alice", org),
         json={"slug": "proj-y", "display_name": "Y"},
     ).json()["id"]
-    resp = client.get(
-        f"/v1/projects/{other}/reviews/{review_id}", headers=_auth("alice", org)
-    )
+    resp = client.get(f"/v1/projects/{other}/reviews/{review_id}", headers=_auth("alice", org))
     assert resp.status_code == 404, resp.text

@@ -19,6 +19,7 @@ from keel_core.approvals import purge_scope as _purge_approvals
 from keel_core.connector_repository import purge_scope as _purge_connector_state
 from keel_core.consolidation.cursor import purge_scope as _purge_cursor
 from keel_core.consolidation.proposals import purge_scope as _purge_proposals
+from keel_core.im_routing import purge_scope as _purge_im_routing
 from keel_core.jobs import purge_scope as _purge_jobs
 from keel_core.knowledge.store import purge_scope as _purge_knowledge
 from keel_core.memory import purge_scope as _purge_memory
@@ -112,6 +113,9 @@ class ScopePurgeRepository:
 
     async def runs(self, scope_id: str) -> int:
         return await _purge_runs(self._engine, scope_id)
+
+    async def im_routing(self, scope_id: str) -> int:
+        return await _purge_im_routing(self._engine, scope_id)
 
     async def schedules(self, scope_id: str) -> int:
         # Inlined (schedules is owned by keel-scheduler) to avoid a reverse dependency.
