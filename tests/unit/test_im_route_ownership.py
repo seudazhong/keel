@@ -229,6 +229,80 @@ async def test_concurrent_enable_disable_revoke_preserves_route_invariant() -> N
         assert entry is None
 
 
+async def test_transition_active_noop_is_true_noop() -> None:
+    """Re-enabling an already-active mapping is a true no-op: no version bump, no route churn."""
+    prov, mappings, index = _provisioner_pair()
+    mapping = await prov.provision(_mapping("org-a", "m1"))
+    key = route_key("telegram", "bot-9", "4242")
+    entry_before = await index.lookup(key)
+
+    again = await prov.transition(mapping.id, ImMappingStatus.active, org_id="org-a", actor="a")
+    assert again == mapping  # byte-for-byte unchanged, including version
+    assert await mappings.get(mapping.id) == mapping
+    assert await index.lookup(key) == entry_before  # no route reclaim
+
+
+async def test_transition_disabled_noop_is_true_noop() -> None:
+    """Re-disabling an already-disabled mapping is a true no-op: no version bump, no route
+    delete."""
+    prov, mappings, index = _provisioner_pair()
+    mapping = await prov.provision(_mapping("org-a", "m1"))
+    key = route_key("telegram", "bot-9", "4242")
+    disabled = await prov.transition(
+        mapping.id, ImMappingStatus.disabled, org_id="org-a", actor="a"
+    )
+    assert disabled is not None
+    assert await index.lookup(key) is None  # already removed by the real transition
+
+    again = await prov.transition(mapping.id, ImMappingStatus.disabled, org_id="org-a", actor="a")
+    assert again == disabled  # unchanged: same version, still no route
+    assert await mappings.get(mapping.id) == disabled
+    assert await index.lookup(key) is None
+
+
+async def test_transition_revoked_noop_is_true_noop_and_stays_terminal() -> None:
+    """Re-revoking an already-revoked mapping is idempotent; it remains terminal to enable."""
+    prov, mappings, _index = _provisioner_pair()
+    mapping = await prov.provision(_mapping("org-a", "m1"))
+    revoked = await prov.transition(mapping.id, ImMappingStatus.revoked, org_id="org-a", actor="a")
+    assert revoked is not None
+
+    again = await prov.transition(mapping.id, ImMappingStatus.revoked, org_id="org-a", actor="a")
+    assert again == revoked  # unchanged: same version, no re-audit
+    assert await mappings.get(mapping.id) == revoked
+    # Still terminal: a transition out of revoked (even via the no-op path's status) is refused.
+    with pytest.raises(TerminalMappingError):
+        await prov.transition(mapping.id, ImMappingStatus.active, org_id="org-a", actor="a")
+
+
+async def test_transition_noop_still_checks_stale_expected_version() -> None:
+    """A no-op request with a stale expected_version still conflicts (never conceals a change)."""
+    prov, _mappings, _index = _provisioner_pair()
+    mapping = await prov.provision(_mapping("org-a", "m1"))  # version 1
+    await prov.transition(mapping.id, ImMappingStatus.disabled, org_id="org-a", actor="a")  # -> v2
+    await prov.transition(mapping.id, ImMappingStatus.active, org_id="org-a", actor="a")  # -> v3
+
+    # A no-op enable (mapping is already active) citing the stale pre-disable version still
+    # conflicts rather than silently succeeding and concealing the intervening disable/enable.
+    with pytest.raises(StaleMappingError):
+        await prov.transition(
+            mapping.id,
+            ImMappingStatus.active,
+            org_id="org-a",
+            actor="a",
+            expected_version=1,
+        )
+    # Citing the exact current version succeeds as the no-op it is.
+    current = await prov.transition(
+        mapping.id,
+        ImMappingStatus.active,
+        org_id="org-a",
+        actor="a",
+        expected_version=3,
+    )
+    assert current is not None and current.version == 3
+
+
 async def test_reprovision_revoked_mapping_reuses_same_row() -> None:
     prov, mappings, index = _provisioner_pair()
     key = route_key("telegram", "bot-9", "4242")
@@ -736,6 +810,30 @@ def test_manage_member_can_disable_and_enable_with_route_invariant() -> None:
     assert enabled.json()["status"] == "active"
     entry = _run(index.lookup(key))
     assert entry is not None and entry.status is ImMappingStatus.active  # active -> route present
+
+
+def test_repeated_enable_retry_is_noop_no_version_bump_no_audit() -> None:
+    """A retried enable on an already-active mapping never bumps version or re-audits."""
+    client, svc = _seeded_client()
+    org_id, agent_id, owner_id = _seed_org_agent_owner(svc, slug="acme")
+    mapping_id = _provision_mapping(client, org_id, agent_id, owner_id)
+    admin_id = _login_id(client, "amy")
+    _run(svc.add_member(org_id, owner_id, admin_id, MembershipRole.admin))
+    key = route_key("telegram", "bot-9", "4242")
+    index = cast(FastAPI, client.app).state.im_route_index
+
+    before = client.get(f"/v1/im/mappings/{mapping_id}", headers=_oidc("amy", org_id)).json()
+    entry_before = _run(index.lookup(key))
+    sink = svc.audit
+    assert isinstance(sink, InMemoryAuditSink)
+    events_before = len(sink.events)
+
+    # The mapping is already active: a retried enable is a true no-op.
+    again = client.post(f"/v1/im/mappings/{mapping_id}/enable", headers=_oidc("amy", org_id))
+    assert again.status_code == 200, again.text
+    assert again.json()["version"] == before["version"]  # no version bump
+    assert _run(index.lookup(key)) == entry_before  # no route reclaim
+    assert len(sink.events) == events_before  # no audit for a no-op
 
 
 def test_stale_version_status_mutation_conflicts() -> None:

@@ -300,3 +300,51 @@ async def test_revoke_after_completion_denies_terminal_reply(migrated_db: AsyncE
     assert sender.sent == []
     stored = await PostgresImReplyStore(engine, _SCOPE).get(reply_id)
     assert stored is not None and stored.status is ImReplyStatus.failed
+
+
+async def test_queued_run_survives_repeated_active_enable(migrated_db: AsyncEngine) -> None:
+    """A harmless retried ``enable`` on an already-active mapping never bumps its version, so a
+    queued run's admitted binding fingerprint (pinned to the mapping's version at admission)
+    still matches at claim time and the run completes normally."""
+    engine = migrated_db
+    await _seed(engine)
+    created = await _provision(engine)
+    run_id = await _admit(engine, _context_for(created))
+
+    # A retried "enable" (the mapping is already active) is a true no-op: no version bump.
+    reenabled = await PostgresImProvisioner(engine).transition(
+        created.id, ImMappingStatus.active, org_id=_ORG, actor="admin"
+    )
+    assert reenabled is not None and reenabled.version == created.version
+
+    sender = _RecordingSender()
+    ctx = _ctx(engine, _provider(), sender)
+    assert await run_interactive(ctx, run_id, _SCOPE) == RunStatus.completed.value
+    assert await send_im_replies_tick(ctx) == 1
+    assert sender.sent == [("4242", "the answer is 42")]
+
+
+async def test_terminal_reply_survives_noop_status_retry(migrated_db: AsyncEngine) -> None:
+    """A retried no-op status transition after completion never invalidates the persisted,
+    not-yet-delivered terminal reply (no version bump means the reply-time revalidation still
+    matches the binding it was admitted/persisted under)."""
+    engine = migrated_db
+    await _seed(engine)
+    created = await _provision(engine)
+    run_id = await _admit(engine, _context_for(created))
+    sender = _RecordingSender()
+    ctx = _ctx(engine, _provider(), sender)
+    assert await run_interactive(ctx, run_id, _SCOPE) == RunStatus.completed.value
+    reply_id = await _reply_id(engine)
+    assert reply_id is not None
+
+    # A harmless retried "enable" on the still-active mapping before delivery is a no-op.
+    noop = await PostgresImProvisioner(engine).transition(
+        created.id, ImMappingStatus.active, org_id=_ORG, actor="admin"
+    )
+    assert noop is not None and noop.version == created.version
+
+    assert await send_im_replies_tick(ctx) == 1
+    assert sender.sent == [("4242", "the answer is 42")]
+    stored = await PostgresImReplyStore(engine, _SCOPE).get(reply_id)
+    assert stored is not None and stored.status is ImReplyStatus.sent

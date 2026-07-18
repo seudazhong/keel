@@ -907,6 +907,13 @@ class ImProvisioner(Protocol):
         (or is not owned by ``org_id``). Raises :class:`StaleMappingError` on an optimistic-version
         miss, :class:`TerminalMappingError` on an illegal transition out of ``revoked``, and
         :class:`RouteConflictError` when enabling a chat another org has since claimed.
+
+        A request whose ``new_status`` already equals the mapping's current status is a **true
+        no-op**: the row is returned byte-for-byte unchanged (same ``version``, no route
+        claim/release), so a harmless retried ``enable``/``disable``/``revoke`` can never bump the
+        version and stale an in-flight admitted run's binding fingerprint. The optimistic-version
+        check runs *before* this no-op short-circuit, so a stale ``expected_version`` still
+        conflicts (``StaleMappingError``) rather than concealing a concurrent change.
         """
         ...
 
@@ -1170,6 +1177,13 @@ class InMemoryImProvisioner:
             if expected_version is not None and current.version != expected_version:
                 raise StaleMappingError("mapping was modified concurrently")
             ensure_transition_allowed(current.status, new_status)
+            if new_status is current.status:
+                # True no-op: the requested status already holds and this transition never
+                # touches any other security-relevant field (binding/policy/run-as/Agent/chat
+                # are immutable here) — return the row unchanged with no version bump, no route
+                # churn, and no audit, so a harmless enable/disable/revoke retry can never stale
+                # an in-flight admitted run's binding fingerprint.
+                return current
             if new_status is ImMappingStatus.active:
                 # Claim the route *before* the status is visibly active so a chat claimed by
                 # another org while this mapping was disabled fails closed and leaves the mapping
@@ -1816,6 +1830,13 @@ class PostgresImProvisioner:
             if expected_version is not None and current.version != expected_version:
                 raise StaleMappingError("mapping was modified concurrently")
             ensure_transition_allowed(current.status, new_status)
+            if new_status is current.status:
+                # True no-op: the requested status already holds and this transition never
+                # touches any other security-relevant field (binding/policy/run-as/Agent/chat
+                # are immutable here) — commit nothing (no version bump, no route churn) and
+                # return the row unchanged, so a harmless enable/disable/revoke retry can never
+                # stale an in-flight admitted run's binding fingerprint.
+                return current
             if new_status is ImMappingStatus.active:
                 active_entry = replace(current.route_entry(), status=ImMappingStatus.active)
                 claimed = (

@@ -352,6 +352,55 @@ async def test_transition_keeps_route_invariant_versioned_and_terminal(
         )
 
 
+async def test_transition_noop_skips_version_bump_and_route_churn(
+    migrated_db: AsyncEngine,
+) -> None:
+    """A same-status transition is a true no-op: no version bump, no route claim/release."""
+    engine = migrated_db
+    await _seed_two_orgs_two_agents(engine)
+    provisioner = PostgresImProvisioner(engine)
+    route = PostgresImRouteIndex(engine)
+    key = route_key("telegram", "bot-9", "4242")
+
+    created = await provisioner.provision(_mapping("org-a", "agent-org-a"))
+    entry_before = await route.lookup(key)
+
+    # Retrying the active enable on an already-active mapping changes nothing.
+    again = await provisioner.transition(
+        created.id, ImMappingStatus.active, org_id="org-a", actor="admin"
+    )
+    assert again is not None and again.version == created.version
+    assert await route.lookup(key) == entry_before
+
+    disabled = await provisioner.transition(
+        created.id, ImMappingStatus.disabled, org_id="org-a", actor="admin"
+    )
+    assert disabled is not None
+    assert await route.lookup(key) is None
+
+    # Retrying disable on an already-disabled mapping changes nothing either.
+    again_disabled = await provisioner.transition(
+        created.id, ImMappingStatus.disabled, org_id="org-a", actor="admin"
+    )
+    assert again_disabled is not None and again_disabled.version == disabled.version
+    assert await route.lookup(key) is None
+
+    revoked = await provisioner.transition(
+        created.id, ImMappingStatus.revoked, org_id="org-a", actor="admin"
+    )
+    assert revoked is not None
+
+    # Retrying revoke on an already-revoked mapping is idempotent and stays terminal.
+    again_revoked = await provisioner.transition(
+        created.id, ImMappingStatus.revoked, org_id="org-a", actor="admin"
+    )
+    assert again_revoked is not None and again_revoked.version == revoked.version
+    with pytest.raises(TerminalMappingError):
+        await provisioner.transition(
+            created.id, ImMappingStatus.active, org_id="org-a", actor="admin"
+        )
+
+
 async def test_transition_enable_conflict_rolls_back_and_stays_disabled(
     migrated_db: AsyncEngine,
 ) -> None:

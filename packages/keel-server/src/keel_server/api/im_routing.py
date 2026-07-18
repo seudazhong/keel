@@ -347,8 +347,10 @@ async def _set_status(
     enable/disable/revoke. A stale optimistic-version request is refused with ``409``; a transition
     out of the terminal ``revoked`` state with ``409``; enabling a chat another org has re-claimed
     fails closed with an opaque ``409`` and rolls back. The audit is recorded **after** the
-    committed outcome.
+    committed outcome — a no-op retry (the requested status already holds) commits nothing and is
+    never audited.
     """
+    before = await _mapping_store(request, org.org_id).get(mapping_id)
     try:
         updated = await _provisioner(request, org.org_id).transition(
             mapping_id,
@@ -369,21 +371,26 @@ async def _set_status(
         ) from None
     if updated is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "mapping not found")
-    # Audit only the committed outcome: enabling re-claimed the route; disable/revoke released it.
-    action = (
-        AuditAction.im_route_claimed
-        if new_status is ImMappingStatus.active
-        else AuditAction.im_route_released
-    )
-    _identity(request).audit.record(
-        AuditEvent(
-            action,
-            org.user_id,
-            org.org_id,
-            mapping_id,
-            {"status": new_status.value, "route": updated.route_key[:12]},
+    # A version bump is the ground truth for "something actually changed"; a no-op retry (the
+    # requested status already held) returns the row unchanged and must never be audited.
+    changed = before is None or updated.version != before.version
+    if changed:
+        # Audit only the committed outcome: enabling re-claimed the route; disable/revoke
+        # released it.
+        action = (
+            AuditAction.im_route_claimed
+            if new_status is ImMappingStatus.active
+            else AuditAction.im_route_released
         )
-    )
+        _identity(request).audit.record(
+            AuditEvent(
+                action,
+                org.user_id,
+                org.org_id,
+                mapping_id,
+                {"status": new_status.value, "route": updated.route_key[:12]},
+            )
+        )
     return MappingResponse.of(updated)
 
 
