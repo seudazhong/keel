@@ -83,8 +83,15 @@ REVIEW_REQUEST_MARKER = "review_request"
 # policy envelope (token/output budget, cost ceiling, provider-attempt/repair count) so the
 # exact values a review was admitted under can be reconstructed for stranded re-dispatch. A
 # record without these fields (legacy v1 / pre-budget) is reconstructed **fail-closed** (see
-# ``load_request_metadata``) rather than back-filled with larger implicit defaults.
-REVIEW_REQUEST_METADATA_VERSION = 2
+# ``load_request_metadata``) rather than back-filled with larger implicit defaults. v3 adds
+# ``effective_agent_id`` — the CANONICAL EFFECTIVE agent (``request.agent_id or
+# DEFAULT_REVIEW_AGENT_ID``, also bound into :func:`review_fingerprint`) recorded ALONGSIDE the
+# raw ``agent_id`` field purely for audit/consistency (reconstruction cross-checks the two and
+# fails closed on a mismatch — see ``_reconstruct_request``); it is never fed into authorization,
+# which always replays the RAW field so an actor-direct (``agent_id=None``) review's stranded
+# re-dispatch never spuriously requires a real Agent grant. A v2 record predates this field
+# entirely and has nothing to cross-check, so it is reconstructed as-is (exact compatibility).
+REVIEW_REQUEST_METADATA_VERSION = 3
 
 # A durable job-lease heartbeat must fire safely *below* the lease expiry — never on/after it.
 # The interval is derived from the ACTUAL job lease (``min(lease/3, cap)``): a third of the
@@ -138,9 +145,13 @@ def review_fingerprint(request: ReviewRequest) -> str:
     """Immutable binding of a review request so a reused idempotency key can't be hijacked.
 
     Binds the full budget/policy envelope (token/output budget, cost ceiling, provider-attempt/
-    repair count) in addition to the identity/source/model, so a retry that reuses an
-    idempotency key but presents a *different* budget is a conflict rather than silently reusing
-    the original run under mismatched limits.
+    repair count) AND the CANONICAL EFFECTIVE ``agent_id`` (``request.agent_id or
+    DEFAULT_REVIEW_AGENT_ID`` — the identity the run is actually admitted/authorized under, see
+    :meth:`ReviewCoordinator.request_review`) in addition to the identity/source/model, so a
+    retry that reuses an idempotency key but presents a *different* budget OR a *different*
+    Agent is a conflict rather than silently reusing the original run under mismatched limits or
+    a mismatched Agent identity. The canonical form means an omitted ``agent_id`` and the
+    explicit default string fingerprint identically (no spurious conflict from that alone).
     """
     payload = json.dumps(
         {
@@ -150,6 +161,7 @@ def review_fingerprint(request: ReviewRequest) -> str:
             "head": request.head,
             "base": request.base or "",
             "model": request.model,
+            "agent_id": request.agent_id or DEFAULT_REVIEW_AGENT_ID,
             "max_findings": request.max_findings,
             "max_diff_bytes": request.max_diff_bytes,
             "token_budget": request.token_budget,
@@ -276,7 +288,20 @@ class ReviewCoordinator:
                     "head": request.head,
                     "base": request.base,
                     "model": request.model,
+                    # RAW request agent_id (``None`` preserved): this is what re-authorization
+                    # replays through (:meth:`load_request_metadata` -> ``execute_review`` ->
+                    # ``authorize_review``), and ``None`` there means "actor acting directly" —
+                    # NOT the same as an explicit Agent named after the default placeholder. Never
+                    # canonicalize this field; doing so would force every actor-direct review's
+                    # stranded-reconciliation replay through a non-existent Agent grant check.
                     "agent_id": request.agent_id,
+                    # CANONICAL EFFECTIVE agent_id (v3): the identity this run is actually
+                    # admitted/audited under (``request.agent_id or DEFAULT_REVIEW_AGENT_ID`` —
+                    # mirrors the run record's own ``agent_id`` column and the fingerprint).
+                    # Recorded alongside the raw field purely for audit/consistency; reconstruction
+                    # cross-checks it against the raw field (fail-closed on mismatch/tamper) but
+                    # never feeds it into authorization.
+                    "effective_agent_id": request.agent_id or DEFAULT_REVIEW_AGENT_ID,
                     "max_findings": request.max_findings,
                     "max_diff_bytes": request.max_diff_bytes,
                     # Full budget/policy envelope: the exact values the review was admitted
@@ -326,6 +351,20 @@ class ReviewCoordinator:
                 "review request metadata missing budget envelope; failing closed run=%s", run_id
             )
             return None
+        raw_agent_id = str(meta["agent_id"]) if meta.get("agent_id") else None
+        # ``effective_agent_id`` (v3+) is an audit companion to the raw field, not an input to
+        # authorization: cross-check it and fail closed on a mismatch/tamper. A v2 record
+        # (predates this field entirely) has nothing to cross-check against — it is reconstructed
+        # from its raw ``agent_id`` exactly as before (exact version compatibility).
+        effective_agent_id = meta.get("effective_agent_id")
+        if effective_agent_id is not None and str(effective_agent_id) != (
+            raw_agent_id or DEFAULT_REVIEW_AGENT_ID
+        ):
+            logger.warning(
+                "review request metadata effective_agent_id mismatch; failing closed run=%s",
+                run_id,
+            )
+            return None
         try:
             return ReviewRequest(
                 org_id=str(meta["org_id"]),
@@ -335,7 +374,7 @@ class ReviewCoordinator:
                 base=str(meta["base"]) if meta.get("base") is not None else None,
                 model=str(meta["model"]),
                 idempotency_key=f"review-meta:{run_id}",
-                agent_id=str(meta["agent_id"]) if meta.get("agent_id") else None,
+                agent_id=raw_agent_id,
                 max_findings=int(meta.get("max_findings", 0)) or 1,
                 max_diff_bytes=int(meta.get("max_diff_bytes", 0)) or 1,
                 token_budget=int(meta["token_budget"]),
@@ -393,45 +432,14 @@ class ReviewCoordinator:
             raise ReviewLeaseLost(
                 f"review run is contended; another worker holds the lease: {run_id}"
             )
-        # Re-authorize at claim time UNDER the lease: access revoked since admission fails closed.
-        # A revocation must terminalize the run durably (cancelled) before the job fails
-        # permanently, so the run never lingers admitted until its TTL and no reclaim can run it.
-        try:
-            project = await self._projects.authorize_review(
-                record.org_id, record.actor, request.project_id, agent_id=request.agent_id
-            )
-        except PermissionDenied as exc:
-            await self._runs.terminalize(
-                lease,
-                status=RunStatus.cancelled,
-                stop_reason="authorization_revoked",
-                now=self._clock(),
-                error_kind="authorization_revoked",
-                error_message=_safe_error_message(exc),
-            )
-            self._audit.record(
-                ReviewAuditEvent(
-                    ReviewAuditAction.review_failed,
-                    record.actor,
-                    record.org_id,
-                    run_id,
-                    {"project_id": request.project_id, "error_kind": "authorization_revoked"},
-                )
-            )
-            raise
-        handle = project.active_git_handle or project.id
-        coding_run_id = worktree_storage_id(run_id)
-        self._audit.record(
-            ReviewAuditEvent(
-                ReviewAuditAction.review_started,
-                record.actor,
-                record.org_id,
-                run_id,
-                {"project_id": request.project_id, "source": request.source.value},
-            )
-        )
-        # Renew the lease well before expiry so a long review keeps its fence; a lost renewal
-        # trips ``keeper.lost`` and the run is abandoned without terminalizing (reclaimable).
+        # Job heartbeat/cancellation supervision (and the run-lease keeper) must be LIVE before
+        # authorization, PR resolution, the GitHub fetch, or Git materialization ever run — every
+        # one of those can block on slow I/O (a control-plane HTTP call, a `git fetch` subprocess),
+        # and a cancellation / lost lease reaching us mid-flight must abort that work rather than
+        # let it complete unobserved with an effect written under a stale fence. Both keepers are
+        # therefore started immediately after the run lease is claimed, each supervised
+        # independently: the run-lease keeper watches OUR fence on the run row; the job-lease
+        # keeper watches the durable JOB lease and cancels the whole review body (below) on loss.
         keeper = _LeaseKeeper(
             run_store=self._runs,
             lease=lease,
@@ -453,33 +461,54 @@ class ReviewCoordinator:
             completion_tokens=record.completion_tokens,
             cost_usd=record.cost_usd,
         )
+
+        async def _run_review_body() -> ReviewOutcome:
+            # Re-authorize at claim time UNDER the lease: access revoked since admission fails
+            # closed. This, the PR resolution / GitHub fetch, and the Git materialization all run
+            # INSIDE the task the job-lease keeper below is bound to, so a cancellation / lost
+            # job lease aborts them exactly like it would abort the review itself.
+            project = await self._projects.authorize_review(
+                record.org_id, record.actor, request.project_id, agent_id=request.agent_id
+            )
+            handle = project.active_git_handle or project.id
+            coding_run_id = worktree_storage_id(run_id)
+            self._audit.record(
+                ReviewAuditEvent(
+                    ReviewAuditAction.review_started,
+                    record.actor,
+                    record.org_id,
+                    run_id,
+                    {"project_id": request.project_id, "source": request.source.value},
+                )
+            )
+            plan = await build_materialization_plan(
+                request,
+                default_branch=getattr(project, "default_branch", None),
+                pr_resolver=self._pr_resolver,
+            )
+            return await self._reviews.review(
+                request,
+                run_id=run_id,
+                coding_run_id=coding_run_id,
+                project_handle=handle,
+                review_id=run_id,
+                now=self._clock(),
+                plan=plan,
+                prior_usage=prior_usage,
+            )
+
         try:
             try:
-                plan = await build_materialization_plan(
-                    request,
-                    default_branch=getattr(project, "default_branch", None),
-                    pr_resolver=self._pr_resolver,
-                )
-                review_task: asyncio.Task[ReviewOutcome] = asyncio.ensure_future(
-                    self._reviews.review(
-                        request,
-                        run_id=run_id,
-                        coding_run_id=coding_run_id,
-                        project_handle=handle,
-                        review_id=run_id,
-                        now=self._clock(),
-                        plan=plan,
-                        prior_usage=prior_usage,
-                    )
-                )
+                work_task: asyncio.Task[ReviewOutcome] = asyncio.ensure_future(_run_review_body())
                 if job_keeper is not None:
-                    # Periodically heartbeat the durable JOB lease throughout the review; a lost
-                    # job lease / cancellation cancels the in-flight review task (abort, no
-                    # terminal write under a superseded fence).
-                    job_keeper.bind(review_task)
+                    # Periodically heartbeat the durable JOB lease throughout authorization, PR
+                    # resolution/GitHub fetch, Git materialization, AND the review itself; a lost
+                    # job lease / cancellation cancels the whole in-flight task (abort, no
+                    # terminal write under a superseded fence, no further HTTP/Git effect).
+                    job_keeper.bind(work_task)
                     job_keeper.start()
                 try:
-                    outcome = await review_task
+                    outcome = await work_task
                 except asyncio.CancelledError:
                     # ``asyncio.CancelledError`` is a ``BaseException`` (not ``Exception``) so the
                     # single job-signal handler in the ``except Exception`` below would miss it.
@@ -514,6 +543,32 @@ class ReviewCoordinator:
                     if isinstance(exc, ReviewLeaseLost):
                         raise
                     raise ReviewLeaseLost(f"review lease lost during execution: {run_id}") from exc
+                if isinstance(exc, PermissionDenied):
+                    # Access was revoked between admission and claim/authorize: a revocation
+                    # must terminalize the run durably (cancelled, not failed — the review never
+                    # ran on its own merits) before the job fails permanently, so the run never
+                    # lingers admitted until its TTL and no reclaim can run it.
+                    await self._runs.terminalize(
+                        lease,
+                        status=RunStatus.cancelled,
+                        stop_reason="authorization_revoked",
+                        now=self._clock(),
+                        error_kind="authorization_revoked",
+                        error_message=_safe_error_message(exc),
+                    )
+                    self._audit.record(
+                        ReviewAuditEvent(
+                            ReviewAuditAction.review_failed,
+                            record.actor,
+                            record.org_id,
+                            run_id,
+                            {
+                                "project_id": request.project_id,
+                                "error_kind": "authorization_revoked",
+                            },
+                        )
+                    )
+                    raise
                 if _is_retryable(exc):
                     # Transient provider/infra failure: do NOT terminalize; the durable job
                     # retries until success or attempts are exhausted. Durably charge any partial

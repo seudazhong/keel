@@ -459,6 +459,40 @@ async def test_postgres_dispatchable_and_exhausted_queries(
     assert await store.exhausted(_NOW, 100) == ["expired-done"]
 
 
+async def test_postgres_dispatchable_excludes_kinds_at_sql_level(
+    migrated_db: AsyncEngine,
+) -> None:
+    """A capability-gap kind (e.g. ``review.run`` on a review-disabled worker) is filtered at
+    the SQL level: it stays out of the returned batch (left ``queued``/expired-lease untouched
+    for a capable worker), while an unlisted kind is unaffected."""
+    scope = "scope:dispatch-exclude"
+    store = PostgresJobStore(migrated_db, scope)
+    plain, _ = await store.enqueue_once(
+        kind="test.echo",
+        payload={},
+        target_session_id=None,
+        idempotency_key="plain",
+        max_attempts=3,
+        now=_NOW,
+    )
+    gapped, _ = await store.enqueue_once(
+        kind="review.run",
+        payload={},
+        target_session_id=None,
+        idempotency_key="gapped",
+        max_attempts=3,
+        now=_NOW,
+    )
+
+    excluded = await store.dispatchable(_NOW, 100, exclude_kinds=["review.run"])
+    assert plain.id in excluded
+    assert gapped.id not in excluded
+
+    unfiltered = await store.dispatchable(_NOW, 100)
+    assert plain.id in unfiltered
+    assert gapped.id in unfiltered
+
+
 async def _pg_job(
     store: PostgresJobStore,
     key: str,

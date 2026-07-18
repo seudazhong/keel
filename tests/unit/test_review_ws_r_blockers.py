@@ -41,6 +41,7 @@ from keel_core.projects.github.urls import UntrustedUrlError, normalize_https_ur
 from keel_core.protocols import ProviderChunk, ProviderRequest, Usage
 from keel_core.review import ReviewCoordinator, ReviewRequest, ReviewService, ReviewSource
 from keel_core.review.coordinator import (
+    DEFAULT_REVIEW_AGENT_ID,
     REVIEW_REQUEST_MARKER,
     REVIEW_REQUEST_METADATA_VERSION,
     _heartbeat_interval,
@@ -854,6 +855,182 @@ class TestBudgetMetadataAndFingerprint:
                 assert meta["version"] == REVIEW_REQUEST_METADATA_VERSION
                 found = True
         assert found
+
+
+# =============================================================================================
+# Final blocker 5 — canonical effective agent_id bound into the fingerprint + request metadata
+# =============================================================================================
+class TestAgentIdFingerprintAndMetadata:
+    def test_fingerprint_binds_agent_id(self) -> None:
+        base = ReviewRequest(
+            org_id="o",
+            project_id="p",
+            source=ReviewSource.branch,
+            head="main",
+            idempotency_key="k",
+            model="m",
+            agent_id="agent-a",
+        )
+        other = ReviewRequest(
+            org_id="o",
+            project_id="p",
+            source=ReviewSource.branch,
+            head="main",
+            idempotency_key="k",
+            model="m",
+            agent_id="agent-b",
+        )
+        assert review_fingerprint(base) != review_fingerprint(other)
+
+    def test_fingerprint_canonicalizes_default_agent(self) -> None:
+        # An omitted agent_id and the explicit default placeholder are the SAME effective
+        # identity: they must fingerprint identically (no spurious conflict from that alone).
+        omitted = ReviewRequest(
+            org_id="o",
+            project_id="p",
+            source=ReviewSource.branch,
+            head="main",
+            idempotency_key="k",
+            model="m",
+        )
+        explicit_default = ReviewRequest(
+            org_id="o",
+            project_id="p",
+            source=ReviewSource.branch,
+            head="main",
+            idempotency_key="k",
+            model="m",
+            agent_id=DEFAULT_REVIEW_AGENT_ID,
+        )
+        assert review_fingerprint(omitted) == review_fingerprint(explicit_default)
+
+    async def test_same_key_different_agent_is_a_conflict(self, tmp_path: Path) -> None:
+        env = await _bootstrap(tmp_path, _good_provider())
+
+        async def _permissive_authorize_resource(*_a: object, **_k: object) -> None:
+            return None
+
+        # Bypass real Agent/grant setup (irrelevant to this test) so it isolates the
+        # fingerprint-conflict behavior on a reused idempotency key with a different Agent.
+        env.svc._authorize_resource = _permissive_authorize_resource  # type: ignore[attr-defined]
+        await env.coordinator.request_review(
+            _request(env, idempotency_key="dup-agent", agent_id="agent-a"), actor=env.actor
+        )
+        # Re-using the idempotency key with a DIFFERENT Agent mismatches the immutable
+        # fingerprint (agent_id is bound into it) and is rejected rather than silently reused
+        # under a different Agent's identity/authorization.
+        with pytest.raises(RunAdmissionConflict):
+            await env.coordinator.request_review(
+                _request(env, idempotency_key="dup-agent", agent_id="agent-b"), actor=env.actor
+            )
+
+    async def test_metadata_preserves_raw_agent_id_for_reauthorization(
+        self, tmp_path: Path
+    ) -> None:
+        # The RAW (possibly None) agent_id must round-trip exactly: it is what a stranded
+        # re-dispatch replays through authorize_review, and None there means "actor acting
+        # directly" — never rewritten to the canonical placeholder.
+        env = await _bootstrap(tmp_path, _good_provider())
+        handle = await env.coordinator.request_review(_request(env), actor=env.actor)
+        loaded = await env.coordinator.load_request_metadata(handle.run_id)
+        assert loaded is not None
+        assert loaded.agent_id is None
+
+    async def test_metadata_records_effective_agent_id_alongside_raw(self, tmp_path: Path) -> None:
+        env = await _bootstrap(tmp_path, _good_provider())
+        handle = await env.coordinator.request_review(_request(env), actor=env.actor)
+        found = False
+        async for event in env.events.read(handle.run_id):  # type: ignore[attr-defined]
+            meta = event.payload.get(REVIEW_REQUEST_MARKER)
+            if isinstance(meta, dict):
+                assert meta["agent_id"] is None
+                assert meta["effective_agent_id"] == DEFAULT_REVIEW_AGENT_ID
+                found = True
+        assert found
+
+    async def test_legacy_v2_record_without_effective_agent_id_is_exact_compatible(
+        self, tmp_path: Path
+    ) -> None:
+        from datetime import datetime as _dt
+
+        from keel_core.events import Event, EventType
+
+        env = await _bootstrap(tmp_path, _good_provider())
+        run_id = "rev_legacy_v2_agent"
+        # A v2 record: full budget envelope present, but predates ``effective_agent_id``.
+        await env.events.append(  # type: ignore[attr-defined]
+            Event(
+                type=EventType.run_started,
+                seq=0,
+                session_id=run_id,
+                scope_id=env.scope_id,
+                run_id=run_id,
+                ts=_dt.now(UTC),
+                payload={
+                    REVIEW_REQUEST_MARKER: {
+                        "version": 2,
+                        "org_id": env.org,
+                        "project_id": env.project_id,
+                        "source": "branch",
+                        "head": "main",
+                        "base": None,
+                        "model": "test-model",
+                        "agent_id": None,
+                        "max_findings": 5,
+                        "max_diff_bytes": 1000,
+                        "token_budget": 1000,
+                        "output_max_tokens": 100,
+                        "cost_ceiling_usd": 1.0,
+                        "max_provider_attempts": 1,
+                    },
+                    "dedup_key": f"review-meta:{run_id}",
+                },
+            )
+        )
+        # Exact version compatibility: nothing to cross-check, reconstructed from the raw field.
+        loaded = await env.coordinator.load_request_metadata(run_id)
+        assert loaded is not None
+        assert loaded.agent_id is None
+
+    async def test_tampered_effective_agent_id_fails_closed(self, tmp_path: Path) -> None:
+        from datetime import datetime as _dt
+
+        from keel_core.events import Event, EventType
+
+        env = await _bootstrap(tmp_path, _good_provider())
+        run_id = "rev_tampered_agent"
+        await env.events.append(  # type: ignore[attr-defined]
+            Event(
+                type=EventType.run_started,
+                seq=0,
+                session_id=run_id,
+                scope_id=env.scope_id,
+                run_id=run_id,
+                ts=_dt.now(UTC),
+                payload={
+                    REVIEW_REQUEST_MARKER: {
+                        "version": 3,
+                        "org_id": env.org,
+                        "project_id": env.project_id,
+                        "source": "branch",
+                        "head": "main",
+                        "base": None,
+                        "model": "test-model",
+                        "agent_id": None,
+                        # Inconsistent with agent_id=None -> DEFAULT_REVIEW_AGENT_ID: fail closed.
+                        "effective_agent_id": "some-other-agent",
+                        "max_findings": 5,
+                        "max_diff_bytes": 1000,
+                        "token_budget": 1000,
+                        "output_max_tokens": 100,
+                        "cost_ceiling_usd": 1.0,
+                        "max_provider_attempts": 1,
+                    },
+                    "dedup_key": f"review-meta:{run_id}",
+                },
+            )
+        )
+        assert await env.coordinator.load_request_metadata(run_id) is None
 
 
 # =============================================================================================

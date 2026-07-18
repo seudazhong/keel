@@ -39,7 +39,9 @@ from keel_core.jobs import (
     retry_delay_seconds,
 )
 from keel_core.knowledge.jobs import KNOWLEDGE_DELETE_KIND, KNOWLEDGE_INGEST_KIND
+from keel_core.lifecycle.jobs import ERASURE_KIND
 from keel_core.observability import get_tracer
+from keel_core.projects.jobs import PROJECT_SYNC_KIND
 from keel_core.review.jobs import REVIEW_RUN_KIND
 from keel_core.scoping import ScopeValidationError, validate_scope_id
 
@@ -62,6 +64,24 @@ _CROSS_SCOPE_JOB_KINDS = frozenset(
         KNOWLEDGE_DELETE_KIND,
         CONNECTOR_SYNC_JOB_KIND,
         CONNECTOR_RENEW_JOB_KIND,
+        REVIEW_RUN_KIND,
+    }
+)
+
+# Every durable job kind the PRODUCT defines, independent of which are registered on THIS
+# worker process's :class:`JobRegistry` (that depends on this process's config/capabilities —
+# e.g. ``review.run`` is only registered when ``KEEL_REVIEW_ENABLED`` is true). Distinguishing
+# "known everywhere, just not enabled on this worker" from "genuinely unsupported/foreign" lets
+# a capability-disabled worker skip a known kind (leaving it queued for a capable worker) while
+# still failing a truly unrecognized kind closed, per the existing unknown-kind policy.
+_ALL_JOB_KINDS = frozenset(
+    {
+        KNOWLEDGE_INGEST_KIND,
+        KNOWLEDGE_DELETE_KIND,
+        CONNECTOR_SYNC_JOB_KIND,
+        CONNECTOR_RENEW_JOB_KIND,
+        ERASURE_KIND,
+        PROJECT_SYNC_KIND,
         REVIEW_RUN_KIND,
     }
 )
@@ -492,6 +512,20 @@ async def run_job(ctx: dict[str, Any], scope_id: str, job_id: str) -> str:
     }:
         return before.status.value
     definition = registry.get(before.kind)
+    if definition is None and before.kind in _ALL_JOB_KINDS:
+        # A known product kind this worker's registry just doesn't have registered right now
+        # (e.g. ``review.run`` on a review-disabled worker) — never claim it: claiming would
+        # consume an attempt and immediately fail it terminally as "unknown", stranding the job
+        # instead of leaving it queued for a capable worker's dispatch/claim. This never applies
+        # to a genuinely unrecognized kind, which still falls through to the claim + fail-closed
+        # path below.
+        logger.info(
+            "run_job skipping capability-disabled kind=%s scope=%s job=%s",
+            before.kind,
+            scope_id,
+            job_id,
+        )
+        return "capability_unavailable"
     lease_seconds = (
         definition.lease_seconds
         if definition is not None
@@ -683,7 +717,16 @@ async def dispatch_jobs(ctx: dict[str, Any]) -> int:
     enqueue: EnqueueJob = ctx["enqueue"]
     processed = 0
 
-    dispatchable_ids = await _without_exception_context(lambda: store.dispatchable(now, limit))
+    # Never nominate a job whose kind is a recognized product kind this worker's registry lacks
+    # (e.g. ``review.run`` when review is disabled here): filtering at the SQL/dispatcher level
+    # leaves those rows queued/expired-lease untouched for a capable worker's tick, instead of
+    # dispatching them only to be claimed and immediately failed closed as "unknown". A
+    # genuinely unrecognized kind is NOT excluded, so it is still dispatched and falls through to
+    # the existing unknown-kind fail-closed policy in ``run_job``.
+    capability_gap = _ALL_JOB_KINDS.difference(registry.kinds())
+    dispatchable_ids = await _without_exception_context(
+        lambda: store.dispatchable(now, limit, exclude_kinds=capability_gap)
+    )
     for job_id in dispatchable_ids:
         try:
             await _without_exception_context(partial(enqueue, "run_job", scope_id, job_id))

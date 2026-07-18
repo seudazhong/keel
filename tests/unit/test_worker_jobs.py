@@ -25,6 +25,7 @@ from keel_core.jobs import (
     PermanentJobError,
     RetryableJobError,
 )
+from keel_core.review.jobs import REVIEW_RUN_KIND
 from keel_worker.jobs import JobContext, JobDefinition, JobRegistry, dispatch_jobs, run_job
 
 _NOW = datetime(2026, 7, 14, 9, 0, tzinfo=UTC)
@@ -1431,9 +1432,9 @@ async def test_dispatcher_queries_clock_and_limit_then_enqueues_due_and_reclaima
     real_dispatchable = store.dispatchable
     real_exhausted = store.exhausted
 
-    async def dispatchable(now: datetime, limit: int) -> list[str]:
+    async def dispatchable(now: datetime, limit: int, *, exclude_kinds: object = ()) -> list[str]:
         queries.append(("dispatchable", now, limit))
-        return await real_dispatchable(now, limit)
+        return await real_dispatchable(now, limit, exclude_kinds=exclude_kinds)
 
     async def exhausted(now: datetime, limit: int) -> list[str]:
         queries.append(("exhausted", now, limit))
@@ -1823,3 +1824,112 @@ async def test_dispatcher_redacts_cancelled_finalizer_message(
     assert str(caught.value) == ""
     assert "FINALIZER-SECRET" not in formatted
     assert (await store.get(job_id)).status is JobStatus.running  # type: ignore[union-attr]
+
+
+# =============================================================================================
+# Capability-disabled kinds (e.g. ``review.run`` on a review-disabled worker) are skipped, not
+# claimed-and-failed: they stay queued for a capable worker, unlike a genuinely unknown kind.
+# =============================================================================================
+def _review_registry() -> JobRegistry:
+    registry = JobRegistry()
+    registry.register(JobDefinition(kind=REVIEW_RUN_KIND, handler=_handler))
+    return registry
+
+
+async def test_run_job_skips_capability_disabled_known_kind_without_claiming() -> None:
+    # A review-DISABLED worker's registry never has ``review.run`` registered.
+    store = InMemoryJobStore("web:local")
+    job_id = await _enqueued_job(store, key="capability-gap", kind=REVIEW_RUN_KIND)
+
+    result = await run_job(
+        _ctx(store, JobRegistry(), _Clock(_NOW), []),
+        "web:local",
+        job_id,
+    )
+
+    assert result == "capability_unavailable"
+    row = await store.get(job_id)
+    # Never claimed: still queued, attempt never incremented, no terminal failure recorded.
+    assert row is not None
+    assert row.status is JobStatus.queued
+    assert row.attempt == 0
+    assert row.error_kind is None
+
+
+async def test_run_job_claims_and_runs_known_kind_when_capability_enabled() -> None:
+    # A review-ENABLED worker's registry (mirroring `register_review_jobs`) claims it normally.
+    store = InMemoryJobStore("web:local")
+    job_id = await _enqueued_job(store, key="capability-ok", kind=REVIEW_RUN_KIND)
+
+    result = await run_job(
+        _ctx(store, _review_registry(), _Clock(_NOW), []),
+        "web:local",
+        job_id,
+    )
+
+    assert result == JobStatus.succeeded.value
+    row = await store.get(job_id)
+    assert row is not None and row.attempt == 1
+
+
+async def test_dispatch_jobs_excludes_capability_disabled_kind_leaving_it_queued() -> None:
+    # The dispatcher must never nominate a known-but-locally-unsupported kind for enqueue: it
+    # should be filtered at the SQL/dispatcher level, leaving it queued for a capable worker.
+    store = InMemoryJobStore("web:local")
+    review_job_id = await _enqueued_job(store, key="disabled-review", kind=REVIEW_RUN_KIND)
+    plain_job_id = await _enqueued_job(store, key="disabled-plain")
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    ctx = _ctx(store, JobRegistry(), _Clock(_NOW), enqueued)
+
+    assert await dispatch_jobs(ctx) == 1
+    assert {str(args[1]) for _, args, _ in enqueued} == {plain_job_id}
+    review_row = await store.get(review_job_id)
+    assert review_row is not None
+    assert review_row.status is JobStatus.queued
+    assert review_row.attempt == 0
+
+
+async def test_dispatch_jobs_dispatches_capability_enabled_kind() -> None:
+    store = InMemoryJobStore("web:local")
+    review_job_id = await _enqueued_job(store, key="enabled-review", kind=REVIEW_RUN_KIND)
+    enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    ctx = _ctx(store, _review_registry(), _Clock(_NOW), enqueued)
+
+    assert await dispatch_jobs(ctx) == 1
+    assert {str(args[1]) for _, args, _ in enqueued} == {review_job_id}
+
+
+async def test_multiple_workers_disabled_then_enabled_eventually_dispatches_review_job() -> None:
+    """A review-disabled worker's tick skips the job; a review-enabled worker's tick claims it.
+
+    Simulates two worker processes sharing one durable store (one per ``dispatch_jobs``/
+    ``run_job`` call with its own process-local registry), as would happen with a mixed
+    enabled/disabled deployment: neither worker ever fails the job closed merely for lacking
+    the capability, and it is eventually run once a capable worker's tick reaches it.
+    """
+    store = InMemoryJobStore("web:local")
+    job_id = await _enqueued_job(store, key="mixed-fleet", kind=REVIEW_RUN_KIND)
+
+    disabled_enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    disabled_ctx = _ctx(store, JobRegistry(), _Clock(_NOW), disabled_enqueued)
+    assert await dispatch_jobs(disabled_ctx) == 0
+    assert disabled_enqueued == []
+    row = await store.get(job_id)
+    assert row is not None and row.status is JobStatus.queued and row.attempt == 0
+
+    # Even if a disabled worker's `run_job` were somehow invoked for this job id directly (e.g.
+    # a stray/duplicate task delivery), it must still skip rather than claim-and-fail it.
+    skip_result = await run_job(disabled_ctx, "web:local", job_id)
+    assert skip_result == "capability_unavailable"
+    row = await store.get(job_id)
+    assert row is not None and row.status is JobStatus.queued and row.attempt == 0
+
+    enabled_enqueued: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+    enabled_ctx = _ctx(store, _review_registry(), _Clock(_NOW), enabled_enqueued)
+    assert await dispatch_jobs(enabled_ctx) == 1
+    assert {str(args[1]) for _, args, _ in enabled_enqueued} == {job_id}
+
+    run_result = await run_job(enabled_ctx, "web:local", job_id)
+    assert run_result == JobStatus.succeeded.value
+    row = await store.get(job_id)
+    assert row is not None and row.status is JobStatus.succeeded and row.attempt == 1

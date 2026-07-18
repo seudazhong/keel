@@ -9,7 +9,7 @@ import hashlib
 import json
 import math
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
@@ -385,7 +385,13 @@ class JobStore(Protocol):
         limit: int = 50,
     ) -> builtins.list[JobRecord]: ...
 
-    async def dispatchable(self, now: datetime, limit: int) -> builtins.list[str]: ...
+    async def dispatchable(
+        self,
+        now: datetime,
+        limit: int,
+        *,
+        exclude_kinds: Iterable[str] = (),
+    ) -> builtins.list[str]: ...
     async def exhausted(self, now: datetime, limit: int) -> builtins.list[str]: ...
 
     async def claim(self, job_id: str, now: datetime, lease_seconds: int) -> JobLease | None: ...
@@ -1011,15 +1017,23 @@ class InMemoryJobStore:
             rows.sort(key=lambda row: (row.created_at, row.id), reverse=True)
             return [_copy_record(row) for row in rows[:limit]]
 
-    async def dispatchable(self, now: datetime, limit: int) -> builtins.list[str]:
+    async def dispatchable(
+        self,
+        now: datetime,
+        limit: int,
+        *,
+        exclude_kinds: Iterable[str] = (),
+    ) -> builtins.list[str]:
         _validate_limit(limit)
         now = _normalized_utc_timestamp(now, field="now")
+        excluded = frozenset(exclude_kinds)
         async with self._lock:
             rows = [
                 row
                 for row in self._rows.values()
                 if row.terminal_intent is None
                 and row.attempt < row.max_attempts
+                and row.kind not in excluded
                 and (
                     (row.status is JobStatus.queued and row.next_attempt_at <= now)
                     or (
@@ -1554,28 +1568,44 @@ class PostgresJobStore:
             rows = (await conn.execute(text(sql), params)).mappings().all()
         return [_to_job_record(row) for row in rows]
 
-    async def dispatchable(self, now: datetime, limit: int) -> builtins.list[str]:
+    async def dispatchable(
+        self,
+        now: datetime,
+        limit: int,
+        *,
+        exclude_kinds: Iterable[str] = (),
+    ) -> builtins.list[str]:
+        """Due jobs ready to enqueue, optionally excluding capability-gap kinds (SQL-level).
+
+        ``exclude_kinds`` lets a worker's own dispatch tick skip kinds it recognizes as valid
+        product kinds but does not currently have the capability to run (e.g. ``review.run`` on
+        a review-disabled worker): those rows are left ``queued``/expired-lease untouched for a
+        capable worker's tick to pick up, rather than being nominated here only to fail closed
+        in ``run_job``. A genuinely unrecognized kind is never passed here, so it is still
+        dispatched and falls through to the existing unknown-kind fail-closed policy.
+        """
         _validate_limit(limit)
         now = _normalized_utc_timestamp(now, field="now")
+        excluded = list(dict.fromkeys(exclude_kinds))
+        clauses = [
+            "scope_id = :scope",
+            "terminal_intent IS NULL",
+            "attempt < max_attempts",
+            "((status = 'queued' AND next_attempt_at <= :now) OR "
+            "(status = 'running' AND lease_expires_at <= :now))",
+        ]
+        params: dict[str, Any] = {"scope": self._scope_id, "now": now, "limit": limit}
+        if excluded:
+            clauses.append("NOT (kind = ANY(:exclude_kinds))")
+            params["exclude_kinds"] = excluded
+        sql = (
+            "SELECT id FROM jobs WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY next_attempt_at, created_at, id LIMIT :limit"
+        )
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            rows = (
-                (
-                    await conn.execute(
-                        text(
-                            "SELECT id FROM jobs WHERE scope_id = :scope "
-                            "AND terminal_intent IS NULL "
-                            "AND attempt < max_attempts AND ("
-                            "  (status = 'queued' AND next_attempt_at <= :now) OR "
-                            "  (status = 'running' AND lease_expires_at <= :now)"
-                            ") ORDER BY next_attempt_at, created_at, id LIMIT :limit"
-                        ),
-                        {"scope": self._scope_id, "now": now, "limit": limit},
-                    )
-                )
-                .scalars()
-                .all()
-            )
+            rows = (await conn.execute(text(sql), params)).scalars().all()
         return [str(value) for value in rows]
 
     async def exhausted(self, now: datetime, limit: int) -> builtins.list[str]:
