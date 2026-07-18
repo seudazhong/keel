@@ -19,7 +19,7 @@ Load-bearing invariants proven here:
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -266,6 +266,7 @@ async def admit_run(
     run_id: RunId,
     *,
     model: str | None = None,
+    extra: Mapping[str, object] | None = None,
 ) -> None:
     """Persist a durable run's user turn, tagged with an admission marker for ``run_id``.
 
@@ -278,7 +279,9 @@ async def admit_run(
 
     ``admission_model`` records the model selected at admission (no schema migration: it lives
     in the event payload) so the worker executes the run with the admitted model rather than
-    its own process default (reproducibility)."""
+    its own process default (reproducibility). ``extra`` carries additional surface metadata
+    bound to the admission (e.g. the IM provider/chat context) under its own payload keys so a
+    worker can rebuild the surface-specific Agent + reply target from the durable log."""
     payload: dict[str, object] = {
         "role": "user",
         "text": content,
@@ -287,6 +290,8 @@ async def admit_run(
     }
     if model:
         payload["admission_model"] = model
+    if extra:
+        payload.update(extra)
     await _emit(
         store,
         EventType.message_token,

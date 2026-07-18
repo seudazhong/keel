@@ -121,6 +121,35 @@ def build_interactive_knowledge_tools(
     ]
 
 
+def build_im_readonly_extras(
+    engine: AsyncEngine | None,
+    scope_id: ScopeId,
+    embedder: Embedder | None,
+    caps: InteractiveCapabilities,
+) -> list[Tool]:
+    """The **read-only** memory/Knowledge recall tools an untrusted IM run may use.
+
+    Unlike :func:`build_interactive_memory_tools` this deliberately omits every *mutating*
+    memory tool (append/replace/rethink core memory, archival insert): an untrusted IM surface
+    may *recall* from durable memory + Knowledge (hybrid session search, archival search,
+    Knowledge search — all read-only, grant-gated) but can never write to them. Empty when no
+    durable engine is wired (in-memory preview)."""
+    if engine is None:
+        return []
+    tools: list[Tool] = [
+        SessionSearchTool(
+            engine,
+            embedder,
+            batch_size=caps.session_embedding_batch_size,
+            catchup_limit=caps.session_embedding_catchup_limit,
+        )
+    ]
+    if embedder is not None:
+        tools.append(ArchivalSearchTool(engine, embedder))
+    tools += build_interactive_knowledge_tools(engine, scope_id, embedder, caps)
+    return tools
+
+
 def build_interactive_registry(
     environment: ExecutionEnvironment,
     *,
@@ -200,5 +229,6 @@ __all__ = [
     "build_interactive_memory_tools",
     "build_interactive_registry",
     "build_interactive_tools",
+    "build_im_readonly_extras",
     "interactive_permissions",
 ]
