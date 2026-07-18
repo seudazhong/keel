@@ -244,3 +244,53 @@ class LinkInstallationRequest(BaseModel):
     app_id: int
     account_login: str
     account_type: str = "Organization"
+
+
+# --- Read-only code review (WS-R) ----------------------------------------------------
+
+
+class CreateReviewRequest(BaseModel):
+    """Trigger a read-only review of a project branch/commit/PR."""
+
+    source: str = "branch"
+    head: str
+    base: str | None = None
+    model: str | None = None
+    agent_id: str | None = None
+    max_findings: int = 50
+    idempotency_key: str | None = None
+
+
+class CreateReviewResponse(BaseModel):
+    """The durable review that was created (or matched by idempotency)."""
+
+    review_id: str
+    run_id: str
+    status: str
+    idempotency_key: str
+    created: bool
+
+
+class ReviewStatusSummary(BaseModel):
+    """The status projection of a read-only review."""
+
+    review_id: str
+    org_id: str
+    project_id: str
+    run_id: str
+    status: str
+    source: str
+    head: str
+    base: str | None = None
+    model: str
+    created_at: str
+    updated_at: str
+    finding_count: int
+    severity_counts: dict[str, int]
+    prompt_tokens: int
+    completion_tokens: int
+    cost_usd: float
+    report_json_sha256: str | None = None
+    report_markdown_sha256: str | None = None
+    error_kind: str | None = None
+    error_message: str | None = None

@@ -587,6 +587,27 @@ class ProjectService:
         return await self._store.list_active_worktrees(org_id, project_id=project_id)
 
     # --- run associations ------------------------------------------------------------
+    async def authorize_review(
+        self,
+        org_id: str,
+        actor_user_id: str,
+        project_id: str,
+        *,
+        capability: Capability = Capability.use,
+        agent_id: str | None = None,
+    ) -> Project:
+        """Authorize a read-only review of a project (read+run == the ``use`` capability).
+
+        Returns the project so a caller (the review coordinator) can resolve its authoritative
+        coding-storage handle. Re-invoked at worker claim time so access revoked between request
+        and execution fails closed — an actor/Agent that lost ``use`` cannot have a review run.
+        """
+        project = await self._load_project(org_id, project_id)
+        await self._authorize_resource(
+            org_id, actor_user_id, project, capability, agent_id=agent_id
+        )
+        return project
+
     async def associate_run(
         self,
         org_id: str,

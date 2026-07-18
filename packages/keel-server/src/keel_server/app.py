@@ -23,7 +23,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from keel_core import __version__
 from keel_core.api import HealthResponse, ReadinessResponse
 from keel_core.approvals import InMemoryApprovalStore, PostgresApprovalStore
-from keel_core.coding import LocalActiveGitStore, LocalCodingStorage, LocalWorktreeStore
+from keel_core.coding import (
+    LocalActiveGitStore,
+    LocalArtifactStore,
+    LocalCodingStorage,
+    LocalWorktreeStore,
+)
 from keel_core.config import Settings, get_settings, load_env_file
 from keel_core.connector_credentials import ConnectorCredentialStore
 from keel_core.connector_schedule_index import PostgresConnectorScheduleIndex
@@ -79,6 +84,11 @@ from keel_core.projects.jobs import (
     sync_idempotency_key,
 )
 from keel_core.providers import LiteLLMGateway
+from keel_core.review import (
+    REVIEW_RUN_MAX_ATTEMPTS,
+    ReviewCoordinator,
+    ReviewService,
+)
 from keel_core.run_dispatch import PostgresRunDispatchOutbox
 from keel_core.runs import InMemoryRunStore, PostgresRunStore
 from keel_core.tools import build_service_execution_environment
@@ -90,6 +100,7 @@ from keel_server.api import knowledge as knowledge_api
 from keel_server.api import lifecycle as lifecycle_api
 from keel_server.api import oauth as oauth_api
 from keel_server.api import projects as projects_api
+from keel_server.api import reviews as reviews_api
 from keel_server.api import v1
 from keel_server.auth import parse_api_keys
 from keel_server.gateway import OneBotGateway, RateLimiter, TelegramGateway
@@ -266,6 +277,37 @@ def _build_project_service(
         storage=storage,
         github=_build_github_integration(settings),
         enqueue_sync=enqueue_sync,
+    )
+
+
+def _build_review_coordinator(
+    engine: AsyncEngine | None,
+    settings: Settings,
+    projects: ProjectService,
+) -> ReviewCoordinator | None:
+    """Build the read-only review coordinator over the same coding storage as projects.
+
+    Requires a durable Postgres substrate (a separate worker process claims the review run).
+    Reuses the project coding storage handle space so review worktrees/artifacts are purged by
+    the same project/scope lifecycle. The provider is the shared ``LiteLLMGateway`` (the same
+    provider path the agent loop uses) — no second, policy-bypassing provider route.
+    """
+    if engine is None:
+        return None
+    hosts = tuple(h.strip().lower() for h in settings.github_allowed_hosts.split(",") if h.strip())
+    coding_root = Path.cwd() / ".keel" / "projects"
+    coding = LocalCodingStorage(coding_root, allowed_https_hosts=hosts)
+    review_service = ReviewService(
+        worktrees=LocalWorktreeStore(coding),
+        artifacts=LocalArtifactStore(coding),
+        provider=LiteLLMGateway(),
+    )
+    return ReviewCoordinator(
+        projects=projects,
+        runs=PostgresRunStore(engine, _DURABLE_SCOPE),
+        review_service=review_service,
+        artifacts=LocalArtifactStore(coding),
+        scope_id=_DURABLE_SCOPE,
     )
 
 
@@ -620,6 +662,23 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.projects = _build_project_service(
         engine, settings, identity_service.store, _enqueue_project_sync
     )
+
+    # Read-only managed-code review (WS-R): a durable ``review.run`` job on the existing
+    # jobs/outbox substrate, keyed by the review's idempotency key (duplicate = no-op).
+    app.state.review_coordinator = _build_review_coordinator(engine, settings, app.state.projects)
+
+    async def _enqueue_review(payload: dict[str, Any], idempotency_key: str) -> None:
+        jobs = app.state.jobs
+        job, _created = await jobs.enqueue_once(
+            kind="review.run",
+            payload=payload,
+            target_session_id=None,
+            idempotency_key=idempotency_key,
+            max_attempts=REVIEW_RUN_MAX_ATTEMPTS,
+        )
+        await _dispatch_knowledge_job(jobs.scope_id, job.id)
+
+    app.state.enqueue_review = _enqueue_review
     # OneBot IM gateway (optional): only wired when an API base is configured.
     if settings.onebot_api_base:
         app.state.onebot_gateway = OneBotGateway(
@@ -665,6 +724,7 @@ def create_app() -> FastAPI:
     knowledge_api.register_exception_handlers(app)
     identity_api.register_exception_handlers(app)
     projects_api.register_exception_handlers(app)
+    reviews_api.register_exception_handlers(app)
 
     @app.get("/", response_class=HTMLResponse, include_in_schema=False)
     async def index() -> str:
@@ -745,6 +805,7 @@ def create_app() -> FastAPI:
     app.include_router(v1.router)
     app.include_router(identity_api.router)
     app.include_router(projects_api.router)
+    app.include_router(reviews_api.router)
     app.include_router(knowledge_api.router)
     app.include_router(lifecycle_api.router)
     app.include_router(connectors_api.router)

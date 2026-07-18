@@ -527,6 +527,47 @@ async def startup(ctx: dict[str, Any]) -> None:
     register_erasure_jobs(
         job_registry, erasure_coordinator, lease_seconds=settings.job_lease_seconds
     )
+
+    # Read-only managed-code review (WS-R): a durable ``review.run`` job that materializes an
+    # isolated worktree from the project's coding storage, reviews the diff through the shared
+    # provider (no tools), verifies evidence, and stores content-addressed report artifacts.
+    from keel_core.coding import (
+        LocalArtifactStore as _ReviewArtifactStore,
+    )
+    from keel_core.coding import (
+        LocalCodingStorage as _ReviewCodingStorage,
+    )
+    from keel_core.coding import (
+        LocalWorktreeStore as _ReviewWorktreeStore,
+    )
+    from keel_core.projects import PostgresProjectStore as _ReviewProjectStore
+    from keel_core.projects import ProjectService as _ReviewProjectService
+    from keel_core.review import ReviewCoordinator, ReviewService
+    from keel_worker.review import register_review_jobs
+
+    _review_hosts = tuple(
+        h.strip().lower() for h in settings.github_allowed_hosts.split(",") if h.strip()
+    )
+    _review_coding = _ReviewCodingStorage(
+        Path.cwd() / ".keel" / "projects", allowed_https_hosts=_review_hosts
+    )
+    _review_service = ReviewService(
+        worktrees=_ReviewWorktreeStore(_review_coding),
+        artifacts=_ReviewArtifactStore(_review_coding),
+        provider=ctx["provider"],
+    )
+    _review_project_service = _ReviewProjectService(
+        _ReviewProjectStore(engine), ctx["identity"].store
+    )
+    review_coordinator = ReviewCoordinator(
+        projects=_review_project_service,
+        runs=ctx["runs"],
+        review_service=_review_service,
+        artifacts=_ReviewArtifactStore(_review_coding),
+        scope_id=_DURABLE_SCOPE,
+    )
+    ctx["review_coordinator"] = review_coordinator
+    register_review_jobs(job_registry, review_coordinator, settings)
     ctx["job_registry"] = job_registry
 
     async def enqueue(name: str, *args: object, **options: object) -> None:

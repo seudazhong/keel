@@ -15,6 +15,8 @@ from keel_sdk.models import (
     CreateMessageResponse,
     CreateOrganizationRequest,
     CreateProjectRequest,
+    CreateReviewRequest,
+    CreateReviewResponse,
     GrantProjectRequest,
     GrantSummary,
     ImportProjectRequest,
@@ -25,6 +27,7 @@ from keel_sdk.models import (
     MeResponse,
     OrganizationMembership,
     ProjectSummary,
+    ReviewStatusSummary,
     RunAssociation,
     SyncEntrySummary,
     UpdateProjectRequest,
@@ -330,3 +333,56 @@ class KeelClient:
         )
         response.raise_for_status()
         return InstallationSummary.model_validate(response.json())
+
+    # --- Read-only code review (WS-R) — additive methods -----------------------------
+    async def create_review(
+        self, org: str, project_id: str, request: CreateReviewRequest
+    ) -> CreateReviewResponse:
+        """Trigger a durable, read-only review of a project change set (idempotent)."""
+        headers = self._org_headers(org)
+        if request.idempotency_key:
+            headers["Idempotency-Key"] = request.idempotency_key
+        response = await self._client.post(
+            f"/v1/projects/{project_id}/reviews",
+            json=request.model_dump(exclude_none=True),
+            headers=headers,
+        )
+        response.raise_for_status()
+        return CreateReviewResponse.model_validate(response.json())
+
+    async def list_reviews(self, org: str, project_id: str) -> list[ReviewStatusSummary]:
+        """List a project's reviews (newest activity first)."""
+        response = await self._client.get(
+            f"/v1/projects/{project_id}/reviews", headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        return [ReviewStatusSummary.model_validate(item) for item in response.json()]
+
+    async def get_review(self, org: str, project_id: str, review_id: str) -> ReviewStatusSummary:
+        """Fetch the status of one review (including finding/cost summary once completed)."""
+        response = await self._client.get(
+            f"/v1/projects/{project_id}/reviews/{review_id}",
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return ReviewStatusSummary.model_validate(response.json())
+
+    async def get_review_report(
+        self, org: str, project_id: str, review_id: str
+    ) -> dict[str, object]:
+        """Fetch the immutable JSON review report (409 until the review completes)."""
+        response = await self._client.get(
+            f"/v1/projects/{project_id}/reviews/{review_id}/report",
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return dict(response.json())
+
+    async def get_review_report_markdown(self, org: str, project_id: str, review_id: str) -> str:
+        """Fetch the Markdown review report (409 until the review completes)."""
+        response = await self._client.get(
+            f"/v1/projects/{project_id}/reviews/{review_id}/report.md",
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return response.text
