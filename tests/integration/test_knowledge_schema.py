@@ -278,7 +278,7 @@ async def test_knowledge_schema_has_exact_columns_checks_fks_and_indexes(
 ) -> None:
     async with migrated_db.connect() as conn:
         revision = await conn.scalar(text("SELECT version_num FROM alembic_version"))
-    assert revision == "0019_patch_proposals"
+    assert revision == "0020_runtime_role_hardening"
 
     for table, expected in _EXPECTED_COLUMNS.items():
         assert set(await _columns(migrated_db, table)) == expected

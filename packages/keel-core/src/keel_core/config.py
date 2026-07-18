@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Self
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from keel_core.errors import MaintenanceDatabaseNotConfigured
+from keel_core.errors import MaintenanceDatabaseNotConfigured, MigrationDatabaseNotConfigured
 
 if TYPE_CHECKING:
     from keel_core.review.pricing import PriceBook as ReviewPriceBook
@@ -260,6 +260,21 @@ class Settings(BaseSettings):
     # not exercised. See ``require_maintenance_database_url`` and ``docs/OPERATIONS.md``.
     maintenance_database_url: str = ""
 
+    # Separate schema-owner / migrator connection (M3A runtime-role split, WS-DB). Alembic
+    # migrations and DB role provisioning must run as a privileged owner/migrator principal
+    # (able to CREATE/ALTER schema, tables, and roles). The server/worker instead connect on
+    # ``database_url`` as the least-privilege, non-owner ``keel_runtime`` login so
+    # ``FORCE ROW LEVEL SECURITY`` is a hard boundary (a superuser/owner would bypass RLS).
+    #
+    # * When set, Alembic (``migrations/env.py``) and the provisioning CLI use THIS url via
+    #   ``require_migration_database_url``.
+    # * When empty, they fall back to ``database_url`` — correct for local/self-hosted preview
+    #   where a single owner login both migrates and serves. In ``cloud_mode`` that fallback is
+    #   refused (``require_migration_database_url``) because ``database_url`` is then the
+    #   non-owner runtime login, so migrating/provisioning on it would fail confusingly; set
+    #   this to the dedicated owner/migrator url instead. The url is never logged.
+    migration_database_url: str = ""
+
     server_host: str = "0.0.0.0"
     server_port: int = 8000
 
@@ -323,7 +338,42 @@ class Settings(BaseSettings):
 
     @property
     def sync_database_url(self) -> str:
-        """SQLAlchemy URL for the synchronous engine (Alembic uses this)."""
+        """SQLAlchemy URL for a synchronous owner/migrator engine (convenience accessor).
+
+        Prefers the dedicated owner/migrator ``migration_database_url`` when set so schema
+        migrations run as a privileged principal even when ``database_url`` is the least-privilege
+        runtime login; falls back to ``database_url`` for the local/self-hosted single-owner
+        profile. Alembic (``migrations/env.py``) resolves its URL through
+        :meth:`require_migration_database_url` instead, which additionally fails closed in
+        ``cloud_mode`` when no migrator url is configured.
+        """
+        return self.migration_database_url.strip() or self.database_url
+
+    def require_migration_database_url(self) -> str:
+        """Resolve the owner/migrator URL for migrations + role provisioning, failing closed.
+
+        Migrations and DB-role provisioning need a privileged owner/migrator principal. This
+        resolver enforces the runtime/owner split operationally:
+
+        * When ``migration_database_url`` is set it is always used (the explicit owner/migrator).
+        * When it is empty, it falls back to ``database_url`` ONLY outside ``cloud_mode`` — the
+          local/self-hosted profile where that url is itself the owner login.
+        * In ``cloud_mode`` a missing ``migration_database_url`` fails closed: ``database_url``
+          is the non-owner runtime login there, so silently running DDL / ``CREATE ROLE`` on it
+          would fail confusingly (or, worse, imply the runtime login is over-privileged).
+
+        Raising :class:`MigrationDatabaseNotConfigured` (a ``KeelError``) keeps the failure
+        typed and auditable. The URL itself is never logged by callers.
+        """
+        url = self.migration_database_url.strip()
+        if url:
+            return url
+        if self.cloud_mode:
+            raise MigrationDatabaseNotConfigured(
+                "migrations and DB role provisioning require KEEL_MIGRATION_DATABASE_URL (a "
+                "dedicated owner/migrator login) in cloud mode; it is unset and KEEL_DATABASE_URL "
+                "is the non-owner runtime login, so it fails closed"
+            )
         return self.database_url
 
     def require_maintenance_database_url(self) -> str:

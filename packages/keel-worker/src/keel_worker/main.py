@@ -317,6 +317,23 @@ async def startup(ctx: dict[str, Any]) -> None:
     from keel_scheduler.store import PostgresClaimStore, PostgresScheduleStore
 
     engine = create_async_engine(settings.database_url)
+    # M3A runtime-role gate (WS-DB): in cloud mode the worker's data-plane connection must be a
+    # least-privilege, non-owner runtime login so ``FORCE ROW LEVEL SECURITY`` is a hard boundary
+    # — a superuser / BYPASSRLS / table-owner connection bypasses RLS for every tenant. Verify the
+    # connected principal and fail closed (crash startup; the supervisor restarts) when it is
+    # over-privileged, so the worker never processes tenant work from an RLS-exempt connection.
+    # The worker has no readiness probe to stay drained on, so failing closed here is the correct
+    # posture (a transient DB error likewise crashes startup and is retried on restart).
+    if settings.cloud_mode:
+        from keel_core.errors import RuntimePrincipalError
+        from keel_core.runtime_db import verify_runtime_principal
+
+        try:
+            async with engine.connect() as conn:
+                await verify_runtime_principal(conn)
+        except RuntimePrincipalError as exc:
+            logger.critical("worker refusing to start: %s", exc)
+            raise
     redis = ctx["redis"]
     ctx["engine"] = engine
     ctx["workspace_root"] = Path.cwd()

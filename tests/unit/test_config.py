@@ -262,6 +262,70 @@ def test_require_maintenance_database_url_env_override(monkeypatch: pytest.Monke
     assert Settings().require_maintenance_database_url() == "postgresql+psycopg://maint@db/keel"
 
 
+def test_migration_database_url_defaults_empty() -> None:
+    from keel_core.config import Settings
+
+    settings = Settings()
+    assert settings.migration_database_url == ""
+    # With no dedicated migrator URL the sync (Alembic) engine uses database_url.
+    assert settings.sync_database_url == settings.database_url
+
+
+def test_sync_database_url_prefers_migration_url() -> None:
+    from keel_core.config import Settings
+
+    migrator = "postgresql+psycopg://owner@db/keel"
+    settings = Settings(
+        database_url="postgresql+psycopg://runtime@db/keel",
+        migration_database_url=migrator,
+    )
+    assert settings.sync_database_url == migrator
+
+
+def test_require_migration_database_url_falls_back_outside_cloud() -> None:
+    from keel_core.config import Settings
+
+    runtime = "postgresql+psycopg://runtime@db/keel"
+    settings = Settings(cloud_mode=False, database_url=runtime, migration_database_url="")
+    # Local/self-hosted single-owner profile: database_url doubles as the migrator.
+    assert settings.require_migration_database_url() == runtime
+
+
+def test_require_migration_database_url_fails_closed_in_cloud_when_unset() -> None:
+    from keel_core.config import Settings
+    from keel_core.errors import MigrationDatabaseNotConfigured
+
+    settings = Settings(
+        cloud_mode=True,
+        database_url="postgresql+psycopg://runtime@db/keel",
+        migration_database_url="",
+    )
+    with pytest.raises(MigrationDatabaseNotConfigured):
+        settings.require_migration_database_url()
+
+
+def test_require_migration_database_url_returns_explicit_url_in_cloud() -> None:
+    from keel_core.config import Settings
+
+    migrator = "postgresql+psycopg://owner@db/keel"
+    settings = Settings(
+        cloud_mode=True,
+        database_url="postgresql+psycopg://runtime@db/keel",
+        migration_database_url=migrator,
+    )
+    assert settings.require_migration_database_url() == migrator
+
+
+def test_require_migration_database_url_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("KEEL_MIGRATION_DATABASE_URL", "postgresql+psycopg://owner@db/keel")
+
+    from keel_core.config import Settings
+
+    settings = Settings(cloud_mode=True)
+    assert settings.require_migration_database_url() == "postgresql+psycopg://owner@db/keel"
+    assert settings.sync_database_url == "postgresql+psycopg://owner@db/keel"
+
+
 @pytest.mark.parametrize("overlap", [100, 101])
 def test_knowledge_settings_reject_overlap_at_or_above_target(overlap: int) -> None:
     from pydantic import ValidationError

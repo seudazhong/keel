@@ -13,7 +13,13 @@ from keel_core.config import get_settings
 
 config = context.config
 if not config.get_main_option("sqlalchemy.url"):
-    config.set_main_option("sqlalchemy.url", get_settings().sync_database_url)
+    # Alembic must connect as the privileged owner/migrator, never the non-owner runtime login.
+    # ``require_migration_database_url`` enforces the M3A split: it uses KEEL_MIGRATION_DATABASE_URL
+    # when set, falls back to KEEL_DATABASE_URL only outside cloud mode (the local single-owner
+    # profile), and fails closed in cloud mode when unset — rather than silently running DDL /
+    # CREATE ROLE on the runtime login (which would only fail later with a confusing permission
+    # error). The test harness sets ``sqlalchemy.url`` explicitly, so this branch is CLI-only.
+    config.set_main_option("sqlalchemy.url", get_settings().require_migration_database_url())
 
 target_metadata = None
 

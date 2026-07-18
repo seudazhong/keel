@@ -27,6 +27,30 @@ class MaintenanceDatabaseNotConfigured(KeelError):
     """
 
 
+class MigrationDatabaseNotConfigured(KeelError):
+    """A schema-owner / migrator connection was required but is not configured.
+
+    Alembic migrations and DB role provisioning must connect as a privileged owner/migrator
+    principal (able to CREATE/ALTER schema + roles), never the least-privilege
+    ``keel_runtime`` login the server/worker use. When ``KEEL_MIGRATION_DATABASE_URL`` is
+    unset in cloud mode — where ``KEEL_DATABASE_URL`` is the non-owner runtime login — this
+    fails closed rather than attempting DDL on the runtime connection. Never carries the URL.
+    """
+
+
+class RuntimePrincipalError(KeelError):
+    """The connected runtime principal is over-privileged for the application data plane.
+
+    Raised by :func:`keel_core.runtime_db.verify_runtime_principal` (and the startup/readiness
+    gate) when the database principal behind ``KEEL_DATABASE_URL`` is a superuser, can
+    ``BYPASSRLS`` (directly or via role membership), or effectively owns the application
+    tables. Such a principal silently defeats ``FORCE ROW LEVEL SECURITY`` (a superuser/owner
+    bypasses RLS entirely), so in cloud mode the server/worker fail closed rather than serve
+    every tenant from an RLS-exempt connection. Carries only role/privilege facts — never a
+    credential or connection URL.
+    """
+
+
 class DuplicateEventError(KeelError):
     """A durably-unique event append lost the race to a concurrent/duplicate writer.
 

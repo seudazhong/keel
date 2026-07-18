@@ -128,6 +128,19 @@ def test_create_message_idempotent_admission() -> None:
 def _readiness_app(*, shared: bool, queue: bool) -> TestClient:
     app = create_app()
 
+    class _FakeResult:
+        def mappings(self) -> _FakeResult:
+            return self
+
+        def one(self) -> dict[str, object]:
+            # Models keel_core.runtime_db.inspect_runtime_principal's catalog row.
+            return {
+                "principal": "keel_runtime_login",
+                "is_super": False,
+                "can_bypass_rls": False,
+                "owns_tables": False,
+            }
+
     class _FakeConn:
         async def __aenter__(self) -> _FakeConn:
             return self
@@ -135,8 +148,8 @@ def _readiness_app(*, shared: bool, queue: bool) -> TestClient:
         async def __aexit__(self, *exc: object) -> None:
             return None
 
-        async def execute(self, *_a: object, **_k: object) -> None:
-            return None
+        async def execute(self, *_a: object, **_k: object) -> _FakeResult:
+            return _FakeResult()
 
     class _FakeEngine:
         def connect(self) -> _FakeConn:
@@ -178,6 +191,8 @@ def test_readiness_ready_when_admission_available() -> None:
     body = resp.json()
     assert body["ready"] is True
     assert body["checks"]["run_admission"] == "ready"
+    # The runtime-role gate surfaces the connected DB principal (M3A).
+    assert "runtime_db_principal" in body["checks"]
 
 
 def test_resolve_unknown_approval_is_404() -> None:

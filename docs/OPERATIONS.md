@@ -133,14 +133,69 @@ A user who is the **sole active owner** of an active org that still has **other*
 members is reported **blocked** (exit 3) with the blocking org ids — transfer ownership first.
 An org the user solely owns and is the only member of is atomically archived.
 
+### Runtime database login (M3A)
+
+`FORCE ROW LEVEL SECURITY` (migrations `0011`/`0013`/`0015`/`0019`) only binds a **non-owner,
+non-`BYPASSRLS`** connection — a superuser or the table owner bypasses RLS entirely. So the
+server/worker must connect (`KEEL_DATABASE_URL`) as a dedicated **least-privilege login** that is
+a member of **only** the `keel_runtime` group. Migration `0020` pins that group least-privilege
+(`NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOINHERIT`), (re)asserts its minimal
+schema/table/sequence grants + default privileges (covering the `0019` patch tables), revokes
+`CREATE` on `public`, and re-applies the `0013` identity least-privilege revokes.
+
+Migrations and role provisioning need a privileged **owner/migrator** principal, kept separate
+from the runtime login: set `KEEL_MIGRATION_DATABASE_URL` to the owner/migrator URL. Alembic (the
+sync engine) and the provisioning CLI use it; when unset it falls back to `KEEL_DATABASE_URL` for
+the local single-owner profile, but in **cloud mode** a missing value **fails closed** (because
+`KEEL_DATABASE_URL` is then the non-owner runtime login).
+
+Provision (or idempotently repair) the runtime login with the operator CLI. The password comes
+from an env var (default `KEEL_RUNTIME_DB_PASSWORD`) or `--password-stdin` — never a CLI argument
+— is quoted server-side, and is never surfaced in error output (a DB failure is re-raised
+sanitized, carrying only the exception class name):
+
+```bash
+export KEEL_MIGRATION_DATABASE_URL=postgresql+psycopg://<owner>:<pw>@<host>/keel
+export KEEL_RUNTIME_DB_PASSWORD='<runtime-login-password>'
+python -m keel_core.provision_runtime_cli --verify
+# then point the app at the runtime login:
+export KEEL_DATABASE_URL=postgresql+psycopg://keel_runtime_login:<runtime-login-password>@<host>/keel
+```
+
+> **Do not enable SQL statement echo on the provisioning connection.** Postgres cannot bind a
+> parameter for `ALTER ROLE … PASSWORD`, so the (server-quoted) password is unavoidably part of
+> that statement's text. Keep SQLAlchemy echo off (`echo=False`, the CLI default) and the
+> `sqlalchemy.engine` logger above INFO, and avoid Postgres `log_statement='all'/'ddl'` while
+> provisioning, so the secret is never written to a log.
+
+`--verify` connects **as** the freshly provisioned login and asserts it is least-privilege (not a
+superuser, cannot `BYPASSRLS` — directly **or** via role membership it could `SET ROLE` into — and
+does not own the tables). On **managed Postgres** that forbids `CREATE ROLE`/`GRANT`, migration
+`0020` skips role setup with a `NOTICE`; create the login manually and grant it the group with an
+administrative role:
+
+```sql
+CREATE ROLE keel_runtime_login LOGIN PASSWORD '…' NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB;
+GRANT keel_runtime TO keel_runtime_login;   -- runtime group membership only
+```
+
+In **cloud mode** the server and worker verify the connected principal at startup and **fail
+closed**: the server crash-loops (and `/readiness` reports `runtime_db_principal` degraded → 503)
+and the worker refuses to start if the connection is a superuser, can `BYPASSRLS`, or owns the
+application tables — so the data plane is never served from an RLS-exempt connection. In
+local-preview (non-cloud) the single owner login is expected; `/readiness` surfaces it as
+`owner (local-preview)` (never reported as least-privilege) and does not fail.
+
 ### Cloud-safety controls (M3.3)
 
 - **Runtime DB role.** Migration `0011` provisions a non-owner, non-bypass `keel_runtime`
-  role (`NOBYPASSRLS`) and `FORCE ROW LEVEL SECURITY` on the scope-bound connector token /
-  outbox tables, so RLS binds even the table owner. Point the application's connection at a
-  login role that is a member of `keel_runtime` (not the schema owner) to make RLS a hard
-  boundary. On managed Postgres that forbids `CREATE ROLE`/`GRANT`, the migration skips role
-  setup with a `NOTICE`; grant `keel_runtime` and its table privileges manually.
+  role and `FORCE ROW LEVEL SECURITY` on the scope-bound tables; migration `0020` pins it
+  least-privilege and re-asserts its minimal grants. Point the application connection
+  (`KEEL_DATABASE_URL`) at a login that is a member of only `keel_runtime` (see **Runtime
+  database login** above) and keep migrations on a separate owner/migrator
+  `KEEL_MIGRATION_DATABASE_URL`. In cloud mode the server/worker verify the connected principal
+  at startup and fail closed if it can bypass RLS. On managed Postgres that forbids
+  `CREATE ROLE`/`GRANT`, the migration skips role setup with a `NOTICE`; provision manually.
 - **IM webhooks.** Set `KEEL_ONEBOT_SIGNING_SECRET` and `KEEL_TELEGRAM_WEBHOOK_SECRET` so
   inbound OneBot (HMAC-SHA1 body signature) and Telegram (secret header) deliveries are
   verified before dispatch and de-duplicated by a durable replay store. With `KEEL_CLOUD_MODE=1`
@@ -156,10 +211,11 @@ An org the user solely owns and is the only member of is atomically archived.
 
 ## Current production-readiness limits
 
-- The default Compose application DB role owns the schema and can bypass RLS. Migration
-  `0011` adds a non-bypass `keel_runtime` role plus `FORCE ROW LEVEL SECURITY` on the
-  connector token/outbox tables; connect as a `keel_runtime` member (not the owner) to make
-  RLS a hard boundary. Extending `FORCE`/grants to the remaining scoped tables is pending.
+- The default Compose application DB role owns the schema and can bypass RLS. Migrations
+  `0011`/`0020` provide a non-bypass, least-privilege `keel_runtime` group, a fail-closed
+  startup/readiness gate, and an operator provisioning CLI for a dedicated runtime login; point
+  `KEEL_DATABASE_URL` at that login (and migrations at `KEEL_MIGRATION_DATABASE_URL`) to make RLS
+  a hard boundary. Wiring the deployment to use the runtime login by default is pending.
 - The authenticated `keel-sandbox` service boundary exists and server/worker wiring fails
   closed when it is unavailable or unauthenticated, but Compose does not deploy it yet.
   The Compose `dev`/`full` profiles therefore run the trusted local-preview
