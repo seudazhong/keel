@@ -26,10 +26,31 @@ from keel_core.approvals import ApprovalRecord, ApprovalStore, PostgresApprovalS
 from keel_core.config import Settings, get_settings
 from keel_core.errors import PermissionDenied
 from keel_core.identity import IdentityService, NotFoundError
+from keel_core.im_routing import (
+    ImChatKind,
+    ImInboundContext,
+    ImMappingStatus,
+    ImProvider,
+    ImReplyDispatchIndex,
+    ImReplyPolicy,
+    ImReplyStore,
+    PostgresImMappingStore,
+    PostgresImReplyDispatchIndex,
+    PostgresImReplyStore,
+    ReplySender,
+    build_im_safe_agent,
+    deliver_reply,
+    final_reply_text_in_log,
+    im_context_in_log,
+    im_safe_permissions,
+    im_safe_tools,
+    persist_terminal_reply,
+)
 from keel_core.interactive import (
     LOCAL_PREVIEW_AGENT_NAME,
     LOCAL_PREVIEW_ORG_ID,
     InteractiveCapabilities,
+    build_im_readonly_extras,
     build_interactive_agent,
     build_interactive_registry,
     interactive_permissions,
@@ -45,8 +66,9 @@ from keel_core.run_service import (
     prompt_persisted_in_log,
     reconcile_runs,
 )
-from keel_core.runs import PostgresRunStore, RunRecord, RunStatus, RunStore
+from keel_core.runs import PostgresRunStore, RunRecord, RunStatus, RunStore, RunSurface
 from keel_core.scoping import ScopeValidationError, validate_scope_id
+from keel_core.secrets import KeyRing, SecretsError, keyring_from_settings
 from keel_core.state import PostgresEventStore
 from keel_core.tools import (
     ExecutionEnvironment,
@@ -185,6 +207,159 @@ def _system_context(engine: Any, scope_id: ScopeId, persona: str) -> SystemConte
     return _ctx
 
 
+def _im_visibility_check(
+    identity: IdentityService | None,
+    engine: Any,
+    im_ctx: ImInboundContext | None,
+    record: RunRecord,
+) -> VisibilityCheck | None:
+    """Claim-time revalidation for an IM run: Agent visibility **and** the channel mapping.
+
+    Layers the durable-run Agent/membership visibility check with a re-read of the persisted
+    channel mapping: a mapping that was revoked/disabled between admit and claim, or whose
+    scope / Agent / provider no longer matches the run's binding, fails the run closed (no
+    cross-org Agent binding, no stale/hijacked mapping ever executes). The local-preview single
+    tenant (or an in-memory worker with no engine) skips the DB mapping re-read."""
+    base = _visibility_check(identity)
+
+    async def _visible(rec: RunRecord) -> bool:
+        if base is not None and not await base(rec):
+            return False
+        if engine is None or _is_local_preview(rec) or im_ctx is None or not im_ctx.mapping_id:
+            return True
+        mapping = await PostgresImMappingStore(engine, rec.org_id).get(im_ctx.mapping_id)
+        if mapping is None or mapping.status is not ImMappingStatus.active:
+            return False
+        return (
+            mapping.scope_id == rec.scope_id
+            and mapping.agent_id == rec.agent_id
+            and mapping.provider is im_ctx.provider
+        )
+
+    return _visible
+
+
+def _im_reply_stores(
+    ctx: dict[str, Any], engine: Any, scope_id: ScopeId
+) -> tuple[ImReplyStore | None, ImReplyDispatchIndex | None]:
+    """The scope-bound reply outbox + global reply-dispatch index (Postgres or test doubles)."""
+    reply_store: ImReplyStore | None = ctx.get("im_replies")
+    reply_dispatch: ImReplyDispatchIndex | None = ctx.get("im_reply_dispatch")
+    if reply_store is None and engine is not None:
+        reply_store = PostgresImReplyStore(engine, scope_id)
+    if reply_dispatch is None and engine is not None:
+        reply_dispatch = PostgresImReplyDispatchIndex(engine)
+    return reply_store, reply_dispatch
+
+
+def _reply_keyring(ctx: dict[str, Any], settings: Settings) -> KeyRing | None:
+    """The envelope keyring used to encrypt a reply payload at rest (fail closed if unset)."""
+    keyring: KeyRing | None = ctx.get("keyring")
+    if keyring is not None:
+        return keyring
+    try:
+        return keyring_from_settings(settings)
+    except SecretsError:
+        return None
+
+
+async def _execute_im_run(
+    ctx: dict[str, Any],
+    record: RunRecord,
+    lease: Any,
+    run_store: RunStore,
+    event_store: Any,
+    approvals: ApprovalStore,
+    environment: ExecutionEnvironment,
+    settings: Settings,
+    identity: IdentityService | None,
+    engine: Any,
+    embedder: Any,
+) -> tuple[RunRecord, str, str]:
+    """Execute a claimed **untrusted IM** run on the safe (read-only) Agent + persist its reply.
+
+    The IM run reuses the single durable agent loop via :func:`execute_run`, but with the
+    IM-safe toolset (read-only file + grant-gated read-only memory/Knowledge only — no
+    write/edit/shell or connector action unless the mapping's policy explicitly approved it),
+    an untrusted scope, and a claim-time mapping+Agent revalidation. On a clean completion the
+    run's terminal reply is persisted idempotently to the durable, encrypted reply outbox and a
+    global dispatch pointer is recorded for the restart-safe sender."""
+    im_ctx = await im_context_in_log(event_store, record.session_id, record.id)
+    policy = im_ctx.policy if im_ctx is not None else ImReplyPolicy(reply_enabled=False)
+    chat_kind = im_ctx.chat_kind if im_ctx is not None else ImChatKind.personal
+    extras = build_im_readonly_extras(engine, lease.scope_id, embedder, _capabilities(settings))
+    extra_names = tuple(tool.name for tool in extras)
+    tools = im_safe_tools(environment) + extras
+    agent_id, agent_name, persona = await _resolve_agent_profile(identity, record)
+    model = (
+        await admission_model_in_log(event_store, record.session_id, record.id)
+        or settings.default_model
+    )
+    agent = build_im_safe_agent(
+        scope_id=lease.scope_id,
+        model=model,
+        agent_id=agent_id,
+        name=agent_name,
+        chat_kind=chat_kind,
+        persona=persona,
+        policy=policy,
+        read_only_extra=extra_names,
+    )
+    final = await execute_run(
+        lease=lease,
+        run_store=run_store,
+        event_store=event_store,
+        approvals=approvals,
+        agent=agent,
+        provider=ctx["provider"],
+        registry=ToolRegistry(tools),
+        permissions=im_safe_permissions(policy, read_only_extra=extra_names),
+        admit_fn=admit,
+        approval_ttl_hours=settings.approval_timeout_hours,
+        visibility_check=_im_visibility_check(identity, engine, im_ctx, record),
+        system_context=_system_context(engine, lease.scope_id, persona),
+        resume=lease.resume,
+    )
+    if final.status is RunStatus.completed and im_ctx is not None:
+        await _persist_im_reply(ctx, record, lease.scope_id, im_ctx, event_store, engine, settings)
+    return final, agent_id, model
+
+
+async def _persist_im_reply(
+    ctx: dict[str, Any],
+    record: RunRecord,
+    scope_id: ScopeId,
+    im_ctx: ImInboundContext,
+    event_store: Any,
+    engine: Any,
+    settings: Settings,
+) -> None:
+    """Persist the terminal reply intent (idempotently, encrypted) + its dispatch pointer."""
+    reply_store, reply_dispatch = _im_reply_stores(ctx, engine, scope_id)
+    keyring = _reply_keyring(ctx, settings)
+    if reply_store is None or reply_dispatch is None or keyring is None:
+        logger.warning(
+            "im reply not persisted run=%s scope=%s (reply store/keyring unavailable)",
+            record.id,
+            scope_id,
+        )
+        return
+    text_payload = await final_reply_text_in_log(event_store, record.session_id, record.id)
+    reply_id = await persist_terminal_reply(
+        reply_store,
+        reply_dispatch,
+        keyring,
+        reply_id=uuid.uuid4().hex,
+        scope_id=scope_id,
+        run_id=record.id,
+        org_id=record.org_id,
+        context=im_ctx,
+        text_payload=text_payload,
+    )
+    if reply_id is not None:
+        logger.info("im reply persisted run=%s scope=%s reply=%s", record.id, scope_id, reply_id)
+
+
 async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> str:
     """Claim + execute (or resume) a durable interactive run under a fenced lease.
 
@@ -243,47 +418,67 @@ async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> st
     # Per-scope, isolated execution environment (no shared writable workspace across scopes).
     environment, owns_environment = _scoped_environment(ctx, lease.scope_id)
     try:
-        # Capability parity with the server web runtime: the same file/shell + memory +
-        # Knowledge tools + permissions, from the shared builders (one contract, two surfaces).
-        tools, extra_names = build_interactive_registry(
-            environment,
-            engine=engine,
-            scope_id=lease.scope_id,
-            embedder=embedder,
-            caps=_capabilities(settings),
-        )
-        agent_id, agent_name, persona = await _resolve_agent_profile(identity, record)
-        # The model captured at admission (reproducibility) — not the worker's process default.
-        model = (
-            await admission_model_in_log(event_store, record.session_id, run_id)
-            or settings.default_model
-        )
-        agent = build_interactive_agent(
-            scope_id=lease.scope_id,
-            model=model,
-            agent_id=agent_id,
-            name=agent_name,
-            persona=persona,
-            extra_tool_names=extra_names,
-        )
-        final = await execute_run(
-            lease=lease,
-            run_store=run_store,
-            event_store=event_store,
-            approvals=approvals,
-            agent=agent,
-            provider=ctx["provider"],
-            registry=ToolRegistry(tools),
-            permissions=interactive_permissions(extra_names),
-            admit_fn=admit,
-            approval_ttl_hours=settings.approval_timeout_hours,
-            # Re-check Agent visibility / org membership / archived at claim (revoke fails closed).
-            visibility_check=_visibility_check(identity),
-            system_context=_system_context(engine, lease.scope_id, persona),
-            # Resume vs fresh-start is decided atomically at claim time (explicit durable marker
-            # or a reclaimed mid-approval run), never inferred from a mutable pre-claim status.
-            resume=lease.resume,
-        )
+        if record.surface == RunSurface.im.value:
+            # Untrusted IM surface: same durable loop, but the read-only safe Agent + a
+            # claim-time mapping/Agent/provider revalidation + a durable encrypted reply.
+            final, agent_id, model = await _execute_im_run(
+                ctx,
+                record,
+                lease,
+                run_store,
+                event_store,
+                approvals,
+                environment,
+                settings,
+                identity,
+                engine,
+                embedder,
+            )
+        else:
+            # Capability parity with the server web runtime: the same file/shell + memory +
+            # Knowledge tools + permissions, from the shared builders (one contract, two
+            # surfaces).
+            tools, extra_names = build_interactive_registry(
+                environment,
+                engine=engine,
+                scope_id=lease.scope_id,
+                embedder=embedder,
+                caps=_capabilities(settings),
+            )
+            agent_id, agent_name, persona = await _resolve_agent_profile(identity, record)
+            # The model captured at admission (reproducibility) — not the worker's default.
+            model = (
+                await admission_model_in_log(event_store, record.session_id, run_id)
+                or settings.default_model
+            )
+            agent = build_interactive_agent(
+                scope_id=lease.scope_id,
+                model=model,
+                agent_id=agent_id,
+                name=agent_name,
+                persona=persona,
+                extra_tool_names=extra_names,
+            )
+            final = await execute_run(
+                lease=lease,
+                run_store=run_store,
+                event_store=event_store,
+                approvals=approvals,
+                agent=agent,
+                provider=ctx["provider"],
+                registry=ToolRegistry(tools),
+                permissions=interactive_permissions(extra_names),
+                admit_fn=admit,
+                approval_ttl_hours=settings.approval_timeout_hours,
+                # Re-check Agent visibility / org membership / archived at claim (revoke fails
+                # closed).
+                visibility_check=_visibility_check(identity),
+                system_context=_system_context(engine, lease.scope_id, persona),
+                # Resume vs fresh-start is decided atomically at claim time (explicit durable
+                # marker or a reclaimed mid-approval run), never inferred from a mutable
+                # pre-claim status.
+                resume=lease.resume,
+            )
     finally:
         if owns_environment:
             await environment.aclose()
@@ -413,7 +608,7 @@ async def reconcile_dispatch_tick(ctx: dict[str, Any]) -> int:
     # Retire intents whose run is terminal (nothing left to dispatch); defer the rest so they
     # are re-checked on a later tick without spinning.
     for intent in claimed:
-        run_store, _events, _approvals = _scoped_stores(ctx, intent.scope_id)
+        run_store, events_for_intent, _approvals = _scoped_stores(ctx, intent.scope_id)
         record = await run_store.get(intent.run_id)
         if record is None or record.status in {
             RunStatus.completed,
@@ -422,10 +617,82 @@ async def reconcile_dispatch_tick(ctx: dict[str, Any]) -> int:
             RunStatus.interrupted,
             RunStatus.expired,
         }:
+            # Backstop the crash-after-terminal / before-reply-intent window: a completed IM run
+            # must have its durable reply persisted before its dispatch pointer is retired
+            # (idempotent — a no-op if the worker already recorded it inline).
+            if (
+                record is not None
+                and record.status is RunStatus.completed
+                and (record.surface == RunSurface.im.value)
+            ):
+                await _ensure_im_reply(ctx, record, events_for_intent)
             await outbox.remove(intent.run_id)
         else:
             await outbox.reschedule(intent.run_id, now=now)
     return reconciled
+
+
+async def _ensure_im_reply(ctx: dict[str, Any], record: RunRecord, event_store: Any) -> None:
+    """Ensure a terminal IM run's durable reply intent exists (crash-window repair)."""
+    im_ctx = await im_context_in_log(event_store, record.session_id, record.id)
+    if im_ctx is None:
+        return
+    engine = ctx.get("engine")
+    await _persist_im_reply(
+        ctx, record, record.scope_id, im_ctx, event_store, engine, get_settings()
+    )
+
+
+async def send_im_replies_tick(ctx: dict[str, Any]) -> int:
+    """Restart-safe durable IM reply sender (cron), driven by the global reply-dispatch index.
+
+    Leases a batch of due reply pointers (fenced so two senders never both deliver one), binds
+    each pointer's scope, claims the encrypted reply intent under a fencing token, decrypts it
+    in-memory, sends through the mapped provider's adapter with the durable idempotency key, and
+    records the delivery result — retiring the pointer on success or rescheduling it on failure.
+    A crash after send / before ack is repaired without a duplicate user-visible reply where the
+    provider dedupes (otherwise at-least-once)."""
+    reply_dispatch: ImReplyDispatchIndex | None = ctx.get("im_reply_dispatch")
+    engine = ctx.get("engine")
+    if reply_dispatch is None and engine is not None:
+        reply_dispatch = PostgresImReplyDispatchIndex(engine)
+    if reply_dispatch is None:
+        return 0
+    senders: dict[ImProvider, ReplySender] = ctx.get("im_senders", {})
+    keyring = _reply_keyring(ctx, get_settings())
+    if keyring is None or not senders:
+        return 0
+    now = datetime.now(UTC)
+    claimed = await reply_dispatch.claim_due(worker_id=_WORKER_ID, now=now)
+    sent = 0
+    for intent in claimed:
+        try:
+            scope_id = validate_scope_id(intent.scope_id)
+        except ScopeValidationError:
+            await reply_dispatch.remove(intent.reply_id)
+            continue
+        reply_store, _rd = _im_reply_stores(ctx, engine, scope_id)
+        if reply_store is None:
+            continue
+        current = await reply_store.get(intent.reply_id)
+        if current is None:
+            await reply_dispatch.remove(intent.reply_id)
+            continue
+        sender = senders.get(current.provider)
+        if sender is None:
+            await reply_dispatch.reschedule(intent.reply_id, now=now)
+            continue
+        delivered = await deliver_reply(
+            reply_store,
+            reply_dispatch,
+            keyring,
+            sender,
+            reply_id=intent.reply_id,
+            worker_id=_WORKER_ID,
+            now=now,
+        )
+        sent += 1 if delivered else 0
+    return sent
 
 
 __all__ = ["reconcile_dispatch_tick", "reconcile_runs_tick", "run_interactive"]
