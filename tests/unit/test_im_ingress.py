@@ -120,7 +120,8 @@ async def test_ingress_admits_durable_im_run_with_context() -> None:
     assert record.actor == "user-member"
     assert record.status in {RunStatus.queued, RunStatus.admitted}
     assert h.enqueued == [(run_id, "agent:org-a/agent-1")]
-    # The durable IM provider/chat context rides on the admission event.
+    # The durable IM mapping admission binding rides on the admission event: provider/chat target,
+    # policy, and the immutable binding identity (mapping id + version, run-as, Agent, scope).
     ctx = await im_context_in_log(h.events["agent:org-a/agent-1"], record.session_id, run_id)
     assert ctx == ImInboundContext(
         provider=ImProvider.telegram,
@@ -130,6 +131,10 @@ async def test_ingress_admits_durable_im_run_with_context() -> None:
         chat_kind=ImChatKind.group,
         mapping_id="map-1",
         policy=ImReplyPolicy(reply_enabled=True),
+        mapping_version=1,
+        run_as_user_id="user-member",
+        agent_id="agent-1",
+        scope_id="agent:org-a/agent-1",
     )
 
 

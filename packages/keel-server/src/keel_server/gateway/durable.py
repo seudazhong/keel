@@ -143,6 +143,7 @@ class DurableImIngress:
 
     @staticmethod
     def _context(inbound: ImInbound, mapping: ImChannelMapping) -> ImInboundContext:
+        policy = mapping.policy if isinstance(mapping.policy, ImReplyPolicy) else ImReplyPolicy()
         return ImInboundContext(
             provider=inbound.provider,
             external_bot_id=inbound.external_bot_id,
@@ -150,7 +151,11 @@ class DurableImIngress:
             external_message_id=inbound.external_message_id,
             chat_kind=inbound.chat_kind,
             mapping_id=mapping.id,
-            policy=mapping.policy if isinstance(mapping.policy, ImReplyPolicy) else ImReplyPolicy(),
+            policy=policy,
+            mapping_version=mapping.version,
+            run_as_user_id=mapping.run_as_user_id,
+            agent_id=mapping.agent_id,
+            scope_id=mapping.scope_id,
         )
 
     @staticmethod

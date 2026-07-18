@@ -29,7 +29,7 @@ from keel_core.identity import IdentityService, NotFoundError
 from keel_core.im_routing import (
     ImChatKind,
     ImInboundContext,
-    ImMappingStatus,
+    ImMappingStore,
     ImProvider,
     ImReplyDispatchIndex,
     ImReplyPolicy,
@@ -207,34 +207,48 @@ def _system_context(engine: Any, scope_id: ScopeId, persona: str) -> SystemConte
     return _ctx
 
 
+def _im_mapping_store(ctx: dict[str, Any], engine: Any, org_id: str) -> ImMappingStore | None:
+    """The org-scoped mapping store used to revalidate an IM run's binding (Postgres or double).
+
+    Prefers an in-memory ``im_mappings`` test double when wired into ``ctx`` (unit tests), else a
+    Postgres store bound to the run's org, else ``None`` (an in-memory worker with no mapping
+    source available — the Agent-visibility check still applies, but the DB binding re-read is
+    skipped)."""
+    store: ImMappingStore | None = ctx.get("im_mappings")
+    if store is not None:
+        return store
+    if engine is not None:
+        return PostgresImMappingStore(engine, org_id)
+    return None
+
+
 def _im_visibility_check(
     identity: IdentityService | None,
-    engine: Any,
+    mapping_store: ImMappingStore | None,
     im_ctx: ImInboundContext | None,
-    record: RunRecord,
 ) -> VisibilityCheck | None:
-    """Claim-time revalidation for an IM run: Agent visibility **and** the channel mapping.
+    """Claim-time revalidation for an IM run: Agent visibility **and** the exact channel binding.
 
     Layers the durable-run Agent/membership visibility check with a re-read of the persisted
-    channel mapping: a mapping that was revoked/disabled between admit and claim, or whose
-    scope / Agent / provider no longer matches the run's binding, fails the run closed (no
-    cross-org Agent binding, no stale/hijacked mapping ever executes). The local-preview single
-    tenant (or an in-memory worker with no engine) skips the DB mapping re-read."""
+    channel mapping: the current mapping must still be ``active`` **and** hash-identically match
+    *every* field the run was admitted against — mapping id + version, run-as org member,
+    provider/bot/chat identity + kind, bound Agent + scope, and the safe-policy fingerprint (see
+    :meth:`ImInboundContext.matches_current_mapping`). A revoke, reprovision, run-as change, Agent
+    change, chat-target/kind change or policy tightening between admit and claim therefore fails
+    the stale queued run closed (deny) before any provider/model/tool effect — no cross-org Agent
+    binding, no stale/hijacked/rebound mapping ever executes. The local-preview single tenant (or a
+    worker with no mapping source) skips only the DB binding re-read."""
     base = _visibility_check(identity)
 
     async def _visible(rec: RunRecord) -> bool:
         if base is not None and not await base(rec):
             return False
-        if engine is None or _is_local_preview(rec) or im_ctx is None or not im_ctx.mapping_id:
+        if _is_local_preview(rec) or im_ctx is None or not im_ctx.mapping_id:
             return True
-        mapping = await PostgresImMappingStore(engine, rec.org_id).get(im_ctx.mapping_id)
-        if mapping is None or mapping.status is not ImMappingStatus.active:
-            return False
-        return (
-            mapping.scope_id == rec.scope_id
-            and mapping.agent_id == rec.agent_id
-            and mapping.provider is im_ctx.provider
-        )
+        if mapping_store is None:
+            return True
+        mapping = await mapping_store.get(im_ctx.mapping_id)
+        return im_ctx.matches_current_mapping(mapping)
 
     return _visible
 
@@ -316,7 +330,9 @@ async def _execute_im_run(
         permissions=im_safe_permissions(policy, read_only_extra=extra_names),
         admit_fn=admit,
         approval_ttl_hours=settings.approval_timeout_hours,
-        visibility_check=_im_visibility_check(identity, engine, im_ctx, record),
+        visibility_check=_im_visibility_check(
+            identity, _im_mapping_store(ctx, engine, record.org_id), im_ctx
+        ),
         system_context=_system_context(engine, lease.scope_id, persona),
         resume=lease.resume,
     )
@@ -643,6 +659,30 @@ async def _ensure_im_reply(ctx: dict[str, Any], record: RunRecord, event_store: 
     )
 
 
+async def _im_reply_still_bound(ctx: dict[str, Any], engine: Any, reply: Any) -> bool:
+    """Whether the reply's admitted channel binding is still the exact, active mapping.
+
+    Fail-closed reply-time revalidation mirroring claim time: re-reads the run's admitted IM
+    binding from the durable log and the current mapping row, and confirms the mapping still
+    exists, is ``active``, and hash-identically matches every admitted binding field. A
+    revoked/reprovisioned/rebound mapping (or a run whose admitted binding can no longer be
+    resolved) denies delivery. When no mapping source is wired (an in-memory worker with neither a
+    Postgres engine nor an ``im_mappings`` double) the reply is allowed — there is nothing to
+    revalidate against."""
+    mapping_store = _im_mapping_store(ctx, engine, reply.org_id)
+    if mapping_store is None:
+        return True
+    run_store, event_store, _approvals = _scoped_stores(ctx, reply.scope_id)
+    record = await run_store.get(reply.run_id)
+    if record is None:
+        return False
+    im_ctx = await im_context_in_log(event_store, record.session_id, reply.run_id)
+    if im_ctx is None or not im_ctx.mapping_id:
+        return False
+    mapping = await mapping_store.get(im_ctx.mapping_id)
+    return im_ctx.matches_current_mapping(mapping)
+
+
 async def send_im_replies_tick(ctx: dict[str, Any]) -> int:
     """Restart-safe durable IM reply sender (cron), driven by the global reply-dispatch index.
 
@@ -676,6 +716,14 @@ async def send_im_replies_tick(ctx: dict[str, Any]) -> int:
             continue
         current = await reply_store.get(intent.reply_id)
         if current is None:
+            await reply_dispatch.remove(intent.reply_id)
+            continue
+        # Reply-time revalidation (fail closed): the run's admitted channel binding must still be
+        # the exact active mapping. A mapping revoked/rebound/reprovisioned between run completion
+        # and delivery denies the reply — a stale reply is never sent to a chat the org no longer
+        # authorizes (the durable intent is terminally denied and its pointer retired).
+        if not await _im_reply_still_bound(ctx, engine, current):
+            await reply_store.deny(intent.reply_id, reason="mapping revoked/rebound", now=now)
             await reply_dispatch.remove(intent.reply_id)
             continue
         sender = senders.get(current.provider)

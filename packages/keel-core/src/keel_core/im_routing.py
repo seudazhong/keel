@@ -240,6 +240,48 @@ def reply_idempotency_key(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def admission_binding_fingerprint(
+    *,
+    mapping_id: str,
+    mapping_version: int,
+    run_as_user_id: str,
+    provider: str,
+    external_bot_id: str,
+    external_chat_id: str,
+    chat_kind: str,
+    agent_id: str,
+    scope_id: str,
+    policy_fingerprint: str,
+) -> str:
+    """The immutable security identity of the IM mapping binding an IM run was admitted under.
+
+    A SHA-256 over exactly the security-relevant binding fields — the mapping id + its monotonic
+    ``version``, the run-as org member, the provider/bot/chat identity + chat kind, the bound
+    Agent + canonical scope, and the safe-policy fingerprint. Non-security metadata (the
+    ``created_by`` audit identity, timestamps) is deliberately **excluded** so a same-version
+    harmless metadata update does not invalidate an in-flight run, while any revoke/reprovision
+    (each bumps ``version``) or run-as / Agent / chat-target / chat-kind / policy change flips the
+    hash and fails older queued runs closed at claim and reply time (before any provider/model/
+    tool effect)."""
+    canonical = json.dumps(
+        {
+            "mapping_id": mapping_id,
+            "version": mapping_version,
+            "run_as": run_as_user_id,
+            "provider": provider,
+            "bot": external_bot_id,
+            "chat": external_chat_id,
+            "chat_kind": chat_kind,
+            "agent_id": agent_id,
+            "scope_id": scope_id,
+            "policy": policy_fingerprint,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 # --------------------------------------------------------------------------- models
 
 
@@ -276,6 +318,26 @@ class ImReplyPolicy:
             approvals_enabled=bool(data.get("approvals_enabled", False)),
             allow_tools=tuple(str(name) for name in allow if isinstance(name, str)),
         )
+
+    def fingerprint(self) -> str:
+        """A stable SHA-256 over the security-relevant capabilities this policy grants.
+
+        Folds the reply/partial/approvals gates and the exact (order-independent) allow-listed
+        tool set into one hash — the *safe-policy fingerprint* an admitted binding pins — so a
+        claim-time or reply-time revalidation detects any policy tightening/loosening (e.g. a
+        reduced ``allow_tools``) against the admitted run. Tool ordering is not security-relevant
+        and is normalized away so a harmless reorder does not invalidate an in-flight run."""
+        canonical = json.dumps(
+            {
+                "reply_enabled": self.reply_enabled,
+                "partial_replies": self.partial_replies,
+                "approvals_enabled": self.approvals_enabled,
+                "allow_tools": sorted(self.allow_tools),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -318,6 +380,26 @@ class ImChannelMapping:
     @property
     def route_key(self) -> str:
         return route_key(self.provider.value, self.external_bot_id, self.external_chat_id)
+
+    def binding_fingerprint(self) -> str:
+        """This mapping's immutable admission-binding fingerprint (its current security identity).
+
+        Recomputed at claim/reply time from the *current* row and compared against the value an
+        IM run pinned at admission — any revoke/reprovision (version bump), run-as change, Agent
+        change, chat-target/kind change or policy tightening flips it and fails the stale run
+        closed."""
+        return admission_binding_fingerprint(
+            mapping_id=self.id,
+            mapping_version=self.version,
+            run_as_user_id=self.run_as_user_id,
+            provider=self.provider.value,
+            external_bot_id=self.external_bot_id,
+            external_chat_id=self.external_chat_id,
+            chat_kind=self.chat_kind.value,
+            agent_id=self.agent_id,
+            scope_id=self.scope_id,
+            policy_fingerprint=self.policy.fingerprint(),
+        )
 
     def route_entry(self) -> ImRouteEntry:
         """The minimal, opaque global index row this mapping publishes."""
@@ -407,12 +489,17 @@ def resolve_inbound_route(entry: ImRouteEntry | None, *, cloud_mode: bool) -> Im
 
 @dataclass(frozen=True)
 class ImInboundContext:
-    """The durable IM provider/chat context bound to a run at admission.
+    """The durable, immutable IM mapping admission binding bound to a run at admission.
 
-    Carried in the admission event payload (no schema migration) so the worker can rebuild the
-    reply target (provider + account + chat + message id) and the mapping's reply policy from
-    the durable log — the run row alone only knows org/actor/agent/session/surface.
-    """
+    Carried in the admission event payload (no schema migration) so the worker can (a) rebuild the
+    reply target (provider + account + chat + message id) and the mapping's reply policy from the
+    durable log — the run row alone only knows org/actor/agent/session/surface — and (b) re-validate
+    at claim and reply time that the *current* active mapping still matches **every** admitted
+    binding field exactly. The immutable binding pins the mapping id + ``mapping_version``, the
+    run-as org member, the provider/bot/chat identity + kind, the bound Agent + scope, and the
+    safe-policy — so a revoke, reprovision, run-as change, Agent change, chat-target/kind change or
+    policy tightening between admit and execute fails the stale queued run closed (deny) before any
+    provider/model/tool effect."""
 
     provider: ImProvider
     external_bot_id: str
@@ -421,6 +508,39 @@ class ImInboundContext:
     chat_kind: ImChatKind
     mapping_id: str
     policy: ImReplyPolicy = field(default_factory=ImReplyPolicy)
+    mapping_version: int = 0
+    run_as_user_id: str = ""
+    agent_id: str = ""
+    scope_id: str = ""
+
+    def binding_fingerprint(self) -> str:
+        """The admitted binding's immutable security identity.
+
+        See :func:`admission_binding_fingerprint`."""
+        return admission_binding_fingerprint(
+            mapping_id=self.mapping_id,
+            mapping_version=self.mapping_version,
+            run_as_user_id=self.run_as_user_id,
+            provider=self.provider.value,
+            external_bot_id=self.external_bot_id,
+            external_chat_id=self.external_chat_id,
+            chat_kind=self.chat_kind.value,
+            agent_id=self.agent_id,
+            scope_id=self.scope_id,
+            policy_fingerprint=self.policy.fingerprint(),
+        )
+
+    def matches_current_mapping(self, mapping: ImChannelMapping | None) -> bool:
+        """Whether ``mapping`` is the *exact*, still-authorized binding this run was admitted under.
+
+        Fail-closed claim/reply-time revalidation: the mapping must still exist, be ``active``, and
+        hash-identically to the admitted binding (mapping id + version, run-as, provider/bot/chat/
+        kind, Agent, scope and safe-policy fingerprint). Any revoke (status no longer ``active``),
+        reprovision (version bump), run-as change, Agent change, chat-target/kind change or policy
+        tightening flips the fingerprint (or clears ``active``) and denies the stale run."""
+        if mapping is None or mapping.status is not ImMappingStatus.active:
+            return False
+        return mapping.binding_fingerprint() == self.binding_fingerprint()
 
     def to_admission_extra(self) -> dict[str, object]:
         """The ``extra`` payload merged into the admission turn (namespaced under ``im``)."""
@@ -432,7 +552,13 @@ class ImInboundContext:
                 "message": self.external_message_id,
                 "chat_kind": self.chat_kind.value,
                 "mapping_id": self.mapping_id,
+                "mapping_version": self.mapping_version,
+                "run_as": self.run_as_user_id,
+                "agent_id": self.agent_id,
+                "scope_id": self.scope_id,
                 "policy": self.policy.to_json(),
+                "policy_fingerprint": self.policy.fingerprint(),
+                "binding_fingerprint": self.binding_fingerprint(),
             }
         }
 
@@ -449,6 +575,10 @@ class ImInboundContext:
                 chat_kind=ImChatKind(str(raw["chat_kind"])),
                 mapping_id=str(raw.get("mapping_id", "")),
                 policy=ImReplyPolicy.from_json(raw.get("policy")),
+                mapping_version=int(raw.get("mapping_version", 0) or 0),
+                run_as_user_id=str(raw.get("run_as", "")),
+                agent_id=str(raw.get("agent_id", "")),
+                scope_id=str(raw.get("scope_id", "")),
             )
         except (KeyError, ValueError):
             return None
@@ -634,6 +764,11 @@ async def persist_terminal_reply(
         next_attempt_at=now,
     )
     stored, _created = await reply_store.record_intent(intent)
+    # Do not (re-)arm a dispatch pointer for an already-terminal reply: a reply that was delivered
+    # (``sent``) or fail-closed denied (``failed`` — its mapping was revoked/rebound) must never be
+    # resurrected for another send attempt by a repaired crash window.
+    if stored.status in {ImReplyStatus.sent, ImReplyStatus.failed}:
+        return stored.id
     await reply_dispatch.record(stored.id, scope_id, now=now)
     return stored.id
 
@@ -810,6 +945,8 @@ class ImReplyStore(Protocol):
         retry_delay_seconds: int,
         now: datetime | None = None,
     ) -> bool: ...
+
+    async def deny(self, reply_id: str, *, reason: str, now: datetime | None = None) -> bool: ...
 
     async def purge_scope(self, scope_id: ScopeId) -> int: ...
 
@@ -1141,6 +1278,21 @@ class InMemoryImReplyStore:
             lease_token="",
             lease_expires_at=None,
             next_attempt_at=now + timedelta(seconds=retry_delay_seconds),
+            updated_at=now,
+        )
+        return True
+
+    async def deny(self, reply_id: str, *, reason: str, now: datetime | None = None) -> bool:
+        now = now or _now()
+        current = self._by_id.get(reply_id)
+        if current is None or current.status is ImReplyStatus.sent:
+            return False
+        self._by_id[reply_id] = _replace_intent(
+            current,
+            status=ImReplyStatus.failed,
+            error=reason[:500],
+            lease_token="",
+            lease_expires_at=None,
             updated_at=now,
         )
         return True
@@ -1852,6 +2004,28 @@ class PostgresImReplyStore:
             )
         return (result.rowcount or 0) > 0
 
+    async def deny(self, reply_id: str, *, reason: str, now: datetime | None = None) -> bool:
+        """Terminally refuse a reply whose mapping was revoked/rebound (fail closed, never sent).
+
+        Unlike :meth:`mark_failed` (a retryable ``pending`` re-arm), a denied reply is a permanent
+        ``failed`` terminal: its dispatch pointer is retired and never re-armed (see
+        :func:`persist_terminal_reply`), so a run whose channel binding is no longer the exact
+        active mapping produces no user-visible reply. Does not require the lease token — a due
+        reply can be denied before it is claimed for delivery."""
+        now = now or _now()
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            result = await conn.execute(
+                text(
+                    "UPDATE im_reply_intents SET "
+                    " status = 'failed', error = :error, lease_token = '', "
+                    " lease_expires_at = NULL, updated_at = :now "
+                    "WHERE id = :id AND status <> 'sent'"
+                ),
+                {"error": reason[:500], "now": now, "id": reply_id},
+            )
+        return (result.rowcount or 0) > 0
+
     async def purge_scope(self, scope_id: ScopeId) -> int:
         async with self._engine.begin() as conn:
             await conn.execute(_SET_SCOPE, {"scope": scope_id})
@@ -1987,6 +2161,7 @@ __all__ = [
     "StaleMappingError",
     "TerminalMappingError",
     "UnknownMappingError",
+    "admission_binding_fingerprint",
     "build_im_safe_agent",
     "decrypt_reply_payload",
     "deliver_reply",
