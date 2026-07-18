@@ -367,6 +367,15 @@ def upgrade() -> None:
     # the non-owner runtime role to read across scopes; the ingress still runs the provider-specific
     # signature/endpoint-token/replay verification against that scope's bound credential after
     # resolving the route. It is intentionally not under RLS (the one table read across scopes).
+    #
+    # A composite FK to ``connector_bindings (scope_id, id)`` (safe because that table carries the
+    # matching ``UNIQUE (scope_id, id)``, per 0016) makes deleting the durable scoped binding —
+    # whether via a single connector revoke or a whole-scope lifecycle purge — atomically cascade
+    # the route away in the *same* transaction/statement, never leaving a stale token that would
+    # still resolve after its binding is gone (follow-up review finding: connector global routing
+    # metadata erasure). ``connector_repository.purge_scope`` additionally deletes by exact
+    # ``scope_id`` explicitly (belt-and-suspenders / idempotent), since it is the one write path
+    # that can remove every binding for a scope in a single bulk statement.
     op.execute(
         """
         CREATE TABLE connector_webhook_routes (
@@ -378,7 +387,9 @@ def upgrade() -> None:
             created_at timestamptz NOT NULL DEFAULT now(),
             updated_at timestamptz NOT NULL DEFAULT now(),
             -- At most one active route per connector per scope; setup replaces the prior token.
-            UNIQUE (scope_id, connector_id)
+            UNIQUE (scope_id, connector_id),
+            FOREIGN KEY (scope_id, binding_id)
+                REFERENCES connector_bindings (scope_id, id) ON DELETE CASCADE
         )
         """
     )

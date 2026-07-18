@@ -47,3 +47,53 @@ test("an auth rejection clears the stored secret and shows credential recovery",
   expect(persisted.agent).toBe("kept-agent");
   expect(sessionStorage.getItem("keel.auth.v1")).not.toContain("rejected-secret");
 });
+
+test("with nothing persisted, the app defaults to local preview and grants access without any sign-in", () => {
+  render(
+    <I18nProvider>
+      <AuthProvider>
+        <AuthGate />
+      </AuthProvider>
+    </I18nProvider>,
+  );
+
+  expect(screen.getByText("Application content")).toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "Sign in to your workspace" })).not.toBeInTheDocument();
+});
+
+test("cloud denial: once the server rejects an unauthenticated request, local preview is hidden and only sign-in remains", () => {
+  render(
+    <I18nProvider>
+      <AuthProvider>
+        <AuthGate />
+      </AuthProvider>
+    </I18nProvider>,
+  );
+  expect(screen.getByText("Application content")).toBeInTheDocument(); // default local preview
+
+  act(() => notifyAuthError(403));
+
+  expect(screen.getByRole("heading", { name: "Sign in to your workspace" })).toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "Continue in local preview" })).not.toBeInTheDocument();
+  expect(screen.getByText(/local preview is not available/i)).toBeInTheDocument();
+});
+
+test("sign-out returns to the choice screen, and choosing local preview recovers app access", () => {
+  render(
+    <I18nProvider>
+      <AuthProvider>
+        <AuthGate />
+      </AuthProvider>
+    </I18nProvider>,
+  );
+  expect(screen.getByText("Application content")).toBeInTheDocument();
+
+  act(() => screen.getByRole("button", { name: "Sign out" }).click());
+
+  expect(screen.getByRole("heading", { name: "Sign in to your workspace" })).toBeInTheDocument();
+  const localPreview = screen.getByRole("button", { name: "Continue in local preview" });
+
+  act(() => localPreview.click());
+
+  expect(screen.getByText("Application content")).toBeInTheDocument();
+});

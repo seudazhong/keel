@@ -1,10 +1,13 @@
 /**
- * Truthful sign-in / workspace-context screen (M3.6 finding 1).
+ * Truthful sign-in / workspace-context screen (M3.6 finding 1 + follow-up).
  *
- * Shown when the server rejects a request for auth (cloud mode). It accepts an API key or a
+ * Shown whenever local preview isn't currently granting access: either the server has rejected
+ * a request for auth, or the caller explicitly signed out. It accepts an API key or a
  * directly-supplied OIDC bearer token (from an external login page / reverse proxy — it does
  * NOT fake an OIDC authorization-code flow) plus the selected organization and Agent, and warns
- * that secrets are held only for this browser tab.
+ * that secrets are held only for this browser tab. The "local preview" choice is hidden once
+ * the server has ever reported that auth is required (`auth.cloudAuthRequired`) so it can never
+ * be (re)selected in a deployment that truly needs a credential.
  */
 
 import { useState, type FormEvent } from "react";
@@ -105,14 +108,19 @@ export function SignInScreen() {
 
         <div className="flex items-center gap-2">
           <Button type="submit">{t("auth.submit")}</Button>
-          <button
-            type="button"
-            className="text-sm text-muted underline"
-            onClick={() => auth.signIn({ credential: null, org: null, agent: null })}
-          >
-            {t("auth.localPreview")}
-          </button>
+          {!auth.cloudAuthRequired && (
+            <button
+              type="button"
+              className="text-sm text-muted underline"
+              onClick={() => auth.enterLocalPreview({ org: org.trim() || null, agent: agent.trim() || null })}
+            >
+              {t("auth.localPreview")}
+            </button>
+          )}
         </div>
+        {auth.cloudAuthRequired && (
+          <p className="text-xs text-muted">{t("auth.localPreviewBlocked")}</p>
+        )}
       </form>
     </div>
   );

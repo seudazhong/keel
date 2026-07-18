@@ -426,3 +426,104 @@ async def test_downgrade_fails_closed_when_run_content_is_unrecoverable(
         assert set(pk_cols) == {"scope_id", "id"}
         fps = (await conn.execute(text("SELECT fingerprint FROM runs ORDER BY id"))).scalars().all()
         assert set(fps) == {fp_a, fp_b}  # nothing cleared/wildcarded
+
+
+async def test_up_down_up_preserves_webhook_route_cascade_and_active_scope_index(
+    migrated_db: AsyncEngine,
+) -> None:
+    """Follow-up review finding (connector global routing metadata erasure), exercised through a
+    genuine down/up round trip rather than only the application-level ``purge_scope`` helper:
+
+    * ``connector_webhook_routes`` carries a composite FK to ``connector_bindings (scope_id,
+      id)`` with ``ON DELETE CASCADE`` — deleting the durable scoped binding row cascades its
+      route away automatically, in the SAME statement/transaction, with no application code
+      involved. A stale route can therefore never outlive (or be resolvable after) its binding.
+    * ``connector_active_scopes`` has no such per-binding FK (it is a per-scope aggregate, not
+      tied to one binding row) and is deliberately left alone by the schema — its cleanup is an
+      explicit application-level responsibility (``connector_repository.purge_scope``), which
+      this test documents by proving the index constraint does *not* auto-clear it.
+    * The migration remains reversible: dropping to 0016 and back to head recreates both tables
+      (and the FK) from scratch with no residual data leaking across the round trip.
+    """
+    url = os.environ["KEEL_TEST_DATABASE_URL"]
+
+    async def _seed_binding_and_route(conn: AsyncConnection, scope_id: str, binding_id: str) -> str:
+        await conn.execute(
+            text(
+                "INSERT INTO connector_bindings (id, scope_id, connector_id, status) "
+                "VALUES (:id, :scope, 'pg_fixture', 'connected')"
+            ),
+            {"id": binding_id, "scope": scope_id},
+        )
+        token = f"tok-{binding_id}"
+        await conn.execute(
+            text(
+                "INSERT INTO connector_webhook_routes "
+                "(route_token, scope_id, connector_id, binding_id, status) "
+                "VALUES (:token, :scope, 'pg_fixture', :binding, 'connected')"
+            ),
+            {"token": token, "scope": scope_id, "binding": binding_id},
+        )
+        await conn.execute(
+            text("INSERT INTO connector_active_scopes (scope_id) VALUES (:scope)"),
+            {"scope": scope_id},
+        )
+        return token
+
+    async with migrated_db.begin() as conn:
+        token = await _seed_binding_and_route(conn, _SCOPE_A, "binding-cascade-1")
+
+    # A composite FK to connector_bindings (scope_id, id) means deleting the binding cascades
+    # the route away with no application code — the very defect this follow-up fixes.
+    async with migrated_db.begin() as conn:
+        await conn.execute(
+            text("DELETE FROM connector_bindings WHERE scope_id = :scope AND id = :id"),
+            {"scope": _SCOPE_A, "id": "binding-cascade-1"},
+        )
+    async with migrated_db.connect() as conn:
+        route_left = await conn.scalar(
+            text("SELECT count(*) FROM connector_webhook_routes WHERE route_token = :token"),
+            {"token": token},
+        )
+        assert route_left == 0
+        # No per-binding FK on connector_active_scopes: this is an explicit purge_scope job,
+        # not a schema-level cascade — confirmed by it surviving the binding delete above.
+        scope_left = await conn.scalar(
+            text("SELECT count(*) FROM connector_active_scopes WHERE scope_id = :scope"),
+            {"scope": _SCOPE_A},
+        )
+        assert scope_left == 1
+
+    # Round trip: downgrade drops both global tables, re-upgrade recreates them (and the FK)
+    # from scratch with no residual rows leaking across the migration boundary.
+    await asyncio.to_thread(_run_to, url, _PREV)
+    async with migrated_db.connect() as conn:
+        exists = await conn.scalar(
+            text(
+                "SELECT to_regclass('connector_webhook_routes') IS NOT NULL "
+                "AND to_regclass('connector_active_scopes') IS NOT NULL"
+            )
+        )
+        assert exists is False
+
+    await asyncio.to_thread(_run_to, url, "head")
+    async with migrated_db.connect() as conn:
+        counts = (
+            await conn.scalar(text("SELECT count(*) FROM connector_webhook_routes")),
+            await conn.scalar(text("SELECT count(*) FROM connector_active_scopes")),
+        )
+        assert counts == (0, 0)
+
+    # The FK is back in force post round-trip: seed fresh rows and prove cascade again.
+    async with migrated_db.begin() as conn:
+        token2 = await _seed_binding_and_route(conn, _SCOPE_B, "binding-cascade-2")
+        await conn.execute(
+            text("DELETE FROM connector_bindings WHERE scope_id = :scope AND id = :id"),
+            {"scope": _SCOPE_B, "id": "binding-cascade-2"},
+        )
+    async with migrated_db.connect() as conn:
+        route_left2 = await conn.scalar(
+            text("SELECT count(*) FROM connector_webhook_routes WHERE route_token = :token"),
+            {"token": token2},
+        )
+        assert route_left2 == 0

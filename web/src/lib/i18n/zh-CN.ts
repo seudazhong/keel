@@ -154,4 +154,5 @@ export const zhCN: Record<MessageKey, string> = {
   "auth.secretWarning": "密钥仅保存在当前浏览器标签页中，退出登录或关闭标签页时清除，绝不会写入持久化存储。",
   "auth.tokenNote": "Bearer 令牌由你的外部登录或反向代理提供；此界面不执行 OIDC 登录流程。",
   "auth.rejected": "你的凭据或工作区被拒绝。请检查后重试。",
+  "auth.localPreviewBlocked": "此部署需要凭据 —— 本地预览不可用。",
 };

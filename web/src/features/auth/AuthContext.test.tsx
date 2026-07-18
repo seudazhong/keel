@@ -2,7 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { ReactNode } from "react";
 import { AuthProvider, useAuth } from "./AuthContext";
-import { authHeaders, getAuthSnapshot } from "./authState";
+import { authHeaders, getAuthSnapshot, notifyAuthError } from "./authState";
 
 const wrapper = ({ children }: { children: ReactNode }) => <AuthProvider>{children}</AuthProvider>;
 
@@ -55,5 +55,62 @@ describe("AuthContext", () => {
     expect(result.current.isAuthenticated).toBe(true);
     expect(result.current.org).toBe("o2");
     expect(authHeaders()).toMatchObject({ "X-API-Key": "kk", "X-Keel-Org": "o2" });
+  });
+
+  it("defaults to local preview (no credential, no header) when nothing is persisted", () => {
+    const { result } = renderHook(() => useAuth(), { wrapper });
+    expect(result.current.mode).toBe("local-preview");
+    expect(result.current.isAuthenticated).toBe(true);
+    expect(result.current.credential).toBeNull();
+    expect(result.current.cloudAuthRequired).toBe(false);
+    // Local preview sends no credential header at all — the server derives `web:local`.
+    expect(authHeaders()).toEqual({});
+  });
+
+  it("a 401/403 (cloud denial) blocks local preview for the rest of the session and never falls back into it", () => {
+    const { result } = renderHook(() => useAuth(), { wrapper });
+    expect(result.current.isAuthenticated).toBe(true); // default local preview
+
+    act(() => notifyAuthError(403));
+
+    expect(result.current.cloudAuthRequired).toBe(true);
+    expect(result.current.needsAuth).toBe(true);
+    expect(result.current.mode).toBeNull();
+    expect(result.current.isAuthenticated).toBe(false);
+
+    // Explicitly re-choosing local preview is now a no-op (fail closed).
+    act(() => result.current.enterLocalPreview({ org: null, agent: null }));
+    expect(result.current.mode).toBeNull();
+    expect(result.current.isAuthenticated).toBe(false);
+  });
+
+  it("a rejected credential is cleared and never accidentally falls into local preview", () => {
+    const { result } = renderHook(() => useAuth(), { wrapper });
+    act(() => {
+      result.current.signIn({ credential: { kind: "api-key", secret: "bad" }, org: "o", agent: "a" });
+    });
+    expect(result.current.mode).toBe("credential");
+
+    act(() => notifyAuthError(401));
+
+    expect(result.current.mode).toBeNull();
+    expect(result.current.credential).toBeNull();
+    expect(result.current.isAuthenticated).toBe(false);
+    expect(sessionStorage.getItem("keel.auth.v1") ?? "").not.toContain("bad");
+  });
+
+  it("sign-out returns to the choice screen, and choosing local preview recovers access", () => {
+    const { result } = renderHook(() => useAuth(), { wrapper });
+    act(() => {
+      result.current.signIn({ credential: { kind: "api-key", secret: "vkey" }, org: "o", agent: "a" });
+    });
+    act(() => result.current.signOut());
+    expect(result.current.mode).toBeNull();
+    expect(result.current.isAuthenticated).toBe(false);
+
+    act(() => result.current.enterLocalPreview({ org: "o", agent: "a" }));
+    expect(result.current.mode).toBe("local-preview");
+    expect(result.current.isAuthenticated).toBe(true);
+    expect(result.current.credential).toBeNull();
   });
 });

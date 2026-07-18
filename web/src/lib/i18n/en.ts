@@ -155,6 +155,7 @@ export const en = {
   "auth.secretWarning": "Secrets are kept only in this browser tab and cleared when you sign out or close the tab. They are never written to persistent storage.",
   "auth.tokenNote": "A bearer token is supplied by your external login or reverse proxy; this screen does not run an OIDC login flow.",
   "auth.rejected": "Your credential or workspace was rejected. Check the values and try again.",
+  "auth.localPreviewBlocked": "This deployment requires a credential — local preview is not available.",
 } satisfies Record<string, string>;
 
 export type MessageKey = keyof typeof en;

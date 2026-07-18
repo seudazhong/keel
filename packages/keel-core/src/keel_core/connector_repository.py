@@ -2124,6 +2124,22 @@ class PostgresConnectorRepository:
 
 
 async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
+    """Purge every connector row for exactly one scope — no cross-scope deletion.
+
+    Deletes the scope-partitioned (RLS) tables first, then the two **global** (non-RLS)
+    connector routing tables by exact ``scope_id`` (follow-up review finding: connector global
+    routing metadata erasure — before this, a whole-scope lifecycle purge deleted
+    ``connector_bindings`` but left ``connector_active_scopes``/``connector_webhook_routes``
+    rows for that scope dangling, since neither is scope-partitioned or in the lifecycle data
+    map). ``connector_webhook_routes`` also carries a composite FK to ``connector_bindings
+    (scope_id, id)`` with ``ON DELETE CASCADE``, so the bulk ``connector_bindings`` delete below
+    already removes every one of this scope's routes atomically in the same transaction; the
+    explicit delete here is a belt-and-suspenders no-op that keeps this purge correct even if
+    that FK is ever dropped. ``connector_active_scopes`` has no such per-binding FK (it is a
+    per-scope aggregate, not tied to one binding row), so it is only ever cleared here — this
+    purge always empties every remaining binding for the scope, so it is safe to delete
+    unconditionally rather than re-deriving "no state left" from a second query.
+    """
     total = 0
     async with engine.begin() as conn:
         await conn.execute(_SET_SCOPE, {"scope": scope_id})
@@ -2140,6 +2156,11 @@ async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
                 {"scope": scope_id},
             )
             total += int(result.rowcount or 0)
+        for table in ("connector_webhook_routes", "connector_active_scopes"):
+            await conn.execute(
+                text(f"DELETE FROM {table} WHERE scope_id = :scope"),
+                {"scope": scope_id},
+            )
     return total
 
 
