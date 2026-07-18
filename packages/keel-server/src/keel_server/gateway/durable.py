@@ -13,7 +13,7 @@ durable, encrypted reply. There is no process-local in-memory gateway runtime.
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 
 from keel_core.im_routing import (
@@ -161,7 +161,7 @@ __all__ = [
 
 
 def parse_onebot_inbound(
-    payload: dict[str, object], *, self_id: int | None, prefixes: tuple[str, ...]
+    payload: Mapping[str, object], *, self_id: int | None, prefixes: tuple[str, ...]
 ) -> ImInbound | None:
     """Parse + wake-gate a OneBot v11 event into a normalized :class:`ImInbound` (None = ignore)."""
     event = OneBotEvent.model_validate(payload)
@@ -185,15 +185,15 @@ def parse_onebot_inbound(
 
 
 def _parse_telegram_woke(
-    payload: dict[str, object], *, bot_username: str | None, prefixes: tuple[str, ...]
+    payload: Mapping[str, object], *, bot_username: str | None, prefixes: tuple[str, ...]
 ) -> str | None:
     """The woke, wake-token-stripped text of a Telegram update (None = ignore/no wake)."""
-    message = _tg_parse(payload, bot_username=bot_username, prefixes=prefixes)
+    message = _tg_parse(dict(payload), bot_username=bot_username, prefixes=prefixes)
     return message.text if message is not None else None
 
 
 def parse_telegram_inbound(
-    payload: dict[str, object],
+    payload: Mapping[str, object],
     *,
     bot_id: str,
     bot_username: str | None,

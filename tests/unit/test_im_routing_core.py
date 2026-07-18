@@ -36,7 +36,7 @@ from keel_core.im_routing import (
     resolve_inbound_route,
     route_key,
 )
-from keel_core.permissions import ToolContext
+from keel_core.protocols import ToolContext
 from keel_core.secrets import KeyRing
 from keel_core.types import ContentTaint, PermissionDecision, TrustLevel
 
