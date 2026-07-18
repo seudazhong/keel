@@ -244,3 +244,43 @@ class LinkInstallationRequest(BaseModel):
     app_id: int
     account_login: str
     account_type: str = "Organization"
+
+
+# --- Durable IM (OneBot/Telegram) channel routing (M3.7) — additive DTOs -------------
+
+
+class ImMappingPolicy(BaseModel):
+    """A channel mapping's reply/tool policy (capability flags only — never a secret)."""
+
+    reply_enabled: bool = True
+    partial_replies: bool = False
+    allow_tools: list[str] = []
+
+
+class CreateImMappingRequest(BaseModel):
+    """Create an org-owned IM channel mapping binding a chat to an Agent + scope + policy."""
+
+    provider: str  # "onebot" | "telegram"
+    external_bot_id: str
+    external_chat_id: str
+    chat_kind: str  # "personal" | "group"
+    agent_id: str
+    policy: ImMappingPolicy = ImMappingPolicy()
+
+
+class ImMappingSummary(BaseModel):
+    """An org-owned durable IM channel mapping (no raw external secrets)."""
+
+    id: str
+    org_id: str
+    provider: str
+    external_bot_id: str
+    external_chat_id: str
+    chat_kind: str
+    agent_id: str
+    scope_id: str
+    policy: ImMappingPolicy
+    status: str  # "active" | "disabled" | "revoked"
+    version: int
+    created_by: str
+    revoked_by: str = ""
