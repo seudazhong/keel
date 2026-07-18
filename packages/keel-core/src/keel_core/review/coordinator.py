@@ -22,9 +22,10 @@ import asyncio
 import hashlib
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from keel_core.coding.models import CodingRunId, ProjectId
 from keel_core.coding.protocols import ArtifactStore
@@ -32,7 +33,7 @@ from keel_core.errors import DuplicateEventError, PermissionDenied
 from keel_core.events import Event, EventType
 from keel_core.projects.service import ProjectService
 from keel_core.projects.storage import worktree_storage_id
-from keel_core.protocols import EventStore
+from keel_core.protocols import EventStore, Usage
 from keel_core.runs import (
     RunBudgetSpec,
     RunCost,
@@ -264,8 +265,20 @@ class ReviewCoordinator:
         return self.build_record(record, request=request, report=report)
 
     # --- execution path (worker) -----------------------------------------------------
-    async def execute_review(self, request: ReviewRequest, *, run_id: str) -> ReviewOutcome | None:
-        """Claim + run a durably-admitted review. Idempotent/restart-safe."""
+    async def execute_review(
+        self,
+        request: ReviewRequest,
+        *,
+        run_id: str,
+        job_checkpoint: Callable[[], Awaitable[None]] | None = None,
+    ) -> ReviewOutcome | None:
+        """Claim + run a durably-admitted review. Idempotent/restart-safe.
+
+        ``job_checkpoint`` is an optional durable job-lease heartbeat (the worker's
+        ``JobContext.checkpoint``): it is invoked periodically throughout the review so a lost
+        job lease or a cancellation request aborts execution *without* a terminal success under
+        a superseded fence (the durable job then retries or the reconciler terminalizes).
+        """
         record = await self._runs.get(run_id)
         if record is None:
             raise ReviewNotFound(f"review run not found: {run_id}")
@@ -333,6 +346,17 @@ class ReviewCoordinator:
             interval_seconds=max(1.0, self._lease_seconds / 3),
         )
         keeper.start()
+        job_keeper: _JobHeartbeatKeeper | None = None
+        if job_checkpoint is not None:
+            job_keeper = _JobHeartbeatKeeper(
+                checkpoint=job_checkpoint,
+                interval_seconds=max(1.0, self._lease_seconds / 3),
+            )
+        prior_usage = Usage(
+            prompt_tokens=record.prompt_tokens,
+            completion_tokens=record.completion_tokens,
+            cost_usd=record.cost_usd,
+        )
         try:
             try:
                 plan = await build_materialization_plan(
@@ -340,25 +364,56 @@ class ReviewCoordinator:
                     default_branch=getattr(project, "default_branch", None),
                     pr_resolver=self._pr_resolver,
                 )
-                outcome = await self._reviews.review(
-                    request,
-                    run_id=run_id,
-                    coding_run_id=coding_run_id,
-                    project_handle=handle,
-                    review_id=run_id,
-                    now=self._clock(),
-                    plan=plan,
+                review_task: asyncio.Task[ReviewOutcome] = asyncio.ensure_future(
+                    self._reviews.review(
+                        request,
+                        run_id=run_id,
+                        coding_run_id=coding_run_id,
+                        project_handle=handle,
+                        review_id=run_id,
+                        now=self._clock(),
+                        plan=plan,
+                        prior_usage=prior_usage,
+                    )
                 )
+                if job_keeper is not None:
+                    # Periodically heartbeat the durable JOB lease throughout the review; a lost
+                    # job lease / cancellation cancels the in-flight review task (abort, no
+                    # terminal write under a superseded fence).
+                    job_keeper.bind(review_task)
+                    job_keeper.start()
+                try:
+                    outcome = await review_task
+                except asyncio.CancelledError:
+                    if job_keeper is not None and job_keeper.lost:
+                        # Preserve the original job signal (cancellation vs lost lease) so the
+                        # worker can honour a cancel; fall back to lease-lost for a bare cancel.
+                        if job_keeper.error is not None:
+                            raise job_keeper.error from None
+                        raise ReviewLeaseLost(
+                            f"review job lease lost during execution: {run_id}"
+                        ) from None
+                    raise
+                finally:
+                    if job_keeper is not None:
+                        await job_keeper.stop()
             except Exception as exc:
-                if keeper.lost:
-                    # Lease lost mid-flight: another worker may own the run. Abort all effects
-                    # WITHOUT terminalizing (contention is never a terminal success).
+                if job_keeper is not None and job_keeper.lost and job_keeper.error is exc:
+                    # A cancellation / lost-job-lease signal propagates untouched (never turned
+                    # into a terminal success): the worker honours cancel, or retries the lease.
+                    raise
+                if keeper.lost or (job_keeper is not None and job_keeper.lost):
+                    # Lease lost mid-flight (run or job): another worker may own the run. Abort
+                    # all effects WITHOUT terminalizing (contention is never a terminal success).
+                    if isinstance(exc, ReviewLeaseLost):
+                        raise
                     raise ReviewLeaseLost(f"review lease lost during execution: {run_id}") from exc
                 if _is_retryable(exc):
                     # Transient provider/infra failure: do NOT terminalize; the durable job
-                    # retries until success or attempts are exhausted. Release the lease so the
-                    # run is promptly reclaimable.
-                    await self._release(lease)
+                    # retries until success or attempts are exhausted. Durably charge any partial
+                    # token/cost usage consumed before the failure, then release the lease so the
+                    # run is promptly reclaimable AND the next attempt gets only remaining budget.
+                    await self._release(lease, cost=_partial_cost(exc))
                     raise
                 error_kind = _error_kind(exc)
                 await self._runs.terminalize(
@@ -414,19 +469,72 @@ class ReviewCoordinator:
         )
         return outcome
 
-    async def _release(self, lease: RunLease) -> None:
-        """Transition a retryable run back to ``queued`` and clear/fence its lease.
+    async def terminalize_orphaned_run(
+        self,
+        run_id: str,
+        *,
+        status: RunStatus,
+        stop_reason: str,
+        error_kind: str,
+        error_message: str,
+    ) -> bool:
+        """Terminalize a non-terminal review run whose durable job exhausted retries / cancelled.
+
+        Called from the worker job's ``on_failed`` / ``on_cancelled`` hooks (and safe to call
+        from a reconciler): when the ``review.run`` job reaches a terminal failed/cancelled state
+        the associated queued/running run would otherwise linger admitted until its TTL. This
+        claims the run and writes the terminal state **exactly once** (idempotent: an
+        already-terminal run, a missing run, or a contended live lease is a no-op — the run TTL /
+        expiry reconciler remains the ultimate backstop).
+        """
+        if status not in (RunStatus.failed, RunStatus.cancelled):
+            raise ReviewValidationError("orphaned review run must terminalize failed/cancelled")
+        record = await self._runs.get(run_id)
+        if record is None or record.surface != REVIEW_SURFACE or record.is_terminal:
+            return False
+        lease = await self._runs.claim(
+            run_id,
+            worker_id=self._worker_id,
+            now=self._clock(),
+            lease_seconds=self._lease_seconds,
+        )
+        if lease is None:
+            # Raced to terminal (no-op) or contended under a live lease (TTL/expiry backstop).
+            return False
+        await self._runs.terminalize(
+            lease,
+            status=status,
+            stop_reason=stop_reason,
+            now=self._clock(),
+            error_kind=error_kind,
+            error_message=error_message[:500],
+        )
+        self._audit.record(
+            ReviewAuditEvent(
+                ReviewAuditAction.review_failed,
+                record.actor,
+                record.org_id,
+                run_id,
+                {"project_id": record.org_id, "error_kind": error_kind},
+            )
+        )
+        return True
+
+    async def _release(self, lease: RunLease, *, cost: RunCost | None = None) -> None:
+        """Transition a retryable run back to ``queued``, charging any partial usage/cost.
 
         On a retryable (transient) failure the run must not stay ``running`` under a stale
         fence: releasing it explicitly to ``queued`` (worker_id/lease_token cleared, version
-        bumped) makes it promptly reclaimable by the next attempt. Best-effort: if the lease was
-        already lost/superseded the release simply no-ops (the lease also expires on its own).
+        bumped) makes it promptly reclaimable by the next attempt, and durably charging the
+        partial token/cost usage consumed before the failure means the next attempt gets only
+        the remaining budget. Best-effort: if the lease was already lost/superseded the release
+        simply no-ops (the lease also expires on its own).
         """
         release = getattr(self._runs, "release", None)
         if release is None:
             return
         try:
-            await release(lease, to_status=RunStatus.queued, now=self._clock())
+            await release(lease, to_status=RunStatus.queued, now=self._clock(), cost=cost)
         except Exception:  # noqa: BLE001 — release is best-effort; the lease also expires
             logger.debug("review lease release to queued failed run=%s", lease.run_id)
 
@@ -444,11 +552,45 @@ class ReviewCoordinator:
             return None
         return record
 
+    async def stranded_review_run_ids(
+        self, *, now: datetime | None = None, limit: int = 100, grace_seconds: int = 30
+    ) -> list[str]:
+        """Review runs admitted/queued but not yet leased, past a small grace — dispatch backstop.
+
+        Used by the durable stranded-admission reconciler: a run whose ``review.run`` job/outbox
+        intent was lost (the API returns 202 even if the in-line enqueue failed, relying on this
+        backstop) is still ``admitted``/``queued`` with no worker lease. The reconciler
+        idempotently (re-)creates its dispatch intent so it is never stranded until TTL.
+        """
+        return await self._runs.surface_pending_dispatch(
+            REVIEW_SURFACE,
+            now or self._clock(),
+            limit,
+            grace_seconds=grace_seconds,
+        )
+
     def read_report(self, *, project_handle: str, run_id: str, json_sha256: str) -> ReviewReport:
         data = self._artifacts.read(
             ProjectId(project_handle), CodingRunId(worktree_storage_id(run_id)), json_sha256
         )
         return ReviewReport.from_dict(json.loads(data.decode("utf-8")))
+
+    def read_report_safe(
+        self, *, project_handle: str, run_id: str, json_sha256: str
+    ) -> ReviewReport | None:
+        """Read a completed review's report, returning ``None`` on a missing/corrupt artifact.
+
+        Used by the list projection so a completed record surfaces its *actual* findings/severity/
+        hash from the immutable report artifact, while a lost or corrupt artifact is reported
+        honestly (the caller annotates it) instead of fabricating a zero-finding projection.
+        """
+        try:
+            return self.read_report(
+                project_handle=project_handle, run_id=run_id, json_sha256=json_sha256
+            )
+        except Exception:  # noqa: BLE001 — missing/corrupt artifact is reported, not fabricated
+            logger.warning("review report artifact unreadable run=%s", run_id)
+            return None
 
     def read_report_markdown(
         self, *, project_handle: str, run_id: str, markdown_sha256: str
@@ -503,6 +645,26 @@ def _error_kind(exc: BaseException) -> str:
     if isinstance(exc, ReviewError):
         return exc.__class__.__name__
     return "review_execution_error"
+
+
+def _partial_cost(exc: BaseException) -> RunCost | None:
+    """Extract partial token/cost usage carried on a retryable provider failure (or ``None``).
+
+    The engine attaches the tokens/cost consumed before a transient stream/provider failure to
+    :class:`ReviewProviderUnavailable`; charging it before release means the next attempt runs
+    under only the remaining budget, so cumulative usage never exceeds the review envelope.
+    """
+    usage = getattr(exc, "usage", None)
+    if not isinstance(usage, Usage):
+        return None
+    if usage.prompt_tokens <= 0 and usage.completion_tokens <= 0 and usage.cost_usd <= 0.0:
+        return None
+    return RunCost(
+        prompt_tokens=max(0, usage.prompt_tokens),
+        completion_tokens=max(0, usage.completion_tokens),
+        cost_usd=max(0.0, usage.cost_usd),
+        iterations=0,
+    )
 
 
 _PERMANENT_ERRORS = (
@@ -578,6 +740,58 @@ class _LeaseKeeper:
                 pass
             except Exception:  # noqa: BLE001 — keeper cleanup must not mask the primary outcome
                 logger.warning("review lease keeper cleanup error suppressed")
+
+
+@dataclass
+class _JobHeartbeatKeeper:
+    """Periodically heartbeats the durable JOB lease; cancels the review on a lost lease.
+
+    Mirrors :class:`_LeaseKeeper` but for the worker's ``JobContext.checkpoint`` (the durable job
+    lease, distinct from the run lease). If a checkpoint raises (job lease reclaimed by another
+    worker, or a cancellation was requested) the bound review task is cancelled so the current
+    worker abandons its effects without a terminal write under a superseded fence.
+    """
+
+    checkpoint: Callable[[], Awaitable[None]]
+    interval_seconds: float
+    lost: bool = False
+    error: BaseException | None = None
+    _target: asyncio.Task[Any] | None = None
+    _task: asyncio.Task[None] | None = None
+
+    def bind(self, target: asyncio.Task[Any]) -> None:
+        self._target = target
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._loop())
+
+    async def _loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self.interval_seconds)
+                try:
+                    await self.checkpoint()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 — any checkpoint failure is a lost lease
+                    logger.warning("review job checkpoint failed; job lease lost")
+                    self.lost = True
+                    self.error = exc
+                    if self._target is not None:
+                        self._target.cancel()
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    async def stop(self) -> None:
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001 — keeper cleanup must not mask the primary outcome
+                logger.warning("review job heartbeat cleanup error suppressed")
 
 
 def _safe_error_message(exc: BaseException) -> str:

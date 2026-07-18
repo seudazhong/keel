@@ -99,26 +99,45 @@ def _snippet_present_in(text: str, snippet: str) -> bool:
 
 
 def _snippet_complete_at(file_text: str, line_start: int, line_end: int, snippet: str) -> bool:
-    """Whether the *complete* normalized snippet appears at the cited line window.
+    """Whether the *complete* normalized snippet appears CONTIGUOUSLY at the cited line window.
 
     The window is the cited ``line_start..line_end`` range (1-based, new-file numbering) padded
-    by :data:`_LINE_CONTEXT` lines. Every substantive snippet line must be present in it — this
-    is the exact-location check that stops a snippet from a different part of the file (or a
-    different file entirely) from satisfying a finding.
+    by :data:`_LINE_CONTEXT` lines. A multi-line snippet must appear as a **contiguous, ordered**
+    block of the window's lines — matching line 1 here and line 2 fifty lines away is rejected.
+    This is the exact-location check that stops a snippet stitched together from independent,
+    non-adjacent lines (or lifted from a different part of the file) from satisfying a finding.
     """
     file_lines = file_text.splitlines()
     if line_start > len(file_lines):
         return False
     lo = max(0, line_start - 1 - _LINE_CONTEXT)
     hi = min(len(file_lines), line_end + _LINE_CONTEXT)
-    window = _normalize("\n".join(file_lines[lo:hi]))
-    if not window:
-        return False
-    lines = _substantive_lines(snippet)
-    if not lines:
+    window_lines = [_normalize(line) for line in file_lines[lo:hi]]
+    snippet_lines = _substantive_lines(snippet)
+    if not snippet_lines:
+        # No substantive lines (all trivial/braces): fall back to a whole-snippet substring.
         whole = _normalize(snippet)
+        window = " ".join(w for w in window_lines if w)
         return bool(whole) and whole in window
-    return all(line in window for line in lines)
+    return _contiguous_ordered_match(window_lines, snippet_lines)
+
+
+def _contiguous_ordered_match(window_lines: list[str], snippet_lines: list[str]) -> bool:
+    """Whether ``snippet_lines`` appear as a contiguous, in-order run within ``window_lines``.
+
+    Empty (normalized-blank) window lines are skipped so incidental blank lines between real
+    code don't break contiguity, but the substantive snippet lines must still align consecutively
+    and in order. Each aligned window line must *contain* the snippet line (post-normalization),
+    tolerating a trailing comment while still enforcing order + adjacency.
+    """
+    compact = [line for line in window_lines if line]
+    n, m = len(compact), len(snippet_lines)
+    if m == 0 or m > n:
+        return m == 0
+    for start in range(n - m + 1):
+        if all(snippet_lines[k] in compact[start + k] for k in range(m)):
+            return True
+    return False
 
 
 class EvidenceVerifier:

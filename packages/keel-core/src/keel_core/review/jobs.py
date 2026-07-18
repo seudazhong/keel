@@ -22,7 +22,12 @@ from pydantic import (
 )
 
 from keel_core.errors import PermissionDenied
-from keel_core.jobs import JobResult, PermanentJobError, RetryableJobError
+from keel_core.jobs import (
+    JobCancellationRequested,
+    JobResult,
+    PermanentJobError,
+    RetryableJobError,
+)
 
 from .coordinator import ReviewCoordinator
 from .errors import (
@@ -161,10 +166,16 @@ class ReviewJobHandlers:
         await context.checkpoint()
         try:
             outcome = await self._coordinator.execute_review(
-                payload.to_request(), run_id=payload.run_id
+                payload.to_request(),
+                run_id=payload.run_id,
+                job_checkpoint=context.checkpoint,
             )
         except _PERMANENT as exc:
             raise PermanentJobError("review_failed", "Review failed.") from exc
+        except JobCancellationRequested:
+            # A cancellation surfaced via the periodic job-lease checkpoint: propagate it so the
+            # worker runs its cancel path (which terminalizes the associated run via on_cancelled).
+            raise
         except Exception as exc:  # transient storage/provider/infra — allow retry.
             raise RetryableJobError("review_transient", "Review temporarily failed.") from exc
         if outcome is None:

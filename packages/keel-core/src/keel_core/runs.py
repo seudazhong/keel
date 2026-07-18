@@ -553,6 +553,15 @@ class RunStore(Protocol):
         self, now: datetime, limit: int, *, grace_seconds: int = 0
     ) -> list[str]: ...
 
+    async def surface_pending_dispatch(
+        self,
+        surface: str,
+        now: datetime,
+        limit: int,
+        *,
+        grace_seconds: int = 0,
+    ) -> list[str]: ...
+
     async def reclaimable(self, now: datetime, limit: int) -> list[str]: ...
 
     async def waiting_approval_ids(self, limit: int) -> list[str]: ...
@@ -1005,6 +1014,28 @@ class InMemoryRunStore:
             and r.worker_id is None
             and r.expires_at > now
             and r.updated_at <= cutoff
+        ]
+        rows.sort(key=lambda r: r.created_at)
+        return [r.id for r in rows[:limit]]
+
+    async def surface_pending_dispatch(
+        self,
+        surface: str,
+        now: datetime,
+        limit: int,
+        *,
+        grace_seconds: int = 0,
+    ) -> list[str]:
+        cutoff = now - timedelta(seconds=grace_seconds)
+        rows = [
+            r
+            for r in self._rows.values()
+            if r.surface == surface
+            and r.status in (RunStatus.admitted, RunStatus.queued)
+            and r.lease_token is None
+            and r.worker_id is None
+            and r.expires_at > now
+            and r.created_at <= cutoff
         ]
         rows.sort(key=lambda r: r.created_at)
         return [r.id for r in rows[:limit]]
@@ -1761,6 +1792,29 @@ class PostgresRunStore:
             "AND worker_id IS NULL AND expires_at > :now AND updated_at <= :cutoff "
             "ORDER BY created_at LIMIT :limit",
             {"scope": self._scope_id, "now": now, "cutoff": cutoff, "limit": limit},
+        )
+
+    async def surface_pending_dispatch(
+        self,
+        surface: str,
+        now: datetime,
+        limit: int,
+        *,
+        grace_seconds: int = 0,
+    ) -> list[str]:
+        cutoff = now - timedelta(seconds=grace_seconds)
+        return await self._select_ids(
+            "SELECT id FROM runs WHERE scope_id = :scope AND surface = :surface "
+            "AND status IN ('admitted', 'queued') AND lease_token IS NULL "
+            "AND worker_id IS NULL AND expires_at > :now AND created_at <= :cutoff "
+            "ORDER BY created_at LIMIT :limit",
+            {
+                "scope": self._scope_id,
+                "surface": surface,
+                "now": now,
+                "cutoff": cutoff,
+                "limit": limit,
+            },
         )
 
     async def reclaimable(self, now: datetime, limit: int) -> list[str]:

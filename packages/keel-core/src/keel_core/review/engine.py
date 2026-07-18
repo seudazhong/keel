@@ -153,7 +153,17 @@ class ReviewEngine:
         attempts = budget.max_provider_attempts
         for attempt in range(attempts):
             self._enforce_budget(total_usage, budget)
-            text, usage = await self._one_turn(model=model, messages=conversation, budget=budget)
+            try:
+                text, usage = await self._one_turn(
+                    model=model, messages=conversation, budget=budget
+                )
+            except ReviewProviderUnavailable as exc:
+                # Transport/timeout/rate-limit mid-stream: surface the tokens/cost already
+                # consumed (this turn's partial usage plus prior turns) so the coordinator can
+                # durably charge it — the next attempt then gets only the remaining budget.
+                partial = exc.usage if isinstance(exc.usage, Usage) else Usage()
+                exc.usage = self._with_authoritative_cost(total_usage + partial, model)
+                raise
             total_usage = self._with_authoritative_cost(total_usage + usage, model)
             self._enforce_budget(total_usage, budget)
             try:
@@ -223,9 +233,11 @@ class ReviewEngine:
             raise
         except Exception as exc:  # noqa: BLE001 — provider transport failures fail closed
             if _is_transient_provider_error(exc):
-                # Transport/timeout/rate-limit: retryable, do NOT terminalize the run.
+                # Transport/timeout/rate-limit: retryable, do NOT terminalize the run. Carry the
+                # partial usage streamed before the failure so it can be durably charged.
                 raise ReviewProviderUnavailable(
-                    f"provider temporarily unavailable: {exc.__class__.__name__}"
+                    f"provider temporarily unavailable: {exc.__class__.__name__}",
+                    usage=usage,
                 ) from exc
             raise ReviewProviderError(f"provider call failed: {exc.__class__.__name__}") from exc
         return "".join(chunks), usage

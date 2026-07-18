@@ -227,7 +227,10 @@ async def list_reviews(
     request: Request,
     org: Annotated[ResolvedOrg, Depends(require_org)],
 ) -> list[ReviewStatusResponse]:
-    await _authorize_read(request, org, project_id)
+    project = await _projects(request).authorize_review(
+        org.org_id, org.user_id, project_id, capability=Capability.read
+    )
+    handle = project.active_git_handle or project.id
     coordinator = _coordinator(request)
     run_ids = await _projects(request).list_project_runs(org.org_id, org.user_id, project_id)
     responses: list[ReviewStatusResponse] = []
@@ -235,13 +238,29 @@ async def list_reviews(
         run = await coordinator.get_run_optional(run_id)
         if run is None:
             continue
+        # A completed record projects its ACTUAL findings/severity/hash from the immutable report
+        # artifact (bounded per-artifact read); a missing/corrupt artifact is reported honestly
+        # rather than shown as a fabricated zero-finding projection.
+        report = None
+        report_unavailable = False
+        if run.status is RunStatus.completed and run.result_ref:
+            report = coordinator.read_report_safe(
+                project_handle=handle, run_id=run_id, json_sha256=run.result_ref
+            )
+            report_unavailable = report is None
         try:
-            record = await coordinator.build_review_record(run)
+            record = await coordinator.build_review_record(run, report=report)
         except ReviewNotFound:
             # A review whose durable metadata is not (yet) available is omitted rather than
             # projected with fabricated defaults.
             continue
-        responses.append(ReviewStatusResponse.model_validate(record.to_dict()))
+        data = record.to_dict()
+        if report_unavailable:
+            data["error_kind"] = data.get("error_kind") or "report_unavailable"
+            data["error_message"] = (
+                data.get("error_message") or "review report artifact is missing or unreadable"
+            )
+        responses.append(ReviewStatusResponse.model_validate(data))
     return responses
 
 

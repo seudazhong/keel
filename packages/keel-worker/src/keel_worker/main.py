@@ -53,7 +53,7 @@ from keel_scheduler.store import ScheduleRow, due_tick
 from keel_worker.connectors import reconcile_connectors_tick, register_connector_jobs
 from keel_worker.jobs import dispatch_jobs, reconcile_job_dispatch_tick, run_job
 from keel_worker.knowledge import knowledge_job_registry
-from keel_worker.review import review_artifact_reaper_tick
+from keel_worker.review import reconcile_stranded_reviews_tick, review_artifact_reaper_tick
 from keel_worker.runs import reconcile_dispatch_tick, reconcile_runs_tick, run_interactive
 
 logger = logging.getLogger("keel.worker")
@@ -630,8 +630,11 @@ async def startup(ctx: dict[str, Any]) -> None:
             pr_resolver=_pr_resolver,
         )
         ctx["review_coordinator"] = review_coordinator
-        # Shared ArtifactStore for the scheduled retention reaper (retained_until/TTL).
+        # Shared stores for the scheduled retention/orphan reaper (retained_until/TTL + stale
+        # crash-orphaned worktrees). Active worktrees (younger than the stale cutoff) are kept.
         ctx["review_artifacts"] = _ReviewArtifactStore(_review_coding)
+        ctx["review_worktrees"] = _ReviewWorktreeStore(_review_coding)
+        ctx["review_worktree_stale_hours"] = settings.review_worktree_stale_hours
         register_review_jobs(job_registry, review_coordinator, settings)
     ctx["job_registry"] = job_registry
 
@@ -669,6 +672,7 @@ class WorkerSettings:
         reconcile_dispatch_tick,
         reconcile_job_dispatch_tick,
         review_artifact_reaper_tick,
+        reconcile_stranded_reviews_tick,
         func(
             run_job,
             timeout=get_settings().job_execution_timeout_seconds,
@@ -683,6 +687,7 @@ class WorkerSettings:
         cron(reconcile_runs_tick, second={0, 30}),
         cron(reconcile_dispatch_tick, second={0, 30}),
         cron(reconcile_job_dispatch_tick, second={0, 30}),
+        cron(reconcile_stranded_reviews_tick, second={0, 30}),
         cron(review_artifact_reaper_tick, minute={0}),
     ]
     on_startup = startup

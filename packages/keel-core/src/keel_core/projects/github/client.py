@@ -21,7 +21,25 @@ from typing import Any, Protocol, runtime_checkable
 
 
 class GitHubError(RuntimeError):
-    """A GitHub API call failed (non-sensitive message; never carries a token)."""
+    """A GitHub API call failed (non-sensitive message; never carries a token).
+
+    ``status_code`` carries the HTTP status when the failure originated from a response (``None``
+    for a transport/timeout failure), so callers can distinguish a *transient* upstream failure
+    (5xx / rate limit) from a *permanent* one (a malformed 4xx) without string-matching.
+    """
+
+    def __init__(
+        self, message: str, *, status_code: int | None = None, retry_after: float | None = None
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+    @property
+    def is_transient(self) -> bool:
+        """Whether retrying could plausibly succeed (rate limit or upstream 5xx)."""
+        code = self.status_code
+        return code in (429, 500, 502, 503, 504) if code is not None else False
 
 
 class GitHubAuthError(GitHubError):
@@ -81,6 +99,29 @@ def _rate_limited(response: GitHubResponse) -> bool:
     return False
 
 
+def _retry_after_seconds(response: GitHubResponse) -> float | None:
+    """Best-effort ``Retry-After`` (delta-seconds) or ``x-ratelimit-reset`` backoff hint."""
+    raw = response.headers.get("retry-after") or response.headers.get("Retry-After")
+    if raw is not None:
+        try:
+            value = float(str(raw).strip())
+        except (TypeError, ValueError):
+            value = None
+        if value is not None and value >= 0:
+            return value
+    reset = response.headers.get("x-ratelimit-reset")
+    if reset is not None:
+        try:
+            import time
+
+            delta = float(str(reset).strip()) - time.time()
+        except (TypeError, ValueError):
+            return None
+        if delta > 0:
+            return delta
+    return None
+
+
 class GitHubClient:
     """High-level GitHub REST client over an injectable :class:`GitHubTransport`.
 
@@ -123,19 +164,31 @@ class GitHubClient:
                 await self._sleep(self._retry.delay_for(attempt))
         assert last_response is not None
         if _rate_limited(last_response):
-            raise GitHubRateLimitError("GitHub API rate limit exhausted")
-        raise GitHubError(f"GitHub API request failed with status {last_response.status}")
+            raise GitHubRateLimitError(
+                "GitHub API rate limit exhausted",
+                status_code=last_response.status,
+                retry_after=_retry_after_seconds(last_response),
+            )
+        raise GitHubError(
+            f"GitHub API request failed with status {last_response.status}",
+            status_code=last_response.status,
+            retry_after=_retry_after_seconds(last_response),
+        )
 
     @staticmethod
     def _raise_for_status(response: GitHubResponse) -> None:
         if response.status in (401, 403):
             if _rate_limited(response):
-                raise GitHubRateLimitError("GitHub API rate limit exhausted")
-            raise GitHubAuthError("GitHub authentication failed")
+                raise GitHubRateLimitError(
+                    "GitHub API rate limit exhausted", status_code=response.status
+                )
+            raise GitHubAuthError("GitHub authentication failed", status_code=response.status)
         if response.status == 404:
-            raise GitHubNotFoundError("GitHub resource not found")
+            raise GitHubNotFoundError("GitHub resource not found", status_code=response.status)
         if response.status >= 400:
-            raise GitHubError(f"GitHub API returned status {response.status}")
+            raise GitHubError(
+                f"GitHub API returned status {response.status}", status_code=response.status
+            )
 
     async def mint_installation_token(
         self, *, installation_id: int, app_jwt: str
@@ -180,9 +233,7 @@ class GitHubClient:
             return [r for r in body["repositories"] if isinstance(r, dict)]
         raise GitHubError("unexpected GitHub repositories payload")
 
-    async def get_pull_request(
-        self, *, token: str, full_name: str, number: int
-    ) -> dict[str, Any]:
+    async def get_pull_request(self, *, token: str, full_name: str, number: int) -> dict[str, Any]:
         """GET one pull request's metadata (read-only): exact base/head SHAs + repos.
 
         Read-only control-plane call. The returned ``base.sha``/``head.sha`` are the exact

@@ -27,12 +27,27 @@ class ReviewProviderError(ReviewError):
 
 
 class ReviewProviderUnavailable(ReviewError):
-    """A *transient* provider failure (transport, timeout, rate limit, 5xx) — safe to retry.
+    """A *transient* provider/upstream failure (transport, timeout, rate limit, 5xx) — retryable.
 
     Distinct from :class:`ReviewProviderError`: a contract violation that survives the bounded
     repair loop is permanent, but a transport/timeout/rate-limit failure must NOT terminalize
     the run — the durable job retries until it succeeds or attempts are exhausted.
+
+    Carries optional retry metadata so the caller can honour an upstream ``Retry-After``/backoff
+    hint, and the partial ``usage`` already consumed before the failure so the coordinator can
+    durably charge it (a subsequent attempt gets only the *remaining* token/cost budget).
     """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after: float | None = None,
+        usage: object | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.usage = usage
 
 
 class ReviewLeaseLost(ReviewError):

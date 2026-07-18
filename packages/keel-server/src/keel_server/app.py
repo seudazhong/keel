@@ -74,13 +74,7 @@ from keel_core.projects import (
     ProjectService,
     ProjectStorage,
 )
-from keel_core.projects.github import (
-    AppJwtMinter,
-    GitHubClient,
-    HttpxGitHubTransport,
-    InstallationTokenService,
-    resolve_private_key,
-)
+from keel_core.projects.github_factory import build_github_integration
 from keel_core.projects.jobs import (
     PROJECT_SYNC_CANCEL_MODE,
     PROJECT_SYNC_KIND,
@@ -232,32 +226,13 @@ def _build_identity(engine: AsyncEngine | None, settings: Settings) -> tuple[Any
 
 
 def _build_github_integration(settings: Settings) -> GitHubIntegration | None:
-    """Build the GitHub App integration when configured (else ``None`` — feature disabled)."""
-    if settings.github_app_id <= 0 or not settings.github_private_key_ref:
-        return None
-    try:
-        minter = AppJwtMinter(
-            app_id=settings.github_app_id,
-            private_key_loader=lambda: resolve_private_key(settings.github_private_key_ref),
-        )
-        transport = HttpxGitHubTransport()
-        client = GitHubClient(transport, api_base_url=settings.github_api_base_url)
+    """Build the GitHub App integration when configured (else ``None`` — feature disabled).
 
-        async def _mint(installation_id: int, app_jwt: str) -> object:
-            return await client.mint_installation_token(
-                installation_id=installation_id, app_jwt=app_jwt
-            )
-
-        tokens = InstallationTokenService(
-            minter, _mint, cache_seconds=settings.github_token_cache_seconds
-        )
-        hosts = frozenset(
-            h.strip().lower() for h in settings.github_allowed_hosts.split(",") if h.strip()
-        )
-        return GitHubIntegration(tokens=tokens, client=client, allowed_hosts=hosts)
-    except Exception:  # noqa: BLE001 - misconfiguration disables the feature, never crashes boot
-        logger.warning("GitHub App configured but could not be initialized; import/sync disabled")
-        return None
+    Delegates to the shared control-plane factory, which validates ``github_api_base_url`` is an
+    HTTPS, non-private, allow-listed host BEFORE any authenticated client is built, so a
+    just-in-time installation token is never sent to an arbitrary/plain-HTTP/internal endpoint.
+    """
+    return build_github_integration(settings)
 
 
 def _build_project_service(

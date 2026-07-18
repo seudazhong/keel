@@ -63,10 +63,12 @@ reviewed change — not that the issue is real.
    run is not terminalized until a permanent error or attempts are exhausted).
 5. **Verify evidence**: every finding's `file_path` must exist and belong to the reviewed scope,
    its `line_start..line_end` must be a **small, bounded span** that overlaps the reviewed diff
-   (computed arithmetically — never by materializing the range), and its `snippet` must appear at
-   the **exact cited file and line window** (not anywhere globally, and never in a *different*
-   file). Fabricated files/snippets are **rejected**; moved or out-of-scope evidence is
-   **downgraded** (kept at low confidence, annotated).
+   (computed arithmetically — never by materializing the range), and its `snippet` must appear as an
+   **exact, normalized, contiguous, ordered multi-line match** at the cited file/line window and
+   within the reviewed hunk (a snippet stitched together from independent, non-adjacent lines is
+   rejected — not anywhere globally, and never in a *different* file). Fabricated files/snippets are
+   **rejected**; moved or out-of-scope evidence is **downgraded** (kept at low confidence,
+   annotated).
 6. **Store**: the report is rendered to canonical JSON + Markdown and stored as immutable,
    content-addressed artifacts under the **shared** project coding storage with an **explicit
    retention TTL** (never indefinite). The run's `result_ref` points at the JSON report's content
@@ -88,7 +90,10 @@ reviewed change — not that the issue is real.
   An injected "enable the shell tool" in a README cannot enable a tool that does not exist.
 * **Token isolation** — the GitHub App JIT installation token used to fetch PR metadata/diff
   lives entirely on the control plane; it is never handed to the review service, the worktree,
-  or the model.
+  or the model. The configured `github_api_base_url` is validated (HTTPS, no embedded credentials,
+  non-loopback/non-private host on the explicit allowlist, default port, no query/fragment) **before**
+  any authenticated client is built, so a mis-configured base can never send the token to an
+  arbitrary/internal endpoint (the integration fails closed / disables instead).
 * **No source/secret leakage** — reports carry only reviewed diff content and findings, never a
   token, a raw provider log, or a system prompt. Audit details forbid sensitive keys.
 * **Fail closed** — authorization, evidence verification, provider-contract violations, and
@@ -142,15 +147,29 @@ budget or cost ceiling is exceeded.
   reclaimed review re-produces identical content-addressed artifacts.
 * **Restart-safe & retryable** — the worker claims/reconciles/retries the `review.run` job on the
   existing jobs substrate; the run lease is heartbeated during execution and a crash reclaims it
-  and starts clean. Transient provider failures (transport/timeout/rate limit) retry; a permanent
-  error or authorization revocation terminalizes safely.
+  and starts clean. The durable **job** lease is also heartbeated throughout the review (a lost
+  job lease or a cancellation aborts the in-flight review without a terminal write under a
+  superseded fence). Transient provider/GitHub failures (transport/timeout/rate limit/5xx) retry
+  with any upstream `Retry-After`/backoff honoured, and the **partial** tokens/cost consumed
+  before a transient failure are durably charged so a subsequent attempt runs under only the
+  remaining budget (cumulative usage can never exceed the review's envelope). A permanent error or
+  authorization revocation terminalizes safely; when the durable job exhausts its retries or is
+  cancelled, a worker failure/cancel hook (backed by a reconciler) terminalizes the associated run
+  exactly once so it never lingers admitted until its TTL.
+* **Never stranded** — admission durably records the run + request metadata; the API enqueues on
+  every request and returns `202` even if the in-line enqueue is lost, because a **stranded-review
+  reconciler** scans admitted/queued review runs that have no `review.run` job and idempotently
+  (re-)creates the dispatch intent.
 * **Explicit retention & erasure** — report artifacts are stored `retained` with a concrete
   `retained_until` TTL (`KEEL_REVIEW_REPORT_RETENTION_DAYS`), never indefinitely. A **scheduled,
   single-owner** worker tick (`review_artifact_reaper_tick`, cron hourly, fenced by a Redis lock)
-  reaps artifacts whose `retained_until` has elapsed over the shared `ArtifactStore`, logging only
-  aggregate counts. Review worktrees and report artifacts live under the shared project coding
-  storage, so project/scope erasure purges them **immediately** via the coding-artifact cleaner
-  wired into the erasure coordinator (idempotently); run metadata is purged with the `runs` table.
+  reaps artifacts whose `retained_until` has elapsed over the shared `ArtifactStore` AND reclaims
+  **crash-orphaned** worktrees older than `KEEL_REVIEW_WORKTREE_STALE_HOURS` (a live review's
+  worktree is disposed within its job, so active worktrees are always younger than the cutoff and
+  never removed), logging only aggregate counts. Review worktrees and report artifacts live under
+  the shared project coding storage, so project/scope erasure purges them **immediately** via the
+  coding-artifact cleaner wired into the erasure coordinator (idempotently); run metadata is purged
+  with the `runs` table.
 
 ## Known limitations (this MVP)
 

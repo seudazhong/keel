@@ -30,9 +30,11 @@ from keel_core.protocols import ProviderGateway, Usage
 
 from .diff import GitDiffComputer, ReviewDiff
 from .engine import ReviewEngine
+from .errors import ReviewBoundsExceeded
 from .evidence import EvidenceVerifier
 from .models import (
     MAX_LIMITATIONS,
+    ReviewBudget,
     ReviewReport,
     ReviewRequest,
     ReviewSource,
@@ -44,6 +46,32 @@ from .pricing import PriceBook
 from .prompts import build_messages
 from .refs import MaterializationPlan
 from .report import ReviewArtifactWriter, StoredReport
+
+
+def _remaining_budget(budget: ReviewBudget, prior_usage: Usage | None) -> ReviewBudget:
+    """Budget for the next attempt after subtracting already-charged usage (fail closed).
+
+    Cumulative token/cost usage across retries can never exceed the review's original envelope:
+    a retry runs under ``original - already_consumed``. If a prior attempt already exhausted the
+    token budget or cost ceiling, the review fails closed (:class:`ReviewBoundsExceeded`) rather
+    than granting a fresh full budget.
+    """
+    if prior_usage is None:
+        return budget
+    used_tokens = max(0, prior_usage.prompt_tokens) + max(0, prior_usage.completion_tokens)
+    used_cost = max(0.0, prior_usage.cost_usd)
+    remaining_tokens = budget.token_budget - used_tokens
+    remaining_cost = budget.cost_ceiling_usd - used_cost
+    if remaining_tokens < 1 or remaining_cost <= 0.0:
+        raise ReviewBoundsExceeded(
+            "review budget already exhausted by prior attempts; no retry budget remains"
+        )
+    return ReviewBudget(
+        token_budget=remaining_tokens,
+        output_max_tokens=budget.output_max_tokens,
+        cost_ceiling_usd=remaining_cost,
+        max_provider_attempts=budget.max_provider_attempts,
+    )
 
 
 def _default_plan(request: ReviewRequest) -> MaterializationPlan:
@@ -106,12 +134,18 @@ class ReviewService:
         review_id: str | None = None,
         now: datetime | None = None,
         plan: MaterializationPlan | None = None,
+        prior_usage: Usage | None = None,
     ) -> ReviewOutcome:
         review_id = review_id or new_review_id()
         created_at = now or datetime.now(UTC)
         computer = self.diff_computer or GitDiffComputer(max_diff_bytes=request.max_diff_bytes)
         pid = ProjectId(project_handle)
         crid = CodingRunId(coding_run_id)
+
+        # A retried attempt runs under only the REMAINING budget: tokens/cost durably charged by
+        # earlier attempts (persisted on the run before release) are subtracted here so cumulative
+        # usage across all attempts can never exceed the review's original envelope.
+        attempt_budget = _remaining_budget(request.budget(), prior_usage)
 
         # Resolve the change set to EXACT commit shas. A pull-request review is always
         # pre-resolved on the control plane (its ``materialize_ref`` is the head sha, never the
@@ -148,7 +182,7 @@ class ReviewService:
                 model=request.model,
                 messages=messages,
                 max_findings=request.max_findings,
-                budget=request.budget(),
+                budget=attempt_budget,
             )
 
             verifier = EvidenceVerifier(worktree_path, diff)

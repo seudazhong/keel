@@ -227,6 +227,11 @@ class Settings(BaseSettings):
     review_max_provider_attempts: int = Field(default=2, ge=1, le=4)
     # Explicit retention window (days) for review report artifacts — never indefinite.
     review_report_retention_days: int = Field(default=90, ge=1, le=3650)
+    # Age (hours) after which a review worktree is considered crash-orphaned and reaped. A live
+    # review's worktree is short-lived (materialized then disposed within one job), so a healthy
+    # worktree is always far younger than this; the reaper only reclaims worktrees left behind by
+    # a crash. Active worktrees (younger than the cutoff) are never removed.
+    review_worktree_stale_hours: int = Field(default=6, ge=1, le=168)
     # Authoritative per-model review pricing for the cost ceiling. Format:
     # ``model=input/output`` (USD per 1,000,000 tokens), comma-separated, e.g.
     # ``gpt-4o=2.5/10,my-model=1.0/3.0``. A review model that is neither in this override map

@@ -18,12 +18,70 @@ import re
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from keel_core.projects.github.client import (
+    GitHubAuthError,
+    GitHubError,
+    GitHubNotFoundError,
+    GitHubRateLimitError,
+)
 from keel_core.projects.service import GitHubIntegration, ProjectService
 
-from .errors import ReviewValidationError
+from .errors import ReviewProviderUnavailable, ReviewValidationError
 from .refs import ResolvedPullRequest
 
 _SHA = re.compile(r"\A[0-9a-f]{40}\Z")
+
+# Exception class-name fragments that indicate a *transient* transport failure (timeout,
+# connection reset, network unreachable) — safe to retry rather than terminalize the review.
+_TRANSIENT_TRANSPORT_MARKERS = (
+    "timeout",
+    "connect",
+    "connection",
+    "network",
+    "readtimeout",
+    "writetimeout",
+    "pooltimeout",
+    "remoteprotocol",
+    "temporar",
+    "unavailable",
+)
+
+
+def _classify_github_failure(exc: Exception, pr_number: int) -> Exception:
+    """Map a GitHub resolution failure to a retryable or permanent typed review error.
+
+    Rate-limit (429), upstream 5xx, and transport/timeout/network failures are *transient*
+    (:class:`ReviewProviderUnavailable`, retryable, carrying any ``Retry-After`` backoff hint);
+    a not-found PR, an auth/binding failure, or any other 4xx is *permanent*
+    (:class:`ReviewValidationError`) — retrying can never make it succeed.
+    """
+    if isinstance(exc, GitHubRateLimitError):
+        return ReviewProviderUnavailable(
+            f"GitHub rate limit while resolving pull request #{pr_number}",
+            retry_after=getattr(exc, "retry_after", None),
+        )
+    if isinstance(exc, GitHubNotFoundError | GitHubAuthError):
+        return ReviewValidationError(
+            f"could not resolve pull request #{pr_number} from GitHub: {exc.__class__.__name__}"
+        )
+    if isinstance(exc, GitHubError):
+        if getattr(exc, "is_transient", False):
+            return ReviewProviderUnavailable(
+                f"GitHub temporarily unavailable while resolving pull request #{pr_number}",
+                retry_after=getattr(exc, "retry_after", None),
+            )
+        return ReviewValidationError(
+            f"could not resolve pull request #{pr_number} from GitHub: {exc.__class__.__name__}"
+        )
+    name = f"{exc.__class__.__module__}.{exc.__class__.__name__}".lower()
+    if any(marker in name for marker in _TRANSIENT_TRANSPORT_MARKERS):
+        return ReviewProviderUnavailable(
+            f"GitHub transport failure while resolving pull request #{pr_number}: "
+            f"{exc.__class__.__name__}"
+        )
+    return ReviewValidationError(
+        f"could not resolve pull request #{pr_number} from GitHub: {exc.__class__.__name__}"
+    )
 
 
 @runtime_checkable
@@ -84,10 +142,10 @@ class GitHubPullRequestResolver:
             payload = await self.github.resolve_pull_request(
                 repo.installation_id, repo.full_name, pr_number
             )
-        except Exception as exc:  # noqa: BLE001 — GitHub unavailability is an explicit failure
-            raise ReviewValidationError(
-                f"could not resolve pull request #{pr_number} from GitHub: {exc.__class__.__name__}"
-            ) from exc
+        except (ReviewProviderUnavailable, ReviewValidationError):
+            raise
+        except Exception as exc:  # noqa: BLE001 — classify transient vs permanent GitHub failure
+            raise _classify_github_failure(exc, pr_number) from exc
         if not isinstance(payload, dict):
             raise ReviewValidationError("unexpected pull-request payload")
 
