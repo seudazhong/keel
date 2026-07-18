@@ -40,7 +40,7 @@ def build_service_execution_environment(
             raise RuntimeError(f"{service}: unauthenticated sandbox RPC is local-test only")
         return SandboxExecutionEnvironment(
             settings.sandbox_url,
-            shared_secret=settings.sandbox_rpc_secret.get_secret_value(),
+            shared_secret=settings.resolved_sandbox_rpc_secret(),
             allow_unauthenticated_local_test=settings.sandbox_rpc_local_test_mode,
         )
     if not settings.trusted_preview_allow_unsafe_execution:
@@ -92,7 +92,7 @@ def build_scoped_execution_environment(
         scoped = None if scope_id == LOCAL_PREVIEW_SCOPE else namespace
         return SandboxExecutionEnvironment(
             settings.sandbox_url,
-            shared_secret=settings.sandbox_rpc_secret.get_secret_value(),
+            shared_secret=settings.resolved_sandbox_rpc_secret(),
             allow_unauthenticated_local_test=settings.sandbox_rpc_local_test_mode,
             workspace=scoped,
         )

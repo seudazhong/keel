@@ -325,6 +325,47 @@ def create_app(
         scoped_workspaces_supported=workspace_provider is not None
     )
 
+    @app.get("/health")
+    async def health() -> JSONResponse:
+        """Unauthenticated liveness: the process is up and serving.
+
+        Deliberately reveals nothing about the shared secret, the admitted egress policy, the
+        workspace contents, or whether isolation was asserted — a container healthcheck must be
+        callable without credentials, so it must never leak security-relevant state. Auth-
+        contract and isolation readiness are proven separately by the authenticated ``/v1/ping``
+        below (callers that hold the shared secret), never by this endpoint.
+        """
+        return JSONResponse({"status": "ok"})
+
+    @app.post("/v1/ping")
+    async def ping(raw_request: Request) -> JSONResponse:
+        """Authenticated readiness probe for control-plane wiring.
+
+        Proves, without executing any tool or exposing workspace state, that (1) the caller and
+        the executor share the RPC secret and the HMAC request-binding contract holds (else
+        401), and (2) the operator asserted an isolation boundary so real operations will be
+        served rather than fail closed (else 503). ``keel-server``/``keel-worker`` call this at
+        readiness/startup so they surface an unreachable or misauthenticated sandbox instead of
+        silently degrading. The empty body still participates in the signature (its digest is
+        bound), so a replayed or unsigned probe is rejected exactly like a real operation.
+        """
+        body_bytes = await raw_request.body()
+        if not verifier.verify(
+            raw_request.headers,
+            body_bytes,
+            method=raw_request.method,
+            path=raw_request.url.path,
+        ):
+            return JSONResponse(
+                {"ready": False, "detail": "authentication failed"}, status_code=401
+            )
+        if not isolation_verified:
+            return JSONResponse(
+                {"ready": False, "detail": "sandbox isolation is not verified"},
+                status_code=503,
+            )
+        return JSONResponse({"ready": True})
+
     def _resolve_environment(request: ExecutionRpcRequest) -> ExecutionEnvironment | None:
         if workspace_provider is None:
             # Legacy single-workspace mode: the admission policy has already rejected any

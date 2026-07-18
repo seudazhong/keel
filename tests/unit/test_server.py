@@ -16,6 +16,7 @@ from keel_core.events import Event, EventType
 from keel_core.jobs import InMemoryJobStore, PostgresJobStore
 from keel_core.knowledge.service import KnowledgeService
 from keel_core.runs import InMemoryRunStore, RunStatus
+from keel_core.tools import ExecutionError, ExecutionErrorCode, ExecutionResult
 from keel_server.app import (
     _build_job_store,
     _build_knowledge_service,
@@ -125,7 +126,7 @@ def test_create_message_idempotent_admission() -> None:
     assert first.json()["run_id"] == second.json()["run_id"]  # same run, no duplicate
 
 
-def _readiness_app(*, shared: bool, queue: bool) -> TestClient:
+def _readiness_app(*, shared: bool, queue: bool, sandbox_ready: bool = True) -> TestClient:
     app = create_app()
 
     class _FakeConn:
@@ -146,10 +147,23 @@ def _readiness_app(*, shared: bool, queue: bool) -> TestClient:
         async def ping(self) -> bool:
             return True
 
+    class _FakeSandbox:
+        """Stand-in execution environment: readiness actively probes this (not a client build)."""
+
+        async def probe_ready(self) -> ExecutionResult:
+            if sandbox_ready:
+                return ExecutionResult(ok=True, output="ready")
+            return ExecutionResult(
+                ok=False,
+                output="unreachable",
+                error=ExecutionError(ExecutionErrorCode.unavailable, "unreachable"),
+            )
+
     app.state.engine = _FakeEngine()
     app.state.redis = _FakeRedis()
     app.state.shared_run_substrate = shared
     app.state.enqueue = (lambda *a, **k: None) if queue else None
+    app.state.execution_environment = _FakeSandbox()
     return TestClient(app)
 
 
@@ -178,6 +192,19 @@ def test_readiness_ready_when_admission_available() -> None:
     body = resp.json()
     assert body["ready"] is True
     assert body["checks"]["run_admission"] == "ready"
+    assert body["checks"]["sandbox"] == "ok"
+
+
+def test_readiness_degraded_when_sandbox_unreachable() -> None:
+    # The fail-closed sandbox backend must actively prove the executor RPC is reachable +
+    # authenticated. A failing probe makes readiness degraded (503) so a load balancer drains
+    # this instance instead of accepting runs whose tool calls would all fail.
+    client = _readiness_app(shared=True, queue=True, sandbox_ready=False)
+    resp = client.get("/readiness")
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["ready"] is False
+    assert body["checks"]["sandbox"].startswith("degraded")
 
 
 def test_resolve_unknown_approval_is_404() -> None:

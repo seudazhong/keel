@@ -331,6 +331,34 @@ class SandboxExecutionEnvironment(ExecutionEnvironment):
             request.options,
         )
 
+    async def probe_ready(self, *, timeout_seconds: float = 5.0) -> ExecutionResult:
+        """Prove the sandbox RPC is reachable **and** the auth contract is valid.
+
+        Signs an empty-bodied request to the executor's ``/v1/ping`` readiness endpoint (the
+        signature binds method/path/timestamp/nonce/body-digest exactly like a real operation,
+        so an unreachable, misauthenticated, or replayed probe is rejected). Returns an
+        ``ok`` result only on HTTP 200; a 401 maps to ``denied`` (shared-secret/HMAC mismatch),
+        a 503 to ``unavailable`` (the executor has not asserted an isolation boundary), and any
+        transport error to ``unavailable``. Control-plane readiness/startup calls this so it can
+        surface a broken sandbox instead of silently degrading to local execution.
+        """
+        headers = self._signer.headers(b"", path="/v1/ping")
+        headers["Content-Type"] = "application/json"
+        try:
+            response = await self._client.post(
+                "/v1/ping", content=b"", headers=headers, timeout=timeout_seconds
+            )
+        except httpx.HTTPError:
+            return _rpc_failure(ExecutionErrorCode.unavailable, "sandbox RPC unreachable")
+        if response.status_code == 200:
+            return ExecutionResult(ok=True, output="ready")
+        if response.status_code == 401:
+            return _rpc_failure(ExecutionErrorCode.denied, "sandbox RPC authentication failed")
+        return _rpc_failure(
+            ExecutionErrorCode.unavailable,
+            f"sandbox RPC not ready ({response.status_code})",
+        )
+
     async def aclose(self) -> None:
         if self._owns_client:
             await self._client.aclose()

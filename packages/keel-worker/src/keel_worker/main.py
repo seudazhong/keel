@@ -11,6 +11,7 @@ inject in-memory doubles into ``ctx`` directly."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -297,6 +298,42 @@ async def scheduler_tick(ctx: dict[str, Any]) -> int:
     return len(enqueued)
 
 
+async def _probe_sandbox_ready(
+    ctx: dict[str, Any],
+    settings: Settings,
+    *,
+    attempts: int = 30,
+    delay_seconds: float = 1.0,
+) -> None:
+    """Fail closed at startup unless the isolated sandbox RPC is reachable and authenticated.
+
+    With the ``sandbox`` execution backend a worker must NOT start claiming agent jobs it
+    cannot actually execute. This actively probes the executor's signed ``/v1/ping`` (retrying
+    briefly while the sandbox container finishes warming up). On a persistent failure it RAISES
+    so arq startup aborts — the worker never silently degrades to local execution. The
+    in-process preview backend has no RPC boundary to probe and is skipped.
+    """
+    if settings.execution_backend != "sandbox":
+        return
+    environment = ctx["execution_environment"]
+    probe = getattr(environment, "probe_ready", None)
+    if probe is None:  # pragma: no cover - defensive: sandbox backend always exposes it
+        raise RuntimeError("worker: sandbox backend has no readiness probe")
+    last = "unknown"
+    for attempt in range(1, attempts + 1):
+        result = await probe()
+        if result.ok:
+            logger.info("sandbox RPC ready after %d attempt(s)", attempt)
+            return
+        last = result.error.code.value if result.error else "unavailable"
+        if attempt < attempts:
+            await asyncio.sleep(delay_seconds)
+    raise RuntimeError(
+        f"worker: sandbox RPC not ready after {attempts} attempts (last={last}); "
+        "refusing to start with an unreachable/misauthenticated executor"
+    )
+
+
 async def startup(ctx: dict[str, Any]) -> None:
     load_env_file()  # provider keys visible to LiteLLM before any agent task runs
     settings = get_settings()
@@ -325,6 +362,9 @@ async def startup(ctx: dict[str, Any]) -> None:
         Path.cwd(),
         service="worker",
     )
+    # Fail closed: refuse to start (and thus never claim jobs) unless the isolated sandbox RPC
+    # is reachable and the HMAC auth contract is valid. Never silently degrade to local exec.
+    await _probe_sandbox_ready(ctx, settings)
     ctx["durable_scope"] = _DURABLE_SCOPE
     ctx["job_settings"] = settings
     ctx["jobs"] = PostgresJobStore(

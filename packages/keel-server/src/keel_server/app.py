@@ -367,6 +367,9 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         Path.cwd(),
         service="server",
     )
+    # Stored so ``/readiness`` can actively probe the sandbox RPC boundary (reachable +
+    # authenticated) rather than merely confirming a client object was constructed.
+    app.state.execution_environment = execution_environment
     app.state.runtime = AgentRuntime(
         redis_client=redis_client,
         engine=engine,
@@ -888,6 +891,34 @@ def create_app() -> FastAPI:
             checks["review"] = "ready" if review_ready else "degraded"
             if not review_ready:
                 ready = False
+
+        # Execution boundary: with the fail-closed ``sandbox`` backend, ACTIVELY probe the
+        # isolated executor's authenticated ``/v1/ping`` (signed empty body) so readiness proves
+        # the RPC is reachable AND the HMAC contract holds — not merely that a client object was
+        # constructed. A broken/misauthenticated/unreachable sandbox reports degraded (503) so a
+        # load balancer drains this instance instead of accepting runs whose tool calls would all
+        # fail. The in-process preview backend has no RPC to probe and is reported as such.
+        execution_environment = getattr(app.state, "execution_environment", None)
+        if settings.execution_backend == "sandbox":
+            probe = getattr(execution_environment, "probe_ready", None)
+            if probe is None:
+                checks["sandbox"] = "unavailable"
+                ready = False
+            else:
+                try:
+                    result = await probe()
+                except Exception as exc:  # noqa: BLE001 - report, never crash the probe
+                    checks["sandbox"] = f"error: {exc.__class__.__name__}"
+                    ready = False
+                else:
+                    if result.ok:
+                        checks["sandbox"] = "ok"
+                    else:
+                        code = result.error.code.value if result.error else "unavailable"
+                        checks["sandbox"] = f"degraded: {code}"
+                        ready = False
+        else:
+            checks["sandbox"] = "unsafe-local-dev (in-process preview)"
 
         body = ReadinessResponse(ready=ready, checks=checks)
         return JSONResponse(body.model_dump(), status_code=200 if ready else 503)
