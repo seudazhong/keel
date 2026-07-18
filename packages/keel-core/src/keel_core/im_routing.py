@@ -294,10 +294,26 @@ class ImChannelMapping:
     status: ImMappingStatus = ImMappingStatus.active
     version: int = 1
     created_by: str = ""
+    run_as_user_id: str = ""
     created_at: datetime = field(default_factory=_now)
     updated_at: datetime = field(default_factory=_now)
     revoked_by: str = ""
     revoked_at: datetime | None = None
+
+    def same_binding(self, other: ImChannelMapping) -> bool:
+        """Whether ``other`` requests the *same* Agent/scope/run-as/kind/policy as this row.
+
+        Used to decide whether a platform-admin create for an already-live chat is an idempotent
+        no-op (exact same request) or a conflicting re-bind (a different Agent/run-as/policy).
+        The provider identity + org are assumed equal (same route key) by the caller.
+        """
+        return (
+            self.agent_id == other.agent_id
+            and self.scope_id == other.scope_id
+            and self.run_as_user_id == other.run_as_user_id
+            and self.chat_kind is other.chat_kind
+            and self.policy == other.policy
+        )
 
     @property
     def route_key(self) -> str:
@@ -718,7 +734,25 @@ class ImProvisioner(Protocol):
 
     async def provision(
         self, mapping: ImChannelMapping, *, now: datetime | None = None
-    ) -> ImChannelMapping: ...
+    ) -> ImChannelMapping:
+        """Provision a chat's mapping, atomically reprovisioning a revoked terminal row.
+
+        In one all-or-nothing unit (a Postgres transaction / an in-memory lock) keyed on the
+        org-unique ``(org, provider, bot, chat)``:
+
+        * an **unclaimed** chat inserts the new mapping and claims its global route (single winner);
+        * a **revoked** (terminal) row is reactivated in place — its Agent/scope/run-as/policy/
+          provisioner are re-bound, the revocation columns cleared, the version bumped, and the
+          **same** route key reclaimed — so a released chat is reprovisioned with **no** duplicate
+          row or orphan;
+        * a **live** (active/disabled) row is returned unchanged only for the byte-for-byte same
+          binding (idempotent), else refused.
+
+        Raises :class:`RouteConflictError` (opaque) when the chat's global route is owned by a
+        *different* org, or when a live row already binds the chat to a different Agent/run-as/
+        policy — the single-owner rule that stops a first-claim / re-bind theft.
+        """
+        ...
 
     async def transition(
         self,
@@ -862,6 +896,7 @@ class InMemoryImMappingStore:
             status=status,
             version=current.version + 1,
             created_by=current.created_by,
+            run_as_user_id=current.run_as_user_id,
             created_at=current.created_at,
             updated_at=now,
             revoked_by=actor if status is ImMappingStatus.revoked else current.revoked_by,
@@ -922,17 +957,64 @@ class InMemoryImProvisioner:
         self._route_index = route_index
         self._lock = asyncio.Lock()
 
+    async def _find_existing(self, mapping: ImChannelMapping) -> ImChannelMapping | None:
+        """The org's row (if any) that already owns this chat's ``(provider, bot, chat)`` key."""
+        for row in await self._mappings.list_for_org(mapping.org_id):
+            if (
+                row.provider is mapping.provider
+                and row.external_bot_id == mapping.external_bot_id
+                and row.external_chat_id == mapping.external_chat_id
+            ):
+                return row
+        return None
+
     async def provision(
         self, mapping: ImChannelMapping, *, now: datetime | None = None
     ) -> ImChannelMapping:
         async with self._lock:
-            created = await self._mappings.create(mapping)
-            try:
-                await self._route_index.claim(created.route_entry(), now=now)
-            except RouteConflictError:
-                await self._mappings.delete(created.id)
-                raise
-            return created
+            existing = await self._find_existing(mapping)
+            if existing is None:
+                created = await self._mappings.create(mapping)
+                try:
+                    await self._route_index.claim(created.route_entry(), now=now)
+                except RouteConflictError:
+                    await self._mappings.delete(created.id)
+                    raise
+                return created
+            if existing.status is ImMappingStatus.revoked:
+                return await self._reprovision_revoked(existing, mapping, now=now)
+            # A live (active/disabled) row: idempotent only for the exact same binding.
+            if existing.same_binding(mapping):
+                return existing
+            raise RouteConflictError("this chat is already claimed")
+
+    async def _reprovision_revoked(
+        self, existing: ImChannelMapping, desired: ImChannelMapping, *, now: datetime | None
+    ) -> ImChannelMapping:
+        """Reactivate a revoked terminal row in place, reclaiming its route (or fail closed)."""
+        now = now or _now()
+        reactivated = replace(
+            existing,
+            agent_id=desired.agent_id,
+            scope_id=desired.scope_id,
+            chat_kind=desired.chat_kind,
+            policy=desired.policy,
+            created_by=desired.created_by,
+            run_as_user_id=desired.run_as_user_id,
+            status=ImMappingStatus.active,
+            version=existing.version + 1,
+            revoked_by="",
+            revoked_at=None,
+            updated_at=now,
+        )
+        await self._mappings.create(reactivated)  # same id — overwrites the terminal row in place
+        try:
+            await self._route_index.claim(reactivated.route_entry(), now=now)
+        except RouteConflictError:
+            # Restore the revoked row so a lost route race leaves no partial reprovision.
+            await self._mappings.create(existing)
+            raise
+        return reactivated
 
     async def transition(
         self,
@@ -1167,15 +1249,17 @@ _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 
 _MAPPING_RETURNING = (
     "id, org_id, provider, external_bot_id, external_chat_id, chat_kind, agent_id, scope_id, "
-    "policy, status, version, created_by, created_at, updated_at, revoked_by, revoked_at"
+    "policy, status, version, created_by, run_as_user_id, created_at, updated_at, "
+    "revoked_by, revoked_at"
 )
 
 _INSERT_MAPPING = text(
     "INSERT INTO im_channel_mappings "
     "(id, org_id, provider, external_bot_id, external_chat_id, chat_kind, agent_id, scope_id, "
-    " policy, status, version, created_by, created_at, updated_at) "
+    " policy, status, version, created_by, run_as_user_id, created_at, updated_at) "
     "VALUES (:id, :org_id, :provider, :bot, :chat, :chat_kind, :agent_id, :scope_id, "
-    " CAST(:policy AS jsonb), :status, :version, :created_by, :created_at, :updated_at) "
+    " CAST(:policy AS jsonb), :status, :version, :created_by, :run_as_user_id, "
+    " :created_at, :updated_at) "
     f"RETURNING {_MAPPING_RETURNING}"
 )
 
@@ -1218,6 +1302,28 @@ _UPDATE_MAPPING_STATUS = text(
 
 _DELETE_ROUTE_FOR_MAPPING = text("DELETE FROM im_route_index WHERE mapping_id = :id")
 
+# Lock the (possibly terminal) mapping row that already owns a chat's org-unique key, so a
+# reprovision serializes behind concurrent provisions/transitions of the *same* chat.
+_LOCK_MAPPING_BY_ROUTE = text(
+    f"SELECT {_MAPPING_RETURNING} FROM im_channel_mappings "
+    "WHERE org_id = :org AND provider = :provider "
+    " AND external_bot_id = :bot AND external_chat_id = :chat "
+    "FOR UPDATE"
+)
+
+# Reactivate a revoked (terminal) mapping in place: re-bind Agent/scope/run-as/policy/provisioner,
+# clear the revocation audit columns, bump the version, and flip it back to active — the atomic
+# reprovision that reclaims the same route key without inserting a duplicate row.
+_REPROVISION_MAPPING = text(
+    "UPDATE im_channel_mappings SET "
+    " agent_id = :agent_id, scope_id = :scope_id, chat_kind = :chat_kind, "
+    " policy = CAST(:policy AS jsonb), created_by = :created_by, "
+    " run_as_user_id = :run_as_user_id, status = 'active', version = version + 1, "
+    " revoked_by = '', revoked_at = NULL, updated_at = :now "
+    "WHERE id = :id "
+    f"RETURNING {_MAPPING_RETURNING}"
+)
+
 
 def _mapping_insert_params(mapping: ImChannelMapping) -> dict[str, object]:
     return {
@@ -1233,6 +1339,7 @@ def _mapping_insert_params(mapping: ImChannelMapping) -> dict[str, object]:
         "status": mapping.status.value,
         "version": mapping.version,
         "created_by": mapping.created_by,
+        "run_as_user_id": mapping.run_as_user_id,
         "created_at": mapping.created_at,
         "updated_at": mapping.updated_at,
     }
@@ -1267,6 +1374,7 @@ def _mapping_from_row(row: object) -> ImChannelMapping:
         status=ImMappingStatus(r.status),  # type: ignore[attr-defined]
         version=r.version,  # type: ignore[attr-defined]
         created_by=r.created_by,  # type: ignore[attr-defined]
+        run_as_user_id=r.run_as_user_id or "",  # type: ignore[attr-defined]
         created_at=r.created_at,  # type: ignore[attr-defined]
         updated_at=r.updated_at,  # type: ignore[attr-defined]
         revoked_by=r.revoked_by or "",  # type: ignore[attr-defined]
@@ -1321,12 +1429,7 @@ class PostgresImMappingStore:
             await conn.execute(_SET_ORG, {"org": self._org_id})
             row = (
                 await conn.execute(
-                    text(
-                        "SELECT id, org_id, provider, external_bot_id, external_chat_id, "
-                        " chat_kind, agent_id, scope_id, policy, status, version, created_by, "
-                        " created_at, updated_at, revoked_by, revoked_at "
-                        "FROM im_channel_mappings WHERE id = :id"
-                    ),
+                    text(f"SELECT {_MAPPING_RETURNING} FROM im_channel_mappings WHERE id = :id"),
                     {"id": mapping_id},
                 )
             ).first()
@@ -1338,9 +1441,7 @@ class PostgresImMappingStore:
             rows = (
                 await conn.execute(
                     text(
-                        "SELECT id, org_id, provider, external_bot_id, external_chat_id, "
-                        " chat_kind, agent_id, scope_id, policy, status, version, created_by, "
-                        " created_at, updated_at, revoked_by, revoked_at "
+                        f"SELECT {_MAPPING_RETURNING} "
                         "FROM im_channel_mappings WHERE org_id = :org ORDER BY created_at"
                     ),
                     {"org": org_id},
@@ -1451,13 +1552,19 @@ class PostgresImRouteIndex:
 
 
 class PostgresImProvisioner:
-    """Transactional provisioner: insert the mapping **and** claim its global route atomically.
+    """Transactional provisioner: insert-or-reprovision the mapping **and** claim its route.
 
     The mapping row (RLS-guarded on ``app.org_id``) and the global route claim run in a **single**
     transaction, so a claim that loses a concurrent cross-org race (the route_key is already owned
     by another mapping — ``RETURNING`` empty) rolls the whole transaction back: exactly one org
     wins the chat and the loser leaves **no** orphan mapping or index row. The route_index
     primary key on ``route_key`` is the serialization point that makes the winner unambiguous.
+
+    Provisioning a chat whose org-unique ``(org, provider, bot, chat)`` row already exists
+    reprovisions it in the same locked transaction: a **revoked** terminal row is reactivated in
+    place (re-bind Agent/scope/run-as/policy/provisioner, clear revocation, bump version, reclaim
+    the same route) so a released chat is reusable with **no** duplicate row; a **live** row is an
+    idempotent no-op only for the byte-for-byte same binding, else a fail-closed conflict.
     """
 
     def __init__(self, engine: AsyncEngine) -> None:
@@ -1469,15 +1576,61 @@ class PostgresImProvisioner:
         now = now or _now()
         async with self._engine.begin() as conn:
             await conn.execute(_SET_ORG, {"org": mapping.org_id})
-            row = (await conn.execute(_INSERT_MAPPING, _mapping_insert_params(mapping))).one()
-            created = _mapping_from_row(row)
-            claimed = (
-                await conn.execute(_CLAIM_ROUTE, _route_claim_params(created.route_entry(), now))
+            existing_row = (
+                await conn.execute(
+                    _LOCK_MAPPING_BY_ROUTE,
+                    {
+                        "org": mapping.org_id,
+                        "provider": mapping.provider.value,
+                        "bot": mapping.external_bot_id,
+                        "chat": mapping.external_chat_id,
+                    },
+                )
             ).first()
-            if claimed is None:
-                # Another org already owns this chat — abort so the mapping insert rolls back.
-                raise RouteConflictError("chat is already claimed by another mapping")
-        return created
+            if existing_row is None:
+                row = (await conn.execute(_INSERT_MAPPING, _mapping_insert_params(mapping))).one()
+                created = _mapping_from_row(row)
+                claimed = (
+                    await conn.execute(
+                        _CLAIM_ROUTE, _route_claim_params(created.route_entry(), now)
+                    )
+                ).first()
+                if claimed is None:
+                    # Another org already owns this chat — abort so the mapping insert rolls back.
+                    raise RouteConflictError("chat is already claimed by another mapping")
+                return created
+            existing = _mapping_from_row(existing_row)
+            if existing.status is ImMappingStatus.revoked:
+                # Reactivate the terminal row in place + reclaim the same route key (single txn).
+                reactivated_row = (
+                    await conn.execute(
+                        _REPROVISION_MAPPING,
+                        {
+                            "id": existing.id,
+                            "agent_id": mapping.agent_id,
+                            "scope_id": mapping.scope_id,
+                            "chat_kind": mapping.chat_kind.value,
+                            "policy": json.dumps(mapping.policy.to_json()),
+                            "created_by": mapping.created_by,
+                            "run_as_user_id": mapping.run_as_user_id,
+                            "now": now,
+                        },
+                    )
+                ).one()
+                reactivated = _mapping_from_row(reactivated_row)
+                claimed = (
+                    await conn.execute(
+                        _CLAIM_ROUTE, _route_claim_params(reactivated.route_entry(), now)
+                    )
+                ).first()
+                if claimed is None:
+                    # Another org has claimed the freed chat — roll the whole reprovision back.
+                    raise RouteConflictError("chat is already claimed by another mapping")
+                return reactivated
+            # A live (active/disabled) row: idempotent only for the exact same binding.
+            if existing.same_binding(mapping):
+                return existing
+            raise RouteConflictError("this chat is already claimed")
 
     async def transition(
         self,

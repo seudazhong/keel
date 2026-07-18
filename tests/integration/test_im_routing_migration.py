@@ -107,6 +107,14 @@ async def _seed_org_agent(engine: AsyncEngine) -> tuple[str, str, str]:
                 ),
                 {"id": org, "slug": org},
             )
+            # u1 is an active member of each org so it can be a mapping's run_as_user_id.
+            await conn.execute(
+                text(
+                    "INSERT INTO memberships(id,org_id,user_id,role,status) "
+                    "VALUES(:id,:o,'u1','owner','active')"
+                ),
+                {"id": f"mem-{org}", "o": org},
+            )
         await conn.execute(
             text(
                 "INSERT INTO agents(id,org_id,kind,owner_user_id,name,status,version) "
@@ -128,7 +136,8 @@ def _mapping(org_id: str, agent_id: str) -> ImChannelMapping:
         agent_id=agent_id,
         scope_id=f"agent:{org_id}/{agent_id}",
         policy=ImReplyPolicy(reply_enabled=True),
-        created_by="u1",
+        created_by="admin-machine",
+        run_as_user_id="u1",
     )
 
 
@@ -233,6 +242,13 @@ async def _seed_two_orgs_two_agents(engine: AsyncEngine) -> None:
                     "VALUES(:id,:slug,:id,'active')"
                 ),
                 {"id": org, "slug": org},
+            )
+            await conn.execute(
+                text(
+                    "INSERT INTO memberships(id,org_id,user_id,role,status) "
+                    "VALUES(:id,:o,'u1','owner','active')"
+                ),
+                {"id": f"mem-{org}", "o": org},
             )
             await conn.execute(
                 text(
@@ -358,3 +374,70 @@ async def test_transition_enable_conflict_rolls_back_and_stays_disabled(
     still = await PostgresImMappingStore(engine, "org-a").get(a.id)
     assert still is not None and still.status is ImMappingStatus.disabled
     assert (await route.lookup(key)).mapping_id == b.id  # type: ignore[union-attr]
+
+
+async def test_provision_reprovisions_revoked_row_in_place(migrated_db: AsyncEngine) -> None:
+    """Reprovisioning a revoked chat reactivates the same terminal row (no duplicate/orphan)."""
+    engine = migrated_db
+    await _seed_two_orgs_two_agents(engine)
+    provisioner = PostgresImProvisioner(engine)
+    route = PostgresImRouteIndex(engine)
+    store = PostgresImMappingStore(engine, "org-a")
+    key = route_key("telegram", "bot-9", "4242")
+
+    created = await provisioner.provision(_mapping("org-a", "agent-org-a"))
+    await provisioner.transition(created.id, ImMappingStatus.revoked, org_id="org-a", actor="admin")
+    assert await route.lookup(key) is None  # revoke released the route
+
+    # A fresh provision for the same (org, provider, bot, chat) reactivates the revoked row in
+    # place: the SAME id, an advanced version, and the same route reclaimed — no duplicate row.
+    again = await provisioner.provision(_mapping("org-a", "agent-org-a"))
+    assert again.id == created.id
+    assert again.status is ImMappingStatus.active and again.version > created.version
+    assert [m.id for m in await store.list_for_org("org-a")] == [created.id]
+    entry = await route.lookup(key)
+    assert entry is not None and entry.mapping_id == created.id
+
+
+async def test_reprovision_cross_org_conflict_stays_revoked(migrated_db: AsyncEngine) -> None:
+    """A revoked chat another org has re-claimed cannot be reprovisioned (opaque fail-closed)."""
+    engine = migrated_db
+    await _seed_two_orgs_two_agents(engine)
+    provisioner = PostgresImProvisioner(engine)
+    route = PostgresImRouteIndex(engine)
+    key = route_key("telegram", "bot-9", "4242")
+
+    a = await provisioner.provision(_mapping("org-a", "agent-org-a"))
+    await provisioner.transition(a.id, ImMappingStatus.revoked, org_id="org-a", actor="admin")
+    b = await provisioner.provision(_mapping("org-b", "agent-org-b"))  # org-b claims the chat
+    assert (await route.lookup(key)).mapping_id == b.id  # type: ignore[union-attr]
+
+    # org-a reprovisioning the now-foreign chat rolls back; its row stays revoked, route intact.
+    with pytest.raises(RouteConflictError):
+        await provisioner.provision(_mapping("org-a", "agent-org-a"))
+    still = await PostgresImMappingStore(engine, "org-a").get(a.id)
+    assert still is not None and still.status is ImMappingStatus.revoked
+    assert (await route.lookup(key)).mapping_id == b.id  # type: ignore[union-attr]
+
+
+async def test_run_as_composite_fk_rejects_nonmember(migrated_db: AsyncEngine) -> None:
+    """The composite ``(org_id, run_as_user_id)`` FK rejects a run-as user with no membership."""
+    engine = migrated_db
+    org_a, _org_b, agent = await _seed_org_agent(engine)
+    store = PostgresImMappingStore(engine, org_a)
+    stranger = _mapping(org_a, agent)
+    stranger = ImChannelMapping(
+        id=stranger.id,
+        org_id=stranger.org_id,
+        provider=stranger.provider,
+        external_bot_id=stranger.external_bot_id,
+        external_chat_id=stranger.external_chat_id,
+        chat_kind=stranger.chat_kind,
+        agent_id=stranger.agent_id,
+        scope_id=stranger.scope_id,
+        policy=stranger.policy,
+        created_by=stranger.created_by,
+        run_as_user_id="not-a-member",
+    )
+    with pytest.raises(Exception):  # noqa: B017,PT011 - IntegrityError from the run-as FK
+        await store.create(stranger)

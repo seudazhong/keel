@@ -46,7 +46,7 @@ not be — so a new store cannot be added without a conscious retention + erasur
 | `erasure_requests` / `erasure_steps` | table | long | `scope_id` | **retained** (audit trail) |
 | `retention_policies` | table | long | `scope_id` | **retained** (operator overrides) |
 | `organizations` / `memberships` / `agents` / `resource_grants` | table | permanent | `org_id` | **org-scoped** — erased by organization erasure (M3.6) |
-| `im_channel_mappings` | table | permanent | `org_id` | **org-scoped** — erased by organization erasure (FK cascade removes its route index rows, M3.7) |
+| `im_channel_mappings` | table | permanent | `org_id` | **org-scoped** — erased by organization erasure (FK cascade removes its route index rows, M3.7); a `run_as_user_id` composite FK to `memberships` ties each mapping to an active org member (the run actor, distinct from the platform-admin `created_by` provisioner) |
 | `users` / `oidc_identities` | table | permanent | *(global)* | **identity-global** — erased by user (data-subject) erasure (M3.6) |
 | provider logs / Langfuse telemetry | external | — | — | **external** — no delete API; recorded incomplete → `partial` |
 

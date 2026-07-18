@@ -14,7 +14,7 @@ from typing import Any
 
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.identity import IdentityService, InMemoryIdentityStore, LoggingAuditSink
-from keel_core.identity.models import AgentKind
+from keel_core.identity.models import AgentKind, MembershipRole
 from keel_core.im_routing import (
     ImChatKind,
     ImInboundContext,
@@ -36,6 +36,7 @@ from keel_core.state import InMemoryEventStore
 from keel_core.testing import ScriptedProviderGateway
 from keel_core.tools import UnavailableExecutionEnvironment
 from keel_core.types import FinishReason
+from keel_worker.im_replies import OneBotReplySender
 from keel_worker.runs import run_interactive, send_im_replies_tick
 
 
@@ -284,3 +285,109 @@ async def test_im_reply_disabled_policy_persists_no_reply() -> None:
     assert await run_interactive(ctx, run_id, scope_id) == RunStatus.completed.value
     assert await dispatch.active_scopes() == set()
     assert await send_im_replies_tick(ctx) == 0
+
+
+async def _identity_with_team_agent_and_member() -> tuple[IdentityService, str, str, str, str]:
+    """An org with a team Agent + a separate active *member* (the run-as identity)."""
+    svc = IdentityService(InMemoryIdentityStore(), audit=LoggingAuditSink())
+    owner = await svc.ensure_local_user()
+    org = await svc.create_org(owner.id, slug="acme", display_name="Acme")
+    agent = await svc.create_agent(
+        org.org_id, owner.id, kind=AgentKind.team, name="Support", persona="Be helpful."
+    )
+    runner = await svc.store.create_user(display_name="Runner", email=None)
+    await svc.add_member(org.org_id, owner.id, runner.id, MembershipRole.member)
+    return svc, org.org_id, owner.id, runner.id, agent.id
+
+
+async def test_im_run_as_active_member_executes_successfully() -> None:
+    svc, org_id, _owner_id, runner_id, agent_id = await _identity_with_team_agent_and_member()
+    scope_id = derive_agent_scope(org_id, agent_id)
+    runs, events, approvals = InMemoryRunStore(), InMemoryEventStore(), InMemoryApprovalStore()
+    replies, dispatch, sender = (
+        InMemoryImReplyStore(),
+        InMemoryImReplyDispatchIndex(),
+        _RecordingSender(),
+    )
+    # The run is admitted as the run-as MEMBER (never the platform admin) and completes.
+    run_id = await _admit_im(
+        runs,
+        events,
+        scope_id=scope_id,
+        org_id=org_id,
+        actor=runner_id,
+        agent_id=agent_id,
+        context=_im_context(),
+    )
+    provider = ScriptedProviderGateway(
+        [[ProviderChunk(delta="hi there", finish_reason=FinishReason.end_turn)]]
+    )
+    ctx = _ctx(
+        runs,
+        events,
+        approvals,
+        svc,
+        provider,
+        scope_id=scope_id,
+        replies=replies,
+        dispatch=dispatch,
+        sender=sender,
+    )
+    assert await run_interactive(ctx, run_id, scope_id) == RunStatus.completed.value
+
+
+async def test_im_run_as_revoked_member_fails_closed() -> None:
+    svc, org_id, owner_id, runner_id, agent_id = await _identity_with_team_agent_and_member()
+    scope_id = derive_agent_scope(org_id, agent_id)
+    runs, events, approvals = InMemoryRunStore(), InMemoryEventStore(), InMemoryApprovalStore()
+    replies, dispatch, sender = (
+        InMemoryImReplyStore(),
+        InMemoryImReplyDispatchIndex(),
+        _RecordingSender(),
+    )
+    run_id = await _admit_im(
+        runs,
+        events,
+        scope_id=scope_id,
+        org_id=org_id,
+        actor=runner_id,
+        agent_id=agent_id,
+        context=_im_context(),
+    )
+    # The run-as member is removed from the org between admit and claim: the worker's claim-time
+    # re-authorization fails the run closed (never executes as the ex-member / platform admin).
+    await svc.remove_member(org_id, owner_id, runner_id)
+    provider = ScriptedProviderGateway(
+        [[ProviderChunk(delta="should not run", finish_reason=FinishReason.end_turn)]]
+    )
+    ctx = _ctx(
+        runs,
+        events,
+        approvals,
+        svc,
+        provider,
+        scope_id=scope_id,
+        replies=replies,
+        dispatch=dispatch,
+        sender=sender,
+    )
+    assert await run_interactive(ctx, run_id, scope_id) == RunStatus.failed.value
+    # No reply was ever persisted or sent for the forbidden run.
+    assert await dispatch.active_scopes() == set()
+    assert await send_im_replies_tick(ctx) == 0
+
+
+def test_onebot_reply_sender_authorization_carries_token_not_a_mask() -> None:
+    """No-secret guard: the OneBot reply header is a real bearer of the configured access token.
+
+    Guards against a regression where the ``Authorization`` header would carry a literal mask
+    instead of the token; the header must be the bearer scheme followed by the exact token, and an
+    unconfigured (empty) token sends no auth header at all.
+    """
+    sender = OneBotReplySender("http://onebot.local/", "tok-abc123")
+    header = sender._headers["Authorization"]  # noqa: SLF001 - test introspection
+    assert header == "Bearer tok-abc123"
+    assert header.startswith("Bearer ") and header.endswith("tok-abc123")
+    assert "******" not in header
+    # No configured token -> no Authorization header (fail-open auth is never sent).
+    assert OneBotReplySender("http://onebot.local", "")._headers == {}  # noqa: SLF001

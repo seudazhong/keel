@@ -43,9 +43,11 @@ from keel_server.gateway.telegram import (
 
 logger = logging.getLogger("keel.server.im_ingress")
 
-# A run admitted from an IM surface acts under the authority of the org member who bound the
-# channel mapping (its ``created_by``), so the worker's Agent-visibility re-check has a real
-# authorizing actor; a mapping with no recorded creator falls back to this service principal.
+# A run admitted from an IM surface acts under the authority of the **run-as** org member the
+# platform admin bound the channel mapping to (its ``run_as_user_id``) — never the platform admin
+# that provisioned it (``created_by`` is only an audit identity). The worker re-validates that
+# run-as member's Agent-use authorization at claim time, so a revoked membership or member removal
+# fails future runs closed. A mapping with no recorded run-as falls back to this service principal.
 _IM_SERVICE_ACTOR = "im:service"
 
 
@@ -117,7 +119,7 @@ class DurableImIngress:
                 await self._resolve_approval(resolved.scope_id, resolved.org_id, mapping, command)
                 return None
         context = self._context(inbound, mapping)
-        actor = mapping.created_by or _IM_SERVICE_ACTOR
+        actor = mapping.run_as_user_id or _IM_SERVICE_ACTOR
         service = self.run_service_factory(resolved.scope_id)
         result = await service.admit(
             org_id=resolved.org_id,
@@ -166,13 +168,13 @@ class DurableImIngress:
         mapping: ImChannelMapping,
         command: ImApprovalCommand,
     ) -> None:
-        """Resolve a durable approval from an IM command under the mapping's authority.
+        """Resolve a durable approval from an IM command under the mapping's run-as authority.
 
-        The decision resolves as the mapping's authorizing principal (``created_by`` — the same
+        The decision resolves as the mapping's **run-as** org member (``run_as_user_id`` — the same
         actor an IM run binds), so the durable ``resolve_approval`` owner check passes; every
         other binding (org, current run attempt, recomputed action hash, terminal state) is
         verified there, denying a stale/replayed or cross-org command."""
-        actor = mapping.created_by or _IM_SERVICE_ACTOR
+        actor = mapping.run_as_user_id or _IM_SERVICE_ACTOR
         service = self.run_service_factory(scope_id)
         ok = await service.resolve_approval(
             command.approval_id,

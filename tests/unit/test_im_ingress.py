@@ -87,6 +87,7 @@ async def _publish_mapping(
         policy=policy or ImReplyPolicy(reply_enabled=reply_enabled),
         status=status,
         created_by="user-admin",
+        run_as_user_id="user-member",
     )
     await h.mappings.create(mapping)
     await h.route_index.put(mapping.route_entry())
@@ -110,13 +111,13 @@ async def test_ingress_admits_durable_im_run_with_context() -> None:
     run_id = await h.ingress().admit(_inbound())
     assert run_id is not None
     # The run was admitted into the mapped Agent's scope as an IM surface, under the mapping's
-    # authorizing actor (created_by), and enqueued for the worker.
+    # run-as org member (run_as_user_id), NOT the platform admin (created_by), and enqueued.
     runs = h.runs["agent:org-a/agent-1"]
     record = await runs.get(run_id)
     assert record is not None
     assert record.surface == RunSurface.im.value
     assert record.org_id == "org-a" and record.agent_id == "agent-1"
-    assert record.actor == "user-admin"
+    assert record.actor == "user-member"
     assert record.status in {RunStatus.queued, RunStatus.admitted}
     assert h.enqueued == [(run_id, "agent:org-a/agent-1")]
     # The durable IM provider/chat context rides on the admission event.

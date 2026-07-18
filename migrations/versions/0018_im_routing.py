@@ -11,8 +11,12 @@ Adds the durable data plane for untrusted IM (OneBot QQ, Telegram) routing:
   policy. Org-partitioned under ``FORCE ROW LEVEL SECURITY`` on ``app.org_id``, with a composite
   FK ``(agent_id, org_id) -> agents(id, org_id)`` so a mapping can only ever bind an Agent in its
   *own* org (cross-org Agent binding is impossible), plus ``ON DELETE CASCADE`` from the org so
-  org erasure removes every mapping. Personal vs group is a first-class column; status /
-  version / audit columns carry revocation.
+  org erasure removes every mapping. The **run-as** org member the worker executes under is a
+  separate, required ``run_as_user_id`` bound by a composite FK
+  ``(org_id, run_as_user_id) -> memberships(org_id, user_id)`` so a mapping can only run as a
+  member of its own org (the platform admin that ``created_by``-provisions it is only an audit
+  identity, never the run actor). Personal vs group is a first-class column; status / version /
+  audit columns carry revocation.
 
 * ``im_route_index`` — a **minimal, global, opaque** route/capability index read by a pre-tenant
   webhook *before* any org/scope is bound: only an opaque ``route_key`` (a SHA-256 of provider +
@@ -83,6 +87,7 @@ def upgrade() -> None:
             chat_kind text NOT NULL CHECK (chat_kind IN ('personal', 'group')),
             agent_id text NOT NULL,
             scope_id text NOT NULL,
+            run_as_user_id text NOT NULL,
             policy jsonb NOT NULL DEFAULT '{{}}'::jsonb {_no_secret_check("policy")},
             status text NOT NULL DEFAULT 'active'
                 CHECK (status IN ('active', 'disabled', 'revoked')),
@@ -95,7 +100,9 @@ def upgrade() -> None:
             UNIQUE (id, org_id),
             UNIQUE (org_id, provider, external_bot_id, external_chat_id),
             FOREIGN KEY (agent_id, org_id)
-                REFERENCES agents (id, org_id) ON DELETE CASCADE
+                REFERENCES agents (id, org_id) ON DELETE CASCADE,
+            FOREIGN KEY (org_id, run_as_user_id)
+                REFERENCES memberships (org_id, user_id) ON DELETE CASCADE
         )
         """
     )
@@ -104,6 +111,9 @@ def upgrade() -> None:
         "ON im_channel_mappings (org_id, provider, status)"
     )
     op.execute("CREATE INDEX ix_im_channel_mappings_scope ON im_channel_mappings (scope_id)")
+    op.execute(
+        "CREATE INDEX ix_im_channel_mappings_run_as ON im_channel_mappings (org_id, run_as_user_id)"
+    )
 
     op.execute("ALTER TABLE im_channel_mappings ENABLE ROW LEVEL SECURITY")
     op.execute(

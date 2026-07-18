@@ -34,6 +34,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.exc import IntegrityError
 
+from keel_core.errors import PermissionDenied
 from keel_core.identity import AuditAction, AuditEvent, IdentityService, NotFoundError
 from keel_core.im_routing import (
     ImChannelMapping,
@@ -104,6 +105,7 @@ class MappingCreateRequest(_Model):
     external_chat_id: str = Field(min_length=1, max_length=200)
     chat_kind: ImChatKind
     agent_id: str = Field(min_length=1, max_length=200)
+    run_as_user_id: str = Field(min_length=1, max_length=200)
     policy: PolicyModel = Field(default_factory=PolicyModel)
 
 
@@ -116,6 +118,7 @@ class MappingResponse(_Model):
     chat_kind: ImChatKind
     agent_id: str
     scope_id: str
+    run_as_user_id: str
     policy: PolicyModel
     status: ImMappingStatus
     version: int
@@ -136,6 +139,7 @@ class MappingResponse(_Model):
             chat_kind=mapping.chat_kind,
             agent_id=mapping.agent_id,
             scope_id=mapping.scope_id,
+            run_as_user_id=mapping.run_as_user_id,
             policy=PolicyModel.of(mapping.policy),
             status=mapping.status,
             version=mapping.version,
@@ -248,15 +252,26 @@ async def create_mapping(
     """Platform-admin-only: claim a global route + create the org-owned channel mapping.
 
     The target org (``X-Keel-Org``) and Agent (``agent_id``) are resolved as authoritative
-    configuration (no membership) and must both be active. The mapping row and its global route
-    claim are committed atomically; a chat already claimed by another org fails closed with an
-    opaque ``409`` (the owning org is never disclosed). The claim is audited.
+    configuration (no membership) and must both be active; the selected **run-as** user
+    (``run_as_user_id``) must be an active org member independently authorized to use that Agent
+    (a personal Agent's owner, or a team Agent user) — the platform admin is only the audited
+    provisioner, never the run actor. The mapping row and its global route claim are committed
+    atomically; a chat already claimed by another org fails closed with an opaque ``409`` (the
+    owning org is never disclosed). Reusing a **revoked** chat idempotently reprovisions the same
+    row (no duplicate); an already-live chat is idempotent only for the exact same binding. The
+    claim is audited.
     """
     identity = _identity(request)
     try:
         org, agent = await identity.resolve_machine_binding(provisioner.org_ref, body.agent_id)
     except NotFoundError:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "organization or agent not found") from None
+    try:
+        await identity.authorize_im_run_as(org, agent, body.run_as_user_id)
+    except NotFoundError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "run-as user not found") from None
+    except PermissionDenied as exc:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, str(exc)) from None
     mapping = ImChannelMapping(
         id=uuid.uuid4().hex,
         org_id=org.id,
@@ -269,6 +284,7 @@ async def create_mapping(
         policy=body.policy.to_policy(),
         status=ImMappingStatus.active,
         created_by=_provision_actor_id(provisioner.actor),
+        run_as_user_id=body.run_as_user_id,
     )
     try:
         created = await _provisioner(request, org.id).provision(mapping)
@@ -290,6 +306,7 @@ async def create_mapping(
                 "provider": created.provider.value,
                 "chat_kind": created.chat_kind.value,
                 "agent_id": created.agent_id,
+                "run_as": created.run_as_user_id,
                 "route": created.route_key[:12],
             },
         )

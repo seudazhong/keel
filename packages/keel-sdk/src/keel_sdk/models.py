@@ -266,6 +266,7 @@ class CreateImMappingRequest(BaseModel):
     external_chat_id: str
     chat_kind: str  # "personal" | "group"
     agent_id: str
+    run_as_user_id: str  # the active org member the IM run executes as (not the platform admin)
     policy: ImMappingPolicy = ImMappingPolicy()
 
 
@@ -280,6 +281,7 @@ class ImMappingSummary(BaseModel):
     chat_kind: str
     agent_id: str
     scope_id: str
+    run_as_user_id: str = ""
     policy: ImMappingPolicy
     status: str  # "active" | "disabled" | "revoked"
     version: int
