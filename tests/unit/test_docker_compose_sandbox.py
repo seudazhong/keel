@@ -211,6 +211,10 @@ def test_secret_init_validates_existing_secret_length(compose: dict) -> None:
     # published read-only, so a reader never observes a partial or writable secret.
     assert "tempfile" in script and "os.replace" in script, "repair must be atomic"
     assert "0o444" in script, "published secret must be read-only"
+    # An unreadable OR non-UTF-8 file must be treated as invalid and repaired, never fail closed.
+    assert "UnicodeError" in script or "UnicodeDecodeError" in script, (
+        "init must catch undecodable (non-UTF-8) secrets and repair them"
+    )
     # The path comes from the same env var every consumer uses.
     assert "KEEL_SANDBOX_RPC_SECRET_FILE" in script
     assert init["environment"]["KEEL_SANDBOX_RPC_SECRET_FILE"] == "/keel-secrets/sandbox_rpc_secret"
@@ -269,6 +273,19 @@ def test_secret_init_script_repairs_short_secret(compose: dict, tmp_path: Path) 
     repaired = secret.read_text(encoding="utf-8").strip()
     assert repaired != "too-short", "short secret must be regenerated"
     assert _byte_len_ok(repaired) and _is_read_only(secret)
+    _restore_writable(secret)
+
+
+def test_secret_init_script_repairs_invalid_utf8_secret(compose: dict, tmp_path: Path) -> None:
+    secret = tmp_path / "sandbox_rpc_secret"
+    # 64 bytes of undecodable data: long enough that only the UTF-8 decode failure (not a short
+    # length) forces regeneration, proving read_text's UnicodeDecodeError is caught, not fatal.
+    secret.write_bytes(b"\xff\xfe\xfa\xfb" * 16)
+    result = _run_secret_init(_secret_init_script(compose), secret)
+    assert result.returncode == 0, result.stderr
+    repaired = secret.read_text(encoding="utf-8").strip()  # must now decode cleanly as UTF-8
+    assert _byte_len_ok(repaired) and _is_read_only(secret)
+    assert repaired not in (result.stdout + result.stderr), "secret must not be logged"
     _restore_writable(secret)
 
 

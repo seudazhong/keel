@@ -128,7 +128,10 @@ services:
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             current = path.read_text(encoding="utf-8").strip()
-        except OSError:
+        except (OSError, UnicodeError):
+            # Unreadable OR not valid UTF-8 (UnicodeDecodeError is a UnicodeError) -> treat as
+            # invalid and repair below, so a corrupt/non-UTF-8 file self-heals instead of
+            # failing closed forever.
             current = ""
         if len(current.encode("utf-8")) >= min_bytes:
             os.chmod(path, 0o444)
