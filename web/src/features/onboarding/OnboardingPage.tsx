@@ -112,7 +112,7 @@ export function OnboardingPage() {
                 )}
                 {connectors.data && (
                   <ConnectorSetupList
-                    connectors={connectors.data.filter((connector) => !connector.connected)}
+                    connectors={connectors.data}
                     compact
                   />
                 )}

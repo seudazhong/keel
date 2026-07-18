@@ -36,6 +36,7 @@ test("renders the shared manifest-driven connector setup step", async () => {
   fireEvent.click(screen.getByRole("button", { name: "Next" }));
   fireEvent.click(screen.getByRole("button", { name: "Next" }));
   fireEvent.click(screen.getByRole("button", { name: "Next" }));
+  expect(await screen.findByText("Gmail")).toBeInTheDocument();
   expect(await screen.findByText("OAuth fixture")).toBeInTheDocument();
   expect(screen.getByText("Secret fixture")).toBeInTheDocument();
 });
