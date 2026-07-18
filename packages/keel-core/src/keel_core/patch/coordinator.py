@@ -222,6 +222,8 @@ class PatchCoordinator:
         lease = await self.runs.claim(
             run_id, worker_id=worker_id, now=moment, lease_seconds=self.lease_seconds
         )
+        if lease is None:
+            raise PatchStateError("patch generation run is leased by another worker")
         try:
             outcome = await self.generation.generate(
                 request,

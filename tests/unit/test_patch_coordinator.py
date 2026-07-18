@@ -36,7 +36,8 @@ from keel_core.patch.models import (
 from keel_core.patch.store import InMemoryPatchProposalStore
 from keel_core.patch.writeback import WritebackResult, WritebackTarget
 from keel_core.protocols import Usage
-from keel_core.runs import InMemoryRunStore
+from keel_core.runs import InMemoryRunStore, RunLease
+from keel_core.types import RunId
 
 
 class _MemArtifacts:
@@ -187,6 +188,18 @@ class _FakeWriteback:
         )
 
 
+class _ContendedRunStore(InMemoryRunStore):
+    async def claim(
+        self,
+        run_id: RunId,
+        *,
+        worker_id: str,
+        now: datetime | None = None,
+        lease_seconds: int,
+    ) -> RunLease | None:
+        return None
+
+
 def _target() -> WritebackTarget:
     return WritebackTarget(
         full_name="o/r",
@@ -209,12 +222,16 @@ def _request(idem: str = "k1") -> PatchProposalRequest:
 
 
 def _coordinator(
-    artifacts: _MemArtifacts, writeback: _FakeWriteback, target: WritebackTarget | None
-):
+    artifacts: _MemArtifacts,
+    writeback: _FakeWriteback,
+    target: WritebackTarget | None,
+    *,
+    runs: InMemoryRunStore | None = None,
+) -> PatchCoordinator:
     approvals = InMemoryApprovalStore()
     return PatchCoordinator(
         store=InMemoryPatchProposalStore(),
-        runs=InMemoryRunStore(),
+        runs=runs or InMemoryRunStore(),
         authorizer=_FakeAuthorizer(target),
         generation=_FakeGeneration(artifacts),  # type: ignore[arg-type]
         approval=PatchApprovalService(approvals),
@@ -271,6 +288,25 @@ async def test_denied_proposal_is_never_written_back() -> None:
     with pytest.raises(PatchStateError):
         await coord.execute_writeback("o", handle.proposal_id, worker_id="w1")
     assert writeback.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_generation_requires_run_lease() -> None:
+    artifacts = _MemArtifacts()
+    generation = _FakeGeneration(artifacts)
+    coord = _coordinator(
+        artifacts,
+        _FakeWriteback(),
+        _target(),
+        runs=_ContendedRunStore(),
+    )
+    coord.generation = generation  # type: ignore[assignment]
+    req = _request()
+    handle = await coord.request_generation(req)
+
+    with pytest.raises(PatchStateError, match="leased by another worker"):
+        await coord.execute_generation("o", handle.run_id, req, worker_id="w2")
+    assert generation.calls == 0
 
 
 @pytest.mark.asyncio
