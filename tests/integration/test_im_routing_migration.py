@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from keel_core.im_routing import (
     ImChannelMapping,
     ImChatKind,
+    ImMappingStatus,
     ImProvider,
     ImReplyIntent,
     ImReplyKind,
@@ -32,6 +33,8 @@ from keel_core.im_routing import (
     PostgresImReplyStore,
     PostgresImRouteIndex,
     RouteConflictError,
+    StaleMappingError,
+    TerminalMappingError,
     purge_scope,
     reply_idempotency_key,
     route_key,
@@ -268,3 +271,90 @@ async def test_provisioner_claim_is_single_winner_and_idempotent(migrated_db: As
     # Re-claiming the *same* mapping is idempotent (no conflict, refreshes the opaque row).
     await route.claim(created.route_entry())
     assert (await route.lookup(key)).mapping_id == created.id  # type: ignore[union-attr]
+
+
+async def test_transition_keeps_route_invariant_versioned_and_terminal(
+    migrated_db: AsyncEngine,
+) -> None:
+    """The transactional status transition keeps route<->status atomic, versioned and terminal."""
+    engine = migrated_db
+    await _seed_two_orgs_two_agents(engine)
+    provisioner = PostgresImProvisioner(engine)
+    route = PostgresImRouteIndex(engine)
+    key = route_key("telegram", "bot-9", "4242")
+
+    created = await provisioner.provision(_mapping("org-a", "agent-org-a"))
+    assert await route.lookup(key) is not None  # active -> route present
+
+    # Disable removes the route in the same transaction and bumps the version.
+    disabled = await provisioner.transition(
+        created.id, ImMappingStatus.disabled, org_id="org-a", actor="admin"
+    )
+    assert disabled is not None and disabled.status is ImMappingStatus.disabled
+    assert disabled.version == created.version + 1
+    assert await route.lookup(key) is None  # inactive -> no route
+
+    # A stale optimistic-version request (citing the pre-disable version) fails closed.
+    with pytest.raises(StaleMappingError):
+        await provisioner.transition(
+            created.id,
+            ImMappingStatus.active,
+            org_id="org-a",
+            actor="admin",
+            expected_version=created.version,
+        )
+
+    # Enabling at the current version re-claims the route before the status is visibly active.
+    enabled = await provisioner.transition(
+        created.id,
+        ImMappingStatus.active,
+        org_id="org-a",
+        actor="admin",
+        expected_version=disabled.version,
+    )
+    assert enabled is not None and enabled.status is ImMappingStatus.active
+    entry = await route.lookup(key)
+    assert entry is not None and entry.status is ImMappingStatus.active  # active -> route present
+
+    # A different org cannot transition a mapping it does not own (RLS -> not found).
+    assert (
+        await provisioner.transition(
+            created.id, ImMappingStatus.disabled, org_id="org-b", actor="x"
+        )
+        is None
+    )
+
+    # Revoke removes the route and is terminal: a subsequent enable is refused (fail closed).
+    revoked = await provisioner.transition(
+        created.id, ImMappingStatus.revoked, org_id="org-a", actor="admin"
+    )
+    assert revoked is not None and revoked.status is ImMappingStatus.revoked
+    assert await route.lookup(key) is None
+    with pytest.raises(TerminalMappingError):
+        await provisioner.transition(
+            created.id, ImMappingStatus.active, org_id="org-a", actor="admin"
+        )
+
+
+async def test_transition_enable_conflict_rolls_back_and_stays_disabled(
+    migrated_db: AsyncEngine,
+) -> None:
+    """Re-enabling a chat another org re-claimed while disabled rolls back the whole transition."""
+    engine = migrated_db
+    await _seed_two_orgs_two_agents(engine)
+    provisioner = PostgresImProvisioner(engine)
+    route = PostgresImRouteIndex(engine)
+    key = route_key("telegram", "bot-9", "4242")
+
+    a = await provisioner.provision(_mapping("org-a", "agent-org-a"))
+    await provisioner.transition(a.id, ImMappingStatus.disabled, org_id="org-a", actor="admin")
+    # org-b claims the freed chat.
+    b = await provisioner.provision(_mapping("org-b", "agent-org-b"))
+    assert (await route.lookup(key)).mapping_id == b.id  # type: ignore[union-attr]
+
+    # org-a's re-enable must fail closed and roll back — never an active-without-route orphan.
+    with pytest.raises(RouteConflictError):
+        await provisioner.transition(a.id, ImMappingStatus.active, org_id="org-a", actor="admin")
+    still = await PostgresImMappingStore(engine, "org-a").get(a.id)
+    assert still is not None and still.status is ImMappingStatus.disabled
+    assert (await route.lookup(key)).mapping_id == b.id  # type: ignore[union-attr]

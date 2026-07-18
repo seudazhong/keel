@@ -27,9 +27,10 @@ so they expose only opaque routing keys + a coarse status, nothing sensitive.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Protocol
@@ -121,6 +122,40 @@ class RouteConflictError(ImRoutingError):
     is idempotent, but a claim by a *different* mapping/org is refused **without** disturbing the
     existing route — so an ordinary tenant admin can never steal a chat another org already owns.
     """
+
+
+class StaleMappingError(ImRoutingError):
+    """A status transition lost an optimistic-version check — the caller holds a stale view.
+
+    The mapping was concurrently mutated (its ``version`` advanced) between the caller reading it
+    and requesting a transition, so the request is refused with a ``409`` rather than clobbering a
+    newer state. The caller must re-read the mapping and retry against the current version.
+    """
+
+
+class TerminalMappingError(ImRoutingError):
+    """A ``revoked`` mapping is terminal — it cannot be re-enabled without an explicit reprovision.
+
+    Revocation is a one-way, terminal transition: a revoked mapping has surrendered its global
+    route and can only be brought back by a fresh platform-admin provision (a new claim), never by
+    an in-place enable. Any transition *out of* ``revoked`` is refused (fail closed) so a released
+    chat is never silently reactivated behind the route-ownership gate.
+    """
+
+
+def ensure_transition_allowed(
+    current: ImMappingStatus, requested: ImMappingStatus
+) -> ImMappingStatus:
+    """Deterministic mapping status-transition rule (fail closed on an illegal move).
+
+    ``revoked`` is **terminal**: any transition out of it — other than the idempotent
+    ``revoked -> revoked`` — is refused with :class:`TerminalMappingError` (reprovision to
+    reactivate). Every other move among ``active``/``disabled``/``revoked`` is permitted and
+    idempotent, so the outcome depends only on ``(current, requested)`` — never on interleaving.
+    """
+    if current is ImMappingStatus.revoked and requested is not ImMappingStatus.revoked:
+        raise TerminalMappingError("revoked mapping is terminal; reprovision to reactivate")
+    return requested
 
 
 # --------------------------------------------------------------------------- hashing
@@ -685,6 +720,27 @@ class ImProvisioner(Protocol):
         self, mapping: ImChannelMapping, *, now: datetime | None = None
     ) -> ImChannelMapping: ...
 
+    async def transition(
+        self,
+        mapping_id: str,
+        new_status: ImMappingStatus,
+        *,
+        org_id: str,
+        actor: str,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> ImChannelMapping | None:
+        """Atomically flip a mapping's status **and** claim/release its global route.
+
+        The mapping status change and the route claim/removal are one all-or-nothing unit under a
+        row/version lock, so the route invariant (``active`` iff a route row exists) can never be
+        observed broken. Returns the updated mapping, or ``None`` when the mapping does not exist
+        (or is not owned by ``org_id``). Raises :class:`StaleMappingError` on an optimistic-version
+        miss, :class:`TerminalMappingError` on an illegal transition out of ``revoked``, and
+        :class:`RouteConflictError` when enabling a chat another org has since claimed.
+        """
+        ...
+
 
 class ImReplyStore(Protocol):
     """The durable, scope-partitioned reply outbox (encrypted payloads)."""
@@ -856,23 +912,62 @@ class InMemoryImProvisioner:
     Mirrors the Postgres transactional provisioner's single-winner semantics without a real
     transaction: if the route is already owned by another org/mapping the just-created mapping
     is deleted (compensated) before the conflict propagates, so the loser of a concurrent
-    cross-org race leaves **no** active orphan mapping or index row.
+    cross-org race leaves **no** active orphan mapping or index row. A single :class:`asyncio.Lock`
+    serializes every provision/transition so concurrent enable/disable/revoke can never interleave
+    into a route-vs-status invariant break — the in-memory parity for the Postgres row/version lock.
     """
 
     def __init__(self, mappings: ImMappingStore, route_index: ImRouteIndexStore) -> None:
         self._mappings = mappings
         self._route_index = route_index
+        self._lock = asyncio.Lock()
 
     async def provision(
         self, mapping: ImChannelMapping, *, now: datetime | None = None
     ) -> ImChannelMapping:
-        created = await self._mappings.create(mapping)
-        try:
-            await self._route_index.claim(created.route_entry(), now=now)
-        except RouteConflictError:
-            await self._mappings.delete(created.id)
-            raise
-        return created
+        async with self._lock:
+            created = await self._mappings.create(mapping)
+            try:
+                await self._route_index.claim(created.route_entry(), now=now)
+            except RouteConflictError:
+                await self._mappings.delete(created.id)
+                raise
+            return created
+
+    async def transition(
+        self,
+        mapping_id: str,
+        new_status: ImMappingStatus,
+        *,
+        org_id: str,
+        actor: str,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> ImChannelMapping | None:
+        async with self._lock:
+            current = await self._mappings.get(mapping_id)
+            if current is None or current.org_id != org_id:
+                return None
+            if expected_version is not None and current.version != expected_version:
+                raise StaleMappingError("mapping was modified concurrently")
+            ensure_transition_allowed(current.status, new_status)
+            if new_status is ImMappingStatus.active:
+                # Claim the route *before* the status is visibly active so a chat claimed by
+                # another org while this mapping was disabled fails closed and leaves the mapping
+                # unchanged — never a routeless "active" orphan. Re-claiming this mapping is
+                # idempotent.
+                active_entry = replace(current.route_entry(), status=ImMappingStatus.active)
+                await self._route_index.claim(active_entry, now=now)
+                updated = await self._mappings.set_status(
+                    mapping_id, new_status, actor=actor, now=now
+                )
+            else:
+                updated = await self._mappings.set_status(
+                    mapping_id, new_status, actor=actor, now=now
+                )
+                # Disable/revoke: release the route so the webhook route is invalid immediately.
+                await self._route_index.remove_for_mapping(mapping_id)
+            return updated
 
 
 class InMemoryImReplyStore:
@@ -1102,6 +1197,27 @@ _CLAIM_ROUTE = text(
     "RETURNING route_key"
 )
 
+# Lock a single mapping row for the duration of a status transition (SELECT ... FOR UPDATE), so a
+# concurrent enable/disable/revoke on the same mapping serializes behind the row lock and the
+# route claim/removal in the same transaction can never race into an invariant break. The explicit
+# ``org_id`` predicate is defense-in-depth alongside RLS so a cross-org transition never resolves.
+_LOCK_MAPPING = text(
+    f"SELECT {_MAPPING_RETURNING} FROM im_channel_mappings "
+    "WHERE id = :id AND org_id = :org FOR UPDATE"
+)
+
+# Bump status + version (and revocation audit columns) for a mapping already loaded/locked above.
+_UPDATE_MAPPING_STATUS = text(
+    "UPDATE im_channel_mappings SET "
+    " status = :status, version = version + 1, updated_at = :now, "
+    " revoked_by = CASE WHEN :revoked THEN :actor ELSE revoked_by END, "
+    " revoked_at = CASE WHEN :revoked THEN :now ELSE revoked_at END "
+    "WHERE id = :id "
+    f"RETURNING {_MAPPING_RETURNING}"
+)
+
+_DELETE_ROUTE_FOR_MAPPING = text("DELETE FROM im_route_index WHERE mapping_id = :id")
+
 
 def _mapping_insert_params(mapping: ImChannelMapping) -> dict[str, object]:
     return {
@@ -1260,16 +1376,7 @@ class PostgresImMappingStore:
             await conn.execute(_SET_ORG, {"org": self._org_id})
             row = (
                 await conn.execute(
-                    text(
-                        "UPDATE im_channel_mappings SET "
-                        " status = :status, version = version + 1, updated_at = :now, "
-                        " revoked_by = CASE WHEN :revoked THEN :actor ELSE revoked_by END, "
-                        " revoked_at = CASE WHEN :revoked THEN :now ELSE revoked_at END "
-                        "WHERE id = :id "
-                        "RETURNING id, org_id, provider, external_bot_id, external_chat_id, "
-                        " chat_kind, agent_id, scope_id, policy, status, version, created_by, "
-                        " created_at, updated_at, revoked_by, revoked_at"
-                    ),
+                    _UPDATE_MAPPING_STATUS,
                     {
                         "status": status.value,
                         "now": now,
@@ -1332,10 +1439,7 @@ class PostgresImRouteIndex:
 
     async def remove_for_mapping(self, mapping_id: str) -> None:
         async with self._engine.begin() as conn:
-            await conn.execute(
-                text("DELETE FROM im_route_index WHERE mapping_id = :id"),
-                {"id": mapping_id},
-            )
+            await conn.execute(_DELETE_ROUTE_FOR_MAPPING, {"id": mapping_id})
 
     async def purge_scope(self, scope_id: ScopeId) -> int:
         async with self._engine.begin() as conn:
@@ -1374,6 +1478,62 @@ class PostgresImProvisioner:
                 # Another org already owns this chat — abort so the mapping insert rolls back.
                 raise RouteConflictError("chat is already claimed by another mapping")
         return created
+
+    async def transition(
+        self,
+        mapping_id: str,
+        new_status: ImMappingStatus,
+        *,
+        org_id: str,
+        actor: str,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> ImChannelMapping | None:
+        """Flip a mapping's status **and** claim/release its route in one locked transaction.
+
+        The mapping row is taken ``FOR UPDATE`` (row lock) so concurrent enable/disable/revoke on
+        the same mapping serialize; the optimistic ``version`` check fails a stale caller closed
+        (:class:`StaleMappingError`) and ``revoked`` is honored as terminal
+        (:class:`TerminalMappingError`). Enabling claims the global route **before** the status is
+        committed active, so a chat re-claimed by another org fails closed
+        (:class:`RouteConflictError`) and the whole transaction rolls back — never a routeless
+        active mapping. Disabling/revoking removes the route in the same transaction — never an
+        inactive mapping that still owns a live route. The route invariant is thus atomic.
+        """
+        now = now or _now()
+        revoked = new_status is ImMappingStatus.revoked
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_ORG, {"org": org_id})
+            locked = (await conn.execute(_LOCK_MAPPING, {"id": mapping_id, "org": org_id})).first()
+            if locked is None:
+                return None
+            current = _mapping_from_row(locked)
+            if expected_version is not None and current.version != expected_version:
+                raise StaleMappingError("mapping was modified concurrently")
+            ensure_transition_allowed(current.status, new_status)
+            if new_status is ImMappingStatus.active:
+                active_entry = replace(current.route_entry(), status=ImMappingStatus.active)
+                claimed = (
+                    await conn.execute(_CLAIM_ROUTE, _route_claim_params(active_entry, now))
+                ).first()
+                if claimed is None:
+                    # Another org owns this chat now — roll the whole transition back.
+                    raise RouteConflictError("chat is already claimed by another mapping")
+            row = (
+                await conn.execute(
+                    _UPDATE_MAPPING_STATUS,
+                    {
+                        "status": new_status.value,
+                        "now": now,
+                        "revoked": revoked,
+                        "actor": actor,
+                        "id": mapping_id,
+                    },
+                )
+            ).first()
+            if new_status is not ImMappingStatus.active:
+                await conn.execute(_DELETE_ROUTE_FOR_MAPPING, {"id": mapping_id})
+        return _mapping_from_row(row) if row is not None else None
 
 
 class PostgresImReplyStore:
@@ -1671,11 +1831,14 @@ __all__ = [
     "ReplySender",
     "RevokedMappingError",
     "RouteConflictError",
+    "StaleMappingError",
+    "TerminalMappingError",
     "UnknownMappingError",
     "build_im_safe_agent",
     "decrypt_reply_payload",
     "deliver_reply",
     "encrypt_reply_payload",
+    "ensure_transition_allowed",
     "final_reply_text_in_log",
     "im_context_in_log",
     "im_safe_permissions",

@@ -26,7 +26,7 @@ global route row so the webhook route is invalid immediately.
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated
 
@@ -51,10 +51,19 @@ from keel_core.im_routing import (
     PostgresImProvisioner,
     PostgresImRouteIndex,
     RouteConflictError,
+    StaleMappingError,
+    TerminalMappingError,
 )
 from keel_core.scoping import derive_agent_scope
 from keel_server.auth import Role
-from keel_server.identity_context import Actor, ActorKind, ResolvedOrg, require_org, resolve_actor
+from keel_server.identity_context import (
+    Actor,
+    ActorKind,
+    ResolvedOrg,
+    require_org,
+    require_org_manage,
+    resolve_actor,
+)
 
 router = APIRouter(prefix="/v1/im/mappings", tags=["im-routing"])
 
@@ -166,11 +175,21 @@ def _route_index(request: Request) -> ImRouteIndexStore:
 
 
 def _provisioner(request: Request, org_id: str) -> ImProvisioner:
-    """The transactional (Postgres) / compensating (in-memory) mapping+route provisioner."""
+    """The transactional (Postgres) / compensating (in-memory) mapping+route provisioner.
+
+    The in-memory provisioner is cached on ``app.state`` so its serializing lock is shared across
+    requests — the in-memory parity for the Postgres row/version lock that keeps concurrent
+    enable/disable/revoke from racing the mapping status against its global route.
+    """
     engine = getattr(request.app.state, "engine", None)
     if engine is not None:
         return PostgresImProvisioner(engine)
-    return InMemoryImProvisioner(_mapping_store(request, org_id), _route_index(request))
+    provisioner = getattr(request.app.state, "im_provisioner", None)
+    if not isinstance(provisioner, InMemoryImProvisioner):
+        provisioner = request.app.state.im_provisioner = InMemoryImProvisioner(
+            _mapping_store(request, org_id), _route_index(request)
+        )
+    return provisioner
 
 
 def _cloud_mode(request: Request) -> bool:
@@ -297,61 +316,88 @@ async def get_mapping(
 
 
 async def _set_status(
-    request: Request, org: ResolvedOrg, mapping_id: str, new_status: ImMappingStatus
+    request: Request,
+    org: ResolvedOrg,
+    mapping_id: str,
+    new_status: ImMappingStatus,
+    expected_version: int | None,
 ) -> MappingResponse:
-    store = _mapping_store(request, org.org_id)
-    existing = await store.get(mapping_id)
-    if existing is None or existing.org_id != org.org_id:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "mapping not found")
-    index = _route_index(request)
-    if new_status is ImMappingStatus.active:
-        # Re-claim the route *before* flipping status so a chat that was claimed by another org
-        # while this mapping was disabled fails closed (409) and leaves the mapping unchanged —
-        # never a routeless "active" orphan. Re-claiming the same mapping is idempotent.
-        active_entry = replace(existing.route_entry(), status=ImMappingStatus.active)
-        try:
-            await index.claim(active_entry)
-        except RouteConflictError:
-            raise HTTPException(status.HTTP_409_CONFLICT, "this chat is already claimed") from None
-    updated = await store.set_status(mapping_id, new_status, actor=org.user_id)
+    """Atomically transition a mapping's status **and** claim/release its global route.
+
+    The mapping status change and the route claim/removal are one all-or-nothing transaction under
+    a row/version lock (Postgres ``SELECT ... FOR UPDATE`` / an in-memory lock), so the route
+    invariant (``active`` iff a route exists) is never observably broken by a concurrent
+    enable/disable/revoke. A stale optimistic-version request is refused with ``409``; a transition
+    out of the terminal ``revoked`` state with ``409``; enabling a chat another org has re-claimed
+    fails closed with an opaque ``409`` and rolls back. The audit is recorded **after** the
+    committed outcome.
+    """
+    try:
+        updated = await _provisioner(request, org.org_id).transition(
+            mapping_id,
+            new_status,
+            org_id=org.org_id,
+            actor=org.user_id,
+            expected_version=expected_version,
+        )
+    except RouteConflictError:
+        raise HTTPException(status.HTTP_409_CONFLICT, "this chat is already claimed") from None
+    except StaleMappingError:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "mapping was modified concurrently; re-read and retry"
+        ) from None
+    except TerminalMappingError:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, "mapping is revoked; reprovision to reactivate"
+        ) from None
     if updated is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "mapping not found")
-    if new_status is not ImMappingStatus.active:
-        # Revoke/disable: drop the global route row so the webhook route is invalid immediately,
-        # then audit the release. Only the owning org reaches here (RLS + org check above), so a
-        # non-owner can never remove the winner's route.
-        await index.remove_for_mapping(mapping_id)
-        _identity(request).audit.record(
-            AuditEvent(
-                AuditAction.im_route_released,
-                org.user_id,
-                org.org_id,
-                mapping_id,
-                {"status": new_status.value, "route": updated.route_key[:12]},
-            )
+    # Audit only the committed outcome: enabling re-claimed the route; disable/revoke released it.
+    action = (
+        AuditAction.im_route_claimed
+        if new_status is ImMappingStatus.active
+        else AuditAction.im_route_released
+    )
+    _identity(request).audit.record(
+        AuditEvent(
+            action,
+            org.user_id,
+            org.org_id,
+            mapping_id,
+            {"status": new_status.value, "route": updated.route_key[:12]},
         )
+    )
     return MappingResponse.of(updated)
 
 
 @router.post("/{mapping_id}/revoke", response_model=MappingResponse)
 async def revoke_mapping(
-    mapping_id: str, request: Request, org: Annotated[ResolvedOrg, Depends(require_org)]
+    mapping_id: str,
+    request: Request,
+    org: Annotated[ResolvedOrg, Depends(require_org_manage)],
+    expected_version: int | None = None,
 ) -> MappingResponse:
-    return await _set_status(request, org, mapping_id, ImMappingStatus.revoked)
+    return await _set_status(request, org, mapping_id, ImMappingStatus.revoked, expected_version)
 
 
 @router.post("/{mapping_id}/disable", response_model=MappingResponse)
 async def disable_mapping(
-    mapping_id: str, request: Request, org: Annotated[ResolvedOrg, Depends(require_org)]
+    mapping_id: str,
+    request: Request,
+    org: Annotated[ResolvedOrg, Depends(require_org_manage)],
+    expected_version: int | None = None,
 ) -> MappingResponse:
-    return await _set_status(request, org, mapping_id, ImMappingStatus.disabled)
+    return await _set_status(request, org, mapping_id, ImMappingStatus.disabled, expected_version)
 
 
 @router.post("/{mapping_id}/enable", response_model=MappingResponse)
 async def enable_mapping(
-    mapping_id: str, request: Request, org: Annotated[ResolvedOrg, Depends(require_org)]
+    mapping_id: str,
+    request: Request,
+    org: Annotated[ResolvedOrg, Depends(require_org_manage)],
+    expected_version: int | None = None,
 ) -> MappingResponse:
-    return await _set_status(request, org, mapping_id, ImMappingStatus.active)
+    return await _set_status(request, org, mapping_id, ImMappingStatus.active, expected_version)
 
 
 __all__ = ["router"]
