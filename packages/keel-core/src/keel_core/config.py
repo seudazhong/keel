@@ -283,6 +283,12 @@ class Settings(BaseSettings):
     execution_backend: str = "sandbox"
     sandbox_url: str = "http://keel-sandbox:8090"
     sandbox_rpc_secret: SecretStr = SecretStr("")
+    # Optional path to a file holding the sandbox RPC shared secret (Docker/Compose
+    # ``*_FILE`` convention). When set it takes precedence over the inline secret above and
+    # keeps the value out of the process env/argv/logs — the Compose stack generates a random
+    # secret into a dedicated read-only volume and points every service here. Unset in
+    # K8s/cloud, which mount the secret straight into ``KEEL_SANDBOX_RPC_SECRET``.
+    sandbox_rpc_secret_file: str = ""
     sandbox_rpc_local_test_mode: bool = False
     trusted_preview_allow_unsafe_execution: bool = False
     trusted_preview_shell_workspace_sanitized: bool = False
@@ -376,6 +382,22 @@ class Settings(BaseSettings):
             )
         return self.database_url
 
+    def resolved_sandbox_rpc_secret(self) -> str:
+        """Effective sandbox RPC shared secret, honoring the ``*_FILE`` indirection.
+
+        When ``KEEL_SANDBOX_RPC_SECRET_FILE`` is set the secret is read from that file — a
+        generated, mounted, read-only Compose/Docker secret kept out of the process env, argv,
+        and logs — and takes precedence over the inline ``KEEL_SANDBOX_RPC_SECRET``. When the
+        file path is unset (the K8s/cloud path, where the secret is mounted straight into the
+        env var) the inline value is used. An unset path with no inline value, or a configured
+        file that is missing/empty/unreadable, yields ``""`` so RPC auth fails **closed**
+        (``RpcRequestSigner``/``RpcRequestVerifier`` raise on an empty secret) rather than
+        silently downgrading to unauthenticated.
+        """
+        if self.sandbox_rpc_secret_file.strip():
+            return read_secret_file(self.sandbox_rpc_secret_file)
+        return self.sandbox_rpc_secret.get_secret_value()
+
     def require_maintenance_database_url(self) -> str:
         """Resolve the identity-erasure maintenance URL, failing closed.
 
@@ -443,6 +465,22 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return a cached :class:`Settings` instance."""
     return Settings()
+
+
+def read_secret_file(path: str | Path | None) -> str:
+    """Read a secret value from a file (the Docker/Compose ``*_FILE`` convention).
+
+    Returns the file's stripped contents, or ``""`` when ``path`` is empty/None or the file is
+    missing or unreadable — callers then fail **closed** on the empty secret rather than
+    proceeding unauthenticated. The value is only ever returned to the caller, never logged
+    here, so the secret cannot leak through this helper.
+    """
+    if not path or not str(path).strip():
+        return ""
+    try:
+        return Path(str(path).strip()).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
 
 
 def load_env_file(path: str | Path | None = None) -> str | None:

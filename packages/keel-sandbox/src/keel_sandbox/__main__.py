@@ -18,6 +18,7 @@ from pathlib import Path
 
 import uvicorn
 
+from keel_core.config import read_secret_file
 from keel_core.tools import UnsafeLocalDevExecutionEnvironment
 from keel_sandbox.service import DirectoryWorkspaceProvider, create_app
 
@@ -26,6 +27,20 @@ DEFAULT_SANDBOX_HOST = "127.0.0.1"
 
 def _enabled(name: str) -> bool:
     return os.getenv(name, "").lower() in {"1", "true", "yes"}
+
+
+def _rpc_secret() -> str | None:
+    """Resolve the RPC shared secret, honoring the ``*_FILE`` indirection.
+
+    ``KEEL_SANDBOX_RPC_SECRET_FILE`` (a generated, mounted, read-only Compose secret) takes
+    precedence and keeps the value out of env/argv/logs; otherwise the inline
+    ``KEEL_SANDBOX_RPC_SECRET`` is used. ``None`` (no secret configured) makes the service
+    require ``KEEL_SANDBOX_RPC_LOCAL_TEST_MODE`` or fail closed at startup.
+    """
+    secret_file = os.getenv("KEEL_SANDBOX_RPC_SECRET_FILE", "").strip()
+    if secret_file:
+        return read_secret_file(secret_file) or None
+    return os.getenv("KEEL_SANDBOX_RPC_SECRET")
 
 
 def main() -> None:
@@ -58,7 +73,7 @@ def main() -> None:
     app = create_app(
         default_environment,
         isolation_verified=_enabled("KEEL_SANDBOX_ISOLATION_VERIFIED"),
-        shared_secret=os.getenv("KEEL_SANDBOX_RPC_SECRET"),
+        shared_secret=_rpc_secret(),
         allow_unauthenticated_local_test=_enabled("KEEL_SANDBOX_RPC_LOCAL_TEST_MODE"),
         workspace_provider=provider,
     )

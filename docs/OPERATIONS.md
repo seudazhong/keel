@@ -23,20 +23,38 @@ Pass `-f docker-compose.yml` so a local `docker-compose.override.yml` cannot sil
 change the startup contract. Do not add `-v` to `down` unless permanent deletion of
 Postgres and Ollama volumes is intended.
 
-The `dev`/`full` profiles are a **trusted single-operator local preview**, not a
-production deployment. Compose ships no `keel-sandbox` executor and no RPC secret, so
-`keel-server`/`keel-worker` explicitly opt into the in-process `unsafe-local-dev`
-execution backend (`KEEL_EXECUTION_BACKEND=unsafe-local-dev` +
-`KEEL_TRUSTED_PREVIEW_ALLOW_UNSAFE_EXECUTION=true`), confined to a dedicated empty
-`execdata` volume via `working_dir`. Shell/command execution stays **disabled**
-(`KEEL_TRUSTED_PREVIEW_SHELL_WORKSPACE_SANITIZED` is unset) because Compose cannot prove
-OS isolation; file tools still work. Code defaults and the K8s/cloud manifests keep the
-fail-closed `sandbox` backend — never reuse these preview settings in production.
+The `dev`/`full` profiles run a **real, authenticated sandbox execution boundary** — not the
+old in-process preview. A one-shot `keel-secret-init` generates a random ≥32-byte RPC shared
+secret into a dedicated `sandboxsecret` volume (idempotent; never committed to source or the
+YAML, never printed to logs/argv), and every service loads it from a read-only file via
+`KEEL_SANDBOX_RPC_SECRET_FILE`. `keel-server`/`keel-worker` use the fail-closed
+`KEEL_EXECUTION_BACKEND=sandbox`: every model-chosen file/shell tool call is sent over an
+**internal-only** RPC network to the dedicated, hardened `keel-sandbox` executor, so the
+control plane runs no tool operation in process and mounts no sandbox workspace. Wiring fails
+**closed** — server readiness and worker startup actively probe the sandbox's authenticated
+`/v1/ping` and refuse to serve/claim rather than silently falling back to local execution. To
+rotate the secret, `docker compose down` then delete the `sandboxsecret` volume.
 
-`keel-migrate` runs `alembic upgrade head` before server/worker startup. `keel-server`,
-`keel-worker`, Postgres, Redis, Ollama, and the nginx-served React web app are in both current
-`dev` and `full` profiles; documented full observability/object-store/sandbox services are not
-implemented in Compose.
+The `keel-sandbox` container is the accepted rootless-OCI floor: non-root (uid 10100),
+read-only rootfs, all Linux capabilities dropped, `no-new-privileges`, tmpfs scratch, on an
+`internal: true` network with **no** public egress, holding **only** the read-only RPC secret
+(no Docker socket, no project storage, no DB/Redis/provider/GitHub credentials). File tools are
+isolated per scope by an opaque `ws_<hash>` namespace. **Shell/command execution stays
+disabled**: namespaced shell is denied (a namespace dir is not an OS mount boundary —
+`KEEL_SANDBOX_NAMESPACE_SHELL_ISOLATED` is never set) and unscoped shell is denied too because
+the default workspace and the namespaces coexist in one container, so no shell can be proven
+confined to a single workspace (`KEEL_SANDBOX_WORKSPACE_SANITIZED` is left unset). No fake
+isolation flag is set anywhere. **Honest downgrades vs. `deploy/k8s`:** this is not a
+gVisor/Kata/microVM boundary (a kernel container escape is out of scope here — that gate is
+`runtimeClassName`), and Compose networks are bidirectional so it cannot express the
+per-direction NetworkPolicy K8s does (the sandbox still cannot reach Postgres/Redis/Ollama or
+the internet and holds no credentials). K8s/cloud keep the same fail-closed `sandbox` backend;
+never relax these settings toward a hostile multi-tenant workload.
+
+`keel-migrate` runs `alembic upgrade head` before server/worker startup. `keel-secret-init`,
+`keel-sandbox`, `keel-server`, `keel-worker`, Postgres, Redis, Ollama, and the nginx-served
+React web app are in both current `dev` and `full` profiles; documented full
+observability/object-store services are not implemented in Compose.
 
 ## Configuration and secrets
 
@@ -216,11 +234,15 @@ local-preview (non-cloud) the single owner login is expected; `/readiness` surfa
   startup/readiness gate, and an operator provisioning CLI for a dedicated runtime login; point
   `KEEL_DATABASE_URL` at that login (and migrations at `KEEL_MIGRATION_DATABASE_URL`) to make RLS
   a hard boundary. Wiring the deployment to use the runtime login by default is pending.
-- The authenticated `keel-sandbox` service boundary exists and server/worker wiring fails
-  closed when it is unavailable or unauthenticated, but Compose does not deploy it yet.
-  The Compose `dev`/`full` profiles therefore run the trusted local-preview
-  `unsafe-local-dev` backend (opt-in, on a dedicated empty `execdata` volume) with shell
-  execution disabled; K8s/cloud must keep the fail-closed `sandbox` backend.
+- The authenticated `keel-sandbox` service boundary is now deployed by the standard Compose
+  `dev`/`full` profiles: server/worker use the fail-closed `sandbox` backend against a
+  hardened, internal-only executor and refuse to serve/claim if it is unreachable or
+  unauthenticated. Remaining gap vs. `deploy/k8s`/production: the Compose executor is the
+  rootless-OCI floor (non-root, read-only rootfs, dropped caps, `no-new-privileges`,
+  default-deny egress), **not** a gVisor/Kata/microVM boundary, and Compose networks are
+  bidirectional (no per-direction NetworkPolicy). Shell/command execution is therefore kept
+  disabled in the standard stack (file tools remain, isolated per `ws_<hash>` scope). Treat it
+  as a trusted single-org dev deployment, not a hostile multi-tenant platform.
   CLI shell is available only for a workspace validated as free of `.git`, `.env`, links,
   and nested mounts.
 - Interactive runs and some approval state are process-local; server restarts can interrupt

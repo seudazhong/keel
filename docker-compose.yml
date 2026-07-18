@@ -2,17 +2,40 @@
 #
 #   docker compose -f docker-compose.yml --profile dev up -d --build
 #
-# The `dev`/`full` profiles run a TRUSTED, single-operator LOCAL PREVIEW — not a
-# production deployment. Compose ships no `keel-sandbox` executor and no RPC secret,
-# so the default fail-closed `sandbox` backend would crash server/worker on startup.
-# Instead they EXPLICITLY opt into the in-process `unsafe-local-dev` backend, confined
-# to a dedicated empty `execdata` volume, with shell/command execution left DISABLED
-# because Compose cannot prove an OS isolation boundary. Code defaults and the K8s /
-# cloud manifests remain fail-closed `sandbox`; never reuse these preview settings in
-# production. Pass `-f docker-compose.yml` so a local `docker-compose.override.yml`
-# cannot silently relax this contract.
+# The `dev`/`full` profiles run a REAL, authenticated sandbox execution boundary — not the
+# old in-process preview. `keel-server`/`keel-worker` use the fail-closed `execution_backend=
+# sandbox`: every model-chosen file/shell tool call is sent over an INTERNAL RPC network to a
+# dedicated, hardened `keel-sandbox` executor, so the control plane runs NO tool operation in
+# process and never mounts the sandbox workspace. RPC is HMAC-authenticated; a one-shot
+# `keel-secret-init` generates a random >=32-byte shared secret into a dedicated volume and
+# every service loads it from a read-only file (`KEEL_SANDBOX_RPC_SECRET_FILE`), so no secret
+# is hard-coded in this file/source and none appears in argv or logs. Wiring fails CLOSED: an
+# unreachable or misauthenticated sandbox makes server readiness/worker startup refuse rather
+# than silently fall back to local. Code defaults and the K8s / cloud manifests keep this same
+# fail-closed `sandbox` backend.
 #
-# Compose lives at the repo root so the build context is the workspace root
+# HONEST SCOPE / KNOWN DOWNGRADES (this is a trusted single-org preview, NOT a hostile
+# multi-tenant platform):
+#   * The `keel-sandbox` container is the accepted rootless-OCI floor (ADR-0005 / design §9):
+#     non-root, read-only rootfs, all Linux capabilities dropped, no-new-privileges, tmpfs
+#     scratch, default-deny egress on an INTERNAL network, holding ONLY the RPC secret (no
+#     Docker socket, no project storage, no DB/Redis/GitHub credentials). It is NOT a
+#     gVisor/Kata/microVM boundary — a kernel-level container escape is still out of scope
+#     here (that gate is `runtimeClassName`, deploy/k8s/base/sandbox/runtimeclass.example.yaml).
+#   * File tools are isolated per scope by an opaque `ws_<hash>` namespace under the sandbox's
+#     own namespaces root. SHELL/command execution stays DISABLED: namespaced shell is denied
+#     (a namespace dir is not an OS mount boundary — KEEL_SANDBOX_NAMESPACE_SHELL_ISOLATED is
+#     never set), and unscoped shell is denied too because the default workspace and the
+#     namespaces coexist in one container, so no shell can be proven confined to a single
+#     workspace (KEEL_SANDBOX_WORKSPACE_SANITIZED is left unset). No fake isolation flag is set.
+#   * Compose networks are bidirectional: `keel-sandbox` shares one internal network with
+#     server/worker for the RPC path. It cannot reach Postgres/Redis/Ollama (not on that
+#     network) or the public internet (the network is `internal: true`) and holds no
+#     credentials, but Compose cannot express the per-direction NetworkPolicy that deploy/k8s
+#     does. Treat this as the documented Compose-tier downgrade, still fail-closed.
+#
+# Pass `-f docker-compose.yml` so a local `docker-compose.override.yml` cannot silently relax
+# this contract. Compose lives at the repo root so the build context is the workspace root
 # (packages/ must be reachable). Dockerfiles are under deploy/docker/.
 name: keel
 
@@ -29,18 +52,16 @@ x-app-env: &app-env
   # here so a worker-written review artifact is readable by the server report APIs (WS-R).
   KEEL_PROJECT_STORAGE_ROOT: /var/lib/keel/projects
 
-# Trusted LOCAL preview execution — applied to keel-server and keel-worker only.
-# This is deliberately NOT a production sandbox: it names the runtime `unsafe-local-dev`
-# and requires the explicit opt-in flag below. The execution workspace is the empty
-# `execdata` volume (via each service's `working_dir`), and shell/command execution stays
-# DISABLED because KEEL_TRUSTED_PREVIEW_SHELL_WORKSPACE_SANITIZED is left unset (-> false):
-# Compose cannot prove the sanitized-workspace/OS-isolation contract, so file tools work
-# while shell is denied. Do NOT set these on K8s/cloud, where the fail-closed `sandbox`
-# backend with an authenticated RPC secret is mandatory.
-x-trusted-preview-exec: &trusted-preview-exec
+# Real sandbox execution — applied to keel-server and keel-worker only. Both call the isolated
+# keel-sandbox executor over the internal RPC network; they run NO file/shell tool in process
+# and mount NO sandbox workspace. The HMAC shared secret is read from a generated, read-only
+# file (never inlined here / in argv / in logs). Keep the fail-closed `sandbox` backend in
+# K8s/cloud too — never swap it for an in-process backend there.
+x-sandbox-exec: &sandbox-exec
   KEEL_APP_ENV: dev
-  KEEL_EXECUTION_BACKEND: unsafe-local-dev
-  KEEL_TRUSTED_PREVIEW_ALLOW_UNSAFE_EXECUTION: "true"
+  KEEL_EXECUTION_BACKEND: sandbox
+  KEEL_SANDBOX_URL: http://keel-sandbox:8090
+  KEEL_SANDBOX_RPC_SECRET_FILE: /keel-secrets/sandbox_rpc_secret
 
 services:
   postgres:
@@ -68,7 +89,8 @@ services:
       retries: 20
     profiles: ["dev", "full"]
 
-  # First-run bootstrap: idempotent schema migrate (DR-4). Runs once and exits.
+  # First-run bootstrap: idempotent schema migrate (DR-4). Runs once and exits. Needs no
+  # sandbox secret — it only runs Alembic, never the server/worker tool wiring.
   keel-migrate:
     <<: *app
     command: ["alembic", "upgrade", "head"]
@@ -80,15 +102,130 @@ services:
     restart: "no"
     profiles: ["dev", "full"]
 
+  # Local secret bootstrap (runs once, then exits). Ensures the `sandboxsecret` volume holds a
+  # random RPC shared secret whose stripped UTF-8 byte length meets the RPC minimum (32 bytes,
+  # keel_core.tools.rpc_auth.MIN_RPC_SECRET_BYTES), so a single `up` needs no manual secret
+  # provisioning and no secret is committed to this file or source. It VALIDATES any pre-existing
+  # value exactly the way every consumer does (read_secret_file() strips, then requires
+  # len(secret.encode("utf-8")) >= 32) and atomically REPAIRS a missing/short/invalid one via a
+  # sibling tempfile + os.replace — so init never "succeeds" on a secret the sandbox and control
+  # plane would then reject. The value is generated in-process and written straight to the mounted
+  # volume — never passed on argv and never printed — then published read-only (0444). keel-server/
+  # keel-worker and keel-sandbox each mount this volume read-only and load the secret via
+  # KEEL_SANDBOX_RPC_SECRET_FILE. Delete the `sandboxsecret` volume to rotate.
+  keel-secret-init:
+    <<: *app
+    entrypoint: ["python", "-c"]
+    environment:
+      KEEL_SANDBOX_RPC_SECRET_FILE: /keel-secrets/sandbox_rpc_secret
+    command:
+      - |
+        import os, pathlib, secrets, tempfile
+        # Consumers strip the file then require len(secret.encode("utf-8")) >= this minimum
+        # (keel_core.tools.rpc_auth.MIN_RPC_SECRET_BYTES); validate the SAME stripped byte length.
+        min_bytes = 32
+        path = pathlib.Path(os.environ.get("KEEL_SANDBOX_RPC_SECRET_FILE") or "/keel-secrets/sandbox_rpc_secret")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            current = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            # Unreadable OR not valid UTF-8 (UnicodeDecodeError is a UnicodeError) -> treat as
+            # invalid and repair below, so a corrupt/non-UTF-8 file self-heals instead of
+            # failing closed forever.
+            current = ""
+        if len(current.encode("utf-8")) >= min_bytes:
+            os.chmod(path, 0o444)
+            print("keel sandbox RPC secret present and valid (>=32 bytes); value not logged")
+        else:
+            # token_urlsafe(48) -> 64 url-safe chars, comfortably above the 32-byte minimum.
+            # Write a sibling tempfile, make it read-only, then atomically replace so a reader
+            # never sees a partial/short secret and any pre-existing short value is repaired.
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".sandbox_rpc_secret.")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(secrets.token_urlsafe(48))
+                os.chmod(tmp, 0o444)
+                os.replace(tmp, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            print("keel sandbox RPC secret (re)generated to satisfy >=32 bytes; value not logged")
+    volumes:
+      - "sandboxsecret:/keel-secrets"
+    restart: "no"
+    profiles: ["dev", "full"]
+
+  # The ONLY container that runs model-chosen file/shell tool operations. Hardened rootless-OCI
+  # floor: non-root (uid 10100), read-only root filesystem, ALL capabilities dropped,
+  # no-new-privileges, tmpfs scratch. Its ONLY writable mounts are its own workspace + per-scope
+  # namespaces volumes; the RPC secret is mounted READ-ONLY. It is on an INTERNAL-only network
+  # (no public egress), is NOT on the Postgres/Redis/Ollama network, has NO Docker socket, NO
+  # project storage, and NO DB/Redis/GitHub credentials. See the honest-scope note in the header
+  # for what this is NOT (a microVM / multi-tenant boundary).
+  keel-sandbox:
+    build:
+      context: .
+      dockerfile: deploy/docker/sandbox.Dockerfile
+    image: keel-sandbox:dev
+    read_only: true
+    security_opt:
+      - "no-new-privileges:true"
+    cap_drop:
+      - ALL
+    user: "10100:10100"
+    networks:
+      - sandboxnet
+    environment:
+      KEEL_APP_ENV: dev
+      KEEL_SANDBOX_HOST: 0.0.0.0
+      KEEL_SANDBOX_PORT: "8090"
+      KEEL_SANDBOX_WORKSPACE: /sandbox/workspace
+      KEEL_SANDBOX_NAMESPACES_ROOT: /sandbox/namespaces
+      # Honest operator assertion for the rootless-OCI floor: this container mounts ONLY the
+      # sandbox workspace/namespaces (+ the read-only secret) — never the host repo/.git/.env
+      # or project storage — and enforces default-deny egress (internal network + EgressPolicy),
+      # so real operations are served instead of failing 503. It is NOT a microVM assertion.
+      KEEL_SANDBOX_ISOLATION_VERIFIED: "true"
+      # DELIBERATELY UNSET (shell stays denied, honestly):
+      #  - KEEL_SANDBOX_WORKSPACE_SANITIZED: default workspace + namespaces coexist here, so no
+      #    unscoped shell can be proven confined to a single workspace.
+      #  - KEEL_SANDBOX_NAMESPACE_SHELL_ISOLATED: a namespace dir is not an OS/microVM mount
+      #    boundary, so a namespaced shell subprocess could escape via absolute/derived paths.
+      # File tools remain available and per-scope isolated; command execution is fail-closed.
+      KEEL_SANDBOX_RPC_SECRET_FILE: /keel-secrets/sandbox_rpc_secret
+    tmpfs:
+      - /tmp
+    volumes:
+      - "sandboxworkspace:/sandbox/workspace"
+      - "sandboxnamespaces:/sandbox/namespaces"
+      - "sandboxsecret:/keel-secrets:ro"
+    depends_on:
+      keel-secret-init:
+        condition: service_completed_successfully
+    healthcheck:
+      # Unauthenticated liveness only; authenticated readiness is proven by keel-server /
+      # keel-worker via the signed /v1/ping. This never exposes the secret or workspace state.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=4).status==200 else 1)"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    profiles: ["dev", "full"]
+
   keel-server:
     <<: *app
     command: ["keel-server"]
-    working_dir: /var/lib/keel/exec
+    networks:
+      - default
+      - sandboxnet
     volumes:
       - "projectdata:/var/lib/keel/projects"
-      - "execdata:/var/lib/keel/exec"
+      - "sandboxsecret:/keel-secrets:ro"
     environment:
-      <<: [*app-env, *trusted-preview-exec]
+      <<: [*app-env, *sandbox-exec]
       KEEL_SERVER_HOST: 0.0.0.0
       KEEL_SERVER_PORT: 8000
       OLLAMA_API_BASE: "http://ollama:11434"
@@ -100,6 +237,10 @@ services:
         condition: service_healthy
       keel-migrate:
         condition: service_completed_successfully
+      keel-secret-init:
+        condition: service_completed_successfully
+      keel-sandbox:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 5s
@@ -118,20 +259,26 @@ services:
   keel-worker:
     <<: *app
     command: ["arq", "keel_worker.main.WorkerSettings"]
-    working_dir: /var/lib/keel/exec
+    networks:
+      - default
+      - sandboxnet
     volumes:
       - "projectdata:/var/lib/keel/projects"
-      - "execdata:/var/lib/keel/exec"
+      - "sandboxsecret:/keel-secrets:ro"
     deploy:
       replicas: 1  # override with `--scale keel-worker=N`; scale-out is CAS-safe
     environment:
-      <<: [*app-env, *trusted-preview-exec]
+      <<: [*app-env, *sandbox-exec]
       OLLAMA_API_BASE: "http://ollama:11434"
     depends_on:
       redis:
         condition: service_healthy
       keel-migrate:
         condition: service_completed_successfully
+      keel-secret-init:
+        condition: service_completed_successfully
+      keel-sandbox:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "arq", "keel_worker.main.WorkerSettings", "--check"]
       interval: 10s
@@ -179,13 +326,27 @@ services:
     restart: "no"
     profiles: ["dev", "full"]
 
+networks:
+  # Control-plane + datastores (Postgres/Redis/Ollama, web -> server). Auto-created by Compose;
+  # declared here so keel-server/keel-worker can also attach to the internal sandbox network.
+  default:
+  # Internal-only RPC path between the control plane and the sandbox executor. `internal: true`
+  # gives the sandbox NO route to the public internet; it is deliberately NOT joined by
+  # Postgres/Redis/Ollama, so the sandbox has no control-plane data path either.
+  sandboxnet:
+    internal: true
+
 volumes:
   pgdata:
   ollama:
-  # Dedicated, initially-empty execution workspace for the trusted local-preview
-  # `unsafe-local-dev` backend (server + worker share it via `working_dir`). Kept
-  # separate from source/projects so preview file tools never touch the repo tree.
-  execdata:
   # Shared managed-project/coding storage (server + worker). In a multi-host cloud
   # deployment replace this with an RWX volume (e.g. NFS/EFS) so BOTH pods share it.
   projectdata:
+  # The sandbox executor's OWN writable trees (mounted only into keel-sandbox): the default
+  # single/unscoped workspace and the per-scope `ws_<hash>` namespaces root. Kept off the
+  # control plane so server/worker never touch tool-written files directly.
+  sandboxworkspace:
+  sandboxnamespaces:
+  # Generated RPC shared secret (written once by keel-secret-init; mounted read-only into
+  # server/worker/sandbox). Delete this volume to rotate the secret.
+  sandboxsecret:

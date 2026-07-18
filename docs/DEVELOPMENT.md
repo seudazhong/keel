@@ -65,13 +65,18 @@ fails fast with an actionable error if the target is unreachable or is a stale p
 
 ## Local services
 
-The Compose `dev` profile is a trusted local preview: server/worker run the opt-in
-`unsafe-local-dev` execution backend (no `keel-sandbox` service), with shell execution
-disabled. Pass `-f docker-compose.yml` so a local override cannot change that contract.
+The Compose `dev` profile runs a **real, authenticated sandbox execution boundary**: a
+one-shot `keel-secret-init` generates a random ≥32-byte RPC secret into a dedicated volume
+(never in source/YAML/logs), and server/worker use the fail-closed `sandbox` backend to send
+every file/shell tool call over an internal-only RPC network to the hardened `keel-sandbox`
+executor (non-root, read-only rootfs, dropped caps, no egress, no credentials). Shell stays
+disabled (file tools work, isolated per scope); it is a trusted single-org dev deployment, not
+a microVM/multi-tenant boundary. Pass `-f docker-compose.yml` so a local override cannot change
+that contract.
 
 ```powershell
 docker compose -f docker-compose.yml --profile dev up -d --build
-Invoke-RestMethod http://localhost:8000/readiness
+Invoke-RestMethod http://localhost:8000/readiness   # checks.sandbox == "ok" (probed RPC)
 docker compose logs --tail 100 keel-server keel-worker
 ```
 

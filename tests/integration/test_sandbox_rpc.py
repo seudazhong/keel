@@ -10,10 +10,18 @@ import httpx
 from keel_core.tools import (
     CommandRequest,
     ExecutionResult,
+    GlobRequest,
+    GrepRequest,
+    ListRequest,
     ReadRequest,
+    RpcRequestSigner,
     SandboxExecutionEnvironment,
     UnsafeLocalDevExecutionEnvironment,
     WriteRequest,
+)
+from keel_core.tools.rpc_auth import (
+    RPC_NONCE_HEADER,
+    RPC_SIGNATURE_HEADER,
 )
 from keel_sandbox.service import create_app
 
@@ -278,4 +286,131 @@ async def test_rpc_namespaced_shell_allowed_only_with_proven_isolation(tmp_path:
     assert result.error is not None
     assert result.error.code.value == "denied"
     assert "RPC-TOP-SECRET" not in result.output
+    await client.aclose()
+
+
+def _service_client(
+    root: Path, *, isolation_verified: bool = True
+) -> tuple[object, httpx.AsyncClient]:
+    """Build the sandbox ASGI app + an in-process httpx client bound to it."""
+    service = create_app(
+        UnsafeLocalDevExecutionEnvironment(root),
+        isolation_verified=isolation_verified,
+        shared_secret=_RPC_SECRET,
+    )
+    client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=service),
+        base_url="http://sandbox",
+    )
+    return service, client
+
+
+async def test_rpc_glob_grep_list_round_trip(tmp_path: Path) -> None:
+    # Read-side discovery tools (glob/grep/list) must round-trip through the authenticated RPC
+    # exactly like write/read, confined to the sandbox workspace.
+    _service, client = _service_client(tmp_path)
+    environment = SandboxExecutionEnvironment(
+        "http://sandbox", shared_secret=_RPC_SECRET, client=client
+    )
+
+    assert (await environment.write(WriteRequest("src/app.py", "import os\nTOKEN = 1\n"))).ok
+    assert (await environment.write(WriteRequest("src/util.py", "TOKEN = 2\n"))).ok
+    assert (await environment.write(WriteRequest("README.md", "docs\n"))).ok
+
+    listed = await environment.list(ListRequest("."))
+    assert listed.ok
+    assert "README.md" in listed.output and "src/" in listed.output
+
+    globbed = await environment.glob(GlobRequest("src/*.py"))
+    assert globbed.ok
+    glob_out = globbed.output.replace("\\", "/")  # normalize Windows path separators
+    assert "src/app.py" in glob_out and "src/util.py" in glob_out
+    assert "README.md" not in glob_out
+
+    grepped = await environment.grep(GrepRequest(pattern="TOKEN", glob="src/*.py"))
+    assert grepped.ok
+    grep_out = grepped.output.replace("\\", "/")
+    assert "src/app.py:2:TOKEN = 1" in grep_out
+    assert "src/util.py:1:TOKEN = 2" in grep_out
+    await client.aclose()
+
+
+async def test_rpc_unsigned_request_is_rejected(tmp_path: Path) -> None:
+    # A request with NO HMAC headers must be rejected at the service boundary (401) before any
+    # tool runs — the shared secret is mandatory (the executor was built with one).
+    _service, client = _service_client(tmp_path)
+    # /v1/execute with a well-formed body but no signature headers.
+    execute = await client.post(
+        "/v1/execute",
+        json={"op": "read", "path": "README.md"},
+    )
+    assert execute.status_code == 401
+    # /v1/ping likewise requires authentication.
+    ping = await client.post("/v1/ping", content=b"")
+    assert ping.status_code == 401
+    await client.aclose()
+
+
+async def test_rpc_replayed_nonce_is_rejected(tmp_path: Path) -> None:
+    # The HMAC binds a per-request nonce; replaying the identical signed headers a second time
+    # must be rejected (401) even though the signature itself is valid.
+    _service, client = _service_client(tmp_path)
+    signer = RpcRequestSigner(_RPC_SECRET)
+    # Sign an empty /v1/ping body with a pinned nonce so the replay is byte-identical.
+    fixed_nonce = "n" * 40
+    signed = signer.headers(b"", path="/v1/ping", nonce=fixed_nonce)
+    assert signed[RPC_SIGNATURE_HEADER] and signed[RPC_NONCE_HEADER] == fixed_nonce
+
+    first = await client.post("/v1/ping", content=b"", headers=signed)
+    assert first.status_code == 200
+    # Identical headers replayed: the nonce cache rejects it.
+    second = await client.post("/v1/ping", content=b"", headers=signed)
+    assert second.status_code == 401
+    await client.aclose()
+
+
+async def test_health_endpoint_is_unauthenticated_and_leaks_nothing(tmp_path: Path) -> None:
+    # Container liveness must be callable without credentials and reveal no security state.
+    (tmp_path / "secret.txt").write_text("WORKSPACE-CONTENT", encoding="utf-8")
+    _service, client = _service_client(tmp_path)
+    response = await client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    # No secret, workspace content, or isolation posture leaks through liveness.
+    text = response.text
+    assert _RPC_SECRET not in text
+    assert "WORKSPACE-CONTENT" not in text
+    assert "isolation" not in text.lower()
+    await client.aclose()
+
+
+async def test_ping_readiness_and_probe_ready_contract(tmp_path: Path) -> None:
+    # probe_ready proves reachability AND a valid auth contract, not merely a constructed client.
+    _service, client = _service_client(tmp_path, isolation_verified=True)
+    good = SandboxExecutionEnvironment("http://sandbox", shared_secret=_RPC_SECRET, client=client)
+    ready = await good.probe_ready()
+    assert ready.ok and ready.output == "ready"
+
+    # Wrong shared secret -> the signed ping fails verification -> mapped to ``denied``.
+    bad = SandboxExecutionEnvironment(
+        "http://sandbox",
+        shared_secret="wrong-secret-" + ("y" * 32),
+        client=client,
+    )
+    denied = await bad.probe_ready()
+    assert not denied.ok
+    assert denied.error is not None and denied.error.code.value == "denied"
+    await client.aclose()
+
+
+async def test_probe_ready_reports_unavailable_when_isolation_unverified(tmp_path: Path) -> None:
+    # A sandbox that has NOT asserted an isolation boundary must fail readiness closed (503),
+    # which the client maps to ``unavailable`` so the control plane refuses to depend on it.
+    _service, client = _service_client(tmp_path, isolation_verified=False)
+    environment = SandboxExecutionEnvironment(
+        "http://sandbox", shared_secret=_RPC_SECRET, client=client
+    )
+    result = await environment.probe_ready()
+    assert not result.ok
+    assert result.error is not None and result.error.code.value == "unavailable"
     await client.aclose()
