@@ -297,9 +297,7 @@ async def test_reply_dispatch_reschedule_is_reclaimable() -> None:
 async def test_mapping_revoke_bumps_version_and_status() -> None:
     store = InMemoryImMappingStore()
     await store.create(_mapping())
-    revoked = await store.set_status(
-        "map-1", ImMappingStatus.revoked, actor="admin@org", now=_NOW
-    )
+    revoked = await store.set_status("map-1", ImMappingStatus.revoked, actor="admin@org", now=_NOW)
     assert revoked is not None
     assert revoked.status is ImMappingStatus.revoked
     assert revoked.version == 2
