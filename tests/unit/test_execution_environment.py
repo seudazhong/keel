@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 
 from keel_core.config import Settings
 from keel_core.tools import (
@@ -30,6 +31,13 @@ from keel_sandbox.__main__ import DEFAULT_SANDBOX_HOST
 from keel_sandbox.service import ExecutorAdmissionPolicy, create_app
 
 _RPC_SECRET = "test-sandbox-rpc-secret-" + ("x" * 32)
+
+
+def test_compose_web_healthcheck_uses_ipv4_loopback() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    compose = yaml.safe_load((repo_root / "docker-compose.yml").read_text(encoding="utf-8"))
+    probe = compose["services"]["keel-web"]["healthcheck"]["test"]
+    assert "http://127.0.0.1/web-health" in probe
 
 
 @pytest.mark.parametrize("service", ["server", "worker"])
