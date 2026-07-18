@@ -1,204 +1,199 @@
 # Keel roadmap
 
-> **Updated:** 2026-07-16 · **Authority:** active execution sequence
+> **Updated:** 2026-07-19 · **Authority:** active execution sequence · **Baseline:** `main` `810a64c`
 
-Keel has a mature agent/data engine relative to its product and production surfaces.
-Durable Jobs, memory consolidation/evals, and the RAG/Knowledge vertical slice are complete.
-Execution now prioritizes **visible, usable product value** in a clearly labeled local/single-
-organization preview, then closes production-safety and multi-user gates before external rollout.
+This roadmap sequences **small, independently verifiable milestones**. Each milestone lists
+explicit dependencies and **machine-verifiable exit gates**. No milestone is "implement all
+future plans." Completion evidence lives in [Status](./STATUS.md), not in dated prose.
 
 ## Execution policy
 
-- Ship visible vertical slices early: real React delivery, truthful product states, Agent/Memory
-  management, onboarding, Calendar, and useful routines.
-- M3.1–M3.2 remain **trusted-environment previews**. They do not imply production or multi-user
-  readiness and must not be exposed to untrusted networks.
-- User login, OIDC, and platform OAuth authentication are deferred to M3.6. Connector-specific
-  OAuth remains in the milestone that introduces that connector because Gmail/Calendar require it.
-- Cloud safety, event evolution, and erasure remain mandatory gates before multi-user rollout.
+- Ground truth is [Status](./STATUS.md). Merged code alone does not complete a milestone; the
+  measurable exit gate must pass.
+- The Compose `dev`/`full` stack is a **trusted single-operator local preview**
+  (`unsafe-local-dev`, dedicated exec volume, shell disabled). It is never production-safe and
+  must not be exposed to untrusted networks.
+- Safety gates (**M3A** runtime DB role/RLS, **M3B** real sandbox) may proceed in parallel with
+  product work but **must close before any untrusted-network or multi-user exposure**.
+- Code existing (C) or tests passing (T) never counts as a usable product scenario (P). A UI/e2e
+  milestone closes only on a real end-to-end scenario.
 
-## Completed foundation
+## Milestones
 
-### Durable Jobs + Memory/Knowledge/Quality
+### M0 — Green Baseline · **Complete**
 
-**Delivered:** DB-backed job lifecycle with leases/reclaim, retries, cancellation, progress,
-and exactly-once result injection; core/archival/recall memory; deterministic memory evals;
-Knowledge Base lifecycle, durable ingest/delete, hybrid retrieval, citations, and taint.
+**Goal:** a reproducible, green baseline on `main`.
 
-**Evidence:** verified baselines and exact capability boundaries are in
-[Status](./STATUS.md). Completion does not imply multi-user or production readiness.
+**Exit gates (met at `810a64c`):**
 
-## M3.1 — Demo-ready Product Surface
+- `docker compose -f docker-compose.yml --profile dev up -d --build` starts; server
+  `/readiness` = `true`; worker arq health check succeeds; web `/health` and `/` return `200`.
+- `ruff check`, `ruff format --check`, `mypy`, and the OpenAPI compatibility check pass.
+- Backend non-integration: 1795 passed / 1 skipped. Full integration: 385/385.
+- Frontend: 116 passed. `app` and `web` images build.
+- Git JIT credential bug fixed (`Authorization` header).
 
-**Status:** **In progress.**
+### M1 — Truthful Baseline Docs · **This commit**
 
-**Goal:** make the capabilities already implemented visible, coherent, and easy to demonstrate.
+**Goal:** README/STATUS/ROADMAP describe exactly what `main` is, using the C/T/D/P maturity
+scale, and correct stale claims while preserving the trusted-preview safety contract.
 
-**Scope:** serve the real React application from the dev/demo Compose path; remove stale product
-copy; add demo seed/bootstrap data; improve empty/loading/error states; expose current Memory
-proposals and Knowledge/jobs clearly; add a lightweight local first-run wizard for provider,
-secret, default Agent profile, and optional connector setup; add Playwright smoke coverage.
-
-**Dependencies:** completed Durable Jobs, Memory, Knowledge, and React source.
-
-**Completed increment:** the dev/demo Compose path serves the built React application through
-nginx with API/health/readiness/SSE proxying and SPA fallback; Jobs and Memory proposals have
-truthful React pages; an opt-in guarded/idempotent bootstrap seeds searchable demo content; and
-a read-only Playwright smoke detects stale stacks and covers empty or populated states.
-
-**Remaining before milestone completion:** implement the lightweight local first-run wizard for
-provider, secret, default Agent profile, and optional connector setup; complete the product-state
-copy/badge exit-gate audit. Until then, M3.1 is not complete.
+**Dependencies:** M0.
 
 **Exit gates:**
 
-- One documented command launches the current React application rather than `web/stub`.
-- A clean demo profile can show Chat, Sessions, Memory/Knowledge, Jobs, Schedules, Approvals,
-  Connectors, and Observability without manually editing database rows.
-- Product copy and capability badges come from current API state, not milestone-era constants.
-- The safe 10–15 minute demo passes as an automated browser smoke.
+- STATUS/README rate capabilities on C/T/D/P and never promote C/T to P.
+- Stale claims removed/corrected (e.g. "no identity/onboarding", "static stub instead of React
+  bundle") while the local-preview safety limits remain stated.
+- The Patch/Draft PR foundation is documented as off-main (branch `feat/future-patch-pr`) and
+  **not** a current product feature.
+- Markdown tracked-link check passes and `git diff --check` is clean.
 
-## M3.2 — Personal Agent Experience Preview
+### M2 — Patch Foundation Merge
 
-**Goal:** deliver a useful personal-assistant loop before implementing full user authentication.
+**Goal:** land the patch-proposal foundation (`feat/future-patch-pr`) on `main` behind its full
+regression suite, with no product-surface exposure yet.
 
-**Scope:** persisted Agent profiles owned by the implicit local operator; Agents CRUD and a real
-switcher; Memory blocks/history/proposal UI; Calendar as the second native connector; natural-
-language routines/triggers; improved approval explanations; local onboarding; responsive and
-accessibility fixes for the primary journey.
-
-**Dependencies:** M3.1 product surface. This milestone may use current open/API-key local mode;
-it does not add public user accounts or claim tenant isolation.
+**Dependencies:** M1.
 
 **Exit gates:**
 
-- A local operator creates/selects an Agent, reviews/edits its memory, grants Gmail/Calendar,
-  and runs a useful inbox/meeting routine from the React UI.
-- Agent selection changes persona, memory, connector grants, and tool policy without code edits.
-- Calendar read/draft/create behavior has least-scope consent and approval tests.
-- Core flows work at narrow desktop/mobile widths and pass keyboard/critical a11y checks.
+- Migration `0019` and the patch models/store/bundle/generation/approval/writeback/coordinator
+  modules are on `main`.
+- On `main`: `ruff` + `mypy` clean; the patch unit suite (≥34) and its Postgres integration
+  tests (≥2) pass in CI.
+- The full M0 baseline (readiness, integration, frontend, image builds) still passes
+  post-merge.
+- No patch UI, API, or worker dispatch is enabled yet (foundation only; scope creep rejected).
 
-## M3.3 — Cloud Safety Foundation
+### M3A — Runtime DB Role / RLS  *(safety gate, parallelizable)*
 
-**Goal:** make the product preview safe enough to become a durable cloud runtime.
+**Goal:** the runtime application role is a **non-owner** with enforced row-level security.
 
-**Scope:** non-owner runtime DB role with enforced RLS; explicit fail-closed permission defaults;
-real isolated execution backend; durable interactive run/approval coordination; hashed/scoped API
-credentials; durable connector OAuth state; authenticated gateway webhooks; durable outbound
-idempotency; secrets/key-rotation design; safety regression suite.
-
-**Dependencies:** M3.1–M3.2. Safety work may begin earlier in parallel, but the milestone closes
-before public exposure or multi-user development.
+**Dependencies:** M1 (may run parallel to M2/M3B).
 
 **Exit gates:**
 
-- Cross-scope reads fail even for the runtime application role and are audited.
-- Shell/file execution cannot run in the API process and passes escape/egress tests.
-- Server restart does not lose an admitted run or pending approval.
-- Connector OAuth callback and gateway replay/forgery tests fail closed.
-- Every permission engine has an explicit non-allow default.
+- The runtime connects as a non-owner role that cannot bypass or disable RLS.
+- An automated test proves a cross-scope read/write **fails** for the runtime role and is
+  audited.
+- Migrations create/verify the non-owner role; CI asserts the role has no ownership/BYPASSRLS.
 
-## M3.4 — Event Evolution
+### M3B — Real Sandbox Deployment  *(safety gate, parallelizable)*
 
-**Goal:** preserve replay and projection rebuilds across schema changes.
+**Goal:** deploy a real isolated execution backend, replacing `unsafe-local-dev` for
+shell/file execution.
 
-**Scope:** upcaster registry, event compatibility policy, fixtures for every historical version,
-projection rebuild tooling, and additive API/schema checks.
+**Dependencies:** M1 (may run parallel to M2/M3A).
 
-**Dependencies:** M3.3 durable runtime boundaries.
+**Exit gates:**
 
-**Exit gates:** event streams from v0 through current rebuild identical projections; CI requires
-old→new contract fixtures; incompatible event changes cannot merge.
+- A `keel-sandbox` service runs shell/file execution in an isolated (container/microVM)
+  boundary; the API/worker process no longer executes untrusted shell in-process.
+- Automated escape/egress and path-traversal tests pass against the sandbox.
+- A deployment profile enables the sandbox; the default preview still fails closed when the
+  sandbox is absent (no silent in-process fallback).
 
-## M3.5 — Retention and Erasure
+### M4 — Patch API / Worker / Outbox
 
-**Goal:** give operators complete, testable control over persisted user data.
+**Goal:** make the merged patch foundation operable end-to-end on the backend.
 
-**Scope:** data map; retention policies; scope/session erasure; event tombstones where required;
-projection, memory, vector, Knowledge, token, artifact, and telemetry purge; audited deletion jobs
-and operator runbook.
+**Dependencies:** M2; safety posture from M3A/M3B for any execution the patch worker performs.
 
-**Dependencies:** M3.3–M3.4.
+**Exit gates:**
 
-**Exit gates:** seeded data is removed from every documented store; rebuild cannot resurrect
-erased content; connector tokens are revoked/purged; retention jobs are idempotent and observable.
+- Patch API/SDK endpoints create/list/inspect patch proposals; OpenAPI compatibility check
+  passes.
+- A durable patch worker job runs generation/writeback via the dispatch outbox with an
+  approved/expiry reconciler.
+- Integration tests cover admit → dispatch → reconcile (approved and expiry) with restart
+  survival.
 
-## M3.6 — Multi-user Identity, Access, and Durable Run Topology
+### M5 — Patch UI + Human Approval → Draft PR e2e
 
-**Goal:** evolve the visible single-operator Agent experience into the target multi-user model.
+**Goal:** a real product scenario — a human reviews a proposed patch and approves it into a
+GitHub **Draft PR**.
 
-**Scope:** users and login sessions; local accounts plus OIDC/OAuth where required; single-
-organization-v1 membership/RBAC; bind existing Agent profiles to users; personal versus explicitly
-shared team Agents; connector/resource grants; worker-owned interactive runs; cross-surface
-approvals; audit UX.
+**Dependencies:** M4, and a review surface (M2/M4 backend + this UI).
 
-**Dependencies:** M3.3–M3.5.
+**Exit gates:**
 
-**Exit gates:** two users and one shared team Agent pass isolation/grant tests; no route depends on
-`web:local`; restart/scale-out preserves run and approval ownership; Web and IM operate the same
-durable runtime; authentication cannot expand connector/resource authority.
+- A React patch/review surface lists proposals, shows diffs, and drives human approval.
+- An approved proposal produces a Draft PR via the GitHub App writeback path.
+- A Playwright/e2e test drives propose → approve → Draft PR against the preview stack.
 
-**Progress (WS-M, durable run topology):** the durable run substrate is landed and tested —
-Postgres `runs` state machine + `run_control` (migration `0014_durable_runs`), fenced
-claim/lease/heartbeat/reclaim/terminalize (`keel_core/runs.py`), worker-owned execution reusing
-the single agent loop (`keel_core.run_service`, `keel_worker.runs.run_interactive`), durable
-cross-surface approvals bound to org/actor/action-hash/attempt, queue/lease reconciliation, and
-`/v1/runs` status/interrupt/steer APIs. Proven by two-worker claim race, lease
-expiry/reclaim/fencing, duplicate admission, interrupt-across-restart, RLS cross-scope, and
-stale-approval integration tests. **Still open for the exit gate:** flipping the server/IM default
-admission off the `web:local` in-process `AgentRuntime` compatibility path onto the durable
-service, worker memory/knowledge tool parity, and binding the persisted-Agent visibility check at
-worker claim (tracked in [STATUS](./STATUS.md#durable-runs--remaining-limitations-m36-ws-m)).
+### M6 — Personal Agent + Calendar
 
-Multi-organization SaaS, billing, and hard organizational tenancy remain later work.
+**Goal:** a useful single-operator personal-agent loop with Calendar as the second native
+connector.
 
-## M3.7 — Connector and Team Experience
+**Dependencies:** M3A/M3B safety posture; existing Agents/Memory/Connectors backend.
 
-**Goal:** expand from the personal preview to governed personal and team workflows.
+**Exit gates:**
 
-**Scope:** connector framework hardening; native depth for core connectors and MCP/n8n for the
-long tail; event triggers; Web/IM parity; team Agent grants; Admin/RBAC UI; connector health and
-reauth; internationalization foundations.
+- A local operator creates/selects a persisted Agent, edits its memory, grants
+  Gmail/Calendar, and runs a useful inbox/meeting routine from the React UI.
+- Calendar read/draft/create has least-scope consent and approval tests.
+- Agent selection changes persona/memory/grants/tool policy without code edits.
 
-**Dependencies:** M3.6 identity, Agents, and grants.
+### M7 — Browser OIDC + Org/Grant/Review/IM Admin UI
 
-**Exit gates:** an authenticated user grants Gmail/Calendar to a personal Agent, receives a
-trigger-driven draft, and approves it from Web or IM; no personal resource is visible to an
-ungranted team Agent; admins can govern connector availability and audit actions.
+**Goal:** turn the tested identity/review/IM backends into real multi-user product surfaces.
 
-## M3.8 — Production Delivery and Scale
+**Dependencies:** M3A (RLS) and M3B (sandbox) closed; M5 review surface; identity/grants APIs.
 
-**Goal:** provide a supportable cloud-native deployment.
+**Exit gates:**
 
-**Scope:** production React image; accurate deployment profiles; scheduler service/leadership;
-N-worker and multi-server topology; generated/versioned SDK; OTel, metrics, alerts, and SLOs; CI
-security/performance gates; backup/restore and DR drills; upgrade/rollback runbooks.
+- A browser OIDC authorization-code flow signs a user in; no route depends on the
+  single-operator preview scope.
+- Two users and one shared team Agent pass isolation/grant tests through the UI.
+- Org/grant admin, the review UI, and an IM admin UI are shipped and covered by e2e tests;
+  IM durable routing is worker-owned and restart-safe.
 
-**Dependencies:** M3.3–M3.7.
+### M8 — Event / Lifecycle Compatibility and Erasure Closure
 
-**Exit gates:** repeatable clean install and upgrade; N-worker load/chaos demonstration;
-100% required run traces and reconciled usage; restore drill meets RPO/RTO; production
-deployment has no static-stub or in-process safety substitutions.
+**Goal:** replay and projection rebuilds survive schema evolution, and erasure is complete and
+testable.
 
-## After the gates
+**Dependencies:** M3A durable boundaries; M7 multi-user data ownership.
 
-### Plugin SDK and hooks
+**Exit gates:**
 
-Begin only after event/API compatibility and production delivery gates. Exit requires
-manifest validation, capability permissions, lifecycle compatibility, rollback, examples,
-and a generated client/version policy.
+- An upcaster registry + fixtures for every historical event version rebuild identical
+  projections; incompatible event changes cannot merge (CI gate).
+- Seeded user data is removed from every documented store; rebuild cannot resurrect erased
+  content; connector tokens are revoked/purged; erasure jobs are idempotent and observable.
 
-### Desktop / LocalDaemon
+### M9 — Production Delivery / Scale / OTel / DR
 
-Begin only after identity, grants, cross-surface approvals, and isolated execution are
-proven. A desktop shell must not create a second runtime; local execution needs its own
-fail-closed trust boundary.
+**Goal:** a supportable, observable, scalable cloud-native deployment.
+
+**Dependencies:** M3A–M8.
+
+**Exit gates:**
+
+- Production React image and accurate deployment profiles with a real scheduler
+  service/leadership; N-worker and multi-server topology proven under load/chaos.
+- OTel traces/metrics/alerts/SLOs: 100% of required run traces and reconciled usage.
+- Backup/restore and DR drill meet documented RPO/RTO; upgrade/rollback runbooks; no
+  static-stub or in-process safety substitutions in production.
+
+## Dependency summary
+
+```
+M0 → M1 → M2 → M4 → M5 → ─┐
+        ├→ M3A ───────────┤
+        └→ M3B ───────────┼→ M7 → M8 → M9
+              M6 (after M3A/M3B) ┘
+```
+
+- M3A and M3B are parallel safety gates that both must close before M7 (multi-user exposure).
+- M6 depends on the M3A/M3B safety posture but not on M4/M5.
+- M5 depends on M4 (patch backend) and the review surface.
 
 ## Roadmap rules
 
 - [Status](./STATUS.md) supplies completion evidence; dated plans do not.
-- M3.1–M3.2 are preview milestones, not authorization to expose open mode publicly.
-- Connector OAuth may ship with its connector; user login/OIDC remains deferred to M3.6.
-- New connector breadth cannot bypass M3.3 safety or M3.6 grants.
-- Plugin SDK/Desktop do not displace safety, lifecycle, identity, or delivery gates.
-- Milestone completion requires measurable exit evidence, not only merged code.
+- Safety gates (M3A/M3B) cannot be bypassed by product or connector breadth.
+- The Patch foundation is off-main until M2; it is not a current product feature.
+- A milestone completes only on its measurable exit gate, never on merged code alone.

@@ -13,40 +13,54 @@ Keel's target is a **multi-user, cloud-native agent platform**:
 - native connectors provide depth for core services, while MCP and automation platforms
   cover the integration long tail.
 
-That is the product direction, not the current feature claim. Today Keel has a strong
-single-scope engine: a bounded tool-using runtime, durable sessions and jobs, approvals,
-schedules, Gmail, memory/search/consolidation/evals, and a RAG/Knowledge Base vertical
-slice. The product still lacks real user identity, persisted Agents CRUD, hard multi-user
-isolation, Calendar, complete Web/IM parity, onboarding, and production delivery controls.
+That is the product direction, not the current feature claim. Today Keel has a strong,
+tested, deployable **single-operator** engine and a broad React surface. It is not yet a
+multi-user product: there is no browser login flow, no real execution sandbox, and the
+runtime database role still owns the schema.
 
-## Current maturity
+## Maturity scale
+
+Capabilities are rated on four independent levels. A higher level never implies a lower one,
+and code or passing tests (C/T) are **never** reported as a usable product scenario (P).
+
+- **C — Code** exists on `main`.
+- **T — Tested** by automated tests that pass in CI.
+- **D — Deployable** in the standard Compose local-preview stack.
+- **P — Product** end-to-end scenario works through a shipped surface (not just an API/preview).
 
 | Track | Maturity |
 |---|---|
-| Agent/data engine | Late M3: Durable Jobs and Memory/Knowledge/Quality slices are complete and tested. |
-| Product surface | Early M1: useful single-scope chat and management surfaces, but no real users or Agents model. |
-| Production readiness | Pre-production: critical isolation, sandbox, durability, auth, webhook, delivery, and operations gaps remain. |
+| Agent/data engine | C/T/D solid: durable sessions/runs/jobs/approvals/schedules, memory/search/consolidation/evals, Knowledge RAG. P is single-operator preview. |
+| Product surface | C/T/D present: React app with Chat, Sessions, Jobs, Memory, Knowledge, Connectors, onboarding, i18n, Agents, Projects. P is preview; many journeys need identity/login and backend work. |
+| Production readiness | Pre-production: no real sandbox, runtime DB role still owns the schema, no browser OIDC, no production scheduler/OTel/DR. |
 
-Read [`docs/STATUS.md`](./docs/STATUS.md) for verified evidence and blockers, and
-[`docs/ROADMAP.md`](./docs/ROADMAP.md) for the active sequence.
+Read [`docs/STATUS.md`](./docs/STATUS.md) for the C/T/D/P capability table, verified evidence,
+and blockers, and [`docs/ROADMAP.md`](./docs/ROADMAP.md) for the active M0–M9 sequence.
 
 ## What works now
 
-- FastAPI minimal chat with SSE, tool timeline, and approvals
-- sessions/history and hybrid session search
-- schedules, durable background jobs, cancellation/retry/recovery
-- Gmail OAuth/status/read flow and approval-gated send path
-- core/archival memory, consolidation proposals, deterministic memory evals
-- Knowledge Base lifecycle, durable ingest/delete, hybrid retrieval, citations, and taint
-- React application runnable with Vite
-- OneBot and Telegram gateway slices
+Verified on `main` at `810a64c`:
+
+- FastAPI chat with SSE, tool timeline, and approvals
+- durable sessions/runs/jobs/schedules with cancellation/retry/recovery, and session search
+- core/archival memory, consolidation proposals, and deterministic memory evals
+- Knowledge Base RAG: lifecycle, durable ingest/delete, hybrid retrieval, citations, and taint
+- identity/org/agents/grants APIs and read-only code-review API + worker (both headless)
+- projects/GitHub App/storage backend
+- Gmail OAuth/status/read/approval-gated send, plus OneBot/Telegram IM routing
+- Compose serves the built **React application** (Chat, Sessions, Jobs, Memory, Knowledge,
+  Connectors, Observability), with onboarding, i18n, and Agents/Projects surfaces
 - CLI local runtime with file, shell, and provider tools
 
-Important limits: the server scope is hard-coded to `web:local`; open mode is implicit
-admin; the runtime DB owner can bypass RLS; the Compose stack runs the opt-in
-`unsafe-local-dev` execution backend (a trusted local preview, not a real sandbox) with
-shell execution disabled; interactive run state is process-local; Compose `:3000` serves a
-static stub rather than the React bundle.
+A controlled Patch/Draft-PR foundation is stable on branch `feat/future-patch-pr`
+(commit `c97fc46`) but is **not** merged into `main` and has no API/worker/UI — it is not a
+current product feature. See [`docs/STATUS.md`](./docs/STATUS.md).
+
+Important limits (trusted single-operator local preview — **not production-safe**): the Compose
+`dev`/`full` stack runs the opt-in `unsafe-local-dev` execution backend (a dedicated exec
+volume, **not** a real sandbox) with shell execution disabled; the runtime DB role owns the
+schema and can bypass RLS; there is no browser OIDC login flow; and the review API+worker and
+IM routing ship without a UI. Do not expose this stack to untrusted networks.
 
 ## Run the development stack
 
@@ -59,8 +73,9 @@ docker compose -f docker-compose.yml --profile dev up -d --build
 Invoke-RestMethod http://localhost:8000/readiness
 ```
 
-Open `http://localhost:8000/` for minimal chat or
-`http://localhost:8000/docs` for the current API. For the actual React UI:
+Open `http://localhost:3000/` for the Compose-served React application,
+`http://localhost:8000/` for the minimal server chat, or `http://localhost:8000/docs` for the
+current API. For a live React dev server against the running `:8000` API:
 
 ```powershell
 Set-Location web

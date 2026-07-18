@@ -1,360 +1,123 @@
 # Keel implementation status
 
-> **Snapshot:** 2026-07-16 · **Branch:** `main`
+> **Snapshot:** 2026-07-19 · **Branch:** `main` · **HEAD:** `810a64c`
 > **Target:** [PRD](./PRD.md) · **Architecture fidelity:** [ARCHITECTURE](./ARCHITECTURE.md#0-implementation-status-and-fidelity) · **Active execution:** [ROADMAP](./ROADMAP.md)
+
+This document is the authority for **what is true on `main` now**. It is rebuilt from directly
+measured evidence, not from historical task ledgers or dated snapshots. When a document
+conflicts with this one about current capability, this document wins.
+
+## Maturity scale
+
+Every capability is rated on four independent levels. A higher level never implies a lower
+one automatically, and **code or passing tests (C/T) are never reported as a usable product
+scenario (P)**.
+
+| Level | Meaning |
+|---|---|
+| **C — Code** | Implementation exists on `main`. |
+| **T — Tested** | Automated tests cover it and pass in CI. |
+| **D — Deployable** | It starts and runs in the standard Compose local-preview stack. |
+| **P — Product** | A real end-to-end user scenario works through a shipped surface, not just an API or a preview screen. |
+
+`✓` = level met, `~` = partial/preview, `—` = not met.
 
 ## Summary
 
-Keel has **late-M3 engine/data maturity**, an **M1 product surface**, and
-**pre-production operational readiness**. Durable Jobs and the Memory/Knowledge/Quality
-track are complete. The current product remains a hard-coded single-scope/single-agent
-system and should not be presented as the target multi-user platform.
+`main` has a **strong, tested, deployable single-operator agent engine** with a broad React
+surface. It is **not** a multi-user product: there is no browser login flow, no real execution
+sandbox, and the runtime database role still owns the schema. Most product surfaces are a
+**trusted single-operator local preview**, not a production or multi-tenant deployment.
 
-## Maturity by track
+## Verified baseline (M0 green baseline)
 
-| Track | Maturity | Evidence | Main gap |
-|---|---|---|---|
-| Agent runtime and data engine | Late M3 | Bounded loop, durable event/session state, tools, approvals, schedules, Durable Jobs, memory/search/consolidation, deterministic evals, Knowledge lifecycle/search/citations/taint. | Event upcasters, retention/erasure, isolated execution, durable interactive topology. |
-| Product surface | M1, M3.1 in progress | Compose-delivered React app, chat, sessions, approvals, Gmail status, schedules, admin overview, Knowledge, Jobs, Memory proposals, demo bootstrap, Playwright smoke, OneBot/Telegram slices. | Local first-run wizard, identity, Agents CRUD/switcher, Calendar, complete Memory/Admin governance, Web/IM parity, responsive/i18n/a11y. |
-| Production readiness | Pre-production | Compose dev stack, migrations, health/readiness, RBAC tiers, core CI, durable jobs recovery tests. | Enforced RLS role, real sandbox, durable auth/OAuth/webhook/idempotency, accurate delivery profiles, scale/SLO/DR/security gates. |
+Measured on `main` at `810a64c`:
 
-## Verified completed capabilities
+- **Standard stack launches.** `docker compose -f docker-compose.yml --profile dev up -d --build`
+  starts cleanly; server `/readiness` returns `true`, the worker arq health check succeeds, and
+  the web surface returns `200` on `/health` and `/`.
+- **Backend CI green.** `ruff check`, `ruff format --check`, `mypy`, and the OpenAPI
+  compatibility check all pass.
+- **Backend tests.** Non-integration suite: **1795 passed / 1 skipped**. Full Postgres/Redis
+  integration suite: **385 passed / 385**.
+- **Frontend tests.** **116 passed.**
+- **Images build.** Both the `app` and `web` container images build.
+- **Git JIT auth fix.** The Git just-in-time credential bug is fixed on `main` — JIT
+  credentials are sent as an `Authorization` header (commit `810a64c`).
 
-### Runtime and autonomy
+## Capability maturity
 
-- Persisted agent loop, streaming/tool events, interrupt, permission/approval paths.
-- LiteLLM gateway with chat-completions and Responses API paths.
-- Cron/interval/one-shot schedules run by worker cron.
-- Durable Jobs:
-  - Postgres lifecycle source of truth with scoped rows/RLS policies;
-  - at-least-once arq delivery with DB lease/reclaim;
-  - progress, cooperative cancellation, bounded retries;
-  - duplicate/crash recovery and attempt exhaustion;
-  - exactly-once terminal result injection;
-  - list/detail/cancel API and RBAC.
-- Durable interactive runs (M3.6, WS-M):
-  - Postgres `runs` state machine (admitted/queued/running/waiting_approval/completed/
-    failed/cancelled/interrupted/expired) with scope RLS + FORCE RLS, fenced `lease_token`,
-    optimistic `version`, attempt counter, budget/cost summary, and single-active-owner
-    constraint; reversible migration `0014_durable_runs`.
-  - Atomic claim/heartbeat/renew/release, lease-expiry reclaim with fencing, idempotent
-    admission (`(scope, idempotency_key)` unique) and idempotent terminalization
-    (`keel_core/runs.py`).
-  - Worker-owned execution reusing the single agent loop via
-    `keel_core.run_service.execute_run` + `keel_worker.runs.run_interactive`; the server
-    admits + streams and no longer owns the run task for the durable path. A per-run lease
-    keeper renews the fenced lease well before expiry and, on a lost renewal, fences the run
-    so no further model/tool/event/terminal write proceeds under a stale lease; the loop
-    budget is the authoritative persisted `max_iterations`/`token_budget`.
-  - Admission is crash-safe and idempotently repairable: the user turn is always persisted
-    before the queued/dispatch transition, a retried request completes exactly the missing
-    steps, and reconciliation never dispatches a prompt-less run.
-  - Durable interrupt/cancel/steering (`run_control`) use claim/ack semantics — steering is
-    acked only after its durable turn is appended; interrupt/cancel are re-honored by a
-    reclaiming worker after a crash. Durable approvals resolve through `DurableRunService`
-    bound to org/actor/action-hash/attempt/run-state/expiry (never optional), persist an
-    explicit resume marker (`resume_requested`) captured atomically at claim time, and are
-    routed separately from legacy scheduled `resume_run`; approval expiry resumes the run to
-    record the denial. Run status/steer/interrupt/approval APIs enforce the run's `org_id`
-    (cross-org user access answers 404) while preserving local-preview/API-key compatibility;
-    queue/lease reconciliation cron.
-  - Evidence: `tests/unit/test_runs_state_machine.py`, `tests/unit/test_run_service.py`,
-    `tests/unit/test_runs_api.py` (production `/v1` wrappers: org authz + approval routing),
-    `tests/integration/test_runs_postgres.py` (two-worker claim race, lease
-    expiry/reclaim/fencing, resume-marker capture, redispatch of queued, peek/ack controls,
-    duplicate admission, durable interrupt across restart, RLS cross-scope denial, stale
-    approval-hash/expiry deny). See _Remaining limitations_ below.
+### Agent/data engine (backend)
 
-### Memory, search, and quality
+| Capability | C | T | D | P | Notes |
+|---|:--:|:--:|:--:|:--:|---|
+| Durable sessions/runs/jobs/approvals/schedules | ✓ | ✓ | ✓ | ~ | Durable job/schedule/approval loops are usable in single-operator preview; multi-user run topology gates remain (see blockers). |
+| Memory: core/archival, search, consolidation, evals | ✓ | ✓ | ✓ | ~ | Deterministic Memory evals pass; block/history editing UI is partial. |
+| Knowledge Base RAG (lifecycle, hybrid retrieval, citations, taint) | ✓ | ✓ | ✓ | ~ | Full vertical slice with React management/search UI, single-operator preview. |
+| Identity / org / agents / grants APIs | ✓ | ✓ | ✓ | — | REST + RBAC exist and are tested, but there is **no browser login flow**, so no end-to-end product scenario. |
+| Projects / GitHub App / storage | ✓ | ✓ | ✓ | ~ | Backend + storage exist; product journey is preview-level. |
+| Read-only code review API + worker | ✓ | ✓ | ✓ | — | Review generation runs server + worker side; **no review UI** ships. |
+| Connectors: Gmail native, IM routing (OneBot/Telegram) | ✓ | ✓ | ✓ | ~ | Gmail OAuth/read/status/send preview works; IM message routing exists, IM durable routing + admin UI do not. |
 
-- Versioned core memory and self-editing tools.
-- Archival pgvector plus lexical/semantic hybrid retrieval.
-- Hybrid session recall with explicit `hybrid`, `lexical`, or degraded mode.
-- Proposal-first memory consolidation with evidence constraints, cursor/lease, CAS, and
-  retry deduplication.
-- Deterministic Memory eval datasets, replay cassettes, reports, gates, optional judge, and
-  optional Langfuse reporting.
+### Product surface (React)
 
-### Knowledge Base
+| Capability | C | T | D | P | Notes |
+|---|:--:|:--:|:--:|:--:|---|
+| React app (Chat, Sessions, Jobs, Schedules, Approvals, Memory, Knowledge, Connectors, Observability) | ✓ | ✓ | ✓ | ~ | Compose serves the built React app; several pages are preview or depend on backend/login work not yet shipped. |
+| i18n foundation | ✓ | ✓ | ✓ | ~ | Present and tested; not a complete localization. |
+| Onboarding / first-run | ✓ | ✓ | ✓ | ~ | Local onboarding flow exists as a single-operator preview. |
+| Agents / Projects UI | ✓ | ✓ | ✓ | ~ | Present; gated by missing identity/login and grant journeys. |
+| Auth/workspace context (API key / bearer, org/Agent) | ✓ | ✓ | ✓ | — | In-memory/tab-scoped credential context exists; it does **not** implement a browser OIDC authorization-code flow. |
 
-- Scope-bound KB/document/version/chunk lifecycle.
-- Text/Markdown create, update, reindex, immediate-hide delete, and durable purge.
-- Deterministic chunking and pinned embedding model/dimension.
-- Hybrid retrieval, stable structured citations, and always-tainted `kb_search`.
-- REST/RBAC and React management/search UI.
-- Durable ingest/delete jobs with ownership fencing, active/desired rollback safety, and
-  zombie-write prevention.
+> **Correction of stale claims.** Earlier docs asserted Keel had "no real identity/onboarding"
+> and served "a static stub rather than the React bundle." Those claims are **false on `main`**:
+> identity/org/agents/grants APIs, a React onboarding flow, and Compose-served React delivery
+> all exist. What is still missing is the **browser OIDC login flow** and multi-user product
+> journeys — not the code.
 
-### Current surfaces/integrations
+## Trusted local-preview safety contract
 
-- Server-rendered minimal chat and management pages.
-- Compose `:3000` serves the built React app through nginx, including SPA fallback and
-  `/v1`, `/health`, `/readiness`, and SSE proxying.
-- React Jobs and Memory proposal pages expose current backend contracts.
-- Guarded, idempotent demo bootstrap seeds searchable Knowledge content and a welcome session.
-- Gmail is the only native connector; OAuth/read/status/revoke paths exist, with optional
-  approval-gated real send.
-- OneBot and Telegram gateway code exists.
+The Compose `dev` and `full` profiles are an **explicit, trusted, single-operator local
+preview**. They are **not production-safe** and must not be exposed to untrusted networks.
 
-## Verified baselines
+- Execution uses the opt-in `unsafe-local-dev` backend with a dedicated execution volume and
+  **shell execution disabled**; there is **no real `keel-sandbox` service deployed**.
+- The runtime database role owns the schema/database and can bypass RLS.
+- The server data-plane scope is the single-operator preview scope; there is no browser login.
 
-The final M3.1 increment validation on 2026-07-16 reported:
+No level of green tests changes this: a real isolated sandbox and a non-owner runtime DB role
+are **not** deployed on `main`.
 
-- Python non-integration: **828 passed / 1 skipped**; isolated Postgres/Redis integration:
-  **239 passed**.
-- React/Vitest: **53 passed**; Playwright Compose smoke: **9 passed** against the isolated
-  stack before and after demo seeding.
-- Ruff lint/format, strict mypy, web lint/build, Compose config, app/web image builds, and
-  live nginx syntax: passed.
-- Demo bootstrap: dry-run credential redaction, production guard refusal, isolated seed,
-  searchable 3-document corpus, and idempotent replay passed.
-- The populated Playwright smoke left sessions, events, Jobs, Knowledge, Memory proposals,
-  approvals, schedules, and connector-token row counts unchanged.
-- Memory replay: **12/12 cases**, **7/7 gates**, weighted overall **0.982**, no live fallback.
-- Knowledge replay: **8/8 cases**, **7/7 gates**, all named retrieval/citation/taint/deletion
-  measures **1.000**, no live embedding fallback.
-- Durable Jobs acceptance: real Postgres + Redis/arq covering lost/duplicate delivery,
-  retry, crash/reclaim, exhaustion, cancel, and exactly-once injection.
-- Knowledge live smoke: create → ingest → cited/tainted search → safe update/activation →
-  immediate-hide delete → durable purge.
+## Patch / Draft PR foundation (off-main, not a current product feature)
 
-The Memory/Knowledge eval figures are retained feature-audit baselines; the other figures above
-come from the final isolated M3.1 increment run.
+A controlled patch-proposal foundation is stable on branch `feat/future-patch-pr`
+(commit `c97fc46`, later synced to the green main baseline at `64c49ce`):
 
-## M3.1 increment status
+- Migration `0019`, plus models / store / bundle / generation / approval / writeback /
+  coordinator modules.
+- `ruff` + `mypy` clean; **34 unit tests** and **2 Postgres integration tests** pass.
 
-**In progress.** This increment completes real Compose React delivery, truthful Jobs/Memory
-surfaces, safe demo bootstrap data, stale-stack detection, and a non-destructive browser smoke.
-M3.1 remains open because the planned local first-run wizard for provider/secret/default-Agent
-and optional connector setup is not implemented. Product-state copy still needs a dedicated
-exit-gate audit before declaring the milestone complete.
+It is **not merged into `main`** and has **no API/SDK, no worker jobs, no dispatch outbox, no
+approved/expiry reconciler, and no UI**. Therefore it is **not a current product capability**
+and must not be described as one. Merging it is milestone **M2**.
 
-## Critical and high blockers
+## Critical blockers (before any multi-user or production exposure)
 
-1. **RLS bypass:** the runtime DB role owns the schema/database and can bypass RLS.
-2. **No real sandbox:** shell executes inside server/CLI processes.
-3. **Process-local interaction:** interactive runs and some approvals are not restart-safe
-   or worker-owned.
-4. **No identity/Agents:** fixed `web:local`; no users, organizations, persisted Agents,
-   memberships, or grants.
-5. **Weak API credential model:** configured keys are plaintext/unscoped; empty means
-   implicit admin.
-6. **OAuth/gateway safety:** OAuth state is process-local; gateway webhooks are
-   unauthenticated.
-7. **Outbound retry safety:** idempotency is process-local.
-8. **Permission construction:** a default can become allow-all when omitted in some paths;
-   explicit fail-closed defaults are not universal.
-9. **Event/data lifecycle:** event versions exist, but no upcasters, retention, or complete
-   erasure.
-10. **Scheduler/topology:** scheduler package is a stub; worker cron schedules jobs;
-    interactive runtime is not the target server/worker topology.
-11. **Delivery profile gap:** Compose `:3000` now delivers the React app, but `full` still does
-    not deliver the documented observability/object-store/sandbox stack.
-12. **SDK/operations:** no generated-client/versioning pipeline; observability, CI security/
-    performance coverage, backup/restore, and DR are below target.
-
-## Current product gaps
-
-- User sign-in/session identity and single-organization-v1 membership/RBAC.
-- Agents CRUD, persisted personal/team Agents, explicit resource grants, real switcher.
-- Calendar and a reusable connector/trigger framework.
-- Web/IM runtime and approval parity.
-- Complete Memory block/history editing, Admin/RBAC UI, and local first-run onboarding.
-- Correct current copy, responsive behavior, internationalization, and accessibility.
-
-### Durable runs — routing status (M3.6, WS-M)
-
-The durable substrate (schema, run state machine/repository, worker executor, durable
-approval binding, reconciliation, `/v1/runs` status/interrupt/steer APIs, lifecycle
-erasure) is implemented and tested. Routing status:
-
-- **Web admission is durable by default.** `POST /v1/sessions/{id}/messages` admits through
-  the identity-bound `DurableRunService.admit` and dispatches the worker-owned
-  `run_interactive` job; there is no server-local asyncio run task and no in-process fallback
-  (a live run queue is required — explicit 503 otherwise). The tenant/actor/Agent identity is
-  derived from the request actor + selected org (`X-Keel-Org`) + selected Agent
-  (`X-Keel-Agent`, re-authorized via `select_agent`); an idempotency key (`Idempotency-Key`
-  header/body) makes a retried message admit exactly once. The in-process `AgentRuntime`
-  remains only as the explicitly-labelled **local-preview** path (`admit_and_run`), never the
-  production default. Evidence: `tests/unit/test_message_routing.py`, `tests/unit/test_server.py`.
-- **Local-preview compatibility profile** (`local` org + `web` Agent + `im:`/`local:` actor)
-  is used only in non-cloud mode; a cloud request with no authenticated user + selected
-  org/Agent fails closed (403). Authorization is org-bound (`select_org`/`select_agent`/
-  `_authorize_run`) — the `web:local` data-plane scope is never an authorization basis.
-- **Worker execution parity.** `run_interactive` rebuilds the interactive Agent from the
-  *persisted* selected-Agent profile (id/name/persona) via the shared builders
-  (`keel_core.interactive`), with file/shell + memory + Knowledge tool + permission parity to
-  the server web runtime, and re-checks Agent visibility / org membership / archived status at
-  claim time (a revoke between admit and claim fails the run closed). Evidence:
-  `tests/unit/test_worker_run_routing.py`.
-
-Review-finding hardening (this increment):
-
-- **Unified OIDC/API-key auth.** `/v1` no longer gates on an API-key-only dependency that
-  rejects a JWT first: a single `require_privilege` dependency resolves the actor (OIDC-first,
-  never downgraded into open-mode admin), maps org membership role → endpoint privilege, and
-  preserves API-key/local behavior. Evidence: `keel_server/endpoint_auth.py`,
-  `tests/unit/test_future_run_routing_review.py::test_real_oidc_user_admits_message`.
-- **Shared-store requirement.** Worker-owned admission requires a shared Postgres run
-  substrate (`app.state.shared_run_substrate`); with in-memory/process-local stores the
-  message endpoint returns 503 (never accepts a run a worker cannot see). Readiness surfaces
-  `run_substrate`. Evidence: `test_memory_mode_admission_denied_503`.
-- **Org/Agent data-plane isolation.** The canonical scope `agent:<org>/<agent>` is derived +
-  validated centrally (`keel_core.scoping`) and used for session/event/memory/connectors/run
-  admission and SSE/history/list/search in authenticated routes; a cross-org/Agent session id
-  is denied 404 (globally-namespaced sessions + per-scope stores). The worker builds all
-  stores/tools with `record.scope_id` (revalidated). Evidence:
-  `tests/integration/test_run_routing_postgres.py::test_two_orgs_identical_session_ids_are_isolated`.
-- **Per-scope workspace isolation.** A scoped execution-environment factory
-  (`build_scoped_execution_environment`) gives each scope its own workspace (validated opaque
-  `ws_<hash>` namespace, no traversal); the sandbox RPC carries the namespace and fails file
-  operations closed when it cannot provision a scoped workspace (never a shared one). A
-  namespace directory under a shared parent confines *file* operations only (path policy); a
-  *shell* subprocess is not confined by a directory, so namespaced `command` execution is
-  denied by default and permitted only when the backend asserts `shell_isolated` (a proven
-  OS/container/microVM mount boundary exposing only that namespace root).
-- **Dispatch failure semantics.** Once durable admission commits, a failed enqueue returns the
-  accepted run (202 + `dispatch_pending`, idempotency key echoed) and relies on the reconciler
-  — never an opaque 500 that risks duplicate retries.
-- **Persisted model selection.** The model selected at admission is captured in the admission
-  fingerprint + event; the worker executes with the admitted model, not its process default.
-  `/settings/model` updates the process model in local preview only and fails closed in cloud
-  mode (never a silent success the worker ignores).
-
-Second-pass review findings (this increment, migration `0017_web_routing_isolation`):
-
-- **Scoped machine API credentials.** The configured machine-principal syntax is extended
-  (backward compatible) to `key:role[:org=…:agent=…|:global]`: a scoped credential binds one
-  org/Agent and works in cloud mode without ambient cross-tenant access, a `global` admin must
-  explicitly select an org/Agent per request (audited), and an unbound credential is denied in
-  cloud. `EndpointAuth` derives the per-Agent scope from the binding and rejects a spoofed
-  `X-Keel-Org`/`X-Keel-Agent`. Evidence: `tests/unit/test_machine_credentials.py`.
-- **Composite session tenant identity.** `sessions` is re-keyed on `(scope_id, id)` and `events`
-  on `(scope_id, session_id, seq)`, so identical external session ids in two orgs coexist as
-  isolated sessions (no cross-scope denial); existing rows upgrade safely. Downgrade restores the
-  global namespace losslessly even with cross-scope id collisions: it keeps the canonical
-  (lexicographically-smallest) scope's id, deterministically renames every other colliding
-  scope's session, repoints all referencing rows in lock-step, and — because a run's immutable
-  admission fingerprint binds the session id — recomputes each remapped run's fingerprint to the
-  exact pre-0016 (legacy, pre-model) form for its new id (content recovered from the run's unique
-  admission event; a fingerprint that cannot be reconstructed safely fails the downgrade rather
-  than being cleared). Evidence: `test_state_postgres.py`,
-  `test_run_routing_postgres.py::test_two_orgs_identical_session_ids_are_isolated`,
-  `test_web_routing_isolation_migration.py::test_downgrade_remaps_run_fingerprints_for_new_session_id`.
-- **Scoped Gmail OAuth.** `/connect` resolves through the unified `require_privilege` and binds
-  the one-time state to the caller's canonical `agent:<org>/<agent>` scope (never the app-global
-  `web:local`); the unauthenticated callback consumes that state and writes the token to that
-  scope. Evidence: `tests/unit/test_oauth_connect.py`.
-- **Global dispatch/reconciliation outbox.** `0016` adds a minimal, non-sensitive, **global**
-  `run_dispatch_outbox` (`run_id` + `scope_id` + coarse state + fenced lease, no payload).
-  Admission records the intent as part of the queued transition; the worker's
-  `reconcile_dispatch_tick` leases due intents (`FOR UPDATE SKIP LOCKED`), reconciles **every**
-  scope with open work, and retires terminal intents — replacing the `web:local`-pinned
-  reconciler. Evidence: `tests/unit/test_run_dispatch_outbox.py`,
-  `test_run_routing_postgres.py::test_dispatch_outbox_leases_across_scopes_and_blocks_duplicate_worker`.
-- **Live SSE tail.** The authenticated per-Agent SSE performs the durable replay and then keeps
-  the connection open, tailing new worker events via bounded durable polling until the run ends
-  or the client disconnects, honoring `Last-Event-ID` with no missed/duplicate events. Evidence:
-  `tests/unit/test_sse_tail.py`.
-- **Real sandbox namespace confinement.** The sandbox service resolves each validated
-  `ws_<hash>` namespace to its own confined workspace via a `WorkspaceProvider`/factory and fails
-  closed when a scoped workspace cannot be provisioned — it never ignores the namespace. Directory
-  confinement bounds *file* operations only; a namespaced `command` is not a shell sandbox (a
-  subprocess can reach absolute/sibling/expanded paths), so namespaced shell is denied before it
-  reaches an environment unless the provider asserts `shell_isolated` (a proven OS/container/
-  microVM boundary). Evidence:
-  `test_sandbox_rpc.py::test_rpc_namespaces_are_confined_to_distinct_workspaces`,
-  `test_sandbox_rpc.py::test_rpc_namespaced_shell_is_denied_without_os_isolation`.
-- **Readiness + OpenAPI compatibility.** Readiness is degraded (503) when default durable message
-  admission cannot execute (no shared substrate / no run queue) instead of reporting 200 while
-  every message 503s. `check_openapi_compat.py` validates against the **main** baseline (the
-  branch masking is reverted) and now allows additive optional parameters by stable `(name,in)`
-  identity while still failing removals/type/required changes. Evidence:
-  `tests/unit/test_server.py`, `tests/unit/test_openapi_compat.py`.
-
-Still to do (not yet done):
-
-- **IM durable routing.** OneBot/Telegram gateways (`ImRunner`) still run the in-process
-  untrusted safe-agent loop and reply inline. Re-pointing them at `DurableRunService`
-  requires an untrusted **safe-agent** branch in the worker (IM must keep the read-only safe
-  toolset — it must never reach write/shell), a durable outbox-idempotent reply delivery that
-  survives a server/worker restart, a reconciler sweep for the crash-after-terminalize
-  delivery window, and a cloud channel→org/Agent mapping (fail closed when absent). Designed
-  but not implemented in this increment.
-- **Per-scope Knowledge + cross-scope worker jobs (finding 3).** The Knowledge API router is now
-  per-request scoped: each call resolves its canonical `auth.scope_id` through the unified
-  `EndpointAuth`/`require_privilege` (OIDC user, bound/global machine credential, or the non-cloud
-  `web:local` local-preview) and a bounded `knowledge_factory` builds a `KnowledgeService` bound to
-  exactly that scope — no authenticated call touches the singleton `web:local` Knowledge, and a
-  cross-org/Agent KB/document id is invisible (404). To keep a document created under a per-Agent
-  scope actually indexed (not orphaned), migration `0016` adds a minimal, non-sensitive **global**
-  `job_dispatch_outbox` (`job_id → jobs(id) ON DELETE CASCADE` + `scope_id` + `kind` + fenced
-  lease, no content). Knowledge admission writes the durable job **and** its dispatch intent in one
-  transaction (`JobStore.enqueue_once_with_dispatch_intent`); a failed intent write rolls the job
-  back, and a lost enqueue returns the accepted job (pending) with the intent surviving. The worker
-  `reconcile_job_dispatch_tick` leases due intents across every scope (`FOR UPDATE SKIP LOCKED` +
-  fenced lease), re-dispatches `run_job(scope, job_id)`, and retires terminal intents; `run_job`
-  builds its `PostgresJobStore` + Knowledge store/service/embedder from the **payload/outbox
-  scope** (revalidated, kind-checked) rather than the process-wide `durable_scope`, preserving all
-  non-Knowledge job behavior. Readiness surfaces `knowledge_dispatch`. Evidence:
-  `tests/unit/test_job_dispatch_outbox.py`, `tests/integration/test_knowledge_routing_postgres.py`.
-- **Connector tool parity** in the durable worker path (beyond file/shell + memory +
-  Knowledge) is a follow-up.
-- **SSE token-streaming liveness** from the worker: durable events (including completed
-  assistant turns) appear via the server's durable-polling SSE tail, but sub-100ms
-  token-by-token deltas are not fanned out from the worker to Redis yet.
-
-### Second-pass review response (this increment)
-
-Hardened the durable Web-routing review findings with tests:
-
-- **Atomic run dispatch (finding 4).** The `admitted → queued` transition and the global
-  `run_dispatch_outbox` intent now commit in one transaction on the same engine
-  (`RunStore.mark_queued_with_dispatch_intent`); the intent write is no longer swallowed, so a
-  committed `queued` run always has a discoverable dispatch pointer (a failed intent rolls the
-  transition back). Added `run_dispatch_outbox.run_id → runs(id) ON DELETE CASCADE` so lifecycle
-  purge/erasure removes the metadata with the run. Fault-injection + live-PG cascade/atomicity
-  tests.
-- **Gmail OAuth launch (finding 2).** Added authenticated `POST /v1/connectors/gmail/connect-url`
-  returning only the consent URL (browser opens it with headers via `fetch`); the legacy `GET`
-  redirect now fails closed in cloud mode. Callback stays state-bound/unauthenticated.
-- **Workspace no-follow isolation (finding 5).** `DirectoryWorkspaceProvider` now provisions the
-  namespace root with an exclusive `mkdir` and re-validates it on every request via a no-follow
-  `lstat` + real-path identity check, rejecting a symlink/junction/reparse-point/alias root even
-  when its target stays inside the base, and defeating a validate/use swap.
-- **SSE cursor (finding 6).** `_resume_cursor()` (Last-Event-ID wins over `after`) now applies to
-  the local-preview live path too, not only the scoped durable path.
-- **OpenAPI checker (finding 7).** Restored the `main` published baseline as the regression guard
-  and hardened the additive checker to reject duplicate parameter identities and deeper
-  `schema` changes (not just top-level `type`).
-- **Browser auth/workspace context (finding 1).** Added a React Auth/Workspace context (API key
-  or OIDC bearer, org + Agent) that keeps secrets in memory / tab-scoped `sessionStorage` (never
-  `localStorage`) and clears them on sign-out; a centralized `api` fetch wrapper attaches
-  `Authorization`/`X-API-Key`/`X-Keel-Org`/`X-Keel-Agent` + idempotency; a `fetch`/`ReadableStream`
-  SSE client replaces the header-less `EventSource` (reconnect with `Last-Event-ID`, de-dupe,
-  abort-on-unmount); and a truthful sign-in/context screen appears when the server rejects a
-  request for auth (it does not fake an OIDC authorization-code flow).
-- **Per-scope Knowledge + cross-scope worker jobs (finding 3).** The Knowledge API router is now
-  per-request scoped (unified `EndpointAuth`/`require_privilege` → canonical `auth.scope_id` →
-  bounded `knowledge_factory`), and its indexing/deletion jobs are driven across every per-Agent
-  scope by a new **global** `job_dispatch_outbox` (migration `0016`, `job_id → jobs(id) ON DELETE
-  CASCADE`) mirroring the run-dispatch outbox: admission writes job + intent atomically, the worker
-  `reconcile_job_dispatch_tick` re-dispatches leased intents across scopes, and `run_job` binds the
-  job's own payload/outbox scope — so a document created in a per-Agent scope is actually indexed
-  rather than orphaned. Evidence: `tests/unit/test_job_dispatch_outbox.py`,
-  `tests/integration/test_knowledge_routing_postgres.py`.
+1. **RLS bypass:** the runtime DB role owns the schema and can bypass RLS (needs a non-owner
+   role with enforced RLS — **M3A**).
+2. **No real sandbox:** shell/file execution has no deployed isolated backend; only
+   `unsafe-local-dev` exists (**M3B**).
+3. **No browser login:** identity/org/agents/grants APIs exist but there is no browser OIDC
+   authorization-code flow, so no real multi-user product scenario (**M7**).
+4. **No review UI / IM admin UI:** the review API+worker and IM routing exist headless (**M5/M7**).
+5. **Event/data lifecycle:** event versions exist without upcasters, and erasure closure is
+   incomplete (**M8**).
+6. **Production operations:** no production scheduler service/leadership, OTel/metrics/SLOs,
+   or backup/restore/DR drills (**M9**).
 
 ## Next work
 
-Follow [Roadmap](./ROADMAP.md), in order:
-
-1. M3.1 Demo-ready Product Surface
-2. M3.2 Personal Agent Experience Preview
-3. M3.3 Cloud Safety Foundation
-4. M3.4 Event Evolution
-5. M3.5 Retention/Erasure
-6. M3.6 Multi-user Identity, Access, and durable run topology
-7. M3.7 Connector and Team Experience
-8. M3.8 Production Delivery and Scale
-
-Plugin SDK and Desktop are deferred until those gates.
+Follow [Roadmap](./ROADMAP.md): M1 (this commit) → M2 Patch Foundation Merge → M3A Runtime DB
+Role/RLS and M3B Real Sandbox (parallel safety gates) → M4 Patch API/worker/outbox → M5 Patch
+UI + approval → Draft PR e2e → M6 Personal Agent + Calendar → M7 Browser OIDC + admin/review/IM
+UI → M8 Event/lifecycle + erasure closure → M9 Production delivery/scale/OTel/DR.
