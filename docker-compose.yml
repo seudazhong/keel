@@ -152,7 +152,7 @@ services:
       keel-server:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost/web-health"]
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1/web-health"]
       interval: 5s
       timeout: 5s
       retries: 20
