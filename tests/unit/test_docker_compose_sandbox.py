@@ -19,7 +19,11 @@ No Docker daemon, image build, or network is required; this runs in the non-inte
 
 from __future__ import annotations
 
+import os
 import re
+import secrets
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -190,6 +194,93 @@ def test_secret_init_generates_strong_secret_without_hardcoding(compose: dict) -
     assert match, "could not find token_urlsafe(n) call"
     assert int(match.group(1)) >= MIN_RPC_SECRET_BYTES, "generated secret too short"
     assert "chmod" in script, "secret file is made read-only after write"
+
+
+def test_secret_init_validates_existing_secret_length(compose: dict) -> None:
+    """The bootstrap must reject a persisted-but-too-short secret, not only an absent/empty one."""
+    init = compose["services"]["keel-secret-init"]
+    script = "\n".join(init["command"]) if isinstance(init["command"], list) else init["command"]
+    # Reads any existing value and compares its stripped UTF-8 *byte* length to the RPC minimum.
+    assert "read_text" in script, "init must inspect an existing secret"
+    assert '.encode("utf-8")' in script, "init must measure UTF-8 byte length, not char length"
+    match = re.search(r"min_bytes\s*=\s*(\d+)", script)
+    assert match and int(match.group(1)) == MIN_RPC_SECRET_BYTES, (
+        "init length threshold must equal keel_core MIN_RPC_SECRET_BYTES"
+    )
+    # A missing/short/invalid value is atomically repaired (sibling tempfile -> os.replace) and
+    # published read-only, so a reader never observes a partial or writable secret.
+    assert "tempfile" in script and "os.replace" in script, "repair must be atomic"
+    assert "0o444" in script, "published secret must be read-only"
+    # The path comes from the same env var every consumer uses.
+    assert "KEEL_SANDBOX_RPC_SECRET_FILE" in script
+    assert init["environment"]["KEEL_SANDBOX_RPC_SECRET_FILE"] == "/keel-secrets/sandbox_rpc_secret"
+
+
+# --- Executable behaviour of the bootstrap script (still Docker-free) --------------------------
+# These run the exact embedded `keel-secret-init` program (extracted from the committed compose)
+# in a subprocess against a temp path, proving the length-validation + atomic-repair behaviour —
+# not merely that the source text contains the right tokens.
+
+
+def _secret_init_script(compose: dict) -> str:
+    cmd = compose["services"]["keel-secret-init"]["command"]
+    return "\n".join(cmd) if isinstance(cmd, list) else cmd
+
+
+def _run_secret_init(script: str, secret_path: Path) -> subprocess.CompletedProcess[str]:
+    env = {**os.environ, "KEEL_SANDBOX_RPC_SECRET_FILE": str(secret_path)}
+    return subprocess.run(
+        [sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=30
+    )
+
+
+def _is_read_only(path: Path) -> bool:
+    # Cross-platform: POSIX 0o444 and the Windows read-only attribute both clear the write bits.
+    return (path.stat().st_mode & 0o222) == 0
+
+
+def _byte_len_ok(value: str) -> bool:
+    return len(value.strip().encode("utf-8")) >= MIN_RPC_SECRET_BYTES
+
+
+def _restore_writable(path: Path) -> None:
+    try:
+        path.chmod(0o666)
+    except OSError:
+        pass
+
+
+def test_secret_init_script_generates_when_absent(compose: dict, tmp_path: Path) -> None:
+    secret = tmp_path / "sandbox_rpc_secret"
+    result = _run_secret_init(_secret_init_script(compose), secret)
+    assert result.returncode == 0, result.stderr
+    value = secret.read_text(encoding="utf-8").strip()
+    assert _byte_len_ok(value) and _is_read_only(secret)
+    assert value not in result.stdout and value not in result.stderr, "secret must not be logged"
+    _restore_writable(secret)
+
+
+def test_secret_init_script_repairs_short_secret(compose: dict, tmp_path: Path) -> None:
+    secret = tmp_path / "sandbox_rpc_secret"
+    secret.write_text("too-short", encoding="utf-8")  # < 32 bytes: every consumer would reject it
+    assert not _byte_len_ok(secret.read_text(encoding="utf-8"))
+    result = _run_secret_init(_secret_init_script(compose), secret)
+    assert result.returncode == 0, result.stderr
+    repaired = secret.read_text(encoding="utf-8").strip()
+    assert repaired != "too-short", "short secret must be regenerated"
+    assert _byte_len_ok(repaired) and _is_read_only(secret)
+    _restore_writable(secret)
+
+
+def test_secret_init_script_is_idempotent_for_valid_secret(compose: dict, tmp_path: Path) -> None:
+    secret = tmp_path / "sandbox_rpc_secret"
+    good = secrets.token_urlsafe(48)
+    secret.write_text(good, encoding="utf-8")
+    result = _run_secret_init(_secret_init_script(compose), secret)
+    assert result.returncode == 0, result.stderr
+    assert secret.read_text(encoding="utf-8").strip() == good, "valid secret must be left intact"
+    assert _is_read_only(secret)
+    _restore_writable(secret)
 
 
 def test_no_hardcoded_rpc_secret_anywhere(compose_text: str) -> None:

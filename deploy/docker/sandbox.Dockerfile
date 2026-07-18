@@ -5,8 +5,11 @@
 # and run distinctly from the app image so it can be hardened independently and carries none
 # of the control-plane's dependencies or credentials:
 #   * only the `keel-sandbox` workspace member (+ its transitive deps) is installed via
-#     `uv sync --package keel-sandbox` — never keel-server/keel-worker/keel-cli or their
-#     extra deps (arq, etc.); it holds no alembic/migrations either;
+#     `uv sync --no-dev --package keel-sandbox` — never keel-server/keel-worker/keel-cli/
+#     keel-sdk/keel-scheduler or their extra deps (arq, etc.), and never the dev group
+#     (pytest/ruff/mypy); it holds no alembic/migrations either. After install, every
+#     non-closure package source is pruned so /app/packages contains only keel-core +
+#     keel-sandbox;
 #   * it runs as a non-root user (uid/gid 10100, matching deploy/k8s/base/sandbox), which
 #     owns ONLY the sandbox workspace + per-scope namespaces roots;
 #   * everything else is meant to run on a read-only root filesystem with tmpfs scratch and
@@ -22,11 +25,23 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Manifests + sources first so the workspace resolves; install ONLY the sandbox member's
-# closure (keel-sandbox -> keel-core + fastapi + uvicorn), not the whole workspace.
+# Manifests + sources first so the uv workspace resolves against the frozen lock. All members
+# are COPYied so resolution succeeds, but only the sandbox member's runtime closure is installed
+# and every non-closure source is then pruned (see below).
 COPY pyproject.toml uv.lock ./
 COPY packages/ ./packages/
-RUN uv sync --frozen --package keel-sandbox
+# --no-dev drops the workspace dev group (pytest/ruff/mypy); --package keel-sandbox installs just
+# keel-sandbox -> keel-core (+ fastapi/uvicorn), never keel-server/keel-worker/keel-cli/keel-sdk/
+# keel-scheduler or their extra deps (arq, etc.). Then prune every non-closure package source so
+# /app/packages holds ONLY keel-core + keel-sandbox — the two editable members that must keep
+# their sources at runtime. Contract: tests/unit/test_sandbox_dockerfile.py.
+RUN uv sync --frozen --no-dev --package keel-sandbox \
+    && for pkg in packages/*/; do \
+         case "$pkg" in \
+           packages/keel-core/ | packages/keel-sandbox/) ;; \
+           *) rm -rf "$pkg" ;; \
+         esac; \
+       done
 
 # Put the workspace venv on PATH so the `keel-sandbox` console script resolves.
 ENV PATH="/app/.venv/bin:$PATH"

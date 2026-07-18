@@ -102,28 +102,54 @@ services:
     restart: "no"
     profiles: ["dev", "full"]
 
-  # Local secret bootstrap (runs once, then exits). Generates a random >=32-byte RPC shared
-  # secret directly into the `sandboxsecret` volume the FIRST time only (idempotent), so a
-  # single `up` needs no manual secret provisioning and no secret is committed to this file or
-  # source. The value is generated in-process and written straight to the mounted file — it is
-  # never passed on argv and never printed — then made read-only. keel-server/keel-worker and
-  # keel-sandbox each mount this volume read-only and load the secret via
+  # Local secret bootstrap (runs once, then exits). Ensures the `sandboxsecret` volume holds a
+  # random RPC shared secret whose stripped UTF-8 byte length meets the RPC minimum (32 bytes,
+  # keel_core.tools.rpc_auth.MIN_RPC_SECRET_BYTES), so a single `up` needs no manual secret
+  # provisioning and no secret is committed to this file or source. It VALIDATES any pre-existing
+  # value exactly the way every consumer does (read_secret_file() strips, then requires
+  # len(secret.encode("utf-8")) >= 32) and atomically REPAIRS a missing/short/invalid one via a
+  # sibling tempfile + os.replace — so init never "succeeds" on a secret the sandbox and control
+  # plane would then reject. The value is generated in-process and written straight to the mounted
+  # volume — never passed on argv and never printed — then published read-only (0444). keel-server/
+  # keel-worker and keel-sandbox each mount this volume read-only and load the secret via
   # KEEL_SANDBOX_RPC_SECRET_FILE. Delete the `sandboxsecret` volume to rotate.
   keel-secret-init:
     <<: *app
     entrypoint: ["python", "-c"]
+    environment:
+      KEEL_SANDBOX_RPC_SECRET_FILE: /keel-secrets/sandbox_rpc_secret
     command:
       - |
-        import os, pathlib, secrets
-        path = pathlib.Path("/keel-secrets/sandbox_rpc_secret")
+        import os, pathlib, secrets, tempfile
+        # Consumers strip the file then require len(secret.encode("utf-8")) >= this minimum
+        # (keel_core.tools.rpc_auth.MIN_RPC_SECRET_BYTES); validate the SAME stripped byte length.
+        min_bytes = 32
+        path = pathlib.Path(os.environ.get("KEEL_SANDBOX_RPC_SECRET_FILE") or "/keel-secrets/sandbox_rpc_secret")
         path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists() or not path.read_text().strip():
-            # token_urlsafe(48) -> 64 url-safe chars, comfortably above the 32-byte minimum
-            # (keel_core.tools.rpc_auth.MIN_RPC_SECRET_BYTES). Generated here and written
-            # straight to the mounted volume; never echoed to argv or logs.
-            path.write_text(secrets.token_urlsafe(48))
-        os.chmod(path, 0o444)
-        print("keel sandbox RPC secret present (>=32 bytes); value not logged")
+        try:
+            current = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            current = ""
+        if len(current.encode("utf-8")) >= min_bytes:
+            os.chmod(path, 0o444)
+            print("keel sandbox RPC secret present and valid (>=32 bytes); value not logged")
+        else:
+            # token_urlsafe(48) -> 64 url-safe chars, comfortably above the 32-byte minimum.
+            # Write a sibling tempfile, make it read-only, then atomically replace so a reader
+            # never sees a partial/short secret and any pre-existing short value is repaired.
+            fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".sandbox_rpc_secret.")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(secrets.token_urlsafe(48))
+                os.chmod(tmp, 0o444)
+                os.replace(tmp, path)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            print("keel sandbox RPC secret (re)generated to satisfy >=32 bytes; value not logged")
     volumes:
       - "sandboxsecret:/keel-secrets"
     restart: "no"
