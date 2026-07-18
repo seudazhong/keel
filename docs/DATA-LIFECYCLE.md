@@ -38,6 +38,7 @@ not be — so a new store cannot be added without a conscious retention + erasur
 | `jobs` | table | standard (30d) | `scope_id` | scope-bound (running erasure job kept) |
 | `runs` | table | standard (30d) | `scope_id` | scope-bound (durable interactive runs, M3.6) |
 | `run_control` | table | standard (30d) | `scope_id` | scope-bound (durable interrupt/cancel/steer, M3.6) |
+| `im_reply_intents` | table | standard (30d) | `scope_id` | scope-bound (durable encrypted IM reply outbox, M3.7) |
 | coding artifacts | filesystem | standard | *(by project id)* | project-scoped (repo/snapshots/worktrees/artifacts) |
 | tool spill files | filesystem | short | *(by recorded path)* | session-scoped, confined to the spill root |
 | Redis event streams (`events:{session_id}`) | redis | permanent | *(by session id)* | session-scoped (bounded key delete) |
@@ -45,6 +46,7 @@ not be — so a new store cannot be added without a conscious retention + erasur
 | `erasure_requests` / `erasure_steps` | table | long | `scope_id` | **retained** (audit trail) |
 | `retention_policies` | table | long | `scope_id` | **retained** (operator overrides) |
 | `organizations` / `memberships` / `agents` / `resource_grants` | table | permanent | `org_id` | **org-scoped** — erased by organization erasure (M3.6) |
+| `im_channel_mappings` | table | permanent | `org_id` | **org-scoped** — erased by organization erasure (FK cascade removes its route index rows, M3.7) |
 | `users` / `oidc_identities` | table | permanent | *(global)* | **identity-global** — erased by user (data-subject) erasure (M3.6) |
 | provider logs / Langfuse telemetry | external | — | — | **external** — no delete API; recorded incomplete → `partial` |
 
