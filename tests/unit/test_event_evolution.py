@@ -18,6 +18,7 @@ from keel_core.evolution import (
     MalformedEventPayloadError,
     UnknownEventTypeError,
     UnknownEventVersionError,
+    current_event_version,
     upcast_event,
 )
 from keel_core.projections import project_messages
@@ -107,6 +108,44 @@ def test_unknown_type_and_missing_transition_fail_closed() -> None:
     registry = EventUpcasterRegistry({event_type: 2 for event_type in EventType})
     with pytest.raises(UnknownEventVersionError):
         registry.upcast(_event(1))
+
+
+def test_new_writers_persist_current_version_and_survive_round_trip() -> None:
+    """New writers must stamp the current version with a valid payload (M0 contract).
+
+    This guards the event fan-out regression: a ``message.token`` written at the
+    current version with a legal payload must decode unchanged, so producers never
+    depend on the v1->v2 upcaster to backfill missing ``role``/``text``.
+    """
+    current = current_event_version(EventType.message_token)
+    written = _event(
+        1,
+        version=current,
+        payload={"role": "assistant", "text": "streamed", "partial": True},
+    )
+    decoded = EVENT_UPCASTERS.decode(written.model_dump(mode="json"))
+    assert decoded.version == current
+    assert decoded == upcast_event(written)
+    assert decoded.payload == {"role": "assistant", "text": "streamed", "partial": True}
+
+
+def test_default_constructed_message_token_fails_closed() -> None:
+    """A default ``Event`` (version=1, empty payload) is a malformed historical write.
+
+    The fail-closed decode is intentional; producers must supply the current
+    version and payload rather than emitting an unupgradeable v1 envelope.
+    """
+    malformed = Event(
+        type=EventType.message_token,
+        seq=1,
+        session_id="session-1",
+        scope_id="scope-1",
+        ts=datetime.now(UTC),
+    )
+    assert malformed.version == 1
+    assert malformed.payload == {}
+    with pytest.raises(MalformedEventPayloadError):
+        EVENT_UPCASTERS.decode(malformed.model_dump(mode="json"))
 
 
 def test_projection_rebuild_dry_run_checkpoint_resume_and_tombstones() -> None:

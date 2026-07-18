@@ -158,6 +158,40 @@ def test_trusted_preview_can_explicitly_select_unsafe_local(tmp_path: Path) -> N
     assert isinstance(environment, UnsafeLocalDevExecutionEnvironment)
 
 
+async def test_compose_trusted_preview_default_disables_shell_but_allows_files(
+    tmp_path: Path,
+) -> None:
+    """The Compose `dev` contract: opt-in unsafe-local-dev with shell still fail-closed.
+
+    Compose sets KEEL_EXECUTION_BACKEND=unsafe-local-dev and the allow-unsafe flag but
+    deliberately leaves KEEL_TRUSTED_PREVIEW_SHELL_WORKSPACE_SANITIZED unset, because it
+    cannot prove OS isolation. Shell/command execution must therefore be denied while
+    file tools still work in the local preview.
+    """
+    settings = Settings(
+        execution_backend="unsafe-local-dev",
+        trusted_preview_allow_unsafe_execution=True,
+    )
+    assert settings.trusted_preview_shell_workspace_sanitized is False
+    for service in ("server", "worker"):
+        environment = build_service_execution_environment(
+            settings,
+            tmp_path,
+            service=service,  # type: ignore[arg-type]
+        )
+        assert isinstance(environment, UnsafeLocalDevExecutionEnvironment)
+
+        shell = await environment.execute(CommandRequest("echo hi"))
+        assert not shell.ok
+        assert shell.error is not None
+        assert shell.error.code is ExecutionErrorCode.denied
+
+        read = await environment.read(ReadRequest("missing.txt"))
+        assert not read.ok
+        assert read.error is not None
+        assert read.error.code is ExecutionErrorCode.not_found
+
+
 def test_rpc_authentication_fails_closed_without_strong_secret() -> None:
     with pytest.raises(RuntimeError, match="shared secret"):
         SandboxExecutionEnvironment("http://sandbox")

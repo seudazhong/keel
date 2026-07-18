@@ -1,6 +1,16 @@
 # Keel — Docker Compose (ADR-0008 profiles).
 #
-#   docker compose --profile dev up -d      # server + worker + web + postgres + redis
+#   docker compose -f docker-compose.yml --profile dev up -d --build
+#
+# The `dev`/`full` profiles run a TRUSTED, single-operator LOCAL PREVIEW — not a
+# production deployment. Compose ships no `keel-sandbox` executor and no RPC secret,
+# so the default fail-closed `sandbox` backend would crash server/worker on startup.
+# Instead they EXPLICITLY opt into the in-process `unsafe-local-dev` backend, confined
+# to a dedicated empty `execdata` volume, with shell/command execution left DISABLED
+# because Compose cannot prove an OS isolation boundary. Code defaults and the K8s /
+# cloud manifests remain fail-closed `sandbox`; never reuse these preview settings in
+# production. Pass `-f docker-compose.yml` so a local `docker-compose.override.yml`
+# cannot silently relax this contract.
 #
 # Compose lives at the repo root so the build context is the workspace root
 # (packages/ must be reachable). Dockerfiles are under deploy/docker/.
@@ -18,6 +28,19 @@ x-app-env: &app-env
   # Shared project/coding storage root: server and worker MUST mount the SAME volume
   # here so a worker-written review artifact is readable by the server report APIs (WS-R).
   KEEL_PROJECT_STORAGE_ROOT: /var/lib/keel/projects
+
+# Trusted LOCAL preview execution — applied to keel-server and keel-worker only.
+# This is deliberately NOT a production sandbox: it names the runtime `unsafe-local-dev`
+# and requires the explicit opt-in flag below. The execution workspace is the empty
+# `execdata` volume (via each service's `working_dir`), and shell/command execution stays
+# DISABLED because KEEL_TRUSTED_PREVIEW_SHELL_WORKSPACE_SANITIZED is left unset (-> false):
+# Compose cannot prove the sanitized-workspace/OS-isolation contract, so file tools work
+# while shell is denied. Do NOT set these on K8s/cloud, where the fail-closed `sandbox`
+# backend with an authenticated RPC secret is mandatory.
+x-trusted-preview-exec: &trusted-preview-exec
+  KEEL_APP_ENV: dev
+  KEEL_EXECUTION_BACKEND: unsafe-local-dev
+  KEEL_TRUSTED_PREVIEW_ALLOW_UNSAFE_EXECUTION: "true"
 
 services:
   postgres:
@@ -60,9 +83,12 @@ services:
   keel-server:
     <<: *app
     command: ["keel-server"]
-    volumes: ["projectdata:/var/lib/keel/projects"]
+    working_dir: /var/lib/keel/exec
+    volumes:
+      - "projectdata:/var/lib/keel/projects"
+      - "execdata:/var/lib/keel/exec"
     environment:
-      <<: *app-env
+      <<: [*app-env, *trusted-preview-exec]
       KEEL_SERVER_HOST: 0.0.0.0
       KEEL_SERVER_PORT: 8000
       OLLAMA_API_BASE: "http://ollama:11434"
@@ -92,11 +118,14 @@ services:
   keel-worker:
     <<: *app
     command: ["arq", "keel_worker.main.WorkerSettings"]
-    volumes: ["projectdata:/var/lib/keel/projects"]
+    working_dir: /var/lib/keel/exec
+    volumes:
+      - "projectdata:/var/lib/keel/projects"
+      - "execdata:/var/lib/keel/exec"
     deploy:
       replicas: 1  # override with `--scale keel-worker=N`; scale-out is CAS-safe
     environment:
-      <<: *app-env
+      <<: [*app-env, *trusted-preview-exec]
       OLLAMA_API_BASE: "http://ollama:11434"
     depends_on:
       redis:
@@ -153,6 +182,10 @@ services:
 volumes:
   pgdata:
   ollama:
+  # Dedicated, initially-empty execution workspace for the trusted local-preview
+  # `unsafe-local-dev` backend (server + worker share it via `working_dir`). Kept
+  # separate from source/projects so preview file tools never touch the repo tree.
+  execdata:
   # Shared managed-project/coding storage (server + worker). In a multi-host cloud
   # deployment replace this with an RWX volume (e.g. NFS/EFS) so BOTH pods share it.
   projectdata:

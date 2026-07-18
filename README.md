@@ -43,9 +43,10 @@ Read [`docs/STATUS.md`](./docs/STATUS.md) for verified evidence and blockers, an
 - CLI local runtime with file, shell, and provider tools
 
 Important limits: the server scope is hard-coded to `web:local`; open mode is implicit
-admin; the runtime DB owner can bypass RLS; shell execution is not isolated in a real
-sandbox; interactive run state is process-local; Compose `:3000` serves a static stub
-rather than the React bundle.
+admin; the runtime DB owner can bypass RLS; the Compose stack runs the opt-in
+`unsafe-local-dev` execution backend (a trusted local preview, not a real sandbox) with
+shell execution disabled; interactive run state is process-local; Compose `:3000` serves a
+static stub rather than the React bundle.
 
 ## Run the development stack
 
@@ -54,7 +55,7 @@ Prerequisites: Docker Desktop and a configured model/provider in `.env`.
 ```powershell
 Copy-Item .env.example .env
 # Edit .env: set KEEL_DEFAULT_MODEL and its provider credentials.
-docker compose --profile dev up -d --build
+docker compose -f docker-compose.yml --profile dev up -d --build
 Invoke-RestMethod http://localhost:8000/readiness
 ```
 

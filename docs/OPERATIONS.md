@@ -11,7 +11,7 @@ scaffold toward the M3.8 production-delivery gates below, not evidence those gat
 ## Lifecycle and probes
 
 ```powershell
-docker compose --profile dev up -d --build
+docker compose -f docker-compose.yml --profile dev up -d --build
 docker compose --profile dev ps
 Invoke-RestMethod http://localhost:8000/health
 Invoke-RestMethod http://localhost:8000/readiness
@@ -19,8 +19,19 @@ docker compose logs --tail 100 keel-server keel-worker
 docker compose --profile dev down
 ```
 
-Do not add `-v` to `down` unless permanent deletion of Postgres and Ollama volumes is
-intended.
+Pass `-f docker-compose.yml` so a local `docker-compose.override.yml` cannot silently
+change the startup contract. Do not add `-v` to `down` unless permanent deletion of
+Postgres and Ollama volumes is intended.
+
+The `dev`/`full` profiles are a **trusted single-operator local preview**, not a
+production deployment. Compose ships no `keel-sandbox` executor and no RPC secret, so
+`keel-server`/`keel-worker` explicitly opt into the in-process `unsafe-local-dev`
+execution backend (`KEEL_EXECUTION_BACKEND=unsafe-local-dev` +
+`KEEL_TRUSTED_PREVIEW_ALLOW_UNSAFE_EXECUTION=true`), confined to a dedicated empty
+`execdata` volume via `working_dir`. Shell/command execution stays **disabled**
+(`KEEL_TRUSTED_PREVIEW_SHELL_WORKSPACE_SANITIZED` is unset) because Compose cannot prove
+OS isolation; file tools still work. Code defaults and the K8s/cloud manifests keep the
+fail-closed `sandbox` backend — never reuse these preview settings in production.
 
 `keel-migrate` runs `alembic upgrade head` before server/worker startup. `keel-server`,
 `keel-worker`, Postgres, Redis, Ollama, and the nginx-served React web app are in both current
@@ -151,6 +162,9 @@ An org the user solely owns and is the only member of is atomically archived.
   RLS a hard boundary. Extending `FORCE`/grants to the remaining scoped tables is pending.
 - The authenticated `keel-sandbox` service boundary exists and server/worker wiring fails
   closed when it is unavailable or unauthenticated, but Compose does not deploy it yet.
+  The Compose `dev`/`full` profiles therefore run the trusted local-preview
+  `unsafe-local-dev` backend (opt-in, on a dedicated empty `execdata` volume) with shell
+  execution disabled; K8s/cloud must keep the fail-closed `sandbox` backend.
   CLI shell is available only for a workspace validated as free of `.git`, `.env`, links,
   and nested mounts.
 - Interactive runs and some approval state are process-local; server restarts can interrupt
