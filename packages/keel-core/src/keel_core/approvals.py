@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 
-_INSERT_APPROVAL = text(
+_INSERT_APPROVAL_SQL = (
     "INSERT INTO approvals (id, scope_id, run_id, session_id, tool, args, "
     "call_id, idempotency_key, reason, status, created_at, expires_at, "
     "org_id, actor, action_hash, run_attempt, batch_id) VALUES "
@@ -25,6 +25,60 @@ _INSERT_APPROVAL = text(
     ":key, :reason, 'pending', now(), :expires_at, :org_id, :actor, "
     ":action_hash, :run_attempt, :batch_id)"
 )
+
+_INSERT_APPROVAL = text(_INSERT_APPROVAL_SQL)
+
+# Insert-or-get keyed by the interactive partial-unique index ``ux_approvals_run_call`` (migration
+# 0014): ``(scope_id, run_id, call_id, run_attempt) WHERE batch_id <> ''``. A concurrent duplicate
+# does nothing and returns no row; the caller then re-reads and verifies the full immutable binding.
+_INSERT_APPROVAL_OR_GET = text(
+    _INSERT_APPROVAL_SQL
+    + " ON CONFLICT (scope_id, run_id, call_id, run_attempt) WHERE batch_id <> '' "
+    "DO NOTHING RETURNING id"
+)
+
+_SELECT_APPROVAL_BY_KEY = text(
+    "SELECT * FROM approvals WHERE scope_id = :scope AND run_id = :run_id "
+    "AND call_id = :call_id AND run_attempt = :run_attempt AND batch_id <> ''"
+)
+
+
+def _approval_params(
+    *,
+    id: str,
+    scope_id: str,
+    run_id: str,
+    session_id: str,
+    tool: str,
+    args: dict[str, Any],
+    call_id: str,
+    idempotency_key: str,
+    reason: str,
+    expires_at: datetime,
+    org_id: str,
+    actor: str,
+    action_hash: str,
+    run_attempt: int,
+    batch_id: str,
+) -> dict[str, Any]:
+    """The single bind-parameter builder shared by every pending-approval INSERT."""
+    return {
+        "id": id,
+        "scope": scope_id,
+        "run_id": run_id,
+        "session_id": session_id,
+        "tool": tool,
+        "args": json.dumps(args),
+        "call_id": call_id,
+        "key": idempotency_key,
+        "reason": reason,
+        "expires_at": expires_at,
+        "org_id": org_id,
+        "actor": actor,
+        "action_hash": action_hash,
+        "run_attempt": run_attempt,
+        "batch_id": batch_id,
+    }
 
 
 async def insert_pending_in_transaction(
@@ -54,24 +108,162 @@ async def insert_pending_in_transaction(
     owns the transaction + ``app.scope_id`` GUC."""
     await conn.execute(
         _INSERT_APPROVAL,
-        {
-            "id": id,
-            "scope": scope_id,
-            "run_id": run_id,
-            "session_id": session_id,
-            "tool": tool,
-            "args": json.dumps(args),
-            "call_id": call_id,
-            "key": idempotency_key,
-            "reason": reason,
-            "expires_at": expires_at,
-            "org_id": org_id,
-            "actor": actor,
-            "action_hash": action_hash,
-            "run_attempt": run_attempt,
-            "batch_id": batch_id,
-        },
+        _approval_params(
+            id=id,
+            scope_id=scope_id,
+            run_id=run_id,
+            session_id=session_id,
+            tool=tool,
+            args=args,
+            call_id=call_id,
+            idempotency_key=idempotency_key,
+            reason=reason,
+            expires_at=expires_at,
+            org_id=org_id,
+            actor=actor,
+            action_hash=action_hash,
+            run_attempt=run_attempt,
+            batch_id=batch_id,
+        ),
     )
+
+
+def _verify_binding(
+    existing: ApprovalRecord,
+    *,
+    scope_id: str,
+    run_id: str,
+    session_id: str,
+    tool: str,
+    args: dict[str, Any],
+    call_id: str,
+    idempotency_key: str,
+    org_id: str,
+    actor: str,
+    action_hash: str,
+    run_attempt: int,
+    batch_id: str,
+) -> None:
+    """Fail closed unless every immutable binding field of an existing approval matches the request.
+
+    A ``create_pending_or_get`` that finds a row for the same interactive key must be an exact
+    replay of the *same* action; any divergence (a different tool/args/call/actor/org/attempt/batch/
+    idempotency key/session) means the caller is trying to reuse another action's approval and is
+    rejected with :class:`~keel_core.patch.errors.PatchApprovalError` (fail closed, P5). The message
+    names only the mismatched field(s) — never a secret, argument value, or payload."""
+    from keel_core.patch.errors import PatchApprovalError
+
+    mismatches = {
+        "scope_id": existing.scope_id != scope_id,
+        "run_id": existing.run_id != run_id,
+        "session_id": existing.session_id != session_id,
+        "tool": existing.tool != tool,
+        "call_id": existing.call_id != call_id,
+        "idempotency_key": existing.idempotency_key != idempotency_key,
+        "org_id": existing.org_id != org_id,
+        "actor": existing.actor != actor,
+        "action_hash": existing.action_hash != action_hash,
+        "run_attempt": existing.run_attempt != run_attempt,
+        "batch_id": existing.batch_id != batch_id,
+        "args": json.dumps(existing.args, sort_keys=True) != json.dumps(args, sort_keys=True),
+    }
+    bad = sorted(name for name, differs in mismatches.items() if differs)
+    if bad:
+        raise PatchApprovalError(f"approval binding mismatch: {', '.join(bad)}")
+
+
+async def insert_pending_or_get_in_transaction(
+    conn: AsyncConnection,
+    *,
+    id: str,
+    scope_id: str,
+    run_id: str,
+    session_id: str,
+    tool: str,
+    args: dict[str, Any],
+    call_id: str,
+    idempotency_key: str,
+    reason: str,
+    expires_at: datetime,
+    org_id: str = "",
+    actor: str = "",
+    action_hash: str = "",
+    run_attempt: int = 0,
+    batch_id: str,
+) -> tuple[str, bool]:
+    """Insert one pending approval, or return the existing one for the same interactive key.
+
+    A truly idempotent create-or-get over the ``ux_approvals_run_call`` partial-unique index,
+    entirely within the caller's transaction (**no** nested ``engine.begin`` — a proposal store can
+    call this inside its single ``ready -> approval_pending`` transaction). Returns
+    ``(approval_id, created)``: ``created`` is ``True`` for a fresh row, ``False`` when an
+    equivalent row already existed. On a conflict the existing row's full immutable binding is
+    re-verified (:func:`_verify_binding`) so a replay for a *different* action fails closed rather
+    than silently adopting a foreign approval. The caller owns the transaction + ``app.scope_id``
+    GUC.
+
+    Requires a non-empty ``batch_id``: the unique index is partial on ``batch_id <> ''``, so an
+    empty batch id would never deduplicate and the get half could not fire."""
+    from keel_core.patch.errors import PatchApprovalError
+
+    if not batch_id:
+        raise PatchApprovalError("insert_pending_or_get requires a non-empty batch_id")
+    inserted = (
+        await conn.execute(
+            _INSERT_APPROVAL_OR_GET,
+            _approval_params(
+                id=id,
+                scope_id=scope_id,
+                run_id=run_id,
+                session_id=session_id,
+                tool=tool,
+                args=args,
+                call_id=call_id,
+                idempotency_key=idempotency_key,
+                reason=reason,
+                expires_at=expires_at,
+                org_id=org_id,
+                actor=actor,
+                action_hash=action_hash,
+                run_attempt=run_attempt,
+                batch_id=batch_id,
+            ),
+        )
+    ).first()
+    if inserted is not None:
+        return id, True
+    existing_row = (
+        (
+            await conn.execute(
+                _SELECT_APPROVAL_BY_KEY,
+                {
+                    "scope": scope_id,
+                    "run_id": run_id,
+                    "call_id": call_id,
+                    "run_attempt": run_attempt,
+                },
+            )
+        )
+        .mappings()
+        .one()
+    )
+    existing = _to_record(existing_row)
+    _verify_binding(
+        existing,
+        scope_id=scope_id,
+        run_id=run_id,
+        session_id=session_id,
+        tool=tool,
+        args=args,
+        call_id=call_id,
+        idempotency_key=idempotency_key,
+        org_id=org_id,
+        actor=actor,
+        action_hash=action_hash,
+        run_attempt=run_attempt,
+        batch_id=batch_id,
+    )
+    return existing.id, False
 
 
 async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
@@ -142,6 +334,34 @@ class ApprovalStore(Protocol):
         batch_id: str = "",
     ) -> str: ...
 
+    async def create_pending_or_get(
+        self,
+        *,
+        scope_id: str,
+        run_id: str,
+        session_id: str,
+        tool: str,
+        args: dict[str, Any],
+        call_id: str,
+        idempotency_key: str,
+        reason: str,
+        expires_at: datetime,
+        org_id: str = "",
+        actor: str = "",
+        action_hash: str = "",
+        run_attempt: int = 0,
+        batch_id: str,
+    ) -> tuple[str, bool]:
+        """Create a pending approval, or idempotently return the existing one (create-or-get).
+
+        The atomic primitive behind ``ready -> approval_pending``: keyed by the interactive
+        partial-unique binding ``(scope_id, run_id, call_id, run_attempt)`` (``batch_id`` required,
+        non-empty), it returns ``(approval_id, created)``. A concurrent second caller for the *same*
+        action gets the *same* ``approval_id`` with ``created=False``; a caller whose immutable
+        binding diverges fails closed with
+        :class:`~keel_core.patch.errors.PatchApprovalError`. There is no non-idempotent fallback."""
+        ...
+
     async def get(self, approval_id: str) -> ApprovalRecord | None: ...
 
     async def list_pending(self, scope_id: str) -> list[ApprovalRecord]: ...
@@ -210,6 +430,75 @@ class InMemoryApprovalStore:
             batch_id=batch_id,
         )
         return approval_id
+
+    async def create_pending_or_get(
+        self,
+        *,
+        scope_id: str,
+        run_id: str,
+        session_id: str,
+        tool: str,
+        args: dict[str, Any],
+        call_id: str,
+        idempotency_key: str,
+        reason: str,
+        expires_at: datetime,
+        org_id: str = "",
+        actor: str = "",
+        action_hash: str = "",
+        run_attempt: int = 0,
+        batch_id: str,
+    ) -> tuple[str, bool]:
+        """Create-or-get mirroring the Postgres ``ux_approvals_run_call`` semantics exactly."""
+        from keel_core.patch.errors import PatchApprovalError
+
+        if not batch_id:
+            raise PatchApprovalError("create_pending_or_get requires a non-empty batch_id")
+        for row in self._rows.values():
+            if (
+                row.scope_id == scope_id
+                and row.run_id == run_id
+                and row.call_id == call_id
+                and row.run_attempt == run_attempt
+                and row.batch_id != ""
+            ):
+                _verify_binding(
+                    row,
+                    scope_id=scope_id,
+                    run_id=run_id,
+                    session_id=session_id,
+                    tool=tool,
+                    args=args,
+                    call_id=call_id,
+                    idempotency_key=idempotency_key,
+                    org_id=org_id,
+                    actor=actor,
+                    action_hash=action_hash,
+                    run_attempt=run_attempt,
+                    batch_id=batch_id,
+                )
+                return row.id, False
+        approval_id = uuid.uuid4().hex
+        self._rows[approval_id] = ApprovalRecord(
+            id=approval_id,
+            scope_id=scope_id,
+            run_id=run_id,
+            session_id=session_id,
+            tool=tool,
+            args=args,
+            call_id=call_id,
+            idempotency_key=idempotency_key,
+            reason=reason,
+            status="pending",
+            created_at=datetime.now(UTC),
+            expires_at=expires_at,
+            org_id=org_id,
+            actor=actor,
+            action_hash=action_hash,
+            run_attempt=run_attempt,
+            batch_id=batch_id,
+        )
+        return approval_id, True
 
     async def get(self, approval_id: str) -> ApprovalRecord | None:
         return self._rows.get(approval_id)
@@ -352,6 +641,46 @@ class PostgresApprovalStore:
                 batch_id=batch_id,
             )
         return approval_id
+
+    async def create_pending_or_get(
+        self,
+        *,
+        scope_id: str,
+        run_id: str,
+        session_id: str,
+        tool: str,
+        args: dict[str, Any],
+        call_id: str,
+        idempotency_key: str,
+        reason: str,
+        expires_at: datetime,
+        org_id: str = "",
+        actor: str = "",
+        action_hash: str = "",
+        run_attempt: int = 0,
+        batch_id: str,
+    ) -> tuple[str, bool]:
+        approval_id = uuid.uuid4().hex
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": scope_id})
+            return await insert_pending_or_get_in_transaction(
+                conn,
+                id=approval_id,
+                scope_id=scope_id,
+                run_id=run_id,
+                session_id=session_id,
+                tool=tool,
+                args=args,
+                call_id=call_id,
+                idempotency_key=idempotency_key,
+                reason=reason,
+                expires_at=expires_at,
+                org_id=org_id,
+                actor=actor,
+                action_hash=action_hash,
+                run_attempt=run_attempt,
+                batch_id=batch_id,
+            )
 
     async def get(self, approval_id: str) -> ApprovalRecord | None:
         async with self._engine.begin() as conn:

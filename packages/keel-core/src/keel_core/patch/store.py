@@ -16,24 +16,41 @@ repository is intentionally thin and truthful.
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+
+from keel_core.approvals import (
+    ApprovalStore,
+    InMemoryApprovalStore,
+    PostgresApprovalStore,
+    insert_pending_or_get_in_transaction,
+)
+from keel_core.scoping import validate_scope_id
 
 from .errors import PatchStateError, PatchValidationError
 from .models import (
+    TERMINAL_STATUSES,
     PatchProposal,
     PatchStatus,
     TestStatus,
     ensure_transition,
 )
+from .outbox import (
+    InMemoryPatchProposalOutbox,
+    PatchOutboxStatus,
+    PatchProposalOutbox,
+    PostgresPatchProposalOutbox,
+)
 
 _SET_ORG = text("SELECT set_config('app.org_id', :org, true)")
+_SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
 
 _COLS = (
     "id, org_id, project_id, run_id, run_attempt, agent_id, actor, source_ref, task_digest, "
@@ -106,6 +123,8 @@ class PatchProposalStore(Protocol):
         fingerprint: str,
         expires_at: datetime,
         now: datetime | None = None,
+        outbox: PatchProposalOutbox | None = None,
+        scope_id: str | None = None,
     ) -> tuple[PatchProposal, bool]: ...
 
     async def get(self, org_id: str, proposal_id: str) -> PatchProposal | None: ...
@@ -125,7 +144,32 @@ class PatchProposalStore(Protocol):
         expected_version: int | None = None,
         updates: Mapping[str, Any] | None = None,
         now: datetime | None = None,
+        outbox: PatchProposalOutbox | None = None,
+        scope_id: str | None = None,
     ) -> PatchProposal: ...
+
+    async def transition_to_approval_pending(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        approvals: ApprovalStore,
+        outbox: PatchProposalOutbox,
+        scope_id: str,
+        draft: ApprovalDraft,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[PatchProposal, str, bool]:
+        """Atomically move a ``ready`` proposal to ``approval_pending`` behind a durable approval.
+
+        The single fail-closed primitive that (in one transaction) locks the ``ready`` proposal,
+        create-or-gets its durable approval (idempotent on the interactive binding), bumps the
+        proposal to ``approval_pending`` (+1 version, bound to the approval id) and deletes the
+        dispatch pointer. Returns ``(proposal, approval_id, created)``. A concurrent second caller
+        observes ``approval_pending`` and takes the idempotent fast path: the *same* approval id,
+        ``created=False``, and **no** second version bump. Any failure rolls the whole unit back —
+        there is never a residual approval, half-transition, or orphaned pointer."""
+        ...
 
     async def expire_due(self, now: datetime, limit: int) -> list[tuple[str, str]]: ...
 
@@ -149,6 +193,66 @@ _STATUS_TIMESTAMP = {
 }
 
 
+@dataclass(frozen=True, slots=True)
+class ApprovalDraft:
+    """The immutable binding of the approval a ``ready -> approval_pending`` transition raises.
+
+    Carries every field of the durable approval *except* its id (the store generates one only when a
+    row is actually created), so the create-or-get primitive can bind/verify the approval to the
+    exact run/call/actor/action without the caller pre-committing an id. A concurrent retry with the
+    same ``(scope_id, run_id, call_id, run_attempt)`` returns the same approval. ``args`` is never
+    hashed. ``batch_id`` defaults to the proposal id when empty (the partial-unique index the
+    create-or-get relies on requires a non-empty batch id)."""
+
+    run_id: str
+    session_id: str
+    tool: str
+    args: dict[str, Any]
+    call_id: str
+    idempotency_key: str
+    reason: str
+    expires_at: datetime
+    actor: str = ""
+    action_hash: str = ""
+    run_attempt: int = 0
+    batch_id: str = ""
+
+
+async def _apply_outbox_transition(
+    conn: AsyncConnection | None,
+    outbox: PatchProposalOutbox,
+    proposal: PatchProposal,
+    target: PatchStatus,
+    scope_id: str | None,
+    now: datetime,
+) -> None:
+    """Mirror a proposal transition onto its global dispatch pointer, in the caller's transaction.
+
+    ``ready`` updates the coarse hint; ``approval_pending`` and every terminal state *delete* the
+    pointer (there is no background work while awaiting a human, or once the proposal is done);
+    ``approved`` re-creates the pointer with the ``approved`` hint (the worker drives writeback);
+    ``writing`` (and any non-mirrored edge) leaves the ``approved`` pointer untouched. A pointer
+    write (``approved``) fails closed without a validated ``scope_id``."""
+    if target == PatchStatus.ready:
+        await outbox.set_status_hint_in_connection(
+            conn, proposal.id, PatchOutboxStatus.ready, now=now
+        )
+    elif target == PatchStatus.approved:
+        if not scope_id:
+            raise PatchValidationError("transition to approved requires scope_id for the outbox")
+        await outbox.upsert_status_hint_in_connection(
+            conn,
+            proposal_id=proposal.id,
+            org_id=proposal.org_id,
+            scope_id=scope_id,
+            status_hint=PatchOutboxStatus.approved,
+            expires_at=proposal.expires_at,
+            now=now,
+        )
+    elif target == PatchStatus.approval_pending or target in TERMINAL_STATUSES:
+        await outbox.delete_in_connection(conn, proposal.id)
+
+
 # --- In-memory -----------------------------------------------------------------------
 
 
@@ -158,6 +262,16 @@ class InMemoryPatchProposalStore:
     def __init__(self) -> None:
         self._rows: dict[str, PatchProposal] = {}
         self._by_idem: dict[tuple[str, str], str] = {}
+
+    def _txn_snapshot(self) -> tuple[dict[str, PatchProposal], dict[tuple[str, str], str]]:
+        """Capture a rollback snapshot so an atomic outbox-coupled operation can undo a partial
+        write on failure (mirrors the durable store's single-transaction all-or-nothing)."""
+        return dict(self._rows), dict(self._by_idem)
+
+    def _txn_restore(
+        self, snapshot: tuple[dict[str, PatchProposal], dict[tuple[str, str], str]]
+    ) -> None:
+        self._rows, self._by_idem = dict(snapshot[0]), dict(snapshot[1])
 
     async def create(
         self,
@@ -176,41 +290,74 @@ class InMemoryPatchProposalStore:
         fingerprint: str,
         expires_at: datetime,
         now: datetime | None = None,
+        outbox: PatchProposalOutbox | None = None,
+        scope_id: str | None = None,
     ) -> tuple[PatchProposal, bool]:
         created_at = now or _now()
         key = (org_id, idempotency_key)
         existing_id = self._by_idem.get(key)
         if existing_id is not None:
-            return self._rows[existing_id], False
-        proposal = PatchProposal(
-            id=proposal_id,
-            org_id=org_id,
-            project_id=project_id,
-            run_id=run_id,
-            run_attempt=run_attempt,
-            agent_id=agent_id,
-            actor=actor,
-            source_ref=source_ref,
-            task_digest=task_digest,
-            base_ref=base_ref,
-            base_sha="",
-            head_sha="",
-            bundle_sha256="",
-            diff_sha256="",
-            changed_path_digest="",
-            changed_files=0,
-            test_status=TestStatus.unknown,
-            status=PatchStatus.generating,
-            version=1,
-            idempotency_key=idempotency_key,
-            fingerprint=fingerprint,
-            expires_at=expires_at,
-            created_at=created_at,
-            updated_at=created_at,
-        )
-        self._rows[proposal_id] = proposal
-        self._by_idem[key] = proposal_id
-        return proposal, True
+            proposal = self._rows[existing_id]
+            created = False
+        else:
+            proposal = PatchProposal(
+                id=proposal_id,
+                org_id=org_id,
+                project_id=project_id,
+                run_id=run_id,
+                run_attempt=run_attempt,
+                agent_id=agent_id,
+                actor=actor,
+                source_ref=source_ref,
+                task_digest=task_digest,
+                base_ref=base_ref,
+                base_sha="",
+                head_sha="",
+                bundle_sha256="",
+                diff_sha256="",
+                changed_path_digest="",
+                changed_files=0,
+                test_status=TestStatus.unknown,
+                status=PatchStatus.generating,
+                version=1,
+                idempotency_key=idempotency_key,
+                fingerprint=fingerprint,
+                expires_at=expires_at,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+            created = True
+        if outbox is None:
+            if created:
+                self._rows[proposal_id] = proposal
+                self._by_idem[key] = proposal_id
+            return proposal, created
+        # Outbox seam: record the ``generating`` dispatch intent atomically with the proposal so a
+        # proposal never becomes durable without a discoverable pointer (both roll back together).
+        if not isinstance(outbox, InMemoryPatchProposalOutbox):
+            raise PatchValidationError("InMemoryPatchProposalStore requires an in-memory outbox")
+        if not scope_id:
+            raise PatchValidationError("patch proposal create with an outbox requires scope_id")
+        store_snap = self._txn_snapshot()
+        outbox_snap = outbox._txn_snapshot()
+        try:
+            if created:
+                self._rows[proposal_id] = proposal
+                self._by_idem[key] = proposal_id
+            await outbox.record_in_connection(
+                None,
+                proposal_id=proposal.id,
+                org_id=org_id,
+                scope_id=scope_id,
+                expires_at=expires_at,
+                status_hint=PatchOutboxStatus.generating,
+                now=created_at,
+            )
+        except BaseException:
+            self._txn_restore(store_snap)
+            outbox._txn_restore(outbox_snap)
+            raise
+        return proposal, created
 
     async def get(self, org_id: str, proposal_id: str) -> PatchProposal | None:
         row = self._rows.get(proposal_id)
@@ -238,8 +385,12 @@ class InMemoryPatchProposalStore:
         expected_version: int | None = None,
         updates: Mapping[str, Any] | None = None,
         now: datetime | None = None,
+        outbox: PatchProposalOutbox | None = None,
+        scope_id: str | None = None,
     ) -> PatchProposal:
         clean = _validate_updates(updates)
+        if outbox is not None and not isinstance(outbox, InMemoryPatchProposalOutbox):
+            raise PatchValidationError("InMemoryPatchProposalStore requires an in-memory outbox")
         row = self._rows.get(proposal_id)
         if row is None or row.org_id != org_id:
             raise ProposalNotFoundInStore(f"proposal not found: {proposal_id}")
@@ -247,6 +398,31 @@ class InMemoryPatchProposalStore:
             raise StaleProposalVersion(
                 f"stale proposal version {expected_version} (current {row.version})"
             )
+        store_snap = self._txn_snapshot()
+        outbox_snap = outbox._txn_snapshot() if outbox is not None else None
+        try:
+            updated = self._apply_transition(org_id, proposal_id, row, target, clean, now)
+            if outbox is not None:
+                await _apply_outbox_transition(
+                    None, outbox, updated, target, scope_id, updated.updated_at
+                )
+        except BaseException:
+            if outbox is not None:
+                self._txn_restore(store_snap)
+                if outbox_snap is not None:
+                    outbox._txn_restore(outbox_snap)
+            raise
+        return updated
+
+    def _apply_transition(
+        self,
+        org_id: str,
+        proposal_id: str,
+        row: PatchProposal,
+        target: PatchStatus,
+        clean: dict[str, Any],
+        now: datetime | None,
+    ) -> PatchProposal:
         moment = now or _now()
         # Idempotent re-apply of the same terminal/decision state: no version bump.
         if row.status == target:
@@ -275,7 +451,77 @@ class InMemoryPatchProposalStore:
         self._rows[proposal_id] = updated
         return updated
 
+    async def transition_to_approval_pending(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        approvals: ApprovalStore,
+        outbox: PatchProposalOutbox,
+        scope_id: str,
+        draft: ApprovalDraft,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[PatchProposal, str, bool]:
+        if not isinstance(outbox, InMemoryPatchProposalOutbox):
+            raise PatchValidationError("InMemoryPatchProposalStore requires an in-memory outbox")
+        if not isinstance(approvals, InMemoryApprovalStore):
+            raise PatchValidationError(
+                "InMemoryPatchProposalStore requires an in-memory approval store"
+            )
+        validate_scope_id(scope_id)
+        moment = now or _now()
+        batch_id = draft.batch_id or proposal_id
+        row = self._rows.get(proposal_id)
+        if row is None or row.org_id != org_id:
+            raise ProposalNotFoundInStore(f"proposal not found: {proposal_id}")
+        if expected_version is not None and row.version != expected_version:
+            raise StaleProposalVersion(
+                f"stale proposal version {expected_version} (current {row.version})"
+            )
+        store_snap = self._txn_snapshot()
+        approvals_snap = approvals._txn_snapshot()
+        outbox_snap = outbox._txn_snapshot()
+        try:
+            approval_id, created = await approvals.create_pending_or_get(
+                scope_id=scope_id,
+                run_id=draft.run_id,
+                session_id=draft.session_id,
+                tool=draft.tool,
+                args=draft.args,
+                call_id=draft.call_id,
+                idempotency_key=draft.idempotency_key,
+                reason=draft.reason,
+                expires_at=draft.expires_at,
+                org_id=org_id,
+                actor=draft.actor,
+                action_hash=draft.action_hash,
+                run_attempt=draft.run_attempt,
+                batch_id=batch_id,
+            )
+            # Idempotent fast path: a concurrent caller already advanced the proposal — reuse the
+            # same approval, do not bump the version or re-delete the (already gone) pointer.
+            if row.status == PatchStatus.approval_pending:
+                return row, approval_id, created
+            ensure_transition(row.status, PatchStatus.approval_pending)
+            updated = replace(
+                row,
+                status=PatchStatus.approval_pending,
+                version=row.version + 1,
+                approval_id=approval_id,
+                updated_at=moment,
+            )
+            self._rows[proposal_id] = updated
+            await outbox.delete_in_connection(None, proposal_id)
+            return updated, approval_id, created
+        except BaseException:
+            self._txn_restore(store_snap)
+            approvals._txn_restore(approvals_snap)
+            outbox._txn_restore(outbox_snap)
+            raise
+
     async def expire_due(self, now: datetime, limit: int) -> list[tuple[str, str]]:
+        """Cross-org TTL scan (maintenance-only; the runtime reconciler uses the outbox instead)."""
         due = [
             (r.org_id, r.id)
             for r in self._rows.values()
@@ -368,8 +614,17 @@ class PostgresPatchProposalStore:
         fingerprint: str,
         expires_at: datetime,
         now: datetime | None = None,
+        outbox: PatchProposalOutbox | None = None,
+        scope_id: str | None = None,
     ) -> tuple[PatchProposal, bool]:
         created_at = now or _now()
+        outbox_scope = ""
+        if outbox is not None:
+            if not isinstance(outbox, PostgresPatchProposalOutbox):
+                raise PatchValidationError("PostgresPatchProposalStore requires a Postgres outbox")
+            if not scope_id:
+                raise PatchValidationError("patch proposal create with an outbox requires scope_id")
+            outbox_scope = scope_id
         params = {
             "id": proposal_id,
             "org": org_id,
@@ -410,23 +665,37 @@ class PostgresPatchProposalStore:
                     .one_or_none()
                 )
                 if row is not None:
-                    return _to_proposal(row), True
-                existing = (
-                    (
-                        await conn.execute(
-                            text(
-                                f"SELECT {_COLS} FROM patch_proposals "
-                                "WHERE org_id = :org AND idempotency_key = :idem"
-                            ),
-                            {"org": org_id, "idem": idempotency_key},
+                    proposal, created = _to_proposal(row), True
+                else:
+                    existing = (
+                        (
+                            await conn.execute(
+                                text(
+                                    f"SELECT {_COLS} FROM patch_proposals "
+                                    "WHERE org_id = :org AND idempotency_key = :idem"
+                                ),
+                                {"org": org_id, "idem": idempotency_key},
+                            )
                         )
+                        .mappings()
+                        .one()
                     )
-                    .mappings()
-                    .one()
-                )
+                    proposal, created = _to_proposal(existing), False
+                # Record the ``generating`` dispatch intent in the SAME transaction: a proposal
+                # never becomes durable without a discoverable pointer (both commit or roll back).
+                if outbox is not None:
+                    await outbox.record_in_connection(
+                        conn,
+                        proposal_id=proposal.id,
+                        org_id=org_id,
+                        scope_id=outbox_scope,
+                        expires_at=expires_at,
+                        status_hint=PatchOutboxStatus.generating,
+                        now=created_at,
+                    )
+                return proposal, created
         except IntegrityError as exc:  # composite FK to projects(id, org_id) violated
             raise ProposalConflictError("proposal binding is invalid for this org/project") from exc
-        return _to_proposal(existing), False
 
     async def get(self, org_id: str, proposal_id: str) -> PatchProposal | None:
         async with self._engine.begin() as conn:
@@ -494,8 +763,12 @@ class PostgresPatchProposalStore:
         expected_version: int | None = None,
         updates: Mapping[str, Any] | None = None,
         now: datetime | None = None,
+        outbox: PatchProposalOutbox | None = None,
+        scope_id: str | None = None,
     ) -> PatchProposal:
         clean = _validate_updates(updates)
+        if outbox is not None and not isinstance(outbox, PostgresPatchProposalOutbox):
+            raise PatchValidationError("PostgresPatchProposalStore requires a Postgres outbox")
         moment = now or _now()
         try:
             async with self._engine.begin() as conn:
@@ -556,15 +829,119 @@ class PostgresPatchProposalStore:
                     .mappings()
                     .one()
                 )
+                updated = _to_proposal(row)
+                # Mirror the transition onto the dispatch pointer in the SAME transaction, so the
+                # durable status and its global pointer can never diverge (both commit / roll back).
+                if outbox is not None:
+                    await _apply_outbox_transition(conn, outbox, updated, target, scope_id, moment)
+                return updated
         except IntegrityError as exc:  # branch-collision partial unique index
             raise ProposalConflictError("remote branch already reserved for this project") from exc
-        return _to_proposal(row)
+
+    async def transition_to_approval_pending(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        approvals: ApprovalStore,
+        outbox: PatchProposalOutbox,
+        scope_id: str,
+        draft: ApprovalDraft,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[PatchProposal, str, bool]:
+        if not isinstance(outbox, PostgresPatchProposalOutbox):
+            raise PatchValidationError("PostgresPatchProposalStore requires a Postgres outbox")
+        if not isinstance(approvals, PostgresApprovalStore):
+            raise PatchValidationError(
+                "PostgresPatchProposalStore requires a Postgres approval store"
+            )
+        validate_scope_id(scope_id)
+        moment = now or _now()
+        batch_id = draft.batch_id or proposal_id
+        approval_id = uuid.uuid4().hex
+        async with self._engine.begin() as conn:
+            # 1) Lock the proposal under its org RLS context.
+            await conn.execute(_SET_ORG, {"org": org_id})
+            current = (
+                (
+                    await conn.execute(
+                        text(
+                            f"SELECT {_COLS} FROM patch_proposals "
+                            "WHERE id = :id AND org_id = :org FOR UPDATE"
+                        ),
+                        {"id": proposal_id, "org": org_id},
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if current is None:
+                raise ProposalNotFoundInStore(f"proposal not found: {proposal_id}")
+            proposal = _to_proposal(current)
+            if expected_version is not None and proposal.version != expected_version:
+                raise StaleProposalVersion(
+                    f"stale proposal version {expected_version} (current {proposal.version})"
+                )
+            # 2) create-or-get the durable approval under the scope RLS context (same transaction;
+            #    the org GUC stays set — the two GUCs coexist for their respective tables).
+            await conn.execute(_SET_SCOPE, {"scope": scope_id})
+            resolved_id, created = await insert_pending_or_get_in_transaction(
+                conn,
+                id=approval_id,
+                scope_id=scope_id,
+                run_id=draft.run_id,
+                session_id=draft.session_id,
+                tool=draft.tool,
+                args=draft.args,
+                call_id=draft.call_id,
+                idempotency_key=draft.idempotency_key,
+                reason=draft.reason,
+                expires_at=draft.expires_at,
+                org_id=org_id,
+                actor=draft.actor,
+                action_hash=draft.action_hash,
+                run_attempt=draft.run_attempt,
+                batch_id=batch_id,
+            )
+            # 3) Idempotent fast path: a concurrent caller already advanced the proposal. Reuse the
+            #    same approval and do NOT bump the version or re-delete the (already gone) pointer.
+            if proposal.status == PatchStatus.approval_pending:
+                return proposal, resolved_id, created
+            ensure_transition(proposal.status, PatchStatus.approval_pending)
+            # 4) Advance the proposal (+1 version, bound to the approval) ...
+            row = (
+                (
+                    await conn.execute(
+                        text(
+                            "UPDATE patch_proposals SET status = :status, "
+                            "version = version + 1, approval_id = :aid, updated_at = :now "
+                            f"WHERE id = :id AND org_id = :org RETURNING {_COLS}"
+                        ),
+                        {
+                            "status": PatchStatus.approval_pending.value,
+                            "aid": resolved_id,
+                            "now": moment,
+                            "id": proposal_id,
+                            "org": org_id,
+                        },
+                    )
+                )
+                .mappings()
+                .one()
+            )
+            updated = _to_proposal(row)
+            # 5) ... and delete the dispatch pointer (no background work while awaiting a human).
+            await outbox.delete_in_connection(conn, proposal_id)
+            return updated, resolved_id, created
 
     async def expire_due(self, now: datetime, limit: int) -> list[tuple[str, str]]:
-        """Cross-org scan for proposals past their TTL (maintenance reconciler path).
+        """Cross-org scan for proposals past their TTL (maintenance reconciler path only).
 
-        RLS is disabled for the scan (the maintenance role owns the table); only ``(org_id, id)``
-        pointers are returned so the caller re-enters each org's RLS context to expire them.
+        Maintenance-only: the runtime reconciler discovers work through the global dispatch outbox
+        (:class:`~keel_core.patch.outbox.PatchProposalOutbox`), never this privileged scan. RLS is
+        disabled for the scan (the maintenance role owns the table); only ``(org_id, id)`` pointers
+        are returned so the caller re-enters each org's RLS context to expire them.
         """
         async with self._engine.begin() as conn:
             await conn.execute(text("SET LOCAL row_security = off"))
@@ -583,6 +960,7 @@ class PostgresPatchProposalStore:
 
 
 __all__ = [
+    "ApprovalDraft",
     "InMemoryPatchProposalStore",
     "PatchProposalStore",
     "PostgresPatchProposalStore",

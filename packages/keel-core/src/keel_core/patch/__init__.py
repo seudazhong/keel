@@ -43,12 +43,22 @@ from .models import (
     validate_commit_sha,
     validate_run_branch,
 )
+from .outbox import (
+    InMemoryPatchProposalOutbox,
+    PatchOutboxEntry,
+    PatchOutboxStatus,
+    PatchProposalOutbox,
+    PostgresPatchProposalOutbox,
+)
+from .store import ApprovalDraft
 
 __all__ = [
     "LEGAL_TRANSITIONS",
     "TERMINAL_STATUSES",
+    "ApprovalDraft",
     "ChangeKind",
     "ChangedFile",
+    "InMemoryPatchProposalOutbox",
     "PatchApprovalError",
     "PatchBoundsExceeded",
     "PatchBudget",
@@ -56,8 +66,11 @@ __all__ = [
     "PatchError",
     "PatchLeaseLost",
     "PatchNotFound",
+    "PatchOutboxEntry",
+    "PatchOutboxStatus",
     "PatchPolicyViolation",
     "PatchProposal",
+    "PatchProposalOutbox",
     "PatchProposalRequest",
     "PatchProviderError",
     "PatchProviderUnavailable",
@@ -68,6 +81,7 @@ __all__ = [
     "PatchStatus",
     "PatchValidationError",
     "PatchWritebackError",
+    "PostgresPatchProposalOutbox",
     "ProposalId",
     "ProposedCommit",
     "TestResult",
