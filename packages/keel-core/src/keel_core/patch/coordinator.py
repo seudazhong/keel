@@ -110,7 +110,14 @@ class PatchAuthorizer(Protocol):
     async def authorize_approval(self, org_id: str, actor: str, project_id: str) -> None: ...
 
     async def authorize_writeback(
-        self, org_id: str, actor: str, project_id: str, *, agent_id: str | None, run_id: str
+        self,
+        org_id: str,
+        project_id: str,
+        *,
+        requester_actor: str,
+        approved_by: str,
+        agent_id: str | None,
+        run_id: str,
     ) -> ProjectBinding: ...
 
     async def associate_run(
@@ -433,6 +440,27 @@ class PatchCoordinator:
         """Bind an approval service to the proposal's canonical scope (never a global one)."""
         return PatchApprovalService(self.approval_factory(scope_id))
 
+    async def _require_granted_resolver(self, scope_id: str, proposal: PatchProposal) -> str:
+        """The actor who granted this proposal's still-valid approval, or fail closed.
+
+        Re-reads the durable approval from the proposal's canonical scope and rechecks the full
+        immutable binding via :meth:`PatchApprovalService.resolved_record`: the record must exist,
+        be ``granted`` (not pending/denied/expired), and name its resolver. A missing, tampered,
+        rebound, or non-granted approval fails the writeback closed — no push proceeds on a
+        decision that cannot be re-verified against this exact proposal.
+        """
+        if not proposal.approval_id:
+            raise PatchApprovalError("approved proposal has no bound approval to re-verify")
+        record = await self._approval_service(scope_id).resolved_record(
+            proposal, proposal.approval_id
+        )
+        if record is None or record.status != "granted":
+            raise PatchApprovalError("writeback requires a granted approval bound to this proposal")
+        resolver = record.resolved_by
+        if not resolver:
+            raise PatchApprovalError("granted approval names no resolver to reauthorize")
+        return resolver
+
     def _approval_draft(self, proposal: PatchProposal, *, now: datetime) -> ApprovalDraft:
         """The full immutable approval binding a ``ready -> approval_pending`` transition raises.
 
@@ -613,10 +641,18 @@ class PatchCoordinator:
             pass  # crash-recovery: resume the writeback
         elif proposal.status is not PatchStatus.approved:
             raise PatchStateError("only an approved proposal can be written back")
+        # Re-verify the durable approval at job time, in the proposal's own canonical scope: the
+        # push side effect is gated on a decision that is still ``granted`` AND still bound to this
+        # exact immutable proposal, and the human who granted it must still hold ``write``. The
+        # generation *requester* is re-checked for ``use`` (never ``write``) — authoring a proposal
+        # never confers push rights; only the approver's ``write`` unlocks the remote.
+        scope_id = self._scope_for(org_id, proposal)
+        approved_by = await self._require_granted_resolver(scope_id, proposal)
         binding = await self.authorizer.authorize_writeback(
             org_id,
-            proposal.actor,
             proposal.project_id,
+            requester_actor=proposal.actor,
+            approved_by=approved_by,
             agent_id=proposal.agent_id,
             run_id=proposal.run_id,
         )

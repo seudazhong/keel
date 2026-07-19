@@ -129,16 +129,18 @@ class PatchApprovalService:
     async def get(self, approval_id: str) -> ApprovalRecord | None:
         return await self.approvals.get(approval_id)
 
-    async def resolved_status(
+    async def resolved_record(
         self,
         proposal: PatchProposal,
         approval_id: str,
-    ) -> str | None:
-        """Return a terminal decision only when it is bound to this exact proposal.
+    ) -> ApprovalRecord | None:
+        """Return the terminal approval record bound to this exact proposal, or ``None``.
 
-        This is the recovery path for a crash after the durable approval was resolved but before
-        the proposal state transition committed. Every persisted binding field is rechecked so an
-        unrelated, regenerated, or replayed approval can never advance the proposal.
+        Every persisted binding field is rechecked so an unrelated, regenerated, replayed, or
+        tampered approval is never surfaced — only a terminal decision (``granted``/``denied``/
+        ``expired``) whose full immutable binding matches this proposal. This is the single fenced
+        read behind both the crash-recovery status check and the writeback-time re-verification of
+        *who* granted the approval (its ``resolved_by``).
         """
         record = await self.get(approval_id)
         if record is None:
@@ -158,7 +160,23 @@ class PatchApprovalService:
             or record.batch_id != proposal.id
         ):
             return None
-        return record.status if record.status in {"granted", "denied", "expired"} else None
+        if record.status not in {"granted", "denied", "expired"}:
+            return None
+        return record
+
+    async def resolved_status(
+        self,
+        proposal: PatchProposal,
+        approval_id: str,
+    ) -> str | None:
+        """Return a terminal decision status only when it is bound to this exact proposal.
+
+        A thin status projection of :meth:`resolved_record` — the recovery path for a crash after
+        the durable approval was resolved but before the proposal state transition committed. An
+        unrelated, regenerated, or replayed approval can never advance the proposal.
+        """
+        record = await self.resolved_record(proposal, approval_id)
+        return record.status if record is not None else None
 
 
 __all__ = [

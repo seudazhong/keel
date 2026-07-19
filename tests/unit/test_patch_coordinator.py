@@ -32,6 +32,7 @@ from keel_core.patch.coordinator import (
     ProjectBinding,
 )
 from keel_core.patch.errors import (
+    PatchApprovalError,
     PatchLeaseLost,
     PatchProviderError,
     PatchProviderUnavailable,
@@ -113,6 +114,8 @@ class _FakeAuthorizer:
     def __init__(self, target: WritebackTarget | None) -> None:
         self._target = target
         self.associated: list[str] = []
+        # Records every (requester_actor, approved_by) pair a writeback authorization was asked for.
+        self.writebacks: list[tuple[str, str]] = []
 
     def _binding(self, org_id: str, agent_id: str | None, run_id: str) -> ProjectBinding:
         # Mirror the real authorizer: derive the canonical per-Agent scope so two orgs/Agents get
@@ -133,7 +136,10 @@ class _FakeAuthorizer:
     async def authorize_approval(self, org_id, actor, project_id):  # type: ignore[no-untyped-def]
         return None
 
-    async def authorize_writeback(self, org_id, actor, project_id, *, agent_id, run_id):  # type: ignore[no-untyped-def]
+    async def authorize_writeback(  # type: ignore[no-untyped-def]
+        self, org_id, project_id, *, requester_actor, approved_by, agent_id, run_id
+    ):
+        self.writebacks.append((requester_actor, approved_by))
         return self._binding(org_id, agent_id, run_id)
 
     async def associate_run(self, org_id, actor, project_id, run_id, *, agent_id):  # type: ignore[no-untyped-def]
@@ -355,11 +361,11 @@ def _target() -> WritebackTarget:
     )
 
 
-def _request(idem: str = "k1", *, org: str = "o") -> PatchProposalRequest:
+def _request(idem: str = "k1", *, org: str = "o", actor: str = "u") -> PatchProposalRequest:
     return PatchProposalRequest(
         org_id=org,
         project_id="p",
-        actor="u",
+        actor=actor,
         task="do it",
         base_ref="main",
         model="m",
@@ -838,23 +844,37 @@ async def test_writeback_permanent_error_fails_and_retires_pointer() -> None:
 
 
 class _RoleAuthorizer(_FakeAuthorizer):
-    """Authorizer double that gates approval/writeback on ``write`` (only a listed writer).
+    """Authorizer double that models the real patch capability matrix.
 
-    Models the real capability matrix: read/deny require only ``read`` (any actor); an *approval*
-    and the trusted *writeback* require ``write`` (a writer). Generation is left open here — the
-    test exercises the decision gate, not generation admission."""
+    read/deny require only ``read`` (any actor); a human *approval* requires ``write`` (a listed
+    writer). The trusted *writeback* re-verifies both principals independently: the generation
+    *requester* must still hold ``use`` (modeled by ``users`` — ``None`` means everyone) and the
+    *approver* who granted the decision must still hold ``write`` (a listed writer). The role sets
+    are mutable so a test can revoke a capability between approval and writeback."""
 
-    def __init__(self, target: WritebackTarget | None, *, writers: set[str]) -> None:
+    def __init__(
+        self,
+        target: WritebackTarget | None,
+        *,
+        writers: set[str],
+        users: set[str] | None = None,
+    ) -> None:
         super().__init__(target)
-        self._writers = set(writers)
+        self.writers = set(writers)
+        self.users = set(users) if users is not None else None
 
     async def authorize_approval(self, org_id, actor, project_id):  # type: ignore[no-untyped-def]
-        if actor not in self._writers:
+        if actor not in self.writers:
             raise PermissionDenied("approval requires the 'write' capability")
 
-    async def authorize_writeback(self, org_id, actor, project_id, *, agent_id, run_id):  # type: ignore[no-untyped-def]
-        if actor not in self._writers:
-            raise PermissionDenied("writeback requires the 'write' capability")
+    async def authorize_writeback(  # type: ignore[no-untyped-def]
+        self, org_id, project_id, *, requester_actor, approved_by, agent_id, run_id
+    ):
+        if self.users is not None and requester_actor not in self.users:
+            raise PermissionDenied("writeback requester requires the 'use' capability")
+        if approved_by not in self.writers:
+            raise PermissionDenied("writeback approver requires the 'write' capability")
+        self.writebacks.append((requester_actor, approved_by))
         return self._binding(org_id, agent_id, run_id)
 
 
@@ -966,3 +986,141 @@ async def test_request_rejects_non_canonical_scope() -> None:
         await coord.request_generation(_request())
     assert await coord.store.list_for_project("o", "p") == []
     assert await coord.run_store_factory(_DEFAULT_SCOPE).get("k1") is None
+
+
+# --- P3a-3 (follow-up): writeback re-verifies requester ``use`` + approver ``write`` -------
+
+
+async def _drive_to_approved(
+    coord: PatchCoordinator, req: PatchProposalRequest, *, approver: str
+) -> Any:
+    """Drive a proposal to ``approved`` (generation -> approval_pending -> granted decision)."""
+    handle = await _drive_to_approval(coord, req)
+    decision = await coord.decide(req.org_id, handle.proposal_id, approve=True, actor=approver)
+    assert decision.applied and decision.status is PatchStatus.approved
+    return handle
+
+
+@pytest.mark.asyncio
+async def test_writeback_reauthorizes_use_requester_and_write_approver() -> None:
+    # The writeback gate re-verifies TWO independent principals: the generation *requester* keeps
+    # only ``use`` (a use-only author who can never push directly) and the *approver* who granted
+    # the decision keeps ``write``. A use-only requester + a writer approver is written back, and
+    # the authorizer is asked with exactly (requester=author, approved_by=granter).
+    artifacts = _MemArtifacts()
+    writeback = _FakeWriteback()
+    authz = _RoleAuthorizer(_target(), writers={"boss"}, users={"author", "boss"})
+    coord = _coordinator(artifacts, writeback, _target(), authorizer=authz)
+
+    handle = await _drive_to_approved(coord, _request(actor="author"), approver="boss")
+    final = await coord.execute_writeback("o", handle.proposal_id, worker_id="w1")
+
+    assert final.status is PatchStatus.draft_pr_created and writeback.calls == 1
+    assert authz.writebacks == [("author", "boss")]
+
+
+@pytest.mark.asyncio
+async def test_writeback_fails_when_requester_use_revoked() -> None:
+    # A requester whose ``use`` is revoked after approval fails the writeback closed — even though a
+    # valid writer approved it. The proposal is untouched (still ``approved``) and never pushes.
+    artifacts = _MemArtifacts()
+    writeback = _FakeWriteback()
+    authz = _RoleAuthorizer(_target(), writers={"boss"}, users={"author", "boss"})
+    coord = _coordinator(artifacts, writeback, _target(), authorizer=authz)
+
+    handle = await _drive_to_approved(coord, _request(actor="author"), approver="boss")
+    authz.users.discard("author")  # requester loses ``use`` between approval and writeback
+
+    with pytest.raises(PermissionDenied):
+        await coord.execute_writeback("o", handle.proposal_id, worker_id="w1")
+    assert writeback.calls == 0
+    proposal = await coord.store.get("o", handle.proposal_id)
+    assert proposal is not None and proposal.status is PatchStatus.approved
+
+
+@pytest.mark.asyncio
+async def test_writeback_fails_when_approver_write_revoked() -> None:
+    # The approver who granted the decision losing ``write`` after approval fails the writeback
+    # closed — a revoked approver cannot retroactively authorize a push.
+    artifacts = _MemArtifacts()
+    writeback = _FakeWriteback()
+    authz = _RoleAuthorizer(_target(), writers={"boss"}, users={"author", "boss"})
+    coord = _coordinator(artifacts, writeback, _target(), authorizer=authz)
+
+    handle = await _drive_to_approved(coord, _request(actor="author"), approver="boss")
+    authz.writers.discard("boss")  # approver loses ``write`` between approval and writeback
+
+    with pytest.raises(PermissionDenied):
+        await coord.execute_writeback("o", handle.proposal_id, worker_id="w1")
+    assert writeback.calls == 0
+    proposal = await coord.store.get("o", handle.proposal_id)
+    assert proposal is not None and proposal.status is PatchStatus.approved
+
+
+@pytest.mark.asyncio
+async def test_writeback_fails_on_missing_approval_record() -> None:
+    # The durable approval is re-read at job time: if the granted record is gone (erased/purged),
+    # the writeback fails closed with a PatchApprovalError and never authorizes or pushes.
+    artifacts = _MemArtifacts()
+    writeback = _FakeWriteback()
+    factory = _ScopeSpyFactory()
+    authz = _RoleAuthorizer(_target(), writers={"boss"}, users={"author", "boss"})
+    coord = _coordinator(
+        artifacts, writeback, _target(), authorizer=authz, approval_factory=factory
+    )
+
+    handle = await _drive_to_approved(coord, _request(actor="author"), approver="boss")
+    proposal = await coord.store.get("o", handle.proposal_id)
+    assert proposal is not None and proposal.approval_id
+    del factory.shared._rows[proposal.approval_id]  # the granted approval disappears
+
+    with pytest.raises(PatchApprovalError):
+        await coord.execute_writeback("o", handle.proposal_id, worker_id="w1")
+    assert writeback.calls == 0
+    assert authz.writebacks == []  # authorization was never reached
+
+
+@pytest.mark.asyncio
+async def test_writeback_fails_on_tampered_approval_binding() -> None:
+    # A durable approval whose immutable binding no longer matches the proposal (e.g. a rebound
+    # action_hash) is rejected by the fenced re-read: the writeback fails closed, no push.
+    artifacts = _MemArtifacts()
+    writeback = _FakeWriteback()
+    factory = _ScopeSpyFactory()
+    authz = _RoleAuthorizer(_target(), writers={"boss"}, users={"author", "boss"})
+    coord = _coordinator(
+        artifacts, writeback, _target(), authorizer=authz, approval_factory=factory
+    )
+
+    handle = await _drive_to_approved(coord, _request(actor="author"), approver="boss")
+    proposal = await coord.store.get("o", handle.proposal_id)
+    assert proposal is not None and proposal.approval_id
+    factory.shared._rows[proposal.approval_id].action_hash = "tampered"  # binding no longer matches
+
+    with pytest.raises(PatchApprovalError):
+        await coord.execute_writeback("o", handle.proposal_id, worker_id="w1")
+    assert writeback.calls == 0
+    assert authz.writebacks == []
+
+
+@pytest.mark.asyncio
+async def test_writeback_fails_when_approval_not_granted() -> None:
+    # Defense in depth: an ``approved`` proposal whose durable approval record is not ``granted``
+    # (e.g. tampered to ``denied``) fails the writeback closed rather than pushing on a non-grant.
+    artifacts = _MemArtifacts()
+    writeback = _FakeWriteback()
+    factory = _ScopeSpyFactory()
+    authz = _RoleAuthorizer(_target(), writers={"boss"}, users={"author", "boss"})
+    coord = _coordinator(
+        artifacts, writeback, _target(), authorizer=authz, approval_factory=factory
+    )
+
+    handle = await _drive_to_approved(coord, _request(actor="author"), approver="boss")
+    proposal = await coord.store.get("o", handle.proposal_id)
+    assert proposal is not None and proposal.approval_id
+    factory.shared._rows[proposal.approval_id].status = "denied"  # not a grant
+
+    with pytest.raises(PatchApprovalError):
+        await coord.execute_writeback("o", handle.proposal_id, worker_id="w1")
+    assert writeback.calls == 0
+    assert authz.writebacks == []

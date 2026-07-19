@@ -2,7 +2,8 @@
 
 Exercises the authorizer purely over public :class:`ProjectService` seams with in-memory stores:
 
-* the capability matrix (generation/read == ``use``; approval/writeback == ``write``);
+* the capability matrix (generation/read == ``use``; approval == ``write``; writeback re-verifies
+  the requester's ``use`` and the approver's ``write`` independently);
 * the canonical per-Agent scope, and the reserved default-Agent label resolving to the actor acting
   *directly* (so re-authorization never spuriously requires an Agent named ``patch``);
 * the GitHub target — the exact installation bound to ``project.github_repository_id``, re-verified
@@ -167,7 +168,9 @@ async def test_exact_installation_among_multiple_active() -> None:
     )
     project = await _bind_github_project(env, org)  # repo 424242 -> installation 777
 
-    binding = await env.authz.authorize_writeback(org, admin, project.id, agent_id=None, run_id="r")
+    binding = await env.authz.authorize_writeback(
+        org, project.id, requester_actor=admin, approved_by=admin, agent_id=None, run_id="r"
+    )
     assert binding.target is not None
     assert binding.target.installation_id == 777  # exactly this project's repo's installation
 
@@ -176,7 +179,9 @@ async def test_inactive_installation_fails_closed() -> None:
     env, org, admin, _member, _viewer = await _bootstrap()
     project = await _bind_github_project(env, org, installation_status=InstallationStatus.suspended)
     with pytest.raises(PatchValidationError):
-        await env.authz.authorize_writeback(org, admin, project.id, agent_id=None, run_id="r")
+        await env.authz.authorize_writeback(
+            org, project.id, requester_actor=admin, approved_by=admin, agent_id=None, run_id="r"
+        )
 
 
 async def test_mismatched_repo_binding_fails_closed() -> None:
@@ -198,7 +203,9 @@ async def test_mismatched_repo_binding_fails_closed() -> None:
         org, project_b.id, handle=project_b.id, backend=StorageBackend.local
     )
     with pytest.raises(PatchValidationError):
-        await env.authz.authorize_writeback(org, admin, project_b.id, agent_id=None, run_id="r")
+        await env.authz.authorize_writeback(
+            org, project_b.id, requester_actor=admin, approved_by=admin, agent_id=None, run_id="r"
+        )
 
 
 async def test_unregistered_repo_fails_closed() -> None:
@@ -218,7 +225,9 @@ async def test_unregistered_repo_fails_closed() -> None:
         org, project.id, handle=project.id, backend=StorageBackend.local
     )
     with pytest.raises(PatchValidationError):
-        await env.authz.authorize_writeback(org, admin, project.id, agent_id=None, run_id="r")
+        await env.authz.authorize_writeback(
+            org, project.id, requester_actor=admin, approved_by=admin, agent_id=None, run_id="r"
+        )
 
 
 async def test_safe_clone_url_revalidation_rejects_hostile_stored_url() -> None:
@@ -228,7 +237,9 @@ async def test_safe_clone_url_revalidation_rejects_hostile_stored_url() -> None:
         env, org, repo_id=333, clone_url="https://evil.example/acme/repo.git"
     )
     with pytest.raises(UntrustedUrlError):
-        await env.authz.authorize_writeback(org, admin, project.id, agent_id=None, run_id="r")
+        await env.authz.authorize_writeback(
+            org, project.id, requester_actor=admin, approved_by=admin, agent_id=None, run_id="r"
+        )
 
 
 async def test_not_found_vs_unauthorized_are_distinct() -> None:
@@ -256,6 +267,40 @@ async def test_capability_matrix_read_deny_vs_write_approve() -> None:
         await env.authz.authorize_approval(org, viewer, project.id)
     # a writer (admin) can approve.
     await env.authz.authorize_approval(org, admin, project.id)
+
+
+async def test_writeback_authorizes_use_requester_and_write_approver() -> None:
+    env, org, admin, member, _viewer = await _bootstrap()
+    project = await _bind_github_project(env, org)
+    # The writeback re-verifies two independent principals: a use-only requester (member) plus a
+    # writer approver (admin) resolves the exact target — the requester never needs 'write'.
+    binding = await env.authz.authorize_writeback(
+        org, project.id, requester_actor=member, approved_by=admin, agent_id=None, run_id="r"
+    )
+    assert binding.target is not None
+    assert binding.target.installation_id == 777
+
+
+async def test_writeback_fails_when_requester_use_revoked() -> None:
+    env, org, admin, _member, viewer = await _bootstrap()
+    project = await _bind_github_project(env, org)
+    # The generation requester must still hold 'use'; a read-only requester fails closed even with a
+    # valid writer approver — authoring never confers push rights.
+    with pytest.raises(PermissionDenied):
+        await env.authz.authorize_writeback(
+            org, project.id, requester_actor=viewer, approved_by=admin, agent_id=None, run_id="r"
+        )
+
+
+async def test_writeback_fails_when_approver_write_revoked() -> None:
+    env, org, _admin, member, _viewer = await _bootstrap()
+    project = await _bind_github_project(env, org)
+    # The approver must still hold 'write'; a use-only approver (member) fails closed even when the
+    # requester has 'use' — only 'write' unlocks the remote push.
+    with pytest.raises(PermissionDenied):
+        await env.authz.authorize_writeback(
+            org, project.id, requester_actor=member, approved_by=member, agent_id=None, run_id="r"
+        )
 
 
 async def test_default_agent_label_authorizes_actor_directly() -> None:

@@ -16,7 +16,9 @@ git/provider/network, proving the pointer lifecycle end-to-end on a live databas
 
 from __future__ import annotations
 
+import hashlib
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -25,6 +27,8 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.approvals import PostgresApprovalStore
+from keel_core.coding.models import ArtifactRecord, ArtifactRetention, CodingRunId, ProjectId
+from keel_core.patch.bundle import PatchBundleWriter
 from keel_core.patch.coordinator import DEFAULT_PATCH_AGENT_ID, PatchCoordinator, ProjectBinding
 from keel_core.patch.generation import GenerationOutcome
 from keel_core.patch.models import (
@@ -49,8 +53,12 @@ pytestmark = pytest.mark.integration
 _SCOPE = "agent:org-a/patch"
 _BASE_SHA = "b" * 40
 _HEAD_SHA = "c" * 40
-_BUNDLE_SHA = "e" * 64
-_DIFF_SHA = "f" * 64
+# A constant diff whose content hash is the bundle's ``diff_sha256``; the manifest uses a fixed
+# ``created_at`` so a provider-unavailable retry reproduces byte-identical bundle bytes (a stable
+# ``bundle_sha256``), keeping the human approval binding stable across attempts.
+_DIFF = b"--- a/app.py\n+++ b/app.py\n@@ -1 +1,2 @@\n def add(a,b):\n+    pass\n"
+_DIFF_SHA = hashlib.sha256(_DIFF).hexdigest()
+_CREATED_AT = datetime(2024, 1, 1, tzinfo=UTC)
 _CHANGED_DIGEST = changed_path_digest(
     (ChangedFile(path="app.py", change_kind=ChangeKind.modified, blob_sha="a" * 40, size_bytes=20),)
 )
@@ -76,7 +84,13 @@ async def _seed_org_project(engine: AsyncEngine, org: str, project: str) -> None
 
 
 def _outcome(
-    proposal_id: str, run_id: str, request: PatchProposalRequest, usage: Usage
+    artifacts: _MemArtifacts,
+    proposal_id: str,
+    run_id: str,
+    coding_run_id: str,
+    project_handle: str,
+    request: PatchProposalRequest,
+    usage: Usage,
 ) -> GenerationOutcome:
     files = (
         ChangedFile(
@@ -92,19 +106,28 @@ def _outcome(
         base_sha=_BASE_SHA,
         head_sha=_HEAD_SHA,
         diff_sha256=_DIFF_SHA,
-        diff_bytes=64,
+        diff_bytes=len(_DIFF),
         files=files,
         commits=(ProposedCommit(sha=_HEAD_SHA, message="m", tree_sha="d" * 40),),
         tests=(),
         test_status=TestStatus.skipped,
-        created_at=datetime.now(UTC),
+        created_at=_CREATED_AT,
+    )
+    # Persist the real content-addressed bundle so writeback's ``PatchBundleReader`` can re-read and
+    # hash-verify the manifest; re-storing identical bytes on a retry is idempotent (same hash).
+    stored = PatchBundleWriter(artifacts).store(  # type: ignore[arg-type]
+        manifest,
+        diff=_DIFF,
+        project_handle=project_handle,
+        coding_run_id=coding_run_id,
+        now=_CREATED_AT,
     )
     return GenerationOutcome(
         proposal_id=proposal_id,
         base_sha=_BASE_SHA,
         head_sha=_HEAD_SHA,
-        bundle_sha256=_BUNDLE_SHA,
-        diff_sha256=_DIFF_SHA,
+        bundle_sha256=stored.bundle_sha256,
+        diff_sha256=stored.diff_sha256,
         changed_path_digest=_CHANGED_DIGEST,
         changed_files=1,
         test_status=TestStatus.skipped,
@@ -118,11 +141,14 @@ class _Generation:
     """Deterministic generation double: no git/provider, driven by a scripted list of behaviors.
 
     Each entry is either a ``BaseException`` to raise (a transient/permanent patch error) or a
-    :class:`Usage` describing a successful attempt's cost. The emitted bundle hashes are constant so
-    the approval binding is stable across a provider-unavailable retry."""
+    :class:`Usage` describing a successful attempt's cost. A successful attempt persists a real,
+    content-addressed bundle into the shared artifact store; the emitted bundle hashes are constant
+    (fixed manifest ``created_at``) so the approval binding is stable across a provider-unavailable
+    retry."""
 
-    def __init__(self, script: list[Any]) -> None:
+    def __init__(self, script: list[Any], artifacts: _MemArtifacts) -> None:
         self._script = list(script)
+        self._artifacts = artifacts
         self.calls = 0
 
     async def generate(
@@ -132,12 +158,21 @@ class _Generation:
         behavior = self._script.pop(0)
         if isinstance(behavior, BaseException):
             raise behavior
-        return _outcome(proposal_id, run_id, request, behavior)
+        return _outcome(
+            self._artifacts,
+            proposal_id,
+            run_id,
+            coding_run_id,
+            project_handle,
+            request,
+            behavior,
+        )
 
 
 class _Authorizer:
     def __init__(self) -> None:
         self.scopes: list[str] = []
+        self.writebacks: list[tuple[str, str]] = []
 
     def _binding(self, org_id: str, agent_id: str | None, run_id: str) -> ProjectBinding:
         return ProjectBinding(
@@ -161,7 +196,10 @@ class _Authorizer:
     async def authorize_approval(self, org_id, actor, project_id):  # type: ignore[no-untyped-def]
         return None
 
-    async def authorize_writeback(self, org_id, actor, project_id, *, agent_id, run_id):  # type: ignore[no-untyped-def]
+    async def authorize_writeback(  # type: ignore[no-untyped-def]
+        self, org_id, project_id, *, requester_actor, approved_by, agent_id, run_id
+    ):
+        self.writebacks.append((requester_actor, approved_by))
         return self._binding(org_id, agent_id, run_id)
 
     async def associate_run(self, org_id, actor, project_id, run_id, *, agent_id):  # type: ignore[no-untyped-def]
@@ -181,14 +219,47 @@ class _Writeback:
         )
 
 
-class _Artifacts:
-    """Unused stub — the coordinator only touches the artifact store during writeback."""
+class _MemArtifacts:
+    """A tiny in-memory ArtifactStore keyed by content hash (enough for the bundle round-trip)."""
 
-    def put(self, *a: Any, **k: Any) -> Any: ...  # pragma: no cover - never called
-    def read(self, *a: Any, **k: Any) -> Any: ...  # pragma: no cover - never called
-    def retain(self, *a: Any, **k: Any) -> Any: ...  # pragma: no cover - never called
-    def delete(self, *a: Any, **k: Any) -> Any: ...  # pragma: no cover - never called
-    def reap(self, *a: Any, **k: Any) -> Any: ...  # pragma: no cover - never called
+    def __init__(self) -> None:
+        self._blobs: dict[str, bytes] = {}
+
+    def put(
+        self,
+        project_id: ProjectId,
+        run_id: CodingRunId,
+        data: bytes,
+        *,
+        name: str,
+        media_type: str = "application/octet-stream",
+        retention: ArtifactRetention = ArtifactRetention.ephemeral,
+        retained_until: Any = None,
+        metadata: Mapping[str, str] | None = None,
+    ) -> ArtifactRecord:
+        digest = hashlib.sha256(data).hexdigest()
+        self._blobs[digest] = data
+        return ArtifactRecord(
+            project_id=project_id,
+            run_id=run_id,
+            content_hash=digest,
+            size_bytes=len(data),
+            name=name,
+            media_type=media_type,
+            created_at=datetime.now(UTC),
+            retention=retention,
+            retained_until=retained_until,
+            metadata=dict(metadata or {}),
+        )
+
+    def read(self, project_id: ProjectId, run_id: CodingRunId, content_hash: str) -> bytes:
+        return self._blobs[content_hash]
+
+    def retain(self, *a: Any, **k: Any) -> Any: ...
+    def delete(self, *a: Any, **k: Any) -> bool:
+        return False
+
+    def reap(self, *a: Any, **k: Any) -> Any: ...
 
 
 class _ScopeSpyFactory:
@@ -222,15 +293,16 @@ def _coordinator(
     run_store_factory: Any | None = None,
 ) -> tuple[PatchCoordinator, _ScopeSpyFactory]:
     factory = _ScopeSpyFactory(engine)
+    artifacts = _MemArtifacts()
     coord = PatchCoordinator(
         store=PostgresPatchProposalStore(engine),
         outbox=PostgresPatchProposalOutbox(engine),
         run_store_factory=run_store_factory or _RunFactory(),
         authorizer=_Authorizer(),
-        generation=_Generation(script),  # type: ignore[arg-type]
+        generation=_Generation(script, artifacts),  # type: ignore[arg-type]
         approval_factory=factory,
         writeback=_Writeback(),  # type: ignore[arg-type]
-        artifacts=_Artifacts(),  # type: ignore[arg-type]
+        artifacts=artifacts,  # type: ignore[arg-type]
     )
     return coord, factory
 
@@ -297,6 +369,31 @@ async def test_coordinator_decide_approve_recreates_approved_pointer(
     assert entry.status_hint is PatchOutboxStatus.approved
     assert entry.scope_id == _SCOPE
     assert set(factory.scopes) == {_SCOPE}
+
+
+async def test_coordinator_writeback_reverifies_postgres_approval_resolver(
+    migrated_db: AsyncEngine,
+) -> None:
+    # End-to-end over live Postgres: writeback re-reads the durable *granted* approval from the
+    # proposal's canonical scope, extracts its resolver, and reauthorizes (the requester keeps
+    # ``use``, the approver keeps ``write``) before pushing — proving the fenced re-read works
+    # against a real PostgresApprovalStore, with requester != approver.
+    await _seed_org_project(migrated_db, "org-a", "proj-a")
+    coord, _ = _coordinator(migrated_db, [Usage(cost_usd=0.01)])
+    req = _request()  # requester (proposal actor) is "alice"
+    handle = await coord.request_generation(req)
+    await coord.execute_generation("org-a", handle.run_id, req, worker_id="w1")
+    decision = await coord.decide("org-a", handle.proposal_id, approve=True, actor="carol")
+    assert decision.applied and decision.status is PatchStatus.approved
+
+    final = await coord.execute_writeback("org-a", handle.proposal_id, worker_id="w1")
+    assert final.status is PatchStatus.draft_pr_created
+    # The requester (proposal actor) and the approver (durable approval resolver) are reauthorized
+    # exactly — the resolver came from the Postgres approval row, not the caller.
+    authorizer = coord.authorizer
+    assert isinstance(authorizer, _Authorizer)
+    assert authorizer.writebacks == [("alice", "carol")]
+    assert await coord.outbox.get(handle.proposal_id) is None  # pointer retired at draft_pr_created
 
 
 async def test_coordinator_deny_and_cancel_retire_pointer(migrated_db: AsyncEngine) -> None:

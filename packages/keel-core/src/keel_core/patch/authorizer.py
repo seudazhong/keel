@@ -5,10 +5,12 @@ for every patch operation, the authorized project↔storage↔remote binding a p
 *only* through the public :class:`ProjectService` seams (never a private membership/grant/GitHub
 helper), so authorization can never drift from the rest of the platform:
 
-* **capability** — generation/read run == the ``use`` capability; human approval and the trusted
-  GitHub writeback (a remote branch + Draft PR side effect) require ``write``. Every seam is
-  re-invocable at worker/decision time so access revoked between request and execution fails
-  closed.
+* **capability** — generation/read run == the ``use`` capability; human approval requires
+  ``write``. The trusted GitHub writeback (a remote branch + Draft PR side effect) re-verifies
+  *both* at job time: the generation **requester** must still hold ``use`` (authoring never
+  confers push rights) and the **approver** who granted the decision must still hold ``write``.
+  Every seam is re-invocable at worker/decision time so access revoked between request and
+  execution fails closed.
 * **scope** — the canonical per-Agent scope is derived from the immutable ``org_id`` + selected
   Agent via :func:`keel_core.scoping.derive_agent_scope`; there is no org-first / default
   installation guessing. A request with no explicit Agent is the *actor acting directly* (the
@@ -59,19 +61,37 @@ class ProjectServicePatchAuthorizer(PatchAuthorizer):
         return await self._binding_for(org_id, project, agent_id=agent_id, run_id=run_id)
 
     async def authorize_writeback(
-        self, org_id: str, actor: str, project_id: str, *, agent_id: str | None, run_id: str
+        self,
+        org_id: str,
+        project_id: str,
+        *,
+        requester_actor: str,
+        approved_by: str,
+        agent_id: str | None,
+        run_id: str,
     ) -> ProjectBinding:
-        """Authorize the trusted GitHub writeback (``write``) and resolve the remote binding.
+        """Authorize the trusted GitHub writeback and resolve the remote binding.
 
-        Re-invoked at job time so an actor/Agent whose ``write`` capability was revoked after
-        approval fails closed before any push/Draft-PR side effect.
+        Two independent capabilities are re-verified at job time so access revoked between approval
+        and execution fails closed before any push/Draft-PR side effect:
+
+        * the generation **requester** (the proposal's actor/Agent) must still hold ``use`` —
+          authoring a proposal never confers push rights, so this is deliberately *not* ``write``;
+        * the human **approver** who granted the decision must still hold ``write`` — only an
+          approval unlocks the remote branch + Draft PR side effect, and the approver authorizes
+          *directly* (a person approves, never an Agent principal).
+
+        The exact GitHub target is resolved only after both checks pass.
         """
         project = await self._service.authorize_project(
             org_id,
-            actor,
+            requester_actor,
             project_id,
-            capability=Capability.write,
+            capability=Capability.use,
             agent_id=self._auth_agent(agent_id),
+        )
+        await self._service.authorize_project(
+            org_id, approved_by, project_id, capability=Capability.write
         )
         return await self._binding_for(org_id, project, agent_id=agent_id, run_id=run_id)
 
