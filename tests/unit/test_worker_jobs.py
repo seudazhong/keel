@@ -25,6 +25,7 @@ from keel_core.jobs import (
     PermanentJobError,
     RetryableJobError,
 )
+from keel_core.patch.jobs import PATCH_GENERATE_KIND, PATCH_WRITEBACK_KIND
 from keel_core.review.jobs import REVIEW_RUN_KIND
 from keel_worker.jobs import JobContext, JobDefinition, JobRegistry, dispatch_jobs, run_job
 
@@ -1870,6 +1871,36 @@ async def test_run_job_claims_and_runs_known_kind_when_capability_enabled() -> N
     assert result == JobStatus.succeeded.value
     row = await store.get(job_id)
     assert row is not None and row.attempt == 1
+
+
+def _patch_generate_only_registry() -> JobRegistry:
+    # A GitHub-unconfigured patch worker registers only ``patch.generate`` (``register_patch_jobs``
+    # omits ``patch.writeback`` when ``coordinator.writeback is None``). This mirrors that registry.
+    registry = JobRegistry()
+    registry.register(JobDefinition(kind=PATCH_GENERATE_KIND, handler=_handler))
+    return registry
+
+
+async def test_run_job_skips_capability_disabled_patch_writeback_without_claiming() -> None:
+    # Heterogeneous fleet: a GitHub-unconfigured worker never has ``patch.writeback`` registered.
+    # It must SKIP the job (leaving it queued for a GitHub-capable peer) rather than claim it and
+    # permanently fail it merely because THIS worker cannot push a remote branch/PR.
+    store = InMemoryJobStore("web:local")
+    job_id = await _enqueued_job(store, key="patch-wb-gap", kind=PATCH_WRITEBACK_KIND)
+
+    result = await run_job(
+        _ctx(store, _patch_generate_only_registry(), _Clock(_NOW), []),
+        "web:local",
+        job_id,
+    )
+
+    assert result == "capability_unavailable"
+    row = await store.get(job_id)
+    # Never claimed: still queued, attempt never incremented, no terminal failure recorded.
+    assert row is not None
+    assert row.status is JobStatus.queued
+    assert row.attempt == 0
+    assert row.error_kind is None
 
 
 async def test_dispatch_jobs_excludes_capability_disabled_kind_leaving_it_queued() -> None:

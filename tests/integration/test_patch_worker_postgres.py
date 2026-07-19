@@ -12,7 +12,8 @@ job-dispatch outbox — proving the *worker* half of the controlled-patch lifecy
 * a TTL-lapsed proposal is expired with the pointer deleted in a single atomic transition;
 * a ``ready`` proposal auto-heals to ``approval_pending`` through the real coordinator (durable
   approval create-or-get) and the pointer is retired; and
-* a pointer whose scope disagrees with the proposal's canonical scope is deferred, never adopted.
+* a pointer whose scope disagrees with the proposal's canonical scope is failed closed under the
+  proposal's OWN canonical scope (immutable corruption), never adopted.
 """
 
 from __future__ import annotations
@@ -313,7 +314,9 @@ async def test_reconcile_ready_heals_to_approval_pending(migrated_db: AsyncEngin
     assert await approvals.get(proposal.approval_id) is not None
 
 
-async def test_reconcile_scope_mismatch_is_never_adopted(migrated_db: AsyncEngine) -> None:
+async def test_reconcile_scope_mismatch_fails_proposal_closed_never_adopted(
+    migrated_db: AsyncEngine,
+) -> None:
     await _seed_org_project(migrated_db)
     store = PostgresPatchProposalStore(migrated_db)
     outbox = PostgresPatchProposalOutbox(migrated_db)
@@ -321,11 +324,13 @@ async def test_reconcile_scope_mismatch_is_never_adopted(migrated_db: AsyncEngin
     # Proposal canonical scope == _SCOPE, but the pointer is recorded under a foreign scope.
     await _create_generating(store, outbox, pid=pid, scope=_SCOPE_B)
 
-    assert await _reconciler(migrated_db).run() == 0  # deferred, not handled
-    entry = await outbox.get(pid)
-    # The foreign scope is never rewritten to the proposal's canonical scope.
-    assert entry is not None and entry.scope_id == _SCOPE_B
-    assert (await store.get(_ORG, pid)).status is PatchStatus.generating
-    # No job was enqueued in either the foreign or the canonical scope.
+    # Immutable corruption (canonical scope is a pure function of org+agent): fail CLOSED under the
+    # proposal's OWN canonical scope with an atomic pointer delete — never an infinite reschedule.
+    assert await _reconciler(migrated_db).run() == 1
+    assert await outbox.get(pid) is None
+    proposal = await store.get(_ORG, pid)
+    assert proposal.status is PatchStatus.failed
+    assert proposal.error_kind == "PatchScopeMismatch"
+    # The foreign scope is never adopted: no job enqueued in EITHER the foreign or canonical scope.
     assert await _jobs_for(migrated_db, scope=_SCOPE, kind=PATCH_GENERATE_KIND) == []
     assert await _jobs_for(migrated_db, scope=_SCOPE_B, kind=PATCH_GENERATE_KIND) == []

@@ -100,6 +100,21 @@ def patch_writeback_idempotency_key(proposal_id: str) -> str:
 # append-only event log (mirroring ``ReviewCoordinator._persist_request_metadata``); the fenced
 # patch reconciler reconstructs it to (re-)create a stranded generation job after a lost enqueue,
 # and fails closed (never fabricates a payload) when it is absent/legacy/tampered.
+#
+# P4 SERVER ORDERING BLOCKER (do not widen this seam here): P3b-1 provides only the persist/load
+# primitives. The P4 request path MUST guarantee that a committed ``generating`` proposal ALWAYS
+# has reconstructable metadata, so the reconciler can resume a lost dispatch. Two acceptable
+# designs — a two-phase ``create`` then ``persist`` is FORBIDDEN because a crash between the two
+# strands a ``generating`` proposal whose request can never be rebuilt (the reconciler then defers
+# within TTL and force-fails it at TTL — an availability regression, not a safety one, but still a
+# blocker):
+#   (a) metadata-BEFORE-create: append the metadata event (keyed by the pre-generated
+#       ``run_id``/``proposal_id``) BEFORE inserting the proposal + outbox pointer, so a committed
+#       proposal implies committed metadata; or
+#   (b) a dedicated scoped payload table added in a NEW migration (0022), written in the SAME
+#       transaction as the proposal ``create`` so both commit atomically.
+# Neither expands any user-facing API; do not add a request-approval endpoint (the reconciler
+# auto-heals ``ready`` -> ``approval_pending``).
 PATCH_GENERATE_REQUEST_MARKER = "patch_generate_request"
 PATCH_GENERATE_METADATA_VERSION = 1
 
@@ -118,6 +133,10 @@ async def persist_generate_metadata(
     per-scope :class:`~keel_core.protocols.EventStore` bound to the proposal's canonical
     ``scope_id`` (passed explicitly — the Protocol exposes no scope accessor) and the metadata is
     written only on the winning admission so a replayed request never rewrites it.
+
+    See the module comment's *P4 SERVER ORDERING BLOCKER*: the P4 caller must persist this BEFORE
+    creating the proposal (or via a 0022 scoped payload table committed in the create transaction),
+    never create-then-persist.
     """
     moment = now or datetime.now(UTC)
     event = Event(

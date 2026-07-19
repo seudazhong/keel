@@ -64,7 +64,12 @@ from keel_core.patch.jobs import (
     patch_writeback_idempotency_key,
 )
 from keel_core.patch.ledger import PostgresPatchWritebackLedger
-from keel_core.patch.models import TERMINAL_STATUSES, PatchProposal, PatchStatus
+from keel_core.patch.models import (
+    TERMINAL_STATUSES,
+    PatchProposal,
+    PatchStatus,
+    can_transition,
+)
 from keel_core.patch.outbox import (
     PatchOutboxEntry,
     PatchProposalOutbox,
@@ -313,9 +318,20 @@ def patch_writeback_job_definition(
 def register_patch_jobs(
     registry: JobRegistry, coordinator: PatchCoordinator, settings: Settings
 ) -> None:
-    """Register both patch handlers on a per-scope registry (built for the claimed scope)."""
+    """Register the per-scope patch handlers for the claimed scope.
+
+    ``patch.generate`` is always registered. ``patch.writeback`` is registered ONLY when this worker
+    has a wired writeback service (``coordinator.writeback is not None`` — i.e. the GitHub App is
+    configured). A worker WITHOUT GitHub deliberately leaves ``patch.writeback`` unregistered so it
+    stays *capability-unavailable* here: ``run_job`` skips a known-but-unregistered product kind
+    (it is in ``_ALL_JOB_KINDS``) instead of claiming + terminally failing it, so the writeback job
+    remains queued for a GitHub-capable peer in the fleet rather than being permanently failed on a
+    worker that could never push a remote branch/PR. The reconciler still enqueues the writeback job
+    + its cross-scope dispatch intent regardless of THIS worker's GitHub capability.
+    """
     registry.register(patch_generate_job_definition(coordinator, settings))
-    registry.register(patch_writeback_job_definition(coordinator, settings))
+    if coordinator.writeback is not None:
+        registry.register(patch_writeback_job_definition(coordinator, settings))
 
 
 # --- fenced patch reconciler ---------------------------------------------------------------------
@@ -408,20 +424,38 @@ class PatchOutboxReconciler:
             return await self.outbox.remove(entry.proposal_id, lease_token=token, now=now)
         canonical = derive_agent_scope(entry.org_id, proposal.agent_id)
         if canonical != scope_id:
-            # The global pointer's scope disagrees with the proposal's canonical per-Agent scope.
-            # NEVER adopt a foreign/corrupted scope (it would drive RLS/job dispatch into the wrong
-            # tenant). Defer under fence + emit a terminal diagnostic; the TTL backstop retires it.
+            # The global pointer's scope disagrees with the proposal's canonical per-Agent scope. A
+            # canonical scope is a pure function of the immutable (org_id, agent_id), so a pointer
+            # written by any legitimate path can NEVER disagree — this is immutable pointer
+            # corruption that can never self-heal. NEVER adopt the foreign scope (it would drive
+            # RLS/job dispatch into the wrong tenant) and NEVER touch a foreign job/run. Fail the
+            # proposal CLOSED under ITS OWN canonical scope with an atomic pointer delete, rather
+            # than rescheduling forever behind a TTL backstop this early branch never reaches.
             logger.error(
-                "patch pointer scope mismatch proposal=%s (deferred, never adopted)",
+                "patch pointer scope mismatch proposal=%s (failing closed, never adopted)",
                 entry.proposal_id,
             )
-            await self.outbox.reschedule(
-                entry.proposal_id,
-                lease_token=token,
-                delay_seconds=self.reschedule_delay_seconds,
+            if not can_transition(proposal.status, PatchStatus.failed):
+                # Already terminal (pointer stale), or a state with no legal ``failed`` edge
+                # (``approval_pending`` awaiting a human under its real scope): retire the corrupt
+                # pointer under our fence without forcing an illegal edge or disturbing it.
+                return await self.outbox.remove(entry.proposal_id, lease_token=token, now=now)
+            # A concurrent advance that changed the version raises StaleProposalVersion (a tolerated
+            # PatchError) → this tick stops and a later tick re-evaluates the (fresh) proposal.
+            await self.store.transition(
+                entry.org_id,
+                proposal.id,
+                PatchStatus.failed,
+                expected_version=proposal.version,
+                updates={
+                    "error_kind": "PatchScopeMismatch",
+                    "error_message": "pointer scope did not match the proposal canonical scope",
+                },
+                outbox=self.outbox,
+                scope_id=canonical,
                 now=now,
             )
-            return False
+            return True
         if proposal.status in TERMINAL_STATUSES:
             # Terminal proposal (already done/expired): the pointer is stale — retire it.
             return await self.outbox.remove(entry.proposal_id, lease_token=token, now=now)

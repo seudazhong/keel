@@ -111,8 +111,9 @@ def _components(**over: Any) -> PatchWorkerComponents:
     return PatchWorkerComponents(**base)
 
 
-def test_register_patch_jobs_registers_both_handlers() -> None:
-    coordinator = build_patch_coordinator(_components(), _SCOPE)
+def test_register_patch_jobs_registers_both_when_writeback_wired() -> None:
+    # A GitHub-capable worker (writeback service wired) registers BOTH kinds.
+    coordinator = build_patch_coordinator(_components(writeback=object()), _SCOPE)
     registry = JobRegistry()
     register_patch_jobs(registry, coordinator, _settings())
 
@@ -124,6 +125,23 @@ def test_register_patch_jobs_registers_both_handlers() -> None:
     assert wb.kind == PATCH_WRITEBACK_KIND
     assert wb.max_attempts == PATCH_WRITEBACK_MAX_ATTEMPTS
     assert wb.cancel_mode is CancelMode.immediate
+
+
+def test_register_patch_jobs_omits_writeback_when_github_unconfigured() -> None:
+    # A heterogeneous fleet: a GitHub-UNCONFIGURED worker (coordinator.writeback is None) registers
+    # ONLY patch.generate. patch.writeback is left unregistered so it stays capability-unavailable
+    # here — because it is a KNOWN kind (in _ALL_JOB_KINDS), run_job skips it (leaving it queued for
+    # a GitHub-capable peer) instead of claiming + permanently failing it on a worker that can never
+    # push a remote branch/PR.
+    coordinator = build_patch_coordinator(_components(writeback=None), _SCOPE)
+    assert coordinator.writeback is None
+    registry = JobRegistry()
+    register_patch_jobs(registry, coordinator, _settings())
+
+    assert registry.get(PATCH_GENERATE_KIND) is not None
+    assert registry.get(PATCH_WRITEBACK_KIND) is None
+    # The invariant that makes run_job skip (not fail) the unregistered writeback kind:
+    assert PATCH_WRITEBACK_KIND in _ALL_JOB_KINDS
 
 
 # --- scope-pinned coordinator factory ------------------------------------------------------------
@@ -344,14 +362,46 @@ async def test_reconcile_removes_pointer_for_absent_proposal() -> None:
     assert await h.outbox.get("ghost") is None
 
 
-async def test_reconcile_defers_and_never_adopts_on_scope_mismatch() -> None:
+async def test_reconcile_fails_proposal_closed_on_generating_scope_mismatch() -> None:
     h = _Harness()
-    await h.seed_proposal(pid="pp1")  # canonical scope == _SCOPE
+    await h.seed_proposal(pid="pp1")  # canonical scope == _SCOPE, status generating
     await h.seed_pointer(pid="pp1", scope=_OTHER_SCOPE)  # pointer claims a foreign scope
-    assert await h.reconciler.run() == 0
-    entry = await h.outbox.get("pp1")
-    assert entry is not None and entry.scope_id == _OTHER_SCOPE  # never adopted/rewritten
-    assert (await h.store.get(_ORG, "pp1")).status is PatchStatus.generating
+    # Immutable corruption (a canonical scope is a pure function of org+agent): fail CLOSED, not an
+    # infinite reschedule. Handled (==1), the corrupt pointer is gone, the proposal is failed.
+    assert await h.reconciler.run() == 1
+    assert await h.outbox.get("pp1") is None
+    proposal = await h.store.get(_ORG, "pp1")
+    assert proposal.status is PatchStatus.failed
+    assert proposal.error_kind == "PatchScopeMismatch"
+    # The foreign scope was NEVER adopted: no job/dispatch intent enqueued in any scope.
+    assert len(await h.job_store.list()) == 0
+    assert await h.dispatch.active_scopes() == set()
+
+
+async def test_reconcile_fails_proposal_closed_on_approved_scope_mismatch() -> None:
+    h = _Harness()
+    await h.seed_proposal(pid="pp1", status=PatchStatus.approved)  # canonical scope == _SCOPE
+    await h.seed_pointer(pid="pp1", scope=_OTHER_SCOPE, status_hint=PatchOutboxStatus.approved)
+    assert await h.reconciler.run() == 1
+    assert await h.outbox.get("pp1") is None
+    proposal = await h.store.get(_ORG, "pp1")
+    assert proposal.status is PatchStatus.failed
+    assert proposal.error_kind == "PatchScopeMismatch"
+    # No writeback job/foreign job touched.
+    assert len(await h.job_store.list()) == 0
+    assert await h.dispatch.active_scopes() == set()
+
+
+async def test_reconcile_retires_pointer_on_approval_pending_scope_mismatch() -> None:
+    # ``approval_pending`` has no legal ``failed`` edge and is awaiting a human under its real
+    # scope; the corrupt pointer is retired under our fence WITHOUT forcing an illegal edge or
+    # disturbing the legitimate proposal.
+    h = _Harness()
+    await h.seed_proposal(pid="pp1", status=PatchStatus.approval_pending)
+    await h.seed_pointer(pid="pp1", scope=_OTHER_SCOPE)
+    assert await h.reconciler.run() == 1
+    assert await h.outbox.get("pp1") is None
+    assert (await h.store.get(_ORG, "pp1")).status is PatchStatus.approval_pending
 
 
 async def test_reconcile_removes_pointer_for_terminal_proposal() -> None:
