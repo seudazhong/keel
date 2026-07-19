@@ -488,7 +488,7 @@ async def test_runtime_login_cannot_delete_identity_or_mutate_control(
 ) -> None:
     """The least-privilege login holds none of the cross-tenant erasure / migration-control
     privileges: the report flags are all clear, ``alembic_version`` SELECT is retained (schema
-    version reads ``0020``), and real identity DELETE / ``keel_erase_*`` EXECUTE / control-table
+    version reads ``0021``), and real identity DELETE / ``keel_erase_*`` EXECUTE / control-table
     DML are all refused at the privilege layer (independent of RLS)."""
     async with runtime_login_engine.connect() as conn:
         report = await inspect_runtime_principal(conn)
@@ -497,9 +497,9 @@ async def test_runtime_login_cannot_delete_identity_or_mutate_control(
         assert report.can_write_control_table is False
         assert report.can_create_in_schema is False
         assert report.unexpected_memberships == ()
-        # SELECT on the control table is kept: a read-only view of the schema version (= 0020).
+        # SELECT on the control table is kept: a read-only view of the schema version (= 0021).
         head = await conn.scalar(text("SELECT version_num FROM alembic_version"))
-        assert head == "0020_runtime_role_hardening"
+        assert head == "0021_patch_proposal_outbox"
 
     denied = (
         "DELETE FROM users",
