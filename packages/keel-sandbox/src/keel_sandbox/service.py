@@ -21,6 +21,7 @@ from keel_core.patch.errors import (
 )
 from keel_core.tools.environment import (
     CommandRequest,
+    DeleteRequest,
     EditRequest,
     ExecutionEnvironment,
     ExecutionError,
@@ -354,6 +355,8 @@ async def _dispatch(
         return await environment.list(ListRequest(request.path or ".", options))
     if request.operation is ExecutionOperation.glob:
         return await environment.glob(GlobRequest(request.pattern or "", options))
+    if request.operation is ExecutionOperation.delete:
+        return await environment.delete(DeleteRequest(request.path or "", options))
     return await environment.grep(
         GrepRequest(request.pattern or "", request.glob or "**/*", options)
     )

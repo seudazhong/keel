@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import stat
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
@@ -17,8 +18,19 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from keel_core.tools.bounding import MAX_BYTES, MAX_LINES, bound_output
+from keel_core.tools.textio import (
+    TextPolicyError,
+    decode_text,
+    detect_newline,
+    encode_text,
+    is_binary,
+    to_logical_newlines,
+)
 
 MAX_TIMEOUT_SECONDS = 300.0
+
+# Bytes read from the head of a file to classify it as binary (a NUL byte) before deleting it.
+_BINARY_SNIFF_BYTES = 8192
 
 
 class ExecutionErrorCode(StrEnum):
@@ -127,6 +139,12 @@ class GrepRequest:
 
 
 @dataclass(frozen=True)
+class DeleteRequest:
+    path: str
+    options: OperationOptions = field(default_factory=OperationOptions)
+
+
+@dataclass(frozen=True)
 class ExecutionResult:
     """A bounded, transport-safe operation result."""
 
@@ -154,6 +172,8 @@ class ExecutionEnvironment(Protocol):
     async def glob(self, request: GlobRequest) -> ExecutionResult: ...
 
     async def grep(self, request: GrepRequest) -> ExecutionResult: ...
+
+    async def delete(self, request: DeleteRequest) -> ExecutionResult: ...
 
     async def aclose(self) -> None: ...
 
@@ -275,6 +295,35 @@ def _error(code: ExecutionErrorCode, message: str) -> ExecutionResult:
     return ExecutionResult(ok=False, output=message, error=ExecutionError(code, message))
 
 
+def _is_reparse_point(st: os.stat_result) -> bool:
+    """A Windows junction/reparse point (a symlink-like entry ``S_ISLNK`` may not report)."""
+    attributes = getattr(st, "st_file_attributes", 0)
+    reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    return bool(attributes & reparse)
+
+
+def _classify_path(path: Path) -> tuple[str, os.stat_result | None]:
+    """Classify ``path`` by its own (un-followed) stat.
+
+    Returns one of ``missing``/``symlink``/``dir``/``regular``/``special``/``error`` so callers
+    can fail closed on anything that is not a real regular file without ever following a symlink,
+    junction, or reparse point.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:
+        return "error", None
+    if stat.S_ISLNK(st.st_mode) or _is_reparse_point(st):
+        return "symlink", st
+    if stat.S_ISDIR(st.st_mode):
+        return "dir", st
+    if stat.S_ISREG(st.st_mode):
+        return "regular", st
+    return "special", st
+
+
 class UnavailableExecutionEnvironment:
     """Fail-closed environment used when no execution infrastructure was wired."""
 
@@ -300,6 +349,9 @@ class UnavailableExecutionEnvironment:
         return await self._unavailable()
 
     async def grep(self, request: GrepRequest) -> ExecutionResult:
+        return await self._unavailable()
+
+    async def delete(self, request: DeleteRequest) -> ExecutionResult:
         return await self._unavailable()
 
     async def aclose(self) -> None:
@@ -428,30 +480,78 @@ class UnsafeLocalDevExecutionEnvironment:
 
     async def write(self, request: WriteRequest) -> ExecutionResult:
         def operation() -> ExecutionResult:
-            path = self._policy.resolve(request.path)
-            if path is None:
+            resolved = self._policy.resolve(request.path)
+            if resolved is None:
                 return _error(ExecutionErrorCode.denied, "path denied or outside workspace")
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(request.content, encoding="utf-8")
-            return ExecutionResult(ok=True, output=f"wrote {len(request.content)} bytes")
+            literal = self._policy.root / request.path
+            kind, _ = _classify_path(literal)
+            if kind in ("symlink", "special"):
+                return _error(
+                    ExecutionErrorCode.denied, "refusing to write through a symlink or special file"
+                )
+            if kind == "dir":
+                return _error(ExecutionErrorCode.invalid, "path is a directory")
+            if kind == "error":
+                return _error(ExecutionErrorCode.failed, "could not stat path")
+            try:
+                # Preserve an existing text file's newline style; new files default to LF. A
+                # binary target is never overwritten with text (fail closed).
+                newline = "\n"
+                if kind == "regular":
+                    existing = literal.read_bytes()
+                    if is_binary(existing):
+                        return _error(
+                            ExecutionErrorCode.invalid,
+                            "refusing to overwrite a binary file with text",
+                        )
+                    newline = detect_newline(existing)
+                data = encode_text(request.content, newline)
+            except TextPolicyError as exc:
+                return _error(ExecutionErrorCode.invalid, str(exc))
+            except OSError:
+                return _error(ExecutionErrorCode.failed, "could not read existing file")
+            try:
+                literal.parent.mkdir(parents=True, exist_ok=True)
+                literal.write_bytes(data)
+            except OSError:
+                return _error(ExecutionErrorCode.failed, "could not write file")
+            return ExecutionResult(ok=True, output=f"wrote {len(data)} bytes")
 
         return await self._blocking(operation, request.options)
 
     async def edit(self, request: EditRequest) -> ExecutionResult:
         def operation() -> ExecutionResult:
-            path = self._policy.resolve(request.path)
-            if path is None or not path.is_file():
-                return _error(
-                    ExecutionErrorCode.denied,
-                    "path denied or file not found",
-                )
-            text = path.read_text(encoding="utf-8")
-            occurrences = text.count(request.old)
-            if occurrences == 0:
-                return _error(ExecutionErrorCode.not_found, "`old` string not found")
-            if occurrences > 1:
-                return _error(ExecutionErrorCode.invalid, "`old` string is not unique")
-            path.write_text(text.replace(request.old, request.new, 1), encoding="utf-8")
+            resolved = self._policy.resolve(request.path)
+            if resolved is None:
+                return _error(ExecutionErrorCode.denied, "path denied or file not found")
+            literal = self._policy.root / request.path
+            kind, _ = _classify_path(literal)
+            if kind != "regular":
+                return _error(ExecutionErrorCode.denied, "path denied or file not found")
+            try:
+                raw = literal.read_bytes()
+                if is_binary(raw):
+                    return _error(ExecutionErrorCode.invalid, "refusing to edit a binary file")
+                # Match/replace on a logical-LF view, then re-emit the file's original endings so
+                # untouched regions (and CRLF line endings) are byte-preserved.
+                newline = detect_newline(raw)
+                logical = to_logical_newlines(decode_text(raw))
+                old = to_logical_newlines(request.old)
+                new = to_logical_newlines(request.new)
+                occurrences = logical.count(old)
+                if occurrences == 0:
+                    return _error(ExecutionErrorCode.not_found, "`old` string not found")
+                if occurrences > 1:
+                    return _error(ExecutionErrorCode.invalid, "`old` string is not unique")
+                data = encode_text(logical.replace(old, new, 1), newline)
+            except TextPolicyError as exc:
+                return _error(ExecutionErrorCode.invalid, str(exc))
+            except OSError:
+                return _error(ExecutionErrorCode.failed, "could not read file")
+            try:
+                literal.write_bytes(data)
+            except OSError:
+                return _error(ExecutionErrorCode.failed, "could not write file")
             return ExecutionResult(ok=True, output="edited 1 occurrence")
 
         return await self._blocking(operation, request.options)
@@ -512,6 +612,41 @@ class UnsafeLocalDevExecutionEnvironment:
                     if regex.search(line):
                         hits.append(f"{relative}:{lineno}:{line}")
             return self._bounded("\n".join(hits), request.options)
+
+        return await self._blocking(operation, request.options)
+
+    async def delete(self, request: DeleteRequest) -> ExecutionResult:
+        def operation() -> ExecutionResult:
+            resolved = self._policy.resolve(request.path)
+            if resolved is None:
+                return _error(ExecutionErrorCode.denied, "path denied or outside workspace")
+            literal = self._policy.root / request.path
+            kind, _ = _classify_path(literal)
+            # Deleting an absent file is idempotent (a reconciler/retry must not fail); a symlink,
+            # junction, directory, or other special entry is refused (no recursive or reparse
+            # delete, and the model may not delete a binary file).
+            if kind == "missing":
+                return ExecutionResult(ok=True, output="deleted 0 files (path did not exist)")
+            if kind == "symlink":
+                return _error(
+                    ExecutionErrorCode.denied, "refusing to delete a symlink or reparse point"
+                )
+            if kind == "dir":
+                return _error(ExecutionErrorCode.denied, "refusing to delete a directory")
+            if kind != "regular":
+                return _error(ExecutionErrorCode.denied, "refusing to delete a special file")
+            try:
+                with literal.open("rb") as handle:
+                    prefix = handle.read(_BINARY_SNIFF_BYTES)
+            except OSError:
+                return _error(ExecutionErrorCode.failed, "could not read path")
+            if is_binary(prefix):
+                return _error(ExecutionErrorCode.denied, "refusing to delete a binary file")
+            try:
+                literal.unlink()
+            except OSError:
+                return _error(ExecutionErrorCode.failed, "could not delete path")
+            return ExecutionResult(ok=True, output="deleted 1 file")
 
         return await self._blocking(operation, request.options)
 

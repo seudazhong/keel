@@ -6,6 +6,7 @@ from keel_core.tools.bounding import BoundedOutput, bound_output
 from keel_core.tools.environment import (
     CancellationToken,
     CommandRequest,
+    DeleteRequest,
     EditRequest,
     ExecutionEnvironment,
     ExecutionError,
@@ -23,7 +24,15 @@ from keel_core.tools.environment import (
     WriteRequest,
 )
 from keel_core.tools.executor import ExecRequest, execute
-from keel_core.tools.files import EditTool, GlobTool, GrepTool, LsTool, ReadTool, WriteTool
+from keel_core.tools.files import (
+    DeleteTool,
+    EditTool,
+    GlobTool,
+    GrepTool,
+    LsTool,
+    ReadTool,
+    WriteTool,
+)
 from keel_core.tools.rpc import SandboxExecutionEnvironment
 from keel_core.tools.rpc_auth import (
     RpcRequestSigner,
@@ -32,6 +41,7 @@ from keel_core.tools.rpc_auth import (
     RpcResponseVerifier,
 )
 from keel_core.tools.shell import ShellTool
+from keel_core.tools.textio import TextPolicyError
 from keel_core.tools.wiring import (
     ExecutionBackend,
     build_scoped_execution_environment,
@@ -43,6 +53,7 @@ __all__ = [
     "bound_output",
     "CancellationToken",
     "CommandRequest",
+    "DeleteRequest",
     "EditRequest",
     "ExecutionBackend",
     "ExecutionEnvironment",
@@ -60,6 +71,7 @@ __all__ = [
     "RpcResponseSigner",
     "RpcResponseVerifier",
     "SandboxExecutionEnvironment",
+    "TextPolicyError",
     "UnavailableExecutionEnvironment",
     "UnsafeLocalDevExecutionEnvironment",
     "WorkspacePathPolicy",
@@ -71,6 +83,7 @@ __all__ = [
     "ReadTool",
     "WriteTool",
     "EditTool",
+    "DeleteTool",
     "LsTool",
     "GlobTool",
     "GrepTool",

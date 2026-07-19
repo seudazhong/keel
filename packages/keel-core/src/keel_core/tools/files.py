@@ -6,6 +6,7 @@ from typing import Any
 
 from keel_core.protocols import ToolContext, ToolResult
 from keel_core.tools.environment import (
+    DeleteRequest,
     EditRequest,
     ExecutionEnvironment,
     ExecutionResult,
@@ -81,6 +82,20 @@ class EditTool(_EnvironmentTool):
             new=str(args.get("new", "")),
         )
         return _tool_result(await self._environment.edit(request))
+
+
+class DeleteTool(_EnvironmentTool):
+    name = "delete"
+    description = "Delete a single regular file within the workspace (no directories or symlinks)."
+    writes = True
+
+    def input_schema(self) -> dict[str, Any]:
+        return {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}
+
+    async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
+        return _tool_result(
+            await self._environment.delete(DeleteRequest(str(args.get("path", ""))))
+        )
 
 
 class LsTool(_EnvironmentTool):

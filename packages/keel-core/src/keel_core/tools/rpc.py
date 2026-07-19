@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from keel_core.tools.bounding import bound_output
 from keel_core.tools.environment import (
     CommandRequest,
+    DeleteRequest,
     EditRequest,
     ExecutionEnvironment,
     ExecutionError,
@@ -36,6 +37,7 @@ class ExecutionOperation(StrEnum):
     list = "list"
     glob = "glob"
     grep = "grep"
+    delete = "delete"
 
 
 class RpcLimits(BaseModel):
@@ -326,6 +328,16 @@ class SandboxExecutionEnvironment(ExecutionEnvironment):
                 operation=ExecutionOperation.grep,
                 pattern=request.pattern,
                 glob=request.glob,
+                limits=_rpc_limits(request.options),
+            ),
+            request.options,
+        )
+
+    async def delete(self, request: DeleteRequest) -> ExecutionResult:
+        return await self._send(
+            self._envelope(
+                operation=ExecutionOperation.delete,
+                path=request.path,
                 limits=_rpc_limits(request.options),
             ),
             request.options,
