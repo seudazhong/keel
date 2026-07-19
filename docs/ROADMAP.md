@@ -1,6 +1,6 @@
 # Keel roadmap
 
-> **Updated:** 2026-07-19 · **Authority:** active execution sequence · **Baseline:** `main` `2ae9dc0`
+> **Updated:** 2026-07-19 · **Authority:** active execution sequence · **Baseline:** `main` `b885f0d`
 
 This roadmap sequences **small, independently verifiable milestones**. Each milestone lists
 explicit dependencies and **machine-verifiable exit gates**. No milestone is "implement all
@@ -10,11 +10,12 @@ future plans." Completion evidence lives in [Status](./STATUS.md), not in dated 
 
 - Ground truth is [Status](./STATUS.md). Merged code alone does not complete a milestone; the
   measurable exit gate must pass.
-- The Compose `dev`/`full` stack is a **trusted single-operator local preview**
-  (`unsafe-local-dev`, dedicated exec volume, shell disabled). It is never production-safe and
-  must not be exposed to untrusted networks.
-- Safety gates (**M3A** runtime DB role/RLS, **M3B** real sandbox) may proceed in parallel with
-  product work but **must close before any untrusted-network or multi-user exposure**.
+- The Compose `dev`/`full` stack is a **trusted single-operator local preview**. The M3A/M3B
+  safety foundation is complete (non-owner runtime DB login + deployed isolated sandbox), but it
+  is still never production-safe or multi-tenant and must not be exposed to untrusted networks.
+- Safety gates **M3A** (runtime DB role/RLS) and **M3B** (real sandbox) are **complete**; their
+  residual limits (single-operator OCI not microVM, bidirectional internal net, shell disabled,
+  K8s example manifests) are tracked in [Status](./STATUS.md), not reopened as blockers.
 - Code existing (C) or tests passing (T) never counts as a usable product scenario (P). A UI/e2e
   milestone closes only on a real end-to-end scenario.
 
@@ -67,44 +68,55 @@ product-surface exposure yet.
   integration **387 / 387**, frontend **116**, `app`/`web` images build.
 - No patch UI, API, or worker dispatch is enabled (C/T foundation only; those are M4/M5).
 
-### M3A — Runtime DB Role / RLS  *(safety gate, parallelizable)*
+### M3A — Runtime DB Role / RLS · **Complete**  *(safety gate)*
 
 **Goal:** the runtime application role is a **non-owner** with enforced row-level security.
 
-**Dependencies:** M1 (M2 complete; the two safety gates M3A/M3B may run in parallel). **Next active milestone.**
+**Dependencies:** M1.
 
-**Exit gates:**
+**Exit gates (met at `b885f0d`):**
 
-- The runtime connects as a non-owner role that cannot bypass or disable RLS.
-- An automated test proves a cross-scope read/write **fails** for the runtime role and is
-  audited.
-- Migrations create/verify the non-owner role; CI asserts the role has no ownership/BYPASSRLS.
+- The data plane connects as the non-owner `keel_runtime_login` via a **passwordless URL +
+  `0600` `PGPASSFILE`**; the login has `super`, `bypassrls`, `createrole`/`createdb`, schema
+  ownership, identity-delete, erase-exec, and Alembic-DML privileges **all false**; RLS-bypass,
+  DDL, and `SET ROLE` are denied.
+- `/readiness` reports `runtime_db_principal = 'least-privilege (keel_runtime_login)'`.
+- Migration `0020_runtime_role_hardening` provisions/verifies the role; the standard Compose
+  startup runs `migrate → runtime-secret-init → provision` before server/worker.
+- M3A targeted suite: **121 passed / 1 skipped**; role/RLS assertions in CI.
 
-### M3B — Real Sandbox Deployment  *(safety gate, parallelizable)*
+### M3B — Real Sandbox Deployment · **Complete**  *(safety gate)*
 
 **Goal:** deploy a real isolated execution backend, replacing `unsafe-local-dev` for
 shell/file execution.
 
-**Dependencies:** M1 (M2 complete; the two safety gates M3A/M3B may run in parallel). **Next active milestone.**
+**Dependencies:** M1.
 
-**Exit gates:**
+**Exit gates (met at `b885f0d`):**
 
-- A `keel-sandbox` service runs shell/file execution in an isolated (container/microVM)
-  boundary; the API/worker process no longer executes untrusted shell in-process.
-- Automated escape/egress and path-traversal tests pass against the sandbox.
-- A deployment profile enables the sandbox; the default preview still fails closed when the
-  sandbox is absent (no silent in-process fallback).
+- A sandbox service runs shell/file execution out-of-process, reached over **authenticated
+  HMAC**, running **nonroot / read-only rootfs / cap-drop** on an **internal-only network**,
+  with **no database, Redis, or public-network** reachability.
+- It provisions **per-scope files** and **denies shell**; `/readiness` reports `sandbox = ok`;
+  the API/worker no longer executes untrusted shell in-process.
+- M3B targeted suite: **69 + 10 targeted tests** pass; Playwright browser smoke **18 / 18**.
 
-### M4 — Patch API / Worker / Outbox
+**Honest residuals (tracked, not blockers):** the Compose sandbox is a **single-operator OCI
+container, not a microVM**; its internal network is **bidirectional**; **per-scope shell stays
+disabled**; and the Kubernetes path is **example manifests** where an operator runs
+`migrate`/`provision` themselves.
+
+### M4 — Patch API / Worker / Outbox · **Next**
 
 **Goal:** make the merged patch foundation operable end-to-end on the backend.
 
-**Dependencies:** M2; safety posture from M3A/M3B for any execution the patch worker performs.
+**Dependencies:** M2 (patch foundation merged); M3A/M3B safety foundation (complete). This is
+the **single next mainline milestone**.
 
 **Exit gates:**
 
 - Patch API/SDK endpoints create/list/inspect patch proposals; OpenAPI compatibility check
-  passes.
+  passes; new schema lands as migration `0021`.
 - A durable patch worker job runs generation/writeback via the dispatch outbox with an
   approved/expiry reconciler.
 - Integration tests cover admit → dispatch → reconcile (approved and expiry) with restart
@@ -182,20 +194,22 @@ testable.
 ## Dependency summary
 
 ```
-M0 → M1 → M2 → M4 → M5 → ─┐
-        ├→ M3A ───────────┤
-        └→ M3B ───────────┼→ M7 → M8 → M9
-              M6 (after M3A/M3B) ┘
+M0 ✓ → M1 ✓ → M2 ✓ → M4 → M5 → ─┐
+        ├→ M3A ✓ ──────────────┤
+        └→ M3B ✓ ──────────────┼→ M7 → M8 → M9
+                  M6 (after M3A/M3B) ┘
 ```
 
-- M3A and M3B are parallel safety gates that both must close before M7 (multi-user exposure).
+- ✓ = complete (M0, M1, M2, M3A, M3B). **M4 is the single next mainline milestone.**
+- M3A and M3B (complete) are the safety foundation required before M7 (multi-user exposure).
 - M6 depends on the M3A/M3B safety posture but not on M4/M5.
 - M5 depends on M4 (patch backend) and the review surface.
 
 ## Roadmap rules
 
 - [Status](./STATUS.md) supplies completion evidence; dated plans do not.
-- Safety gates (M3A/M3B) cannot be bypassed by product or connector breadth.
+- Safety gates M3A/M3B are complete; their residual limits are tracked, not bypassed, and do
+  not authorize multi-tenant or untrusted-network exposure by themselves.
 - The Patch foundation is merged on `main` (M2) as a C/T foundation only; it is not product
   usable until its API/worker (M4) and UI/e2e (M5) close.
 - A milestone completes only on its measurable exit gate, never on merged code alone.

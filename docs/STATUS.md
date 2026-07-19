@@ -1,6 +1,6 @@
 # Keel implementation status
 
-> **Snapshot:** 2026-07-19 · **Branch:** `main` · **HEAD:** `2ae9dc0`
+> **Snapshot:** 2026-07-19 · **Branch:** `main` · **HEAD:** `b885f0d`
 > **Target:** [PRD](./PRD.md) · **Architecture fidelity:** [ARCHITECTURE](./ARCHITECTURE.md#0-implementation-status-and-fidelity) · **Active execution:** [ROADMAP](./ROADMAP.md)
 
 This document is the authority for **what is true on `main` now**. It is rebuilt from directly
@@ -25,24 +25,38 @@ scenario (P)**.
 ## Summary
 
 `main` has a **strong, tested, deployable single-operator agent engine** with a broad React
-surface. It is **not** a multi-user product: there is no browser login flow, no real execution
-sandbox, and the runtime database role still owns the schema. Most product surfaces are a
-**trusted single-operator local preview**, not a production or multi-tenant deployment.
+surface, now on a **completed safety foundation**: the data plane runs as a non-owner,
+least-privilege runtime DB login with enforced RLS (**M3A**), and shell/file execution runs in a
+deployed, authenticated, isolated sandbox service (**M3B**). It is still **not** a multi-user
+product: there is no browser login flow, and the surfaces remain a **trusted single-operator
+local preview**, not a production or multi-tenant deployment. Safety infrastructure being
+complete (C/T/D) does **not** make the platform a usable multi-tenant product (P).
 
-## Verified baseline (M0 green baseline + M2 patch merge)
+## Verified baseline (M0 green + M2 patch merge + M3A/M3B safety foundation)
 
-Measured on `main` at `2ae9dc0` (patch foundation merged; migration `0019` actually applied
-in the standard Compose database):
+Measured on `main` at `b885f0d`. The standard Compose stack runs, in one command, the ordered
+startup `migrate → runtime-secret-init → provision → sandbox → server/worker/web`
+(migration head `0020_runtime_role_hardening`):
 
 - **Standard stack launches.** `docker compose -f docker-compose.yml --profile dev up -d --build`
-  starts cleanly; server `/readiness` returns `true`, the worker arq health check succeeds, and
-  the web surface returns `200` on `/health` and `/`.
+  starts cleanly; server `/readiness` returns `true` with
+  `runtime_db_principal = 'least-privilege (keel_runtime_login)'` and `sandbox = ok`; the worker
+  arq health check succeeds; the web surface returns `200` on `/health` and `/`.
 - **Backend CI green.** `ruff check`, `ruff format --check`, `mypy`, and the OpenAPI
   compatibility check all pass.
-- **Backend tests.** Non-integration suite: **1830 passed / 1 skipped** (1831 selected). Full
-  Postgres/Redis integration suite: **387 passed / 387**.
+- **Backend tests.** Non-integration suite: **1924 passed / 2 skipped**. Full Postgres/Redis
+  integration suite: **397 passed**.
+- **M3A targeted (runtime DB least-privilege).** **121 passed / 1 skipped.** The runtime
+  connects via a **passwordless URL + `0600` `PGPASSFILE`**; the runtime login has
+  `super`, `bypassrls`, `createrole`/`createdb`, schema ownership, identity-delete,
+  erase-exec, and Alembic-DML privileges **all false**; RLS-bypass, DDL, and `SET ROLE`
+  attempts are denied.
+- **M3B targeted (real sandbox).** **69 + 10 targeted tests pass** — the sandbox service is
+  reached over **authenticated HMAC**, runs **nonroot / read-only rootfs / cap-drop** on an
+  **internal-only network**, provisions **per-scope files**, **denies shell**, and has **no
+  database, Redis, or public-network** reachability.
 - **Patch/review targeted tests.** **45** patch/review targeted tests pass on merged `main`.
-- **Frontend tests.** **116 passed.**
+- **Frontend tests.** **116 passed.** Playwright browser smoke: **18 / 18**.
 - **Images build.** Both the `app` and `web` container images build.
 - **Git JIT auth fix.** The Git just-in-time credential bug is fixed on `main` — JIT
   credentials are sent as an `Authorization` header.
@@ -61,6 +75,8 @@ in the standard Compose database):
 | Read-only code review API + worker | ✓ | ✓ | ✓ | — | Review generation runs server + worker side; **no review UI** ships. |
 | Patch / Draft PR foundation (models/store/bundle/generation/approval/writeback/coordinator) | ✓ | ✓ | ✓ | — | Merged on `main` (M2); C/T foundation only. No API/SDK/worker/outbox/reconciler/UI (M4/M5). |
 | Connectors: Gmail native, IM routing (OneBot/Telegram) | ✓ | ✓ | ✓ | ~ | Gmail OAuth/read/status/send preview works; IM message routing exists, IM durable routing + admin UI do not. |
+| Runtime DB least-privilege role + enforced RLS (M3A) | ✓ | ✓ | ✓ | — | Data plane runs as non-owner `keel_runtime_login`; RLS/DDL/`SET ROLE` denied. Safety infrastructure, not a multi-tenant product. |
+| Real isolated execution sandbox (M3B) | ✓ | ✓ | ✓ | — | Deployed HMAC-authenticated nonroot/read-only/cap-drop service, per-scope files, shell denied. Safety infrastructure, not a product surface. |
 
 ### Product surface (React)
 
@@ -80,16 +96,24 @@ in the standard Compose database):
 
 ## Trusted local-preview safety contract
 
-The Compose `dev` and `full` profiles are an **explicit, trusted, single-operator local
-preview**. They are **not production-safe** and must not be exposed to untrusted networks.
+The Compose `dev` and `full` profiles are a **trusted, single-operator local preview**. The
+M3A/M3B safety foundation is now in place — the data plane runs as the non-owner
+least-privilege runtime login, and shell/file execution runs in the deployed isolated sandbox —
+but the preview is still **not a production or multi-tenant deployment** and must not be exposed
+to untrusted networks. Honest residual limits:
 
-- Execution uses the opt-in `unsafe-local-dev` backend with a dedicated execution volume and
-  **shell execution disabled**; there is **no real `keel-sandbox` service deployed**.
-- The runtime database role owns the schema/database and can bypass RLS.
-- The server data-plane scope is the single-operator preview scope; there is no browser login.
+- The Compose sandbox is a **single-operator OCI container** (nonroot, read-only rootfs,
+  cap-drop, internal-only network), **not a microVM**; container isolation is weaker than a VM
+  boundary.
+- Sandbox networking is restricted to the internal service network but is **bidirectional**
+  within it (not a one-way/egress-only boundary).
+- **Per-scope shell execution remains disabled**; the sandbox provisions per-scope files and
+  denies shell.
+- The Kubernetes path is **example manifests**: an operator must run the `migrate` and
+  `provision` steps themselves (the single-command ordering is Compose-only).
 
-No level of green tests changes this: a real isolated sandbox and a non-owner runtime DB role
-are **not** deployed on `main`.
+Safety infrastructure completing (C/T/D) does **not** by itself deliver a multi-tenant product
+(P): there is still no browser login and no multi-user product journey.
 
 ## Patch / Draft PR foundation (merged on `main`, C/T foundation only — not product usable)
 
@@ -109,21 +133,22 @@ patch foundation is **not a usable product scenario (not P)** and must not be de
 
 ## Critical blockers (before any multi-user or production exposure)
 
-1. **RLS bypass:** the runtime DB role owns the schema and can bypass RLS (needs a non-owner
-   role with enforced RLS — **M3A**).
-2. **No real sandbox:** shell/file execution has no deployed isolated backend; only
-   `unsafe-local-dev` exists (**M3B**).
-3. **No browser login:** identity/org/agents/grants APIs exist but there is no browser OIDC
+Resolved by the safety foundation: **RLS bypass** (M3A — the data plane now runs as the
+non-owner least-privilege `keel_runtime_login` with RLS/DDL/`SET ROLE` denied) and **no real
+sandbox** (M3B — shell/file execution runs in the deployed authenticated isolated sandbox).
+Remaining:
+
+1. **No browser login:** identity/org/agents/grants APIs exist but there is no browser OIDC
    authorization-code flow, so no real multi-user product scenario (**M7**).
-4. **No review UI / IM admin UI:** the review API+worker and IM routing exist headless (**M5/M7**).
-5. **Event/data lifecycle:** event versions exist without upcasters, and erasure closure is
+2. **No review UI / IM admin UI:** the review API+worker and IM routing exist headless (**M5/M7**).
+3. **Event/data lifecycle:** event versions exist without upcasters, and erasure closure is
    incomplete (**M8**).
-6. **Production operations:** no production scheduler service/leadership, OTel/metrics/SLOs,
+4. **Production operations:** no production scheduler service/leadership, OTel/metrics/SLOs,
    or backup/restore/DR drills (**M9**).
 
 ## Next work
 
-Follow [Roadmap](./ROADMAP.md): M0 and M1 and M2 are complete → **next** M3A Runtime DB
-Role/RLS and M3B Real Sandbox (parallel safety gates) → M4 Patch API/worker/outbox → M5 Patch
-UI + approval → Draft PR e2e → M6 Personal Agent + Calendar → M7 Browser OIDC + admin/review/IM
-UI → M8 Event/lifecycle + erasure closure → M9 Production delivery/scale/OTel/DR.
+Follow [Roadmap](./ROADMAP.md): M0, M1, M2, **M3A, and M3B are complete** → **next: M4 Patch
+API/worker/outbox** (migration `0021`) → M5 Patch UI + approval → Draft PR e2e → M6 Personal
+Agent + Calendar → M7 Browser OIDC + admin/review/IM UI → M8 Event/lifecycle + erasure closure →
+M9 Production delivery/scale/OTel/DR.

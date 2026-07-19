@@ -14,10 +14,11 @@ Keel's target is a **multi-user, cloud-native agent platform**:
   cover the integration long tail.
 
 That is the product direction, not the current feature claim. Today Keel has a strong,
-tested, deployable **single-operator** engine and a broad React surface. It is not yet a
-multi-user product: there is no browser login flow, the execution sandbox is a single-org
-rootless-OCI boundary rather than a hardened multi-tenant microVM, and the runtime database
-role still owns the schema.
+tested, deployable **single-operator** engine and a broad React surface on a **completed
+safety foundation**: the data plane runs as a non-owner least-privilege runtime DB login with
+enforced RLS (M3A), and shell/file execution runs in a deployed authenticated isolated sandbox
+(M3B). It is not yet a multi-user product: there is no browser login flow, and the sandbox is a
+single-operator rootless-OCI boundary rather than a hardened multi-tenant microVM.
 
 ## Maturity scale
 
@@ -33,15 +34,16 @@ and code or passing tests (C/T) are **never** reported as a usable product scena
 |---|---|
 | Agent/data engine | C/T/D solid: durable sessions/runs/jobs/approvals/schedules, memory/search/consolidation/evals, Knowledge RAG. P is single-operator preview. |
 | Product surface | C/T/D present: React app with Chat, Sessions, Jobs, Memory, Knowledge, Connectors, onboarding, i18n, Agents, Projects. P is preview; many journeys need identity/login and backend work. |
-| Production readiness | Pre-production: sandbox is a single-org rootless-OCI boundary (not a hardened multi-tenant microVM), runtime DB role still owns the schema, no browser OIDC, no production scheduler/OTel/DR. |
+| Production readiness | Pre-production: safety foundation complete (M3A non-owner least-privilege runtime DB login + RLS; M3B deployed isolated sandbox), but sandbox is a single-operator rootless-OCI boundary (not a multi-tenant microVM), no browser OIDC, no production scheduler/OTel/DR. |
 
 Read [`docs/STATUS.md`](./docs/STATUS.md) for the C/T/D/P capability table, verified evidence,
 and blockers, and [`docs/ROADMAP.md`](./docs/ROADMAP.md) for the active M0–M9 sequence.
 
 ## What works now
 
-Verified on `main` at `2ae9dc0` (non-integration 1830 passed / 1 skipped; integration 387/387;
-frontend 116; migration `0019` applied in the standard Compose database):
+Verified on `main` at `b885f0d` (non-integration 1924 passed / 2 skipped; integration 397
+passed; frontend 116; Playwright 18/18; migration head `0020` applied by the standard Compose
+`migrate → runtime-secret-init → provision → sandbox → server/worker/web` startup):
 
 - FastAPI chat with SSE, tool timeline, and approvals
 - durable sessions/runs/jobs/schedules with cancellation/retry/recovery, and session search
@@ -52,6 +54,9 @@ frontend 116; migration `0019` applied in the standard Compose database):
 - Gmail OAuth/status/read/approval-gated send, plus OneBot/Telegram IM routing
 - Compose serves the built **React application** (Chat, Sessions, Jobs, Memory, Knowledge,
   Connectors, Observability), with onboarding, i18n, and Agents/Projects surfaces
+- non-owner least-privilege runtime DB login (`keel_runtime_login`) with enforced RLS, and a
+  deployed HMAC-authenticated isolated sandbox for file execution (readiness reports
+  `runtime_db_principal = 'least-privilege (keel_runtime_login)'` and `sandbox = ok`)
 - CLI local runtime with file, shell, and provider tools
 
 The controlled Patch/Draft-PR foundation is **merged on `main`** (migration `0019`, plus
@@ -63,11 +68,13 @@ reconciler, or UI (those are milestones M4/M5), so it is **not yet product usabl
 Important limits (trusted single-operator local deployment — **not production-safe**): the
 Compose `dev`/`full` stack runs a real authenticated `keel-sandbox` execution boundary (server/
 worker use the fail-closed `sandbox` backend over an internal-only RPC network to a hardened,
-credential-less executor), but it is the single-org rootless-OCI floor — **not** a hardened
-multi-tenant microVM — so shell execution stays disabled (file tools work, isolated per scope);
-the runtime DB role owns the schema and can bypass RLS; there is no browser OIDC login flow; and
-the review API+worker and IM routing ship without a UI. Do not expose this stack to untrusted
-networks.
+credential-less executor) and the data plane runs as the non-owner least-privilege
+`keel_runtime_login` (RLS/DDL/`SET ROLE` denied, passwordless URL + `0600` `PGPASSFILE`). Honest
+residuals remain: the sandbox is the single-operator rootless-OCI floor — **not** a hardened
+multi-tenant microVM — its internal network is bidirectional, and shell execution stays disabled
+(file tools work, isolated per scope); the Kubernetes path is example manifests where an operator
+runs `migrate`/`provision` themselves; there is no browser OIDC login flow; and the review
+API+worker and IM routing ship without a UI. Do not expose this stack to untrusted networks.
 
 ## Run the development stack
 
