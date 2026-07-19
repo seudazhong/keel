@@ -32,7 +32,17 @@ class PatchPolicyViolation(PatchError):
 
 
 class PatchProviderError(PatchError):
-    """The generation provider failed, or produced output that could not be used."""
+    """The generation provider failed, or produced output that could not be used.
+
+    Carries the optional partial ``usage`` already consumed (mirroring
+    :class:`PatchProviderUnavailable`) so the coordinator can durably charge a *permanent* failure
+    onto the run/proposal as a fenced delta — a terminal failure neither loses nor double-counts the
+    tokens a cost-ceiling stop, malformed completion, or permanent transfer rejection spent.
+    """
+
+    def __init__(self, message: str, *, usage: object | None = None) -> None:
+        super().__init__(message)
+        self.usage = usage
 
 
 class PatchProviderUnavailable(PatchError):

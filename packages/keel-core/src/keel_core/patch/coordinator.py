@@ -316,13 +316,24 @@ class PatchCoordinator:
             raise
         except PatchError as exc:
             # A permanent generation failure: fail the proposal (deleting its dispatch pointer) and
-            # the run, then rethrow.
+            # the run, then rethrow. A permanent provider failure (cost-ceiling stop, malformed
+            # completion, a permanent transfer rejection) may still have consumed tokens: charge
+            # that partial usage onto the run as a fenced delta (cumulative = prior attempts + this
+            # outcome) and mirror the cumulative onto the proposal, so a terminal failure neither
+            # loses nor double-counts cost. A failure that carries no usage charges nothing.
+            failure_cost = _run_cost_from_usage(getattr(exc, "usage", None))
+            run_record = await self.runs.get(run_id)
+            prior_cost = run_record.cost_usd if run_record is not None else 0.0
             await self.store.transition(
                 org_id,
                 proposal.id,
                 PatchStatus.failed,
                 expected_version=proposal.version,
-                updates={"error_kind": type(exc).__name__, "error_message": str(exc)[:500]},
+                updates={
+                    "error_kind": type(exc).__name__,
+                    "error_message": str(exc)[:500],
+                    "cost_usd": prior_cost + failure_cost.cost_usd,
+                },
                 now=moment,
                 outbox=self.outbox,
                 scope_id=binding.scope_id,
@@ -333,6 +344,7 @@ class PatchCoordinator:
                 stop_reason="generation_failed",
                 error_kind=type(exc).__name__,
                 error_message=str(exc)[:500],
+                cost=failure_cost,
                 now=moment,
             )
             raise

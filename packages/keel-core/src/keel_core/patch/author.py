@@ -19,11 +19,20 @@ Fail-closed error mapping (never a broad ``except`` or a success-shaped fallback
 * a transient provider transport failure → a retryable
   :class:`~keel_core.patch.errors.PatchProviderUnavailable` carrying the partial usage consumed;
 * any other non-``DONE`` stop (max iterations, budget, halted, malformed) → a permanent
-  :class:`~keel_core.patch.errors.PatchProviderError`.
+  :class:`~keel_core.patch.errors.PatchProviderError`;
+* a sandbox transfer failure (upload/export) is never allowed to escape raw: a recoverable one
+  (namespace not ready, timeout, 5xx) maps to a retryable
+  :class:`~keel_core.patch.errors.PatchProviderUnavailable` and a permanent one (auth, policy
+  rejection, malformed response) to a :class:`~keel_core.patch.errors.PatchProviderError`. Every
+  provider-touched failure carries the cumulative :class:`~keel_core.protocols.Usage` consumed so
+  the coordinator can durably charge it.
 
-The sandbox namespace is always cleaned up; a cleanup failure is surfaced (never silently
-swallowed) — after a successful generation it raises, and while a primary error is propagating it
-is logged by namespace only (no source bytes) so the primary error survives.
+The sandbox namespace is always cleaned up. A cleanup failure never becomes a retryable error:
+after a successful generation the worktree has already been mutated, so re-running to retry cleanup
+would re-apply the patch — instead the successful result is still returned and the dangling
+namespace is logged by name only (no source bytes), left for the sandbox's stale-namespace sweep on
+the next upload. While a primary error is propagating a cleanup failure is likewise logged, never
+swallowing the primary error.
 """
 
 from __future__ import annotations
@@ -53,7 +62,7 @@ from keel_core.tools.files import (
 )
 from keel_core.types import PermissionDecision, ScopeKind, SessionId, StopReason, TrustLevel
 
-from .errors import PatchLeaseLost, PatchProviderError, PatchProviderUnavailable
+from .errors import PatchError, PatchLeaseLost, PatchProviderError, PatchProviderUnavailable
 from .generation import AuthorResult
 from .models import PatchProposalRequest
 from .transfer import (
@@ -62,7 +71,12 @@ from .transfer import (
     apply_export_to_worktree,
     build_snapshot_from_directory,
 )
-from .transfer_client import SandboxTransferClientError, UploadAck
+from .transfer_client import (
+    SandboxTransferClientError,
+    SandboxTransferNotFound,
+    SandboxTransferUnavailable,
+    UploadAck,
+)
 
 # The exact final-message contract the model must satisfy for a change to be exported/applied.
 _DONE_SENTINEL = "DONE"
@@ -121,6 +135,21 @@ def _is_transient_provider_error(exc: Exception) -> bool:
     if isinstance(status_code, int) and status_code in (408, 425, 429, 500, 502, 503, 504):
         return True
     return any(marker in name for marker in _TRANSIENT_PROVIDER_MARKERS)
+
+
+def _map_transfer_error(exc: SandboxTransferClientError, *, stage: str, usage: Usage) -> PatchError:
+    """Map a sandbox transfer failure to a typed patch error carrying the usage consumed so far.
+
+    A *recoverable* transfer failure (the namespace is not yet ready, a timeout, an upstream 5xx) is
+    retryable, so it becomes a :class:`PatchProviderUnavailable`; a *permanent* one (authentication,
+    a policy rejection, or a malformed response) becomes a :class:`PatchProviderError`. Both carry
+    the cumulative ``usage`` — zero before the first provider call, the full run usage after a
+    completed generation — so the coordinator charges the run/proposal neither too little nor too
+    much. No ``SandboxTransferClientError`` is ever allowed to escape the author raw.
+    """
+    if isinstance(exc, (SandboxTransferUnavailable, SandboxTransferNotFound)):
+        return PatchProviderUnavailable(f"sandbox transfer unavailable during {stage}", usage=usage)
+    return PatchProviderError(f"sandbox transfer failed during {stage}", usage=usage)
 
 
 def _is_done(text: str) -> bool:
@@ -258,7 +287,11 @@ class SandboxedLoopPatchAuthor:
         uploaded = False
         succeeded = False
         try:
-            ack = await self.transfer.upload_snapshot(namespace, archive)
+            try:
+                ack = await self.transfer.upload_snapshot(namespace, archive)
+            except SandboxTransferClientError as exc:
+                # No provider call has happened yet, so no tokens were spent (usage is zero).
+                raise _map_transfer_error(exc, stage="snapshot upload", usage=Usage()) from exc
             uploaded = True
             if ack.cleanup_pending:
                 # The upload committed but the sandbox deferred removing a prior tree's backup.
@@ -291,7 +324,7 @@ class SandboxedLoopPatchAuthor:
             if interrupt is not None and interrupt():
                 raise PatchLeaseLost("run lease lost before export")
 
-            export_archive = await self.transfer.export_snapshot(namespace)
+            export_archive = await self._export(namespace, provider)
             await asyncio.to_thread(
                 apply_export_to_worktree, worktree_path, export_archive, bounds=self.bounds
             )
@@ -302,19 +335,33 @@ class SandboxedLoopPatchAuthor:
             if uploaded:
                 await self._cleanup(namespace, succeeded=succeeded)
 
+    async def _export(self, namespace: str, provider: _BudgetedProvider) -> bytes:
+        """Export the edited namespace, mapping a transfer failure to a typed patch error.
+
+        The generation already completed cleanly, so the full run usage is attached to a failure (a
+        recoverable transfer error stays retryable, a permanent one does not) for durable charging.
+        """
+        try:
+            return await self.transfer.export_snapshot(namespace)
+        except SandboxTransferClientError as exc:
+            raise _map_transfer_error(exc, stage="export", usage=provider.total_usage) from exc
+
     async def _cleanup(self, namespace: str, *, succeeded: bool) -> None:
         try:
             await self.transfer.delete_namespace(namespace)
-        except SandboxTransferClientError as cleanup_exc:
-            if succeeded:
-                # No primary error is pending: a cleanup failure after success must surface (a
-                # dangling namespace is a real, retryable problem).
-                raise PatchProviderUnavailable(
-                    "sandbox namespace cleanup failed after a successful generation"
-                ) from cleanup_exc
-            # A primary error is already propagating: record the cleanup failure by namespace only
-            # (no source) and let the primary error survive unchanged.
-            self.logger.warning("patch author namespace cleanup failed for %s", namespace)
+        except SandboxTransferClientError:
+            # Cleanup must never become a retryable failure. On the success path the worktree has
+            # already been mutated, so re-running the whole generation just to retry a *cleanup*
+            # would re-apply the patch (unsafe); on the primary-error path the primary error must
+            # survive. Either way, record the dangling namespace by name only (no source bytes) and
+            # rely on the sandbox's stale-namespace sweep on the next upload to reclaim it.
+            context = "after a successful generation" if succeeded else "during a primary error"
+            self.logger.warning(
+                "patch author namespace cleanup failed for %s (%s); leaving it for the sandbox "
+                "stale-namespace sweep",
+                namespace,
+                context,
+            )
 
     async def _run_loop(
         self,
@@ -393,12 +440,16 @@ class SandboxedLoopPatchAuthor:
         store: EventStore,
         session_id: SessionId,
     ) -> None:
-        # Lease loss always wins: never terminalize/charge a lost lease, and never export.
+        # Lease loss always wins: never terminalize/charge a lost lease, and never export. A lost
+        # lease deliberately carries no usage — the current lease owner (or a reclaim) finishes and
+        # charges the attempt, so the coordinator leaves the run untouched.
         if interrupter.lease_lost:
             raise PatchLeaseLost("run lease lost during generation")
         # Exceeding the cost ceiling fails the proposal with no export (even a single overshoot).
         if provider.ceiling_reached:
-            raise PatchProviderError("generation exceeded its cost ceiling")
+            raise PatchProviderError(
+                "generation exceeded its cost ceiling", usage=provider.total_usage
+            )
         reason = result.reason
         if reason is StopReason.error:
             if provider.transport_error is not None and provider.transport_transient:
@@ -406,16 +457,23 @@ class SandboxedLoopPatchAuthor:
                     "provider temporarily unavailable during generation",
                     usage=provider.total_usage,
                 )
-            raise PatchProviderError("generation failed before completion")
+            raise PatchProviderError(
+                "generation failed before completion", usage=provider.total_usage
+            )
         if reason is StopReason.interrupted:
             # Interrupted without a recorded lease-loss or ceiling cause: still a non-completion.
             # Treat as a lost lease (safe: no export, retryable) rather than terminalizing.
             raise PatchLeaseLost("run interrupted during generation")
         if reason is not StopReason.completed:
-            raise PatchProviderError(f"generation did not complete ({reason})")
+            raise PatchProviderError(
+                f"generation did not complete ({reason})", usage=provider.total_usage
+            )
         final_text = await _final_assistant_text(store, session_id)
         if not _is_done(final_text):
-            raise PatchProviderError("generation stopped without the required completion signal")
+            raise PatchProviderError(
+                "generation stopped without the required completion signal",
+                usage=provider.total_usage,
+            )
 
 
 __all__ = [

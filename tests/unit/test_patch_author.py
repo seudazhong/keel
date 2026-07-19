@@ -25,6 +25,8 @@ from keel_core.patch.models import PatchProposalRequest
 from keel_core.patch.transfer import build_snapshot_from_directory, parse_snapshot_archive
 from keel_core.patch.transfer_client import (
     DeleteAck,
+    SandboxTransferNotFound,
+    SandboxTransferRejected,
     SandboxTransferUnavailable,
     UploadAck,
 )
@@ -97,11 +99,19 @@ class _FakeSandbox:
     """A namespace-keyed sandbox backed by real snapshot codec + a real local environment."""
 
     def __init__(
-        self, root: Path, *, cleanup_pending: bool = False, fail_delete: bool = False
+        self,
+        root: Path,
+        *,
+        cleanup_pending: bool = False,
+        fail_delete: bool = False,
+        fail_upload: Exception | None = None,
+        fail_export: Exception | None = None,
     ) -> None:
         self._root = root
         self._cleanup_pending = cleanup_pending
         self._fail_delete = fail_delete
+        self._fail_upload = fail_upload
+        self._fail_export = fail_export
         self.uploaded: list[str] = []
         self.exported: list[str] = []
         self.deleted: list[str] = []
@@ -110,6 +120,8 @@ class _FakeSandbox:
         return self._root / namespace
 
     async def upload_snapshot(self, namespace: str, archive: bytes) -> UploadAck:
+        if self._fail_upload is not None:
+            raise self._fail_upload
         target = self._ns(namespace)
         if target.exists():
             shutil.rmtree(target)
@@ -130,6 +142,8 @@ class _FakeSandbox:
         )
 
     async def export_snapshot(self, namespace: str) -> bytes:
+        if self._fail_export is not None:
+            raise self._fail_export
         self.exported.append(namespace)
         archive, _manifest = build_snapshot_from_directory(self._ns(namespace))
         return archive
@@ -369,13 +383,16 @@ async def test_cost_ceiling_fails_without_export(tmp_path: Path) -> None:
         ]
     )
 
-    with pytest.raises(PatchProviderError):
+    with pytest.raises(PatchProviderError) as excinfo:
         await _author(sandbox, provider).author(
             worktree_path=worktree,
             request=_request(cost_ceiling_usd=0.5),
             coding_run_id=_CODING_RUN_ID,
         )
 
+    # The ceiling failure carries the usage already consumed so the coordinator can charge it.
+    assert excinfo.value.usage is not None
+    assert excinfo.value.usage.cost_usd == pytest.approx(1.0)
     assert sandbox.exported == []
     assert sandbox.deleted == [patch_run_namespace(_CODING_RUN_ID)]
 
@@ -389,13 +406,15 @@ async def test_single_completed_call_overshoot_still_fails(tmp_path: Path) -> No
         [_done_turn(usage=Usage(prompt_tokens=10, completion_tokens=10, cost_usd=9.0))]
     )
 
-    with pytest.raises(PatchProviderError):
+    with pytest.raises(PatchProviderError) as excinfo:
         await _author(sandbox, provider).author(
             worktree_path=worktree,
             request=_request(cost_ceiling_usd=1.0),
             coding_run_id=_CODING_RUN_ID,
         )
 
+    assert excinfo.value.usage is not None
+    assert excinfo.value.usage.cost_usd == pytest.approx(9.0)
     assert sandbox.exported == []
 
 
@@ -426,13 +445,14 @@ async def test_max_iterations_without_done_fails(tmp_path: Path) -> None:
     # The model never signals DONE; the loop halts at the iteration bound -> permanent error.
     provider = ScriptedProviderGateway([_tool_turn("c1", "read", path="app.py")])
 
-    with pytest.raises(PatchProviderError):
+    with pytest.raises(PatchProviderError) as excinfo:
         await _author(sandbox, provider).author(
             worktree_path=worktree,
             request=_request(max_iterations=1),
             coding_run_id=_CODING_RUN_ID,
         )
 
+    assert excinfo.value.usage is not None  # a non-completion still reports the usage consumed
     assert sandbox.exported == []
 
 
@@ -462,32 +482,144 @@ async def test_permanent_provider_failure_is_provider_error(tmp_path: Path) -> N
     worktree = tmp_path / "worktree"
     _seed_worktree(worktree)
     sandbox = _FakeSandbox(tmp_path / "sandbox")
-    provider = _RaisingProvider(before=[], exc=_PermanentBoom("bad request"))
+    # A partial-usage chunk lands before the permanent failure: the error must still carry it so the
+    # coordinator charges the tokens spent even on a terminal failure.
+    provider = _RaisingProvider(
+        before=[ProviderChunk(delta="partial", usage=Usage(completion_tokens=3, cost_usd=0.05))],
+        exc=_PermanentBoom("bad request"),
+    )
 
-    with pytest.raises(PatchProviderError):
+    with pytest.raises(PatchProviderError) as excinfo:
         await _author(sandbox, provider).author(
             worktree_path=worktree, request=_request(), coding_run_id=_CODING_RUN_ID
         )
 
+    assert excinfo.value.usage is not None
+    assert excinfo.value.usage.cost_usd == pytest.approx(0.05)
     assert sandbox.exported == []
 
 
 # --- cleanup semantics ---------------------------------------------------------------
 
 
-async def test_cleanup_failure_after_success_raises_unavailable(tmp_path: Path) -> None:
+async def test_cleanup_failure_after_success_still_returns_result(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     worktree = tmp_path / "worktree"
     _seed_worktree(worktree)
     sandbox = _FakeSandbox(tmp_path / "sandbox", fail_delete=True)
     provider = ScriptedProviderGateway(_happy_turns())
 
-    with pytest.raises(PatchProviderUnavailable):
+    # The worktree is already mutated by a successful apply, so a failed *cleanup* must not raise a
+    # retryable error (re-running would re-apply the patch). It returns success + logs a warning.
+    with caplog.at_level(logging.WARNING, logger="keel_core.patch.author"):
+        result = await _author(sandbox, provider).author(
+            worktree_path=worktree, request=_request(), coding_run_id=_CODING_RUN_ID
+        )
+
+    namespace = patch_run_namespace(_CODING_RUN_ID)
+    assert result.iterations == 4  # the successful generation result is preserved
+    assert result.usage.cost_usd == pytest.approx(0.3)
+    # The writeback happened exactly once (single export + apply, single delete attempt).
+    assert (worktree / "app.py").read_bytes() == b"print('new')\n"
+    assert sandbox.exported == [namespace]
+    assert sandbox.deleted == [namespace]
+    assert any(
+        "cleanup failed" in record.message and "successful generation" in record.message
+        for record in caplog.records
+    )
+
+
+# --- transfer failure mapping (never a raw SandboxTransferClientError) ----------------
+
+
+async def test_upload_transient_failure_maps_to_unavailable_zero_usage(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    _seed_worktree(worktree)
+    sandbox = _FakeSandbox(
+        tmp_path / "sandbox", fail_upload=SandboxTransferUnavailable("sandbox not ready")
+    )
+    provider = ScriptedProviderGateway(_happy_turns())
+
+    with pytest.raises(PatchProviderUnavailable) as excinfo:
         await _author(sandbox, provider).author(
             worktree_path=worktree, request=_request(), coding_run_id=_CODING_RUN_ID
         )
 
-    # The writeback still happened (cleanup runs after apply); the failure is surfaced, not hidden.
-    assert (worktree / "app.py").read_bytes() == b"print('new')\n"
+    # No provider call happened before the upload, so the charge is zero; nothing was exported or
+    # cleaned up (the upload never committed).
+    assert excinfo.value.usage is not None
+    assert excinfo.value.usage.cost_usd == pytest.approx(0.0)
+    assert sandbox.exported == []
+    assert sandbox.deleted == []
+    assert (worktree / "app.py").read_bytes() == b"print('old')\n"  # worktree untouched
+
+
+async def test_upload_permanent_failure_maps_to_provider_error(tmp_path: Path) -> None:
+    worktree = tmp_path / "worktree"
+    _seed_worktree(worktree)
+    sandbox = _FakeSandbox(
+        tmp_path / "sandbox",
+        fail_upload=SandboxTransferRejected("archive too large", status_code=413),
+    )
+    provider = ScriptedProviderGateway(_happy_turns())
+
+    with pytest.raises(PatchProviderError) as excinfo:
+        await _author(sandbox, provider).author(
+            worktree_path=worktree, request=_request(), coding_run_id=_CODING_RUN_ID
+        )
+
+    assert excinfo.value.usage is not None
+    assert excinfo.value.usage.cost_usd == pytest.approx(0.0)
+    assert sandbox.exported == []
+    assert sandbox.deleted == []
+
+
+async def test_export_transient_failure_maps_to_unavailable_with_full_usage(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    _seed_worktree(worktree)
+    sandbox = _FakeSandbox(
+        tmp_path / "sandbox", fail_export=SandboxTransferNotFound("namespace vanished")
+    )
+    # A clean DONE (no file mutations) so the run completes and we reach the export step.
+    provider = ScriptedProviderGateway(
+        [_done_turn(usage=Usage(prompt_tokens=50, completion_tokens=10, cost_usd=0.25))]
+    )
+
+    with pytest.raises(PatchProviderUnavailable) as excinfo:
+        await _author(sandbox, provider).author(
+            worktree_path=worktree, request=_request(), coding_run_id=_CODING_RUN_ID
+        )
+
+    # Generation completed, so the failure carries the full run usage; nothing was applied and the
+    # namespace was still cleaned up.
+    assert excinfo.value.usage is not None
+    assert excinfo.value.usage.cost_usd == pytest.approx(0.25)
+    assert sandbox.deleted == [patch_run_namespace(_CODING_RUN_ID)]
+    assert (worktree / "app.py").read_bytes() == b"print('old')\n"  # apply never ran
+
+
+async def test_export_permanent_failure_maps_to_provider_error_with_full_usage(
+    tmp_path: Path,
+) -> None:
+    worktree = tmp_path / "worktree"
+    _seed_worktree(worktree)
+    sandbox = _FakeSandbox(
+        tmp_path / "sandbox", fail_export=SandboxTransferRejected("bad export", status_code=422)
+    )
+    provider = ScriptedProviderGateway(
+        [_done_turn(usage=Usage(prompt_tokens=50, completion_tokens=10, cost_usd=0.25))]
+    )
+
+    with pytest.raises(PatchProviderError) as excinfo:
+        await _author(sandbox, provider).author(
+            worktree_path=worktree, request=_request(), coding_run_id=_CODING_RUN_ID
+        )
+
+    assert excinfo.value.usage is not None
+    assert excinfo.value.usage.cost_usd == pytest.approx(0.25)
     assert sandbox.deleted == [patch_run_namespace(_CODING_RUN_ID)]
 
 

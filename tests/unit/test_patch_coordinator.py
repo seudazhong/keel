@@ -28,6 +28,7 @@ from keel_core.patch.bundle import PatchBundleWriter
 from keel_core.patch.coordinator import PatchCoordinator, ProjectBinding
 from keel_core.patch.errors import (
     PatchLeaseLost,
+    PatchProviderError,
     PatchProviderUnavailable,
     PatchRemoteUnavailable,
     PatchStateError,
@@ -636,8 +637,71 @@ async def test_permanent_generation_error_fails_and_retires_pointer() -> None:
 
     proposal = await coord.store.get("o", handle.proposal_id)
     assert proposal is not None and proposal.status is PatchStatus.failed
+    # A failure that carries no usage charges nothing (cost stays zero).
+    assert proposal.cost_usd == pytest.approx(0.0)
     run = await coord.runs.get(handle.run_id)
     assert run is not None and run.status is RunStatus.failed
+    assert run.cost_usd == pytest.approx(0.0)
+    assert await coord.outbox.get(handle.proposal_id) is None
+
+
+@pytest.mark.asyncio
+async def test_permanent_provider_error_charges_partial_usage_on_run_and_proposal() -> None:
+    # A permanent PatchProviderError (cost ceiling, malformed output, or a permanent transfer
+    # rejection all reach the coordinator as this error) still consumed tokens: the terminal failure
+    # must charge that usage onto the run *and* mirror it onto the proposal — never lose it.
+    artifacts = _MemArtifacts()
+    gen = _ScriptedGeneration(
+        artifacts,
+        [PatchProviderError("ceiling exceeded", usage=Usage(prompt_tokens=8, cost_usd=0.05))],
+    )
+    coord = _coordinator(artifacts, _FakeWriteback(), _target(), generation=gen)
+    req = _request()
+    handle = await coord.request_generation(req)
+
+    with pytest.raises(PatchProviderError):
+        await coord.execute_generation("o", handle.run_id, req, worker_id="w1")
+
+    proposal = await coord.store.get("o", handle.proposal_id)
+    assert proposal is not None and proposal.status is PatchStatus.failed
+    assert proposal.cost_usd == pytest.approx(0.05)
+    run = await coord.runs.get(handle.run_id)
+    assert run is not None and run.status is RunStatus.failed
+    assert run.cost_usd == pytest.approx(0.05)  # the run row is the authoritative charge ledger
+    assert await coord.outbox.get(handle.proposal_id) is None
+
+
+@pytest.mark.asyncio
+async def test_transient_then_permanent_charges_cumulatively_without_double_count() -> None:
+    # A transient outage charges a partial cost and requeues; a later *permanent* failure charges
+    # its own usage on top (cumulative = prior partial + this outcome), proving the terminal-failure
+    # path neither loses nor double-counts what earlier attempts already charged.
+    artifacts = _MemArtifacts()
+    gen = _ScriptedGeneration(
+        artifacts,
+        [
+            PatchProviderUnavailable("upstream 503", usage=Usage(prompt_tokens=5, cost_usd=0.01)),
+            PatchProviderError("permanent failure", usage=Usage(prompt_tokens=3, cost_usd=0.02)),
+        ],
+    )
+    coord = _coordinator(artifacts, _FakeWriteback(), _target(), generation=gen)
+    req = _request()
+    handle = await coord.request_generation(req)
+
+    with pytest.raises(PatchProviderUnavailable):
+        await coord.execute_generation("o", handle.run_id, req, worker_id="w1")
+    r1 = await coord.runs.get(handle.run_id)
+    assert r1 is not None and r1.status is RunStatus.queued and r1.cost_usd == pytest.approx(0.01)
+
+    with pytest.raises(PatchProviderError):
+        await coord.execute_generation("o", handle.run_id, req, worker_id="w1")
+    proposal = await coord.store.get("o", handle.proposal_id)
+    assert proposal is not None and proposal.status is PatchStatus.failed
+    assert proposal.cost_usd == pytest.approx(0.03)
+    r2 = await coord.runs.get(handle.run_id)
+    assert r2 is not None and r2.status is RunStatus.failed
+    assert r2.cost_usd == pytest.approx(0.03)  # 0.01 (prior partial) + 0.02 (this failure)
+    assert gen.calls == 2
     assert await coord.outbox.get(handle.proposal_id) is None
 
 
