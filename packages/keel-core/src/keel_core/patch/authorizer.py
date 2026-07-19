@@ -14,7 +14,7 @@ helper), so authorization can never drift from the rest of the platform:
 * **scope** — the canonical per-Agent scope is derived from the immutable ``org_id`` + selected
   Agent via :func:`keel_core.scoping.derive_agent_scope`; there is no org-first / default
   installation guessing. A request with no explicit Agent is the *actor acting directly* (the
-  reserved :data:`~keel_core.patch.coordinator.DEFAULT_PATCH_AGENT_ID` label names the scope,
+  reserved :data:`~keel_core.patch.models.DEFAULT_PATCH_AGENT_ID` label names the scope,
   never a real Agent principal), so it never requires an Agent grant.
 * **remote target** — the writeback target uses the **exact** ``installation_id`` recorded on the
   repository bound to ``project.github_repository_id``; the repository↔project↔installation binding
@@ -35,8 +35,9 @@ from keel_core.projects.models import GitHubRepository, Project
 from keel_core.projects.service import ProjectService
 from keel_core.scoping import derive_agent_scope
 
-from .coordinator import DEFAULT_PATCH_AGENT_ID, PatchAuthorizer, ProjectBinding
+from .coordinator import PatchAuthorizer, ProjectBinding
 from .errors import PatchValidationError
+from .models import DEFAULT_PATCH_AGENT_ID
 from .writeback import WritebackTarget
 
 

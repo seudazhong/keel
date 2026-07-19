@@ -74,6 +74,12 @@ MAX_PATCH_COST_CEILING_USD = 100.0
 DEFAULT_PATCH_MAX_ITERATIONS = 30
 MAX_PATCH_MAX_ITERATIONS = 100
 
+# The reserved Agent label a controlled patch runs under when the request selects no explicit Agent.
+# It names the canonical per-Agent scope (``agent:<org>/patch``) every proposal/run/payload is
+# partitioned by. Defined here (a dependency-free leaf) so the payload contract, coordinator, and
+# authorizer can share it without an import cycle.
+DEFAULT_PATCH_AGENT_ID = "patch"
+
 # Paths a controlled patch may never touch (verbatim segment or prefix match). The sandbox path
 # policy also blocks these; this is the belt-and-braces domain check on the *captured* tree.
 FORBIDDEN_PATH_SEGMENTS = frozenset({".git", ".env", ".ssh", ".aws", ".gnupg"})

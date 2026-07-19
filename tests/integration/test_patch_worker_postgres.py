@@ -36,16 +36,14 @@ from keel_core.jobs import JobLimits, PostgresJobStore
 from keel_core.patch.coordinator import DEFAULT_PATCH_AGENT_ID, PatchCoordinator
 from keel_core.patch.jobs import (
     PATCH_GENERATE_KIND,
-    PatchGenerateJobPayload,
-    persist_generate_metadata,
 )
-from keel_core.patch.models import PatchStatus
+from keel_core.patch.models import PatchProposalRequest, PatchStatus
 from keel_core.patch.outbox import PostgresPatchProposalOutbox
+from keel_core.patch.payload import PatchGenerationRequestRecord
 from keel_core.patch.store import PostgresPatchProposalStore
 from keel_core.runs import PostgresRunStore
 from keel_core.runtime_db import provision_runtime_login
 from keel_core.scoping import derive_agent_scope
-from keel_core.state import PostgresEventStore
 from keel_worker.patch import PatchOutboxReconciler
 
 pytestmark = pytest.mark.integration
@@ -99,8 +97,27 @@ async def _create_generating(
     agent_id: str = _AGENT,
     org: str = _ORG,
     expires: datetime | None = None,
+    with_request: bool = True,
 ) -> str:
     run_id = f"run-{pid}"
+    generation_request = None
+    if with_request:
+        # Since P4a the authorized generate request is written in the SAME atomic transaction as the
+        # proposal + ``generating`` pointer, so a committed ``generating`` proposal always carries a
+        # durable, scope-partitioned payload the reconciler can reload to resume dispatch.
+        request = PatchProposalRequest(
+            org_id=org,
+            project_id=_PROJECT,
+            actor="u",
+            task="apply the change",
+            base_ref="main",
+            model="m",
+            idempotency_key=f"idem-{pid}",
+            agent_id=agent_id,
+        )
+        generation_request = PatchGenerationRequestRecord.from_request(
+            request, proposal_id=pid, run_id=run_id, scope_id=scope
+        )
     await store.create(
         proposal_id=pid,
         org_id=org,
@@ -117,24 +134,9 @@ async def _create_generating(
         expires_at=expires or _exp(),
         outbox=outbox,
         scope_id=scope,
+        generation_request=generation_request,
     )
     return run_id
-
-
-async def _persist_metadata(engine: AsyncEngine, *, scope: str, pid: str, run_id: str) -> None:
-    payload = PatchGenerateJobPayload(
-        proposal_id=pid,
-        run_id=run_id,
-        org_id=_ORG,
-        project_id=_PROJECT,
-        actor="u",
-        task="apply the change",
-        base_ref="main",
-        model="m",
-        idempotency_key=f"idem-{pid}",
-    )
-    events = PostgresEventStore(engine, scope)
-    await persist_generate_metadata(events, scope_id=scope, payload=payload)
 
 
 def _reconciler(engine: AsyncEngine, *, worker_id: str = "rec-1") -> PatchOutboxReconciler:
@@ -154,7 +156,6 @@ def _reconciler(engine: AsyncEngine, *, worker_id: str = "rec-1") -> PatchOutbox
         outbox=PostgresPatchProposalOutbox(engine),
         coordinator_factory=_coord,
         job_store_factory=lambda s: PostgresJobStore(engine, s, limits=limits),
-        run_events_factory=lambda s: PostgresEventStore(engine, s),
         job_dispatch_outbox=PostgresJobDispatchOutbox(engine),
         worker_id=worker_id,
     )
@@ -225,9 +226,9 @@ async def test_runtime_login_reconcile_generating_enqueues_scoped_job(
     owner_store = PostgresPatchProposalStore(migrated_db)
     owner_outbox = PostgresPatchProposalOutbox(migrated_db)
     pid = f"pp_{uuid.uuid4().hex}"
-    run_id = await _create_generating(owner_store, owner_outbox, pid=pid)
-    # The server durably persisted the authorized generate request; the reconciler resumes from it.
-    await _persist_metadata(migrated_db, scope=_SCOPE, pid=pid, run_id=run_id)
+    # The authorized generate request is persisted atomically at create (same transaction as the
+    # proposal + pointer); the reconciler resumes from that durable, scope-partitioned payload.
+    await _create_generating(owner_store, owner_outbox, pid=pid)
 
     # Reconcile as the least-privilege runtime LOGIN (no owner, no row_security=off).
     handled = await _reconciler(runtime_login_engine, worker_id="w-runtime").run()
@@ -248,10 +249,8 @@ async def test_reconcile_generating_two_scopes_skip_locked(migrated_db: AsyncEng
     outbox = PostgresPatchProposalOutbox(migrated_db)
     pid_a = f"pp_{uuid.uuid4().hex}"
     pid_b = f"pp_{uuid.uuid4().hex}"
-    run_a = await _create_generating(store, outbox, pid=pid_a, scope=_SCOPE, agent_id=_AGENT)
-    run_b = await _create_generating(store, outbox, pid=pid_b, scope=_SCOPE_B, agent_id=_AGENT_B)
-    await _persist_metadata(migrated_db, scope=_SCOPE, pid=pid_a, run_id=run_a)
-    await _persist_metadata(migrated_db, scope=_SCOPE_B, pid=pid_b, run_id=run_b)
+    await _create_generating(store, outbox, pid=pid_a, scope=_SCOPE, agent_id=_AGENT)
+    await _create_generating(store, outbox, pid=pid_b, scope=_SCOPE_B, agent_id=_AGENT_B)
 
     # Two concurrent reconcilers race for the two due pointers under SKIP LOCKED.
     a = _reconciler(migrated_db, worker_id="w-a")
@@ -321,8 +320,10 @@ async def test_reconcile_scope_mismatch_fails_proposal_closed_never_adopted(
     store = PostgresPatchProposalStore(migrated_db)
     outbox = PostgresPatchProposalOutbox(migrated_db)
     pid = f"pp_{uuid.uuid4().hex}"
-    # Proposal canonical scope == _SCOPE, but the pointer is recorded under a foreign scope.
-    await _create_generating(store, outbox, pid=pid, scope=_SCOPE_B)
+    # Proposal canonical scope == _SCOPE, but the pointer is recorded under a foreign scope. (No
+    # durable request: the canonical scope is a pure function of org+agent, so a request row could
+    # never carry the foreign scope; the reconciler fails closed on the pointer mismatch first.)
+    await _create_generating(store, outbox, pid=pid, scope=_SCOPE_B, with_request=False)
 
     # Immutable corruption (canonical scope is a pure function of org+agent): fail CLOSED under the
     # proposal's OWN canonical scope with an atomic pointer delete — never an infinite reschedule.

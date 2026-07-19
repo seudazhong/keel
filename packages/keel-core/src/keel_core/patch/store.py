@@ -16,6 +16,7 @@ repository is intentionally thin and truthful.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
@@ -59,9 +60,70 @@ from .outbox import (
     PatchProposalOutbox,
     PostgresPatchProposalOutbox,
 )
+from .payload import PatchGenerationRequestRecord, canonical_payload_json
+
+logger = logging.getLogger("keel.patch.store")
 
 _SET_ORG = text("SELECT set_config('app.org_id', :org, true)")
 _SET_SCOPE = text("SELECT set_config('app.scope_id', :scope, true)")
+
+# The immutable per-proposal generation-request row (scope-RLS; migration 0022). Written in the same
+# transaction as the proposal + dispatch pointer so a committed ``generating`` proposal always
+# implies a committed, reconstructable request.
+_INSERT_GENERATION_REQUEST = text(
+    "INSERT INTO patch_generation_requests "
+    "(proposal_id, org_id, scope_id, payload, fingerprint, created_at) "
+    "VALUES (:pid, :org, :scope, CAST(:payload AS jsonb), :fp, :now)"
+)
+_SELECT_GENERATION_REQUEST = text(
+    "SELECT proposal_id, org_id, scope_id, payload, fingerprint, created_at "
+    "FROM patch_generation_requests WHERE proposal_id = :pid AND org_id = :org"
+)
+
+
+def _validate_generation_request(
+    record: PatchGenerationRequestRecord,
+    *,
+    proposal_id: str,
+    org_id: str,
+    scope_id: str | None,
+) -> None:
+    """Fail closed if a supplied generation request does not match the proposal it is admitted with.
+
+    The record is built from the same authorized request, so its binding must line up exactly with
+    the proposal + outbox scope (defense-in-depth against a caller that wires a mismatched payload).
+    """
+    if not scope_id:
+        raise PatchValidationError(
+            "patch proposal create with a generation request requires scope_id"
+        )
+    if record.proposal_id != proposal_id or record.org_id != org_id or record.scope_id != scope_id:
+        raise PatchValidationError(
+            "generation request binding does not match the proposal being created"
+        )
+
+
+async def insert_generation_request_in_connection(
+    conn: AsyncConnection, record: PatchGenerationRequestRecord
+) -> None:
+    """Insert the immutable request row inside the caller's transaction (module-level helper).
+
+    Shared by the atomic proposal-store create path so the proposal, its scoped request payload, and
+    the global dispatch pointer commit (or roll back) together. The caller MUST have set the
+    ``app.scope_id`` GUC to ``record.scope_id`` so the row satisfies the scope-RLS ``WITH CHECK``.
+    """
+    await conn.execute(
+        _INSERT_GENERATION_REQUEST,
+        {
+            "pid": record.proposal_id,
+            "org": record.org_id,
+            "scope": record.scope_id,
+            "payload": canonical_payload_json(record.payload),
+            "fp": record.fingerprint,
+            "now": record.created_at,
+        },
+    )
+
 
 _COLS = (
     "id, org_id, project_id, run_id, run_attempt, agent_id, actor, source_ref, task_digest, "
@@ -136,9 +198,22 @@ class PatchProposalStore(Protocol):
         now: datetime | None = None,
         outbox: PatchProposalOutbox | None = None,
         scope_id: str | None = None,
+        generation_request: PatchGenerationRequestRecord | None = None,
     ) -> tuple[PatchProposal, bool]: ...
 
     async def get(self, org_id: str, proposal_id: str) -> PatchProposal | None: ...
+
+    async def get_generation_request(
+        self, org_id: str, proposal_id: str, scope_id: str
+    ) -> PatchGenerationRequestRecord | None:
+        """Load the immutable generation-request row for a proposal behind its scope (or ``None``).
+
+        Scoped: a caller bound to one scope can never read another scope's request payload. Returns
+        ``None`` when no request row exists (a legacy pre-0022 proposal, or a payload that fails
+        fail-closed reconstruction) so a caller can treat an unreconstructable ``generating``
+        proposal as terminal corruption.
+        """
+        ...
 
     async def get_by_run(self, org_id: str, run_id: str) -> PatchProposal | None: ...
 
@@ -429,16 +504,52 @@ class InMemoryPatchProposalStore:
     def __init__(self) -> None:
         self._rows: dict[str, PatchProposal] = {}
         self._by_idem: dict[tuple[str, str], str] = {}
+        self._requests: dict[str, PatchGenerationRequestRecord] = {}
 
-    def _txn_snapshot(self) -> tuple[dict[str, PatchProposal], dict[tuple[str, str], str]]:
+    def _txn_snapshot(
+        self,
+    ) -> tuple[
+        dict[str, PatchProposal],
+        dict[tuple[str, str], str],
+        dict[str, PatchGenerationRequestRecord],
+    ]:
         """Capture a rollback snapshot so an atomic outbox-coupled operation can undo a partial
         write on failure (mirrors the durable store's single-transaction all-or-nothing)."""
-        return dict(self._rows), dict(self._by_idem)
+        return dict(self._rows), dict(self._by_idem), dict(self._requests)
 
     def _txn_restore(
-        self, snapshot: tuple[dict[str, PatchProposal], dict[tuple[str, str], str]]
+        self,
+        snapshot: tuple[
+            dict[str, PatchProposal],
+            dict[tuple[str, str], str],
+            dict[str, PatchGenerationRequestRecord],
+        ],
     ) -> None:
-        self._rows, self._by_idem = dict(snapshot[0]), dict(snapshot[1])
+        self._rows = dict(snapshot[0])
+        self._by_idem = dict(snapshot[1])
+        self._requests = dict(snapshot[2])
+
+    def _verify_generation_request_replay(
+        self, existing_proposal_id: str, record: PatchGenerationRequestRecord
+    ) -> None:
+        """Fail closed on an idempotent replay whose durable request is absent or divergent.
+
+        A committed proposal created *with* a request always has its immutable row; a replay that
+        carries a request must match it by the request-identity fingerprint (which excludes the
+        per-attempt ids, so a retry with a fresh proposal/run id still matches). A missing
+        row is an unrecoverable conflict (never insert after the fact); a fingerprint mismatch is
+        a request-binding conflict. The row is looked up by the *existing* proposal id (the retry's
+        fresh id was discarded when the proposal deduped on its idempotency key).
+        """
+        existing = self._requests.get(existing_proposal_id)
+        if existing is None:
+            raise ProposalConflictError(
+                "existing proposal has no durable generation request payload"
+            )
+        if existing.fingerprint != record.fingerprint:
+            raise ProposalConflictError(
+                "generation request fingerprint mismatch on idempotent replay"
+            )
 
     async def create(
         self,
@@ -459,6 +570,7 @@ class InMemoryPatchProposalStore:
         now: datetime | None = None,
         outbox: PatchProposalOutbox | None = None,
         scope_id: str | None = None,
+        generation_request: PatchGenerationRequestRecord | None = None,
     ) -> tuple[PatchProposal, bool]:
         created_at = now or _now()
         key = (org_id, idempotency_key)
@@ -494,29 +606,43 @@ class InMemoryPatchProposalStore:
                 updated_at=created_at,
             )
             created = True
+        if generation_request is not None:
+            _validate_generation_request(
+                generation_request, proposal_id=proposal_id, org_id=org_id, scope_id=scope_id
+            )
+            if outbox is None:
+                raise PatchValidationError(
+                    "patch proposal create with a generation request requires an outbox"
+                )
         if outbox is None:
             if created:
                 self._rows[proposal_id] = proposal
                 self._by_idem[key] = proposal_id
             return proposal, created
-        # Outbox seam. The ``generating`` dispatch intent is recorded atomically with the proposal
-        # so a proposal never becomes durable without a discoverable pointer (both roll back
-        # together) -- but ONLY on a genuine create. On the idempotent replay of an existing
-        # proposal the pointer already reflects that proposal's current lifecycle stage (it may have
-        # been intentionally deleted at ``approval_pending`` or a terminal state), so re-recording
-        # here would resurrect a retired pointer; the existing path never touches the outbox. The
-        # seam contract (concrete outbox type + a validated scope) is still enforced on both paths.
+        # Outbox seam. The ``generating`` dispatch intent (and, when supplied, the immutable request
+        # payload) is recorded atomically with the proposal so a proposal never becomes durable
+        # without a discoverable pointer AND a reconstructable request (all roll back together) --
+        # but ONLY on a genuine create. On the idempotent replay of an existing proposal the pointer
+        # already reflects that proposal's current lifecycle stage (it may have been intentionally
+        # deleted at ``approval_pending`` or a terminal state), so re-recording here would resurrect
+        # a retired pointer; the existing path never touches the outbox (it only verifies the
+        # persisted request, never re-inserts it). The seam contract (concrete outbox type + a
+        # validated scope) is still enforced on both paths.
         if not isinstance(outbox, InMemoryPatchProposalOutbox):
             raise PatchValidationError("InMemoryPatchProposalStore requires an in-memory outbox")
         if not scope_id:
             raise PatchValidationError("patch proposal create with an outbox requires scope_id")
         if not created:
+            if generation_request is not None:
+                self._verify_generation_request_replay(proposal.id, generation_request)
             return proposal, created
         store_snap = self._txn_snapshot()
         outbox_snap = outbox._txn_snapshot()
         try:
             self._rows[proposal_id] = proposal
             self._by_idem[key] = proposal_id
+            if generation_request is not None:
+                self._requests[proposal_id] = generation_request
             await outbox.record_in_connection(
                 None,
                 proposal_id=proposal.id,
@@ -531,6 +657,18 @@ class InMemoryPatchProposalStore:
             outbox._txn_restore(outbox_snap)
             raise
         return proposal, created
+
+    async def get_generation_request(
+        self, org_id: str, proposal_id: str, scope_id: str
+    ) -> PatchGenerationRequestRecord | None:
+        record = self._requests.get(proposal_id)
+        if record is None:
+            return None
+        # Cross-org / cross-scope isolation (mirrors the Postgres RLS filter): a caller bound to a
+        # different scope/org can never observe this request payload.
+        if record.org_id != org_id or record.scope_id != scope_id:
+            return None
+        return record
 
     async def get(self, org_id: str, proposal_id: str) -> PatchProposal | None:
         row = self._rows.get(proposal_id)
@@ -951,6 +1089,7 @@ class PostgresPatchProposalStore:
         now: datetime | None = None,
         outbox: PatchProposalOutbox | None = None,
         scope_id: str | None = None,
+        generation_request: PatchGenerationRequestRecord | None = None,
     ) -> tuple[PatchProposal, bool]:
         created_at = now or _now()
         outbox_scope = ""
@@ -960,6 +1099,14 @@ class PostgresPatchProposalStore:
             if not scope_id:
                 raise PatchValidationError("patch proposal create with an outbox requires scope_id")
             outbox_scope = scope_id
+        if generation_request is not None:
+            _validate_generation_request(
+                generation_request, proposal_id=proposal_id, org_id=org_id, scope_id=scope_id
+            )
+            if outbox is None:
+                raise PatchValidationError(
+                    "patch proposal create with a generation request requires an outbox"
+                )
         params = {
             "id": proposal_id,
             "org": org_id,
@@ -979,6 +1126,10 @@ class PostgresPatchProposalStore:
         try:
             async with self._engine.begin() as conn:
                 await conn.execute(_SET_ORG, {"org": org_id})
+                if generation_request is not None:
+                    # The scoped row is written (WITH CHECK) / verified (USING) under its own
+                    # scope RLS, so set the scope GUC alongside the org GUC in this transaction.
+                    await conn.execute(_SET_SCOPE, {"scope": generation_request.scope_id})
                 row = (
                     (
                         await conn.execute(
@@ -1016,25 +1167,101 @@ class PostgresPatchProposalStore:
                         .one()
                     )
                     proposal, created = _to_proposal(existing), False
-                # Record the ``generating`` dispatch intent in the SAME transaction as a genuine
-                # create (both commit or roll back), so a proposal never becomes durable without a
-                # discoverable pointer. The idempotent replay of an existing proposal never
-                # re-records it: that proposal's pointer already reflects its current lifecycle
-                # stage (it may have been intentionally deleted at ``approval_pending`` or a
-                # terminal state), and re-inserting here would resurrect a retired pointer.
-                if outbox is not None and created:
-                    await outbox.record_in_connection(
+                # On a genuine create, record the immutable request payload (when supplied) AND the
+                # ``generating`` dispatch pointer in this SAME txn (all commit or roll back),
+                # so a proposal never becomes durable without a reconstructable request and a
+                # discoverable pointer. The idempotent replay of an existing one never re-records
+                # either: the pointer already reflects that proposal's current lifecycle stage (it
+                # may have been deleted at ``approval_pending`` or a terminal state) and
+                # re-inserting would resurrect a retired pointer; the request row is only *verified*
+                # (fail closed) against the persisted one, never inserted after the fact.
+                if created:
+                    if generation_request is not None:
+                        await insert_generation_request_in_connection(conn, generation_request)
+                    if outbox is not None:
+                        await outbox.record_in_connection(
+                            conn,
+                            proposal_id=proposal.id,
+                            org_id=org_id,
+                            scope_id=outbox_scope,
+                            expires_at=expires_at,
+                            status_hint=PatchOutboxStatus.generating,
+                            now=created_at,
+                        )
+                elif generation_request is not None:
+                    await self._verify_stored_generation_request(
                         conn,
                         proposal_id=proposal.id,
                         org_id=org_id,
-                        scope_id=outbox_scope,
-                        expires_at=expires_at,
-                        status_hint=PatchOutboxStatus.generating,
-                        now=created_at,
+                        fingerprint=generation_request.fingerprint,
                     )
                 return proposal, created
         except IntegrityError as exc:  # composite FK to projects(id, org_id) violated
             raise ProposalConflictError("proposal binding is invalid for this org/project") from exc
+
+    @staticmethod
+    async def _verify_stored_generation_request(
+        conn: AsyncConnection, *, proposal_id: str, org_id: str, fingerprint: str
+    ) -> None:
+        """Fail closed if an idempotent replay's request diverges from the persisted one.
+
+        Looked up by the *existing* proposal id under the scope GUC set by ``create`` (RLS scopes
+        the row). A missing row is an unrecoverable conflict (never inserted after the fact); a
+        fingerprint mismatch is a request-binding conflict. The identity fingerprint excludes the
+        per-attempt ids, so a legitimate retry (fresh proposal/run id) still matches.
+        """
+        existing_fp = await conn.scalar(
+            text(
+                "SELECT fingerprint FROM patch_generation_requests "
+                "WHERE proposal_id = :pid AND org_id = :org"
+            ),
+            {"pid": proposal_id, "org": org_id},
+        )
+        if existing_fp is None:
+            raise ProposalConflictError(
+                "existing proposal has no durable generation request payload"
+            )
+        if existing_fp != fingerprint:
+            raise ProposalConflictError(
+                "generation request fingerprint mismatch on idempotent replay"
+            )
+
+    async def get_generation_request(
+        self, org_id: str, proposal_id: str, scope_id: str
+    ) -> PatchGenerationRequestRecord | None:
+        async with self._engine.begin() as conn:
+            # Scope RLS isolates the row: a caller bound to a different scope reads nothing (the
+            # ``WHERE org_id`` predicate is belt-and-braces behind the composite FK).
+            await conn.execute(_SET_SCOPE, {"scope": scope_id})
+            row = (
+                (
+                    await conn.execute(
+                        _SELECT_GENERATION_REQUEST, {"pid": proposal_id, "org": org_id}
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        if row is None:
+            return None
+        try:
+            return PatchGenerationRequestRecord.from_stored(
+                proposal_id=row["proposal_id"],
+                org_id=row["org_id"],
+                scope_id=row["scope_id"],
+                payload=row["payload"],
+                fingerprint=row["fingerprint"],
+                created_at=row["created_at"],
+            )
+        except PatchValidationError:
+            # A persisted row that no longer reconstructs (schema drift / tampered digest) fails
+            # closed to ``None`` -- the caller (reconciler) treats an unreconstructable generating
+            # proposal as terminal corruption rather than re-dispatching an unverified request.
+            logger.warning(
+                "patch generation request failed fail-closed reconstruction proposal=%s",
+                proposal_id,
+            )
+            return None
 
     async def get(self, org_id: str, proposal_id: str) -> PatchProposal | None:
         async with self._engine.begin() as conn:

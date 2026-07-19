@@ -37,21 +37,19 @@ from keel_core.patch.jobs import (
     PATCH_GENERATE_MAX_ATTEMPTS,
     PATCH_WRITEBACK_KIND,
     PATCH_WRITEBACK_MAX_ATTEMPTS,
-    PatchGenerateJobPayload,
     patch_generate_idempotency_key,
     patch_writeback_idempotency_key,
-    persist_generate_metadata,
 )
-from keel_core.patch.models import PatchStatus
+from keel_core.patch.models import PatchProposalRequest, PatchStatus
 from keel_core.patch.outbox import (
     InMemoryPatchProposalOutbox,
     PatchOutboxEntry,
     PatchOutboxStatus,
 )
+from keel_core.patch.payload import PatchGenerationRequestRecord
 from keel_core.patch.store import InMemoryPatchProposalStore
 from keel_core.runs import PostgresRunStore
 from keel_core.scoping import derive_agent_scope
-from keel_core.state import InMemoryEventStore
 from keel_worker.jobs import _ALL_JOB_KINDS, _CROSS_SCOPE_JOB_KINDS, JobRegistry
 from keel_worker.patch import (
     PatchOutboxReconciler,
@@ -255,7 +253,6 @@ class _Harness:
         self.store = InMemoryPatchProposalStore()
         self.outbox = InMemoryPatchProposalOutbox()
         self.job_store = InMemoryJobStore(_SCOPE)
-        self.events = InMemoryEventStore()
         self.dispatch = InMemoryJobDispatchOutbox()
         self.coordinator = coordinator or _StubCoordinator()
         self.reconciler = PatchOutboxReconciler(
@@ -263,7 +260,6 @@ class _Harness:
             outbox=self.outbox,
             coordinator_factory=lambda _s: self.coordinator,
             job_store_factory=lambda _s: self.job_store,
-            run_events_factory=lambda _s: self.events,
             job_dispatch_outbox=self.dispatch,
             worker_id="rec-1",
         )
@@ -276,8 +272,33 @@ class _Harness:
         expires_at: datetime | None = None,
         agent_id: str = _AGENT,
         org: str = _ORG,
+        with_request: bool = False,
+        scope: str = _SCOPE,
     ) -> Any:
         expires = expires_at or (_now() + timedelta(hours=1))
+        extra: dict[str, Any] = {}
+        if with_request:
+            # A durable, scope-partitioned generation request written in the SAME atomic create as
+            # the proposal + ``generating`` pointer (P4a). The reconciler reloads it to resume a
+            # stranded generation, so seeding it exercises the real store path rather than a
+            # side-channel event log.
+            request = PatchProposalRequest(
+                org_id=org,
+                project_id="p",
+                actor="u",
+                task="do the thing",
+                base_ref="main",
+                model="m",
+                idempotency_key=pid,
+                agent_id=agent_id,
+            )
+            extra = {
+                "generation_request": PatchGenerationRequestRecord.from_request(
+                    request, proposal_id=pid, run_id=pid, scope_id=scope
+                ),
+                "outbox": self.outbox,
+                "scope_id": scope,
+            }
         proposal, created = await self.store.create(
             proposal_id=pid,
             org_id=org,
@@ -292,6 +313,7 @@ class _Harness:
             idempotency_key=pid,
             fingerprint="f" * 64,
             expires_at=expires,
+            **extra,
         )
         assert created
         if status in _STATUS_CHAIN:
@@ -320,20 +342,6 @@ class _Harness:
             status_hint=status_hint,
             job_id=job_id,
         )
-
-    async def persist_metadata(self, *, pid: str) -> None:
-        payload = PatchGenerateJobPayload(
-            proposal_id=pid,
-            run_id=pid,
-            org_id=_ORG,
-            project_id="p",
-            actor="u",
-            task="do the thing",
-            base_ref="main",
-            model="m",
-            idempotency_key=pid,
-        )
-        await persist_generate_metadata(self.events, scope_id=_SCOPE, payload=payload)
 
     async def enqueue_active_job(self, *, kind: str, pid: str) -> str:
         idem = (
@@ -427,9 +435,7 @@ async def test_reconcile_expires_on_ttl_and_deletes_pointer() -> None:
 
 async def test_reconcile_generating_enqueues_generate_job_and_fences_job_id() -> None:
     h = _Harness()
-    await h.seed_proposal(pid="pp1")
-    await h.persist_metadata(pid="pp1")
-    await h.seed_pointer(pid="pp1")
+    await h.seed_proposal(pid="pp1", with_request=True)  # atomic proposal + request + pointer
 
     assert await h.reconciler.run() == 1
     # The pointer now references the enqueued generate job.
@@ -448,17 +454,25 @@ async def test_reconcile_generating_enqueues_generate_job_and_fences_job_id() ->
     assert len(intents) == 1
 
 
-async def test_reconcile_generating_without_metadata_defers_within_ttl() -> None:
+async def test_reconcile_generating_without_request_fails_closed_within_ttl() -> None:
+    # Since P4a a committed ``generating`` proposal ALWAYS has a durable request row (written in the
+    # same atomic create). A ``generating`` proposal with NO request is unrecoverable corruption (a
+    # legacy pre-0022 row / erased payload): fail it closed at once with an atomic pointer delete
+    # -- there is no TTL defer, because the request can never appear later.
     h = _Harness()
-    await h.seed_proposal(pid="pp1")  # future TTL, no durable metadata persisted
+    await h.seed_proposal(pid="pp1")  # future TTL, but no durable request persisted
     await h.seed_pointer(pid="pp1")
-    assert await h.reconciler.run() == 0
+    assert await h.reconciler.run() == 1
+    proposal = await h.store.get(_ORG, "pp1")
+    assert proposal.status is PatchStatus.failed
+    assert proposal.error_kind == "patch_generation_request_missing"
     assert len(await h.job_store.list()) == 0
-    assert (await h.store.get(_ORG, "pp1")).status is PatchStatus.generating
-    assert await h.outbox.get("pp1") is not None
+    assert await h.outbox.get("pp1") is None
 
 
-async def test_reconcile_generating_without_metadata_fails_past_ttl() -> None:
+async def test_reconcile_generating_without_request_fails_closed_past_ttl() -> None:
+    # TTL is irrelevant to the fail-closed decision: a stranded ``generating`` proposal past its TTL
+    # still fails on the MISSING REQUEST (not a TTL backstop), proving the request is the invariant.
     h = _Harness()
     past = _now() - timedelta(hours=1)
     await h.seed_proposal(pid="pp1", expires_at=past)
@@ -466,7 +480,7 @@ async def test_reconcile_generating_without_metadata_fails_past_ttl() -> None:
     assert await h.reconciler.run() == 1
     proposal = await h.store.get(_ORG, "pp1")
     assert proposal.status is PatchStatus.failed
-    assert proposal.error_kind == "patch_generation_unrecoverable"
+    assert proposal.error_kind == "patch_generation_request_missing"
     assert await h.outbox.get("pp1") is None
 
 
@@ -552,9 +566,7 @@ async def test_reconcile_writeback_defers_when_job_active() -> None:
 
 async def test_reconcile_stops_on_stale_token_without_rescheduling() -> None:
     h = _Harness()
-    await h.seed_proposal(pid="pp1")
-    await h.persist_metadata(pid="pp1")
-    await h.seed_pointer(pid="pp1")
+    await h.seed_proposal(pid="pp1", with_request=True)
 
     async def _stale(*_a: Any, **_k: Any) -> bool:
         return False
@@ -570,9 +582,7 @@ async def test_reconcile_stops_on_stale_token_without_rescheduling() -> None:
 
 async def test_reconcile_isolates_one_pointers_typed_failure() -> None:
     h = _Harness()
-    await h.seed_proposal(pid="good")
-    await h.persist_metadata(pid="good")
-    await h.seed_pointer(pid="good")
+    await h.seed_proposal(pid="good", with_request=True)
     await h.seed_pointer(pid="poison")  # no proposal + a poisoned get raises below
 
     real_get = h.store.get

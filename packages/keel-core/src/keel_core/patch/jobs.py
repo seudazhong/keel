@@ -22,24 +22,17 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import (
     BaseModel,
     ConfigDict,
-    Field,
     StrictBool,
-    StrictFloat,
-    StrictInt,
     StrictStr,
     ValidationError,
-    field_validator,
 )
 from sqlalchemy.exc import SQLAlchemyError
 
-from keel_core.errors import DuplicateEventError
-from keel_core.events import Event, EventType
 from keel_core.jobs import (
     JobCancellationRequested,
     JobLeaseLostError,
@@ -47,7 +40,6 @@ from keel_core.jobs import (
     PermanentJobError,
     RetryableJobError,
 )
-from keel_core.protocols import EventStore
 
 from .coordinator import PatchCoordinator
 from .errors import (
@@ -57,14 +49,7 @@ from .errors import (
     PatchRemoteUnavailable,
     PatchWritebackError,
 )
-from .models import (
-    DEFAULT_MAX_DIFF_BYTES,
-    DEFAULT_PATCH_COST_CEILING_USD,
-    DEFAULT_PATCH_MAX_ITERATIONS,
-    DEFAULT_PATCH_OUTPUT_MAX_TOKENS,
-    DEFAULT_PATCH_TOKEN_BUDGET,
-    PatchProposalRequest,
-)
+from .payload import PatchGenerateJobPayload
 
 logger = logging.getLogger("keel.patch.jobs")
 
@@ -91,105 +76,6 @@ def patch_generate_idempotency_key(proposal_id: str) -> str:
 def patch_writeback_idempotency_key(proposal_id: str) -> str:
     """A stable job idempotency key so a retried enqueue schedules at most one writeback job."""
     return f"{PATCH_WRITEBACK_KIND}:{proposal_id}"
-
-
-# --- durable generate-request metadata (reconstruction seam) -------------------------------------
-# A ``patch.generate`` job carries the full authorized request (raw tainted task text + budgets),
-# but a proposal row persists only a ``task_digest`` and the outbox pointer deliberately carries no
-# sensitive payload. So when a proposal is admitted the full request is recorded ONCE on the run's
-# append-only event log (mirroring ``ReviewCoordinator._persist_request_metadata``); the fenced
-# patch reconciler reconstructs it to (re-)create a stranded generation job after a lost enqueue,
-# and fails closed (never fabricates a payload) when it is absent/legacy/tampered.
-#
-# P4 SERVER ORDERING BLOCKER (do not widen this seam here): P3b-1 provides only the persist/load
-# primitives. The P4 request path MUST guarantee that a committed ``generating`` proposal ALWAYS
-# has reconstructable metadata, so the reconciler can resume a lost dispatch. Two acceptable
-# designs — a two-phase ``create`` then ``persist`` is FORBIDDEN because a crash between the two
-# strands a ``generating`` proposal whose request can never be rebuilt (the reconciler then defers
-# within TTL and force-fails it at TTL — an availability regression, not a safety one, but still a
-# blocker):
-#   (a) metadata-BEFORE-create: append the metadata event (keyed by the pre-generated
-#       ``run_id``/``proposal_id``) BEFORE inserting the proposal + outbox pointer, so a committed
-#       proposal implies committed metadata; or
-#   (b) a dedicated scoped payload table added in a NEW migration (0022), written in the SAME
-#       transaction as the proposal ``create`` so both commit atomically.
-# Neither expands any user-facing API; do not add a request-approval endpoint (the reconciler
-# auto-heals ``ready`` -> ``approval_pending``).
-PATCH_GENERATE_REQUEST_MARKER = "patch_generate_request"
-PATCH_GENERATE_METADATA_VERSION = 1
-
-
-async def persist_generate_metadata(
-    events: EventStore,
-    *,
-    scope_id: str,
-    payload: PatchGenerateJobPayload,
-    now: datetime | None = None,
-) -> None:
-    """Durably record the immutable generate-job payload on the run's event log (idempotent).
-
-    No schema migration: the payload lives in the append-only ``events`` payload keyed by the
-    run id. A duplicate append (a retried/idempotent re-request) is ignored. The caller injects a
-    per-scope :class:`~keel_core.protocols.EventStore` bound to the proposal's canonical
-    ``scope_id`` (passed explicitly — the Protocol exposes no scope accessor) and the metadata is
-    written only on the winning admission so a replayed request never rewrites it.
-
-    See the module comment's *P4 SERVER ORDERING BLOCKER*: the P4 caller must persist this BEFORE
-    creating the proposal (or via a 0022 scoped payload table committed in the create transaction),
-    never create-then-persist.
-    """
-    moment = now or datetime.now(UTC)
-    event = Event(
-        type=EventType.run_started,
-        seq=0,
-        session_id=payload.run_id,
-        scope_id=scope_id,
-        run_id=payload.run_id,
-        ts=moment,
-        payload={
-            PATCH_GENERATE_REQUEST_MARKER: {
-                "version": PATCH_GENERATE_METADATA_VERSION,
-                "payload": payload.model_dump(mode="json"),
-            },
-            "dedup_key": f"patch-generate-meta:{payload.run_id}",
-        },
-    )
-    try:
-        await events.append(event)
-    except DuplicateEventError:
-        # A concurrent/replayed admission already recorded the immutable metadata — the winner's
-        # copy is authoritative and identical, so observing the duplicate is the idempotent no-op.
-        pass
-
-
-async def load_generate_metadata(events: EventStore, run_id: str) -> PatchGenerateJobPayload | None:
-    """Reconstruct the durably-persisted generate-job payload for ``run_id`` (or ``None``).
-
-    Fail closed: a missing marker, an unknown/legacy metadata version, or a payload that no longer
-    validates against the current strict schema returns ``None`` rather than a fabricated or
-    partially-defaulted request — so a stranded re-dispatch never runs generation under a payload
-    the server never admitted. The reconciler defers such an entry to the TTL backstop.
-    """
-    async for event in events.read(run_id):
-        marker = event.payload.get(PATCH_GENERATE_REQUEST_MARKER)
-        if not isinstance(marker, dict):
-            continue
-        if marker.get("version") != PATCH_GENERATE_METADATA_VERSION:
-            logger.warning(
-                "patch generate metadata version mismatch; failing closed run=%s", run_id
-            )
-            return None
-        raw = marker.get("payload")
-        if not isinstance(raw, dict):
-            return None
-        try:
-            return PatchGenerateJobPayload.model_validate(raw)
-        except ValidationError:
-            logger.warning(
-                "patch generate metadata failed schema validation; failing closed run=%s", run_id
-            )
-            return None
-    return None
 
 
 def _heartbeat_interval(lease_seconds: float) -> float:
@@ -225,88 +111,6 @@ class PatchJobContext(Protocol):
     def job_lease_seconds(self) -> int: ...
 
     async def checkpoint(self) -> None: ...
-
-
-class PatchGenerateJobPayload(BaseModel):
-    """The durable payload carried by a ``patch.generate`` job.
-
-    Reconstructs the authorized :class:`~keel_core.patch.models.PatchProposalRequest` (the tainted
-    development ``task`` is bounded storage-safe text) plus the ``run_id`` the server bound to the
-    proposal, so the worker can resume generation idempotently after a crash/retry."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True, hide_input_in_errors=True, strict=True)
-
-    proposal_id: StrictStr
-    run_id: StrictStr
-    org_id: StrictStr
-    project_id: StrictStr
-    actor: StrictStr
-    task: StrictStr
-    base_ref: StrictStr
-    model: StrictStr
-    idempotency_key: StrictStr
-    agent_id: StrictStr | None = None
-    source_ref: StrictStr = ""
-    test_commands: tuple[StrictStr, ...] = ()
-    max_diff_bytes: StrictInt = Field(default=DEFAULT_MAX_DIFF_BYTES)
-    token_budget: StrictInt = Field(default=DEFAULT_PATCH_TOKEN_BUDGET)
-    output_max_tokens: StrictInt = Field(default=DEFAULT_PATCH_OUTPUT_MAX_TOKENS)
-    cost_ceiling_usd: StrictFloat = Field(default=DEFAULT_PATCH_COST_CEILING_USD)
-    max_iterations: StrictInt = Field(default=DEFAULT_PATCH_MAX_ITERATIONS)
-
-    @field_validator("test_commands", mode="before")
-    @classmethod
-    def _coerce_test_commands(cls, value: object) -> object:
-        # A durable job payload survives a JSONB store/read round-trip, which lowers the immutable
-        # ``tuple`` to a JSON ``list``. Coerce a list back to a tuple BEFORE strict validation so a
-        # reconstructed/enqueued payload validates, while every element is still checked as a
-        # ``StrictStr`` (a non-list, e.g. a bare string, is left untouched and fails closed).
-        if isinstance(value, list):
-            return tuple(value)
-        return value
-
-    def to_request(self) -> PatchProposalRequest:
-        return PatchProposalRequest(
-            org_id=self.org_id,
-            project_id=self.project_id,
-            actor=self.actor,
-            task=self.task,
-            base_ref=self.base_ref,
-            model=self.model,
-            idempotency_key=self.idempotency_key,
-            agent_id=self.agent_id,
-            source_ref=self.source_ref,
-            test_commands=self.test_commands,
-            max_diff_bytes=self.max_diff_bytes,
-            token_budget=self.token_budget,
-            output_max_tokens=self.output_max_tokens,
-            cost_ceiling_usd=self.cost_ceiling_usd,
-            max_iterations=self.max_iterations,
-        )
-
-    @classmethod
-    def from_request(
-        cls, request: PatchProposalRequest, *, proposal_id: str, run_id: str
-    ) -> PatchGenerateJobPayload:
-        return cls(
-            proposal_id=proposal_id,
-            run_id=run_id,
-            org_id=request.org_id,
-            project_id=request.project_id,
-            actor=request.actor,
-            task=request.task,
-            base_ref=request.base_ref,
-            model=request.model,
-            idempotency_key=request.idempotency_key,
-            agent_id=request.agent_id,
-            source_ref=request.source_ref,
-            test_commands=tuple(request.test_commands),
-            max_diff_bytes=request.max_diff_bytes,
-            token_budget=request.token_budget,
-            output_max_tokens=request.output_max_tokens,
-            cost_ceiling_usd=request.cost_ceiling_usd,
-            max_iterations=request.max_iterations,
-        )
 
 
 class PatchWritebackJobPayload(BaseModel):
@@ -531,16 +335,12 @@ class PatchJobHandlers:
 __all__ = [
     "PATCH_GENERATE_KIND",
     "PATCH_GENERATE_MAX_ATTEMPTS",
-    "PATCH_GENERATE_METADATA_VERSION",
-    "PATCH_GENERATE_REQUEST_MARKER",
     "PATCH_WRITEBACK_KIND",
     "PATCH_WRITEBACK_MAX_ATTEMPTS",
     "PatchGenerateJobPayload",
     "PatchJobContext",
     "PatchJobHandlers",
     "PatchWritebackJobPayload",
-    "load_generate_metadata",
     "patch_generate_idempotency_key",
     "patch_writeback_idempotency_key",
-    "persist_generate_metadata",
 ]

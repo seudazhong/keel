@@ -78,6 +78,7 @@ from .errors import (
 )
 from .generation import GenerationOutcome, PatchGenerationService
 from .models import (
+    DEFAULT_PATCH_AGENT_ID,
     PatchProposal,
     PatchProposalRequest,
     PatchStatus,
@@ -86,13 +87,13 @@ from .models import (
     task_digest,
 )
 from .outbox import PatchProposalOutbox
+from .payload import PatchGenerationRequestRecord
 from .store import ApprovalDraft, PatchProposalStore
 from .writeback import PatchWritebackService, WritebackTarget
 
 logger = logging.getLogger("keel.patch.coordinator")
 
 PATCH_SURFACE = "patch"
-DEFAULT_PATCH_AGENT_ID = "patch"
 DEFAULT_PATCH_TTL_SECONDS = 14 * 24 * 3600
 DEFAULT_PATCH_LEASE_SECONDS = 1800
 
@@ -329,6 +330,13 @@ class PatchCoordinator:
         await self.authorizer.associate_run(
             request.org_id, request.actor, request.project_id, run_id, agent_id=request.agent_id
         )
+        # Persist the full authorized request in the SAME transaction as the proposal + dispatch
+        # pointer (below), so a committed ``generating`` proposal always implies a committed,
+        # reconstructable request the fenced reconciler can re-dispatch after a lost enqueue -- the
+        # server can never forget it (no create-then-persist seam).
+        generation_request = PatchGenerationRequestRecord.from_request(
+            request, proposal_id=proposal_id, run_id=run_id, scope_id=binding.scope_id, now=moment
+        )
         proposal, created = await self.store.create(
             proposal_id=proposal_id,
             org_id=request.org_id,
@@ -346,6 +354,7 @@ class PatchCoordinator:
             now=moment,
             outbox=self.outbox,
             scope_id=binding.scope_id,
+            generation_request=generation_request,
         )
         if created:
             self.audit.record(

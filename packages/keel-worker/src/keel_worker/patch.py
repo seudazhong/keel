@@ -59,7 +59,6 @@ from keel_core.patch.jobs import (
     PATCH_WRITEBACK_MAX_ATTEMPTS,
     PatchJobHandlers,
     PatchWritebackJobPayload,
-    load_generate_metadata,
     patch_generate_idempotency_key,
     patch_writeback_idempotency_key,
 )
@@ -80,10 +79,9 @@ from keel_core.patch.transfer_client import SandboxTransferClient
 from keel_core.patch.writeback import PatchWritebackService
 from keel_core.projects import PostgresProjectStore, ProjectService
 from keel_core.projects.github_factory import build_github_integration
-from keel_core.protocols import EventStore, ProviderGateway
+from keel_core.protocols import ProviderGateway
 from keel_core.runs import PostgresRunStore, RunStore
 from keel_core.scoping import ScopeValidationError, derive_agent_scope, validate_scope_id
-from keel_core.state import PostgresEventStore
 from keel_core.tools.rpc import SandboxExecutionEnvironment
 
 from .jobs import JobDefinition, JobRegistry
@@ -363,7 +361,6 @@ class PatchOutboxReconciler:
     outbox: PatchProposalOutbox
     coordinator_factory: Callable[[str], PatchCoordinator]
     job_store_factory: Callable[[str], JobStore]
-    run_events_factory: Callable[[str], EventStore]
     job_dispatch_outbox: JobDispatchOutbox
     worker_id: str
     batch_limit: int = PATCH_RECONCILE_LIMIT
@@ -533,38 +530,31 @@ class PatchOutboxReconciler:
                 now=now,
             )
             return True
-        # No servicing job yet: (re-)create it from the durably-persisted request metadata.
-        events = self.run_events_factory(scope_id)
-        payload = await load_generate_metadata(events, proposal.run_id)
-        if payload is None:
-            # Cannot reconstruct the authorized request (the server has not persisted it yet, or it
-            # is legacy/tampered). NEVER fabricate one: defer within TTL; once past TTL fail closed
-            # so an unrecoverable pointer cannot loop forever.
-            if proposal.expires_at <= now:
-                await self.store.transition(
-                    entry.org_id,
-                    proposal.id,
-                    PatchStatus.failed,
-                    expected_version=proposal.version,
-                    updates={
-                        "error_kind": "patch_generation_unrecoverable",
-                        "error_message": "no durable generate-request metadata to resume",
-                    },
-                    outbox=self.outbox,
-                    scope_id=scope_id,
-                    now=now,
-                )
-                return True
-            await self.outbox.reschedule(
-                entry.proposal_id,
-                lease_token=token,
-                delay_seconds=self.reschedule_delay_seconds,
+        # No servicing job yet: (re-)create it from the durably-persisted request payload. Since
+        # P4a the request is written in the SAME transaction as the proposal, so a committed
+        # ``generating`` proposal ALWAYS has a reconstructable request. A missing/unreconstructable
+        # one is terminal corruption (a legacy pre-0022 row, or a tampered payload): fail the
+        # proposal closed with an atomic pointer delete -- NEVER fabricate one, and (unlike the
+        # old event-log seam) never defer within TTL, because the request can never appear later.
+        record = await self.store.get_generation_request(entry.org_id, proposal.id, scope_id)
+        if record is None:
+            await self.store.transition(
+                entry.org_id,
+                proposal.id,
+                PatchStatus.failed,
+                expected_version=proposal.version,
+                updates={
+                    "error_kind": "patch_generation_request_missing",
+                    "error_message": "no durable generation request payload to resume generation",
+                },
+                outbox=self.outbox,
+                scope_id=scope_id,
                 now=now,
             )
-            return False
+            return True
         job, _created = await job_store.enqueue_once_with_dispatch_intent(
             kind=PATCH_GENERATE_KIND,
-            payload=payload.model_dump(mode="json"),
+            payload=record.payload.model_dump(mode="json"),
             target_session_id=None,
             idempotency_key=patch_generate_idempotency_key(proposal.id),
             max_attempts=PATCH_GENERATE_MAX_ATTEMPTS,
@@ -678,7 +668,6 @@ def build_patch_reconciler(
         outbox=components.outbox,
         coordinator_factory=lambda s: build_patch_coordinator(components, s),
         job_store_factory=lambda s: PostgresJobStore(engine, s, limits=limits),
-        run_events_factory=lambda s: PostgresEventStore(engine, s),
         job_dispatch_outbox=job_dispatch_outbox,
         worker_id=worker_id,
     )

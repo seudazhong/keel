@@ -62,6 +62,11 @@ from .outbox import (
     PatchProposalOutbox,
     PostgresPatchProposalOutbox,
 )
+from .payload import (
+    PatchGenerationRequestRecord,
+    canonical_payload_json,
+    request_fingerprint,
+)
 from .store import ApprovalDraft
 
 __all__ = [
@@ -81,6 +86,7 @@ __all__ = [
     "PatchBundleManifest",
     "PatchError",
     "PatchGenerateJobPayload",
+    "PatchGenerationRequestRecord",
     "PatchJobContext",
     "PatchJobHandlers",
     "PatchLeaseLost",
@@ -107,6 +113,7 @@ __all__ = [
     "TestResult",
     "TestStatus",
     "can_transition",
+    "canonical_payload_json",
     "changed_path_digest",
     "ensure_transition",
     "is_forbidden_path",
@@ -114,6 +121,7 @@ __all__ = [
     "normalize_repo_path",
     "patch_generate_idempotency_key",
     "patch_writeback_idempotency_key",
+    "request_fingerprint",
     "run_branch_for",
     "task_digest",
     "validate_commit_sha",

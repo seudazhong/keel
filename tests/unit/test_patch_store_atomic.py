@@ -24,14 +24,19 @@ import pytest
 
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.patch.errors import PatchApprovalError, PatchStateError, PatchValidationError
-from keel_core.patch.models import PatchProposal, PatchStatus
+from keel_core.patch.models import PatchProposal, PatchProposalRequest, PatchStatus
 from keel_core.patch.outbox import (
     InMemoryPatchProposalOutbox,
     PatchOutboxStatus,
     PatchProposalOutbox,
     PostgresPatchProposalOutbox,
 )
-from keel_core.patch.store import ApprovalDraft, InMemoryPatchProposalStore
+from keel_core.patch.payload import PatchGenerationRequestRecord
+from keel_core.patch.store import (
+    ApprovalDraft,
+    InMemoryPatchProposalStore,
+    ProposalConflictError,
+)
 
 _SCOPE = "agent:org-a/patch"
 _T0 = datetime(2026, 7, 19, 12, 0, tzinfo=UTC)
@@ -50,6 +55,7 @@ async def _create_full(
     idem: str = "idem-1",
     org: str = "org-a",
     run: str = "run-1",
+    generation_request: PatchGenerationRequestRecord | None = None,
 ) -> tuple[PatchProposal, bool]:
     return await store.create(
         proposal_id=pid,
@@ -68,6 +74,31 @@ async def _create_full(
         now=_T0,
         outbox=outbox,
         scope_id=scope_id,
+        generation_request=generation_request,
+    )
+
+
+def _gen_request(
+    *,
+    pid: str = "pp_1",
+    run: str = "run-1",
+    org: str = "org-a",
+    idem: str = "idem-1",
+    task: str = "apply the change",
+    scope: str = _SCOPE,
+) -> PatchGenerationRequestRecord:
+    request = PatchProposalRequest(
+        org_id=org,
+        project_id="proj-a",
+        actor="u",
+        task=task,
+        base_ref="main",
+        model="m",
+        idempotency_key=idem,
+        agent_id="patch",
+    )
+    return PatchGenerationRequestRecord.from_request(
+        request, proposal_id=pid, run_id=run, scope_id=scope, now=_T0
     )
 
 
@@ -204,6 +235,150 @@ async def test_create_idempotent_replay_does_not_resurrect_deleted_pointer() -> 
     assert fresh_created is True
     fresh_entry = await outbox.get("pp_2")
     assert fresh_entry is not None and fresh_entry.status_hint is PatchOutboxStatus.generating
+
+
+# --- create seam: durable generation request (P4a) -----------------------------------
+
+
+async def test_create_writes_generation_request_atomically() -> None:
+    store = InMemoryPatchProposalStore()
+    outbox = InMemoryPatchProposalOutbox()
+    record = _gen_request()
+    proposal, created = await _create_full(
+        store, outbox=outbox, scope_id=_SCOPE, generation_request=record
+    )
+    assert created is True
+    got = await store.get_generation_request("org-a", proposal.id, _SCOPE)
+    assert got is not None
+    assert got.fingerprint == record.fingerprint
+    assert got.payload.task == "apply the change"
+    # The generating pointer landed in the SAME atomic create.
+    assert (await outbox.get(proposal.id)) is not None
+
+
+async def test_create_with_request_requires_outbox() -> None:
+    store = InMemoryPatchProposalStore()
+    with pytest.raises(PatchValidationError):
+        await _create_full(store, outbox=None, scope_id=_SCOPE, generation_request=_gen_request())
+    # Fail closed: no proposal and no request row were written.
+    assert await store.get("org-a", "pp_1") is None
+    assert await store.get_generation_request("org-a", "pp_1", _SCOPE) is None
+
+
+async def test_create_with_request_rejects_mismatched_binding() -> None:
+    store = InMemoryPatchProposalStore()
+    outbox = InMemoryPatchProposalOutbox()
+    # The record's scope must line up with the create's scope (defense-in-depth against a caller
+    # wiring a mismatched payload); a mismatch fails closed before anything is written.
+    with pytest.raises(PatchValidationError):
+        await _create_full(
+            store, outbox=outbox, scope_id="agent:org-a/other", generation_request=_gen_request()
+        )
+    assert await store.get("org-a", "pp_1") is None
+    assert await store.get_generation_request("org-a", "pp_1", _SCOPE) is None
+
+
+async def test_create_rolls_back_request_when_pointer_write_fails() -> None:
+    store = InMemoryPatchProposalStore()
+    outbox = _FailingRecordOutbox()
+    with pytest.raises(RuntimeError, match="pointer store down"):
+        await _create_full(store, outbox=outbox, scope_id=_SCOPE, generation_request=_gen_request())
+    # Proposal, request payload, and pointer all roll back together — none is half-written.
+    assert await store.get("org-a", "pp_1") is None
+    assert await store.get_generation_request("org-a", "pp_1", _SCOPE) is None
+
+
+async def test_create_replay_with_fresh_ids_verifies_by_identity() -> None:
+    store = InMemoryPatchProposalStore()
+    outbox = InMemoryPatchProposalOutbox()
+    first, created = await _create_full(
+        store, outbox=outbox, scope_id=_SCOPE, generation_request=_gen_request()
+    )
+    assert created is True
+    # A retry mints a FRESH proposal_id/run_id under the same idempotency key + task; the
+    # request-identity fingerprint matches, so the replay verifies (created=False, no re-insert) and
+    # dedupes to the original proposal.
+    replay, replay_created = await _create_full(
+        store,
+        outbox=outbox,
+        scope_id=_SCOPE,
+        pid="pp_fresh",
+        run="run-fresh",
+        generation_request=_gen_request(pid="pp_fresh", run="run-fresh"),
+    )
+    assert replay_created is False
+    assert replay.id == first.id
+
+
+async def test_create_replay_same_request_does_not_resurrect_pointer() -> None:
+    store = InMemoryPatchProposalStore()
+    outbox = InMemoryPatchProposalOutbox()
+    record = _gen_request()
+    first, created = await _create_full(
+        store, outbox=outbox, scope_id=_SCOPE, generation_request=record
+    )
+    assert created is True
+    # Advance ready -> approval_pending: the dispatch pointer is intentionally deleted.
+    ready_v = await _ready(store, first.id, outbox=outbox, scope_id=_SCOPE)
+    await store.transition(
+        "org-a",
+        first.id,
+        PatchStatus.approval_pending,
+        expected_version=ready_v,
+        now=_T0,
+        outbox=outbox,
+        scope_id=_SCOPE,
+    )
+    assert (await outbox.get(first.id)) is None
+    # The idempotent replay carrying the same request must NOT resurrect the retired pointer nor
+    # re-insert the request; the originally-persisted request stays readable and unchanged.
+    replay, replay_created = await _create_full(
+        store, outbox=outbox, scope_id=_SCOPE, generation_request=_gen_request()
+    )
+    assert replay_created is False
+    assert replay.status is PatchStatus.approval_pending
+    assert (await outbox.get(first.id)) is None
+    got = await store.get_generation_request("org-a", first.id, _SCOPE)
+    assert got is not None and got.fingerprint == record.fingerprint
+
+
+async def test_create_replay_divergent_request_conflicts() -> None:
+    store = InMemoryPatchProposalStore()
+    outbox = InMemoryPatchProposalOutbox()
+    await _create_full(store, outbox=outbox, scope_id=_SCOPE, generation_request=_gen_request())
+    # A divergent task under the SAME idempotency key is a request-binding conflict (fingerprints
+    # differ) — never a silent accept.
+    with pytest.raises(ProposalConflictError):
+        await _create_full(
+            store,
+            outbox=outbox,
+            scope_id=_SCOPE,
+            generation_request=_gen_request(task="a different task"),
+        )
+
+
+async def test_create_replay_missing_stored_request_conflicts() -> None:
+    store = InMemoryPatchProposalStore()
+    outbox = InMemoryPatchProposalOutbox()
+    # A proposal created WITHOUT a request (a legacy / pre-0022 path)...
+    await _create_full(store, outbox=outbox, scope_id=_SCOPE)
+    # ...can never have a request inserted after the fact on replay: fail closed (no late insert).
+    with pytest.raises(ProposalConflictError):
+        await _create_full(store, outbox=outbox, scope_id=_SCOPE, generation_request=_gen_request())
+
+
+async def test_get_generation_request_isolates_cross_scope_and_org() -> None:
+    store = InMemoryPatchProposalStore()
+    outbox = InMemoryPatchProposalOutbox()
+    proposal, _ = await _create_full(
+        store, outbox=outbox, scope_id=_SCOPE, generation_request=_gen_request()
+    )
+    assert await store.get_generation_request("org-a", proposal.id, _SCOPE) is not None
+    # A caller bound to a different scope or org can never observe the payload (mirrors the RLS).
+    assert await store.get_generation_request("org-a", proposal.id, "agent:org-a/other") is None
+    assert await store.get_generation_request("org-b", proposal.id, _SCOPE) is None
+    # An unknown proposal id returns None (fail closed).
+    assert await store.get_generation_request("org-a", "nope", _SCOPE) is None
 
 
 # --- transition seam: status-hint lifecycle ------------------------------------------
