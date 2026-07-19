@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping
 RPC_TIMESTAMP_HEADER = "X-Keel-Rpc-Timestamp"
 RPC_NONCE_HEADER = "X-Keel-Rpc-Nonce"
 RPC_SIGNATURE_HEADER = "X-Keel-Rpc-Signature"
+RPC_RESPONSE_SIGNATURE_HEADER = "X-Keel-Rpc-Response-Signature"
 MIN_RPC_SECRET_BYTES = 32
 DEFAULT_REPLAY_WINDOW_SECONDS = 60
 DEFAULT_NONCE_CACHE_SIZE = 10_000
@@ -41,6 +42,35 @@ def _signature_payload(
 ) -> bytes:
     body_digest = hashlib.sha256(body).hexdigest()
     return "\n".join((method.upper(), path, timestamp, nonce, body_digest)).encode("utf-8")
+
+
+def _response_signature_payload(
+    method: str,
+    path: str,
+    request_nonce: str,
+    request_body: bytes,
+    response_body: bytes,
+) -> bytes:
+    """Bind the response to the exact request it answers.
+
+    The ``response`` domain prefix separates this payload from request
+    signatures, and including the request nonce plus the request body digest
+    ties a signature to a single in-flight request so a valid response cannot
+    be replayed against a different request.
+    """
+
+    request_digest = hashlib.sha256(request_body).hexdigest()
+    response_digest = hashlib.sha256(response_body).hexdigest()
+    return "\n".join(
+        (
+            "response",
+            method.upper(),
+            path,
+            request_nonce,
+            request_digest,
+            response_digest,
+        )
+    ).encode("utf-8")
 
 
 class RpcRequestSigner:
@@ -149,3 +179,80 @@ class RpcRequestVerifier:
             return False
         self._nonces[nonce] = timestamp
         return True
+
+
+class RpcResponseSigner:
+    """Sign RPC responses so the caller can authenticate their integrity.
+
+    The signature is bound to the request nonce, method, path, and request body
+    digest as well as the response body digest. This proves the response was
+    produced by a holder of the shared secret for this specific request, and it
+    prevents a captured response from being replayed against a different request
+    (whose nonce differs).
+    """
+
+    def __init__(
+        self,
+        secret: str | None,
+        *,
+        allow_unauthenticated_local_test: bool = False,
+    ) -> None:
+        self._secret = _secret_bytes(
+            secret,
+            allow_unauthenticated_local_test=allow_unauthenticated_local_test,
+        )
+
+    def headers(
+        self,
+        response_body: bytes,
+        *,
+        request_nonce: str,
+        request_body: bytes,
+        method: str = "POST",
+        path: str,
+    ) -> dict[str, str]:
+        if self._secret is None:
+            return {}
+        signature = hmac.new(
+            self._secret,
+            _response_signature_payload(method, path, request_nonce, request_body, response_body),
+            hashlib.sha256,
+        ).hexdigest()
+        return {RPC_RESPONSE_SIGNATURE_HEADER: signature}
+
+
+class RpcResponseVerifier:
+    """Verify that an RPC response was signed for the caller's own request."""
+
+    def __init__(
+        self,
+        secret: str | None,
+        *,
+        allow_unauthenticated_local_test: bool = False,
+    ) -> None:
+        self._secret = _secret_bytes(
+            secret,
+            allow_unauthenticated_local_test=allow_unauthenticated_local_test,
+        )
+
+    def verify(
+        self,
+        headers: Mapping[str, str],
+        response_body: bytes,
+        *,
+        request_nonce: str,
+        request_body: bytes,
+        method: str = "POST",
+        path: str,
+    ) -> bool:
+        if self._secret is None:
+            return True
+        provided = headers.get(RPC_RESPONSE_SIGNATURE_HEADER, "")
+        if not provided:
+            return False
+        expected = hmac.new(
+            self._secret,
+            _response_signature_payload(method, path, request_nonce, request_body, response_body),
+            hashlib.sha256,
+        ).hexdigest()
+        return hmac.compare_digest(expected, provided)
