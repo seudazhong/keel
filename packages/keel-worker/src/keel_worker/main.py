@@ -54,6 +54,7 @@ from keel_scheduler.store import ScheduleRow, due_tick
 from keel_worker.connectors import reconcile_connectors_tick, register_connector_jobs
 from keel_worker.jobs import dispatch_jobs, reconcile_job_dispatch_tick, run_job
 from keel_worker.knowledge import knowledge_job_registry
+from keel_worker.patch import reconcile_patch_outbox_tick
 from keel_worker.review import reconcile_stranded_reviews_tick, review_artifact_reaper_tick
 from keel_worker.runs import (
     reconcile_dispatch_tick,
@@ -703,6 +704,46 @@ async def startup(ctx: dict[str, Any]) -> None:
         register_review_jobs(job_registry, review_coordinator, settings)
     ctx["job_registry"] = job_registry
 
+    # Controlled patch proposals (WS-PP, P3b-1): a patch-capable worker builds the shared patch
+    # dependencies once (global proposal store + dispatch outbox, project-service authorizer with
+    # GitHub, the sandboxed-loop author over a single shared transfer client) and exposes a
+    # scope-pinned coordinator factory (consumed per-claimed-scope by ``run_job``/``_scoped_job_
+    # execution``) plus a fenced reconciler (the patch cron tick). Patch shares the review storage
+    # root; with patches enabled a missing/unwritable shared root FAILS STARTUP (crash-loop) rather
+    # than silently stranding proposals. No server router/API/SDK is wired here.
+    from keel_core.patch.transfer_client import SandboxTransferClient as _PatchTransferClient
+    from keel_worker.patch import (
+        build_patch_coordinator,
+        build_patch_reconciler,
+        build_patch_worker_components,
+        resolve_patch_storage_root,
+    )
+
+    _patch_root = resolve_patch_storage_root(settings)
+    if _patch_root is not None:
+        # One shared, long-lived transfer HTTP client for every generation run (closed at
+        # shutdown); each run still gets its own per-namespace execution environment.
+        _patch_transfer = _PatchTransferClient(
+            settings.sandbox_url,
+            shared_secret=settings.resolved_sandbox_rpc_secret(),
+            allow_unauthenticated_local_test=settings.sandbox_rpc_local_test_mode,
+        )
+        ctx["patch_transfer_client"] = _patch_transfer
+        _patch_components = build_patch_worker_components(
+            settings,
+            engine=engine,
+            provider=ctx["provider"],
+            transfer_client=_patch_transfer,
+            identity_store=ctx["identity"].store,
+            storage_root=_patch_root,
+        )
+        ctx["patch_coordinator_factory"] = lambda s: build_patch_coordinator(_patch_components, s)
+        ctx["patch_reconciler"] = build_patch_reconciler(
+            _patch_components,
+            job_dispatch_outbox=ctx["job_dispatch_outbox"],
+            worker_id=f"patch:{uuid.uuid4().hex[:12]}",
+        )
+
     async def enqueue(name: str, *args: object, **options: object) -> None:
         await _enqueue_arq(redis, name, *args, **options)
 
@@ -714,6 +755,12 @@ async def shutdown(ctx: dict[str, Any]) -> None:
     execution_environment = ctx.get("execution_environment")
     if execution_environment is not None:
         await execution_environment.aclose()
+    # Close the shared patch transfer HTTP client (owned by startup; per-run sandbox environments
+    # are closed by the author). Surfaced explicitly rather than leaked so no socket outlives the
+    # process.
+    patch_transfer_client = ctx.get("patch_transfer_client")
+    if patch_transfer_client is not None:
+        await patch_transfer_client.aclose()
     engine = ctx.get("engine")
     if engine is not None:
         await engine.dispose()
@@ -738,6 +785,7 @@ class WorkerSettings:
         reconcile_job_dispatch_tick,
         review_artifact_reaper_tick,
         reconcile_stranded_reviews_tick,
+        reconcile_patch_outbox_tick,
         send_im_replies_tick,
         func(
             run_job,
@@ -754,6 +802,7 @@ class WorkerSettings:
         cron(reconcile_dispatch_tick, second={0, 30}),
         cron(reconcile_job_dispatch_tick, second={0, 30}),
         cron(reconcile_stranded_reviews_tick, second={0, 30}),
+        cron(reconcile_patch_outbox_tick, second={0, 30}),
         cron(review_artifact_reaper_tick, minute={0}),
         cron(send_im_replies_tick, second={0, 15, 30, 45}),
     ]

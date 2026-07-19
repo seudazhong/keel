@@ -41,6 +41,7 @@ from keel_core.jobs import (
 from keel_core.knowledge.jobs import KNOWLEDGE_DELETE_KIND, KNOWLEDGE_INGEST_KIND
 from keel_core.lifecycle.jobs import ERASURE_KIND
 from keel_core.observability import get_tracer
+from keel_core.patch.jobs import PATCH_GENERATE_KIND, PATCH_WRITEBACK_KIND
 from keel_core.projects.jobs import PROJECT_SYNC_KIND
 from keel_core.review.jobs import REVIEW_RUN_KIND
 from keel_core.scoping import ScopeValidationError, validate_scope_id
@@ -65,6 +66,8 @@ _CROSS_SCOPE_JOB_KINDS = frozenset(
         CONNECTOR_SYNC_JOB_KIND,
         CONNECTOR_RENEW_JOB_KIND,
         REVIEW_RUN_KIND,
+        PATCH_GENERATE_KIND,
+        PATCH_WRITEBACK_KIND,
     }
 )
 
@@ -83,6 +86,8 @@ _ALL_JOB_KINDS = frozenset(
         ERASURE_KIND,
         PROJECT_SYNC_KIND,
         REVIEW_RUN_KIND,
+        PATCH_GENERATE_KIND,
+        PATCH_WRITEBACK_KIND,
     }
 )
 
@@ -474,6 +479,18 @@ def _scoped_job_execution(
         from keel_worker.connectors import register_connector_jobs
 
         register_connector_jobs(registry, factory(scope_id), settings)
+    # Register the per-scope patch generate/writeback handlers when this worker is patch-capable
+    # (a coordinator factory was wired at startup). Patch jobs are only ever admitted under a
+    # canonical per-Agent scope, so they are built HERE for the job's own scope — never in the
+    # process-wide durable-scope registry. Without the factory the registry omits patch handlers
+    # and a patch kind fails closed as capability-unavailable (left queued for a capable worker),
+    # per ``run_job``'s capability-gap skip.
+    patch_factory = ctx.get("patch_coordinator_factory")
+    if patch_factory is not None:
+        # Lazy import avoids a worker.patch <-> worker.jobs import cycle.
+        from keel_worker.patch import register_patch_jobs
+
+        register_patch_jobs(registry, patch_factory(scope_id), settings)
     job_store = PostgresJobStore(engine, scope_id, limits=JobLimits.from_settings(settings))
     return job_store, registry
 
