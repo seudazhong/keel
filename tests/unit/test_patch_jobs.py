@@ -204,6 +204,73 @@ class _BlockingWritebackCoordinator:
         return _draft_pr_proposal()
 
 
+class _DelayedRaiseGenerationCoordinator:
+    """``execute_generation`` blocks for ``delay`` then raises the scripted error.
+
+    ``delay`` sits comfortably above the heartbeat interval, and the keeper's shorter heartbeat
+    sleep always elapses first in the same loop — so the heartbeat fires *before* the error. A
+    frozen checkpoint count afterwards can then only mean the keeper was stopped (never leaked).
+    """
+
+    def __init__(self, *, exc: BaseException, delay: float) -> None:
+        self._exc = exc
+        self._delay = delay
+        self.gen_calls = 0
+
+    async def execute_generation(
+        self,
+        org_id: str,
+        run_id: str,
+        request: Any,
+        *,
+        worker_id: str,
+        interrupt: Any,
+        now: Any = None,
+    ) -> Any:
+        self.gen_calls += 1
+        await asyncio.sleep(self._delay)
+        raise self._exc
+
+
+class _StartedThenBlockingGenerationCoordinator:
+    """Signals it started, then blocks so the handler task can be cancelled."""
+
+    def __init__(self, started: asyncio.Event) -> None:
+        self._started = started
+        self.gen_calls = 0
+
+    async def execute_generation(
+        self,
+        org_id: str,
+        run_id: str,
+        request: Any,
+        *,
+        worker_id: str,
+        interrupt: Any,
+        now: Any = None,
+    ) -> Any:
+        self.gen_calls += 1
+        self._started.set()
+        await asyncio.sleep(3600)
+        raise AssertionError("generation must be cancelled before completing")  # pragma: no cover
+
+
+class _DelayedRaiseWritebackCoordinator:
+    """``execute_writeback`` blocks for ``delay`` (above the heartbeat interval) then raises."""
+
+    def __init__(self, *, exc: BaseException, delay: float) -> None:
+        self._exc = exc
+        self._delay = delay
+        self.wb_calls = 0
+
+    async def execute_writeback(
+        self, org_id: str, proposal_id: str, *, worker_id: str, now: Any = None
+    ) -> Any:
+        self.wb_calls += 1
+        await asyncio.sleep(self._delay)
+        raise self._exc
+
+
 def _handlers(coordinator: Any) -> PatchJobHandlers:
     return PatchJobHandlers(coordinator)  # type: ignore[arg-type]
 
@@ -480,3 +547,65 @@ async def test_writeback_lost_job_lease_maps_to_lease_lost() -> None:
             _handlers(coord).writeback(ctx, {"proposal_id": "p", "org_id": "o"}), timeout=5.0
         )
     assert coord.wb_calls == 1
+
+
+# --- handler keeper lifecycle: no heartbeat-task leak ---------------------------------
+
+
+@pytest.mark.asyncio
+async def test_generate_handler_non_patch_error_stops_keeper_and_does_not_leak() -> None:
+    # A non-``PatchError`` (a bare ``RuntimeError`` from the coordinator) is caught by none of the
+    # handler's typed ``except`` branches, so only the ``try/finally`` can stop the heartbeat
+    # keeper. Without it the heartbeat task would leak and keep renewing the (now doomed) job lease.
+    ctx = _FakeContext(lease=1)  # heartbeat interval 0.5s (< the coordinator's 0.7s delay)
+    coord = _DelayedRaiseGenerationCoordinator(exc=RuntimeError("coordinator boom"), delay=0.7)
+    before = asyncio.all_tasks()
+    with pytest.raises(RuntimeError, match="coordinator boom"):
+        await _handlers(coord).generate(ctx, _gen_payload_dict())
+
+    # The keeper heartbeated past the handler's initial checkpoint and is now stopped: the count
+    # freezes and no heartbeat task is left behind on the loop.
+    assert ctx.checkpoints >= 2
+    frozen = ctx.checkpoints
+    await asyncio.sleep(0.6)  # span a would-be next heartbeat interval
+    assert ctx.checkpoints == frozen
+    assert [t for t in asyncio.all_tasks() if t not in before] == []
+
+
+@pytest.mark.asyncio
+async def test_generate_handler_external_cancellation_stops_keeper_and_does_not_leak() -> None:
+    # Cancelling the handler task injects ``asyncio.CancelledError`` at the coordinator await — a
+    # path no typed ``except`` catches. The ``finally`` must still stop the heartbeat keeper.
+    ctx = _FakeContext(lease=1)
+    started = asyncio.Event()
+    coord = _StartedThenBlockingGenerationCoordinator(started)
+    before = asyncio.all_tasks()
+    task = asyncio.ensure_future(_handlers(coord).generate(ctx, _gen_payload_dict()))
+    await started.wait()
+    await asyncio.sleep(0.7)  # let at least one heartbeat fire past the initial checkpoint
+    assert ctx.checkpoints >= 2
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    frozen = ctx.checkpoints
+    await asyncio.sleep(0.6)
+    assert ctx.checkpoints == frozen
+    assert [t for t in asyncio.all_tasks() if t not in before] == []
+
+
+@pytest.mark.asyncio
+async def test_writeback_handler_non_patch_error_stops_keeper_and_does_not_leak() -> None:
+    # The writeback handler already wraps its keeper in a ``finally``; confirm a non-patch
+    # ``RuntimeError`` (caught by no typed branch) still stops the heartbeat with no task leak.
+    ctx = _FakeContext(lease=1)
+    coord = _DelayedRaiseWritebackCoordinator(exc=RuntimeError("writeback boom"), delay=0.7)
+    before = asyncio.all_tasks()
+    with pytest.raises(RuntimeError, match="writeback boom"):
+        await _handlers(coord).writeback(ctx, {"proposal_id": "p", "org_id": "o"})
+
+    assert ctx.checkpoints >= 2
+    frozen = ctx.checkpoints
+    await asyncio.sleep(0.6)
+    assert ctx.checkpoints == frozen
+    assert [t for t in asyncio.all_tasks() if t not in before] == []

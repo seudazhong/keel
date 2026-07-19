@@ -416,73 +416,92 @@ class PatchCoordinator:
         def _combined_interrupt() -> bool:
             return bool(interrupt is not None and interrupt()) or keeper.lost
 
+        # From here the keeper owns a background renew task: a *single* try/finally guarantees it is
+        # always stopped — on success, any typed patch error, a non-patch ``RuntimeError`` from the
+        # author, or an ``asyncio.CancelledError`` cancelling this coroutine — so a renew task can
+        # never outlive generation and hold the run lease alive. The typed finalize paths stop the
+        # keeper *before* their terminal transaction (so a renew can never race the finalize); the
+        # finally is the idempotent backstop (a second stop is a no-op).
         try:
-            outcome = await generation.generate(
-                request,
+            try:
+                outcome = await generation.generate(
+                    request,
+                    proposal_id=proposal.id,
+                    run_id=run_id,
+                    coding_run_id=binding.coding_run_id,
+                    project_handle=binding.project_handle,
+                    interrupt=_combined_interrupt,
+                    now=moment,
+                )
+            except PatchLeaseLost:
+                # The lease was reclaimed/expired mid-generation (or our keeper folded a lost fence
+                # into the interrupt). Leave the proposal AND the run untouched so the current owner
+                # (or a reclaim) can finish; a stale lease must never terminalize either. Caught
+                # before ``PatchError`` so a lost lease is never mistaken for a permanent failure.
+                raise
+            except PatchProviderUnavailable as exc:
+                await keeper.stop()
+                # A lost lease preempts a transient finalize: never release/charge under a stale
+                # fence.
+                self._raise_if_lease_lost(keeper)
+                # Transient upstream failure. Atomically release the lease back to the queue
+                # (proposal stays ``generating`` for a retry), charge the partial usage as a
+                # cumulative delta on the run, and mirror that cumulative onto the proposal — all in
+                # one transaction so no partial cost is lost and the pointer stays ``generating``.
+                # Rethrow for P3 retry.
+                await self._finalize_transient(
+                    org_id, proposal, run_store, lease, exc, scope_id, moment
+                )
+                raise
+            except PatchError as exc:
+                await keeper.stop()
+                self._raise_if_lease_lost(keeper)
+                # A permanent generation failure: atomically fail the proposal (deleting its
+                # dispatch pointer) and the run, then rethrow. A permanent provider failure
+                # (cost-ceiling stop, malformed completion, a permanent transfer rejection) may
+                # still have consumed tokens; that partial usage is charged onto the run as a fenced
+                # delta and mirrored onto the proposal, so a terminal failure neither loses nor
+                # double-counts cost (no usage => 0). The finalize derives the proposal cost from
+                # the run's cumulative charge inside the transaction — never a pre-cleanup
+                # ``runs.get`` that could itself fail.
+                await self._finalize_failed(
+                    org_id, proposal, run_store, lease, exc, scope_id, moment
+                )
+                raise
+            await keeper.stop()
+            # A completed generation must NOT be finalized (ready) under a lost lease: abort instead
+            # so the run row that a reclaimer now owns is never terminalized behind its back.
+            self._raise_if_lease_lost(keeper)
+            # Success. Atomically terminalize the run ``completed`` and move the proposal
+            # ``generating -> ready`` (updating its pointer hint), deriving the proposal cost from
+            # the run's cumulative charge (prior partial attempts + this outcome) inside the SAME
+            # transaction — a crash can never leave a *completed* run behind a still-``generating``
+            # proposal (nor the reverse), and a provider-unavailable retry neither loses nor
+            # double-counts cost.
+            updated = await self._finalize_ready(
+                org_id, proposal, run_store, lease, outcome, scope_id, moment
+            )
+            self.audit.record(
+                action="ready",
+                org_id=org_id,
+                actor=proposal.actor,
                 proposal_id=proposal.id,
-                run_id=run_id,
-                coding_run_id=binding.coding_run_id,
-                project_handle=binding.project_handle,
-                interrupt=_combined_interrupt,
-                now=moment,
+                detail={
+                    "bundle_sha256": outcome.bundle_sha256,
+                    "changed_files": str(outcome.changed_files),
+                },
             )
-        except PatchLeaseLost:
-            # The lease was reclaimed/expired mid-generation (or our keeper folded a lost fence into
-            # the interrupt). Stop the keeper and leave the proposal AND the run untouched so the
-            # current owner (or a reclaim) can finish; a stale lease must never terminalize either.
+            # ``ready`` is transient: immediately run the atomic approval transition so the normal
+            # terminal state the caller observes is ``approval_pending`` (pointer retired, approval
+            # bound). A reconciler can re-drive this idempotently after a crash.
+            return await self._advance_ready_to_approval_pending(org_id, updated, now=moment)
+        finally:
+            # Idempotent backstop: guarantees the renew task is stopped on *every* exit path,
+            # including a non-patch ``RuntimeError`` from the author or an
+            # ``asyncio.CancelledError`` cancelling this coroutine — neither of which the typed
+            # handlers above catch. Without it such a path would leak the renew task and keep
+            # renewing the run lease indefinitely.
             await keeper.stop()
-            raise
-        except PatchProviderUnavailable as exc:
-            await keeper.stop()
-            # A lost lease preempts a transient finalize: never release/charge under a stale fence.
-            self._raise_if_lease_lost(keeper)
-            # Transient upstream failure. Atomically release the lease back to the queue (proposal
-            # stays ``generating`` for a retry), charge the partial usage as a cumulative delta on
-            # the run, and mirror that cumulative onto the proposal — all in one transaction so no
-            # partial cost is lost and the pointer stays ``generating``. Rethrow for P3 retry.
-            await self._finalize_transient(
-                org_id, proposal, run_store, lease, exc, scope_id, moment
-            )
-            raise
-        except PatchError as exc:
-            await keeper.stop()
-            self._raise_if_lease_lost(keeper)
-            # A permanent generation failure: atomically fail the proposal (deleting its dispatch
-            # pointer) and the run, then rethrow. A permanent provider failure (cost-ceiling stop,
-            # malformed completion, a permanent transfer rejection) may still have consumed tokens;
-            # that partial usage is charged onto the run as a fenced delta and mirrored onto the
-            # proposal, so a terminal failure neither loses nor double-counts cost (no usage => 0).
-            # The finalize derives the proposal cost from the run's cumulative charge inside the
-            # transaction — never a pre-cleanup ``runs.get`` that could itself fail.
-            await self._finalize_failed(org_id, proposal, run_store, lease, exc, scope_id, moment)
-            raise
-        await keeper.stop()
-        # A completed generation must NOT be finalized (ready) under a lost lease: abort instead so
-        # the run row that a reclaimer now owns is never terminalized behind its back.
-        self._raise_if_lease_lost(keeper)
-        # Success. Atomically terminalize the run ``completed`` and move the proposal
-        # ``generating -> ready`` (updating its pointer hint), deriving the proposal cost from the
-        # run's cumulative charge (prior partial attempts + this outcome) inside the SAME
-        # transaction — a crash can never leave a *completed* run behind a still-``generating``
-        # proposal (nor the reverse), and a provider-unavailable retry neither loses nor
-        # double-counts cost.
-        updated = await self._finalize_ready(
-            org_id, proposal, run_store, lease, outcome, scope_id, moment
-        )
-        self.audit.record(
-            action="ready",
-            org_id=org_id,
-            actor=proposal.actor,
-            proposal_id=proposal.id,
-            detail={
-                "bundle_sha256": outcome.bundle_sha256,
-                "changed_files": str(outcome.changed_files),
-            },
-        )
-        # ``ready`` is transient: immediately run the atomic approval transition so the normal
-        # terminal state the caller observes is ``approval_pending`` (pointer retired, approval
-        # bound). A reconciler can re-drive this idempotently after a crash.
-        return await self._advance_ready_to_approval_pending(org_id, updated, now=moment)
 
     def _raise_if_lease_lost(self, keeper: _RunLeaseKeeper) -> None:
         """Abort via ``PatchLeaseLost`` (chaining the typed cause) when the keeper lost the fence.

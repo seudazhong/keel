@@ -15,6 +15,7 @@ Covers the durable state machine end-to-end with in-memory fakes:
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -237,6 +238,78 @@ class _GetTrackingRunStore(InMemoryRunStore):
         return await super().get(run_id)
 
 
+class _RenewCountingRunStore(InMemoryRunStore):
+    """In-memory run store that counts lease renewals (the run-lease keeper's only call).
+
+    A renewal count that keeps *rising* while generation is in-flight and then *freezes* once
+    ``execute_generation`` unwinds proves the keeper's background renew task was stopped — never
+    leaked to keep renewing the lease indefinitely and pin the run ``running``.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.renew_calls = 0
+
+    async def renew(
+        self, lease: RunLease, *, lease_seconds: int, now: datetime | None = None
+    ) -> bool:
+        self.renew_calls += 1
+        return await super().renew(lease, lease_seconds=lease_seconds, now=now)
+
+
+class _SleepThenRaiseGeneration:
+    """Generation double that lets the keeper renew a few times, then raises a *non-patch* error.
+
+    A bare ``RuntimeError`` (not a ``PatchError``) is exactly the path none of the
+    ``execute_generation`` typed ``except`` branches catch — so only the ``try/finally`` backstop
+    can stop the keeper.
+    """
+
+    def __init__(self, exc: BaseException, *, delay: float) -> None:
+        self._exc = exc
+        self._delay = delay
+        self.calls = 0
+
+    async def generate(
+        self,
+        request,
+        *,
+        proposal_id,
+        run_id,
+        coding_run_id,
+        project_handle,
+        now=None,
+        interrupt=None,
+    ):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        await asyncio.sleep(self._delay)
+        raise self._exc
+
+
+class _BlockingGeneration:
+    """Generation double that signals it started, then blocks so the parent task can cancel it."""
+
+    def __init__(self, started: asyncio.Event) -> None:
+        self._started = started
+        self.calls = 0
+
+    async def generate(
+        self,
+        request,
+        *,
+        proposal_id,
+        run_id,
+        coding_run_id,
+        project_handle,
+        now=None,
+        interrupt=None,
+    ):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        self._started.set()
+        await asyncio.sleep(3600)
+        raise AssertionError("generation must be cancelled before completing")  # pragma: no cover
+
+
 def _build_outcome(
     artifacts: _MemArtifacts,
     request,  # type: ignore[no-untyped-def]
@@ -399,6 +472,7 @@ def _coordinator(
     approval_factory: Any | None = None,
     authorizer: Any | None = None,
     outbox: InMemoryPatchProposalOutbox | None = None,
+    run_renew_interval_seconds: float | None = None,
 ) -> PatchCoordinator:
     factory = approval_factory or _ScopeSpyFactory()
     return PatchCoordinator(
@@ -410,6 +484,7 @@ def _coordinator(
         approval_factory=factory,
         writeback=writeback,  # type: ignore[arg-type]
         artifacts=artifacts,  # type: ignore[arg-type]
+        run_renew_interval_seconds=run_renew_interval_seconds,
     )
 
 
@@ -664,6 +739,84 @@ async def test_lease_lost_leaves_proposal_and_run_untouched() -> None:
     entry = await coord.outbox.get(handle.proposal_id)
     assert entry is not None and entry.status_hint is PatchOutboxStatus.generating
     assert gen.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_generation_non_patch_error_stops_keeper_and_does_not_leak() -> None:
+    # A *non*-``PatchError`` (a bare ``RuntimeError`` from the author) escapes every typed
+    # ``except`` branch, so only the ``try/finally`` backstop can stop the run-lease keeper.
+    # Without it the renew task would leak and keep renewing the lease forever, pinning the run
+    # ``running``.
+    artifacts = _MemArtifacts()
+    runs = _RenewCountingRunStore()
+    gen = _SleepThenRaiseGeneration(RuntimeError("author boom"), delay=0.06)
+    coord = _coordinator(
+        artifacts,
+        _FakeWriteback(),
+        _target(),
+        runs=runs,
+        generation=gen,
+        run_renew_interval_seconds=0.01,
+    )
+    req = _request()
+    handle = await coord.request_generation(req)
+
+    before = asyncio.all_tasks()
+    with pytest.raises(RuntimeError, match="author boom"):
+        await coord.execute_generation("o", handle.run_id, req, worker_id="w1")
+
+    # The keeper actively renewed the lease while the author slept...
+    assert runs.renew_calls >= 1
+    frozen = runs.renew_calls
+    # ...and is now stopped: no further renewal fires and no keeper task is left behind.
+    await asyncio.sleep(0.05)
+    assert runs.renew_calls == frozen
+    assert [t for t in asyncio.all_tasks() if t not in before] == []
+
+    # A non-patch error never terminalizes (fail-safe): the proposal/run/pointer are untouched,
+    # but the lease is no longer renewed, so the run can expire and be reclaimed (not pinned
+    # ``running``).
+    proposal = await coord.store.get("o", handle.proposal_id)
+    assert proposal is not None and proposal.status is PatchStatus.generating
+    run = await _run_get(coord, handle.run_id)
+    assert run is not None and run.status is RunStatus.running
+    entry = await coord.outbox.get(handle.proposal_id)
+    assert entry is not None and entry.status_hint is PatchOutboxStatus.generating
+
+
+@pytest.mark.asyncio
+async def test_generation_parent_cancellation_stops_keeper_and_does_not_leak() -> None:
+    # Cancelling the ``execute_generation`` task injects ``asyncio.CancelledError`` at the author
+    # await — another path no typed ``except`` catches. The ``finally`` must still stop the keeper.
+    artifacts = _MemArtifacts()
+    runs = _RenewCountingRunStore()
+    started = asyncio.Event()
+    gen = _BlockingGeneration(started)
+    coord = _coordinator(
+        artifacts,
+        _FakeWriteback(),
+        _target(),
+        runs=runs,
+        generation=gen,
+        run_renew_interval_seconds=0.01,
+    )
+    req = _request()
+    handle = await coord.request_generation(req)
+
+    before = asyncio.all_tasks()
+    task = asyncio.ensure_future(coord.execute_generation("o", handle.run_id, req, worker_id="w1"))
+    await started.wait()
+    await asyncio.sleep(0.03)  # let the keeper renew a couple of times
+    assert runs.renew_calls >= 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The keeper was stopped by the finally as the cancellation unwound: renewals freeze, no leak.
+    frozen = runs.renew_calls
+    await asyncio.sleep(0.05)
+    assert runs.renew_calls == frozen
+    assert [t for t in asyncio.all_tasks() if t not in before] == []
 
 
 @pytest.mark.asyncio

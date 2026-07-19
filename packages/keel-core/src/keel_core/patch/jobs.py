@@ -307,48 +307,55 @@ class PatchJobHandlers:
             cancel_event=cancel_event,
         )
         keeper.start()
+        # A single try/finally stops the heartbeat on *every* path — typed patch errors, a
+        # non-patch ``RuntimeError`` from the coordinator, an ``asyncio.CancelledError`` cancelling
+        # this handler, or success — so the heartbeat task can never leak. The typed mapping runs
+        # inside the try and reads the keeper's ``cancelled``/``lost`` (set before the signal that
+        # aborted generation), which the later idempotent ``stop`` never clears.
         try:
-            proposal = await self._coordinator.execute_generation(
-                payload.org_id,
-                payload.run_id,
-                request,
-                worker_id=context.job_id,
-                interrupt=cancel_event.is_set,
+            try:
+                proposal = await self._coordinator.execute_generation(
+                    payload.org_id,
+                    payload.run_id,
+                    request,
+                    worker_id=context.job_id,
+                    interrupt=cancel_event.is_set,
+                )
+            except PatchLeaseLost as exc:
+                # The generation aborted on a lost fence. A cooperative job cancellation surfaces
+                # the cancel path; anything else (a lost job lease, or the RUN lease being
+                # reclaimed) is a lost lease. Either way the proposal/run are untouched — never a
+                # terminal success.
+                if keeper.cancelled:
+                    raise JobCancellationRequested from exc
+                raise JobLeaseLostError(context.job_id) from exc
+            except (PatchProviderUnavailable, PatchRemoteUnavailable) as exc:
+                # Transient upstream failure. The coordinator already released the run to the queue
+                # and persisted the partial usage atomically; retry while attempts remain.
+                raise RetryableJobError(
+                    "patch_generation_transient", "Patch generation temporarily failed."
+                ) from exc
+            except PatchError as exc:
+                # A permanent generation failure. The coordinator already terminalized the proposal
+                # (failed) + run and retired the dispatch pointer atomically; fail permanently.
+                raise PermanentJobError(
+                    "patch_generation_failed", "Patch generation failed."
+                ) from exc
+            # Success (normal ``approval_pending``, an idempotent replay of an already
+            # ``approval_pending`` proposal, or a healed ``ready``). The durable outcome is
+            # authoritative and idempotent, so a heartbeat signal that raced a successful completion
+            # never undoes it.
+            return JobResult(
+                data={
+                    "proposal_id": proposal.id,
+                    "run_id": proposal.run_id,
+                    "status": proposal.status.value,
+                    "approval_id": proposal.approval_id,
+                },
+                message=f"patch generation reached {proposal.status.value}",
             )
-        except PatchLeaseLost as exc:
+        finally:
             await keeper.stop()
-            # The generation aborted on a lost fence. A cooperative job cancellation surfaces the
-            # cancel path; anything else (a lost job lease, or the RUN lease being reclaimed) is a
-            # lost lease. Either way the proposal/run are untouched — never a terminal success.
-            if keeper.cancelled:
-                raise JobCancellationRequested from exc
-            raise JobLeaseLostError(context.job_id) from exc
-        except (PatchProviderUnavailable, PatchRemoteUnavailable) as exc:
-            await keeper.stop()
-            # Transient upstream failure. The coordinator already released the run to the queue and
-            # persisted the partial usage atomically; retry while attempts remain.
-            raise RetryableJobError(
-                "patch_generation_transient", "Patch generation temporarily failed."
-            ) from exc
-        except PatchError as exc:
-            await keeper.stop()
-            # A permanent generation failure. The coordinator already terminalized the proposal
-            # (failed) + run and retired the dispatch pointer atomically; fail the job permanently.
-            raise PermanentJobError("patch_generation_failed", "Patch generation failed.") from exc
-        await keeper.stop()
-        # Success (normal ``approval_pending``, an idempotent replay of an already
-        # ``approval_pending`` proposal, or a healed ``ready``). The durable outcome is
-        # authoritative and idempotent, so a heartbeat signal that raced a successful completion
-        # never undoes it.
-        return JobResult(
-            data={
-                "proposal_id": proposal.id,
-                "run_id": proposal.run_id,
-                "status": proposal.status.value,
-                "approval_id": proposal.approval_id,
-            },
-            message=f"patch generation reached {proposal.status.value}",
-        )
 
     async def writeback(self, context: PatchJobContext, raw_payload: dict[str, Any]) -> JobResult:
         try:
