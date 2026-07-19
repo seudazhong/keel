@@ -332,18 +332,24 @@ class InMemoryPatchProposalStore:
                 self._rows[proposal_id] = proposal
                 self._by_idem[key] = proposal_id
             return proposal, created
-        # Outbox seam: record the ``generating`` dispatch intent atomically with the proposal so a
-        # proposal never becomes durable without a discoverable pointer (both roll back together).
+        # Outbox seam. The ``generating`` dispatch intent is recorded atomically with the proposal
+        # so a proposal never becomes durable without a discoverable pointer (both roll back
+        # together) -- but ONLY on a genuine create. On the idempotent replay of an existing
+        # proposal the pointer already reflects that proposal's current lifecycle stage (it may have
+        # been intentionally deleted at ``approval_pending`` or a terminal state), so re-recording
+        # here would resurrect a retired pointer; the existing path never touches the outbox. The
+        # seam contract (concrete outbox type + a validated scope) is still enforced on both paths.
         if not isinstance(outbox, InMemoryPatchProposalOutbox):
             raise PatchValidationError("InMemoryPatchProposalStore requires an in-memory outbox")
         if not scope_id:
             raise PatchValidationError("patch proposal create with an outbox requires scope_id")
+        if not created:
+            return proposal, created
         store_snap = self._txn_snapshot()
         outbox_snap = outbox._txn_snapshot()
         try:
-            if created:
-                self._rows[proposal_id] = proposal
-                self._by_idem[key] = proposal_id
+            self._rows[proposal_id] = proposal
+            self._by_idem[key] = proposal_id
             await outbox.record_in_connection(
                 None,
                 proposal_id=proposal.id,
@@ -681,9 +687,13 @@ class PostgresPatchProposalStore:
                         .one()
                     )
                     proposal, created = _to_proposal(existing), False
-                # Record the ``generating`` dispatch intent in the SAME transaction: a proposal
-                # never becomes durable without a discoverable pointer (both commit or roll back).
-                if outbox is not None:
+                # Record the ``generating`` dispatch intent in the SAME transaction as a genuine
+                # create (both commit or roll back), so a proposal never becomes durable without a
+                # discoverable pointer. The idempotent replay of an existing proposal never
+                # re-records it: that proposal's pointer already reflects its current lifecycle
+                # stage (it may have been intentionally deleted at ``approval_pending`` or a
+                # terminal state), and re-inserting here would resurrect a retired pointer.
+                if outbox is not None and created:
                     await outbox.record_in_connection(
                         conn,
                         proposal_id=proposal.id,

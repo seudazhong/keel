@@ -24,7 +24,7 @@ import pytest
 
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.patch.errors import PatchApprovalError, PatchStateError, PatchValidationError
-from keel_core.patch.models import PatchStatus
+from keel_core.patch.models import PatchProposal, PatchStatus
 from keel_core.patch.outbox import (
     InMemoryPatchProposalOutbox,
     PatchOutboxStatus,
@@ -41,7 +41,7 @@ def _exp() -> datetime:
     return _T0 + timedelta(hours=1)
 
 
-async def _create(
+async def _create_full(
     store: InMemoryPatchProposalStore,
     *,
     outbox: PatchProposalOutbox | None = None,
@@ -49,12 +49,13 @@ async def _create(
     pid: str = "pp_1",
     idem: str = "idem-1",
     org: str = "org-a",
-) -> str:
-    proposal, _ = await store.create(
+    run: str = "run-1",
+) -> tuple[PatchProposal, bool]:
+    return await store.create(
         proposal_id=pid,
         org_id=org,
         project_id="proj-a",
-        run_id="run-1",
+        run_id=run,
         run_attempt=1,
         agent_id="patch",
         actor="u",
@@ -67,6 +68,20 @@ async def _create(
         now=_T0,
         outbox=outbox,
         scope_id=scope_id,
+    )
+
+
+async def _create(
+    store: InMemoryPatchProposalStore,
+    *,
+    outbox: PatchProposalOutbox | None = None,
+    scope_id: str | None = None,
+    pid: str = "pp_1",
+    idem: str = "idem-1",
+    org: str = "org-a",
+) -> str:
+    proposal, _ = await _create_full(
+        store, outbox=outbox, scope_id=scope_id, pid=pid, idem=idem, org=org
     )
     return proposal.id
 
@@ -154,6 +169,41 @@ async def test_create_rolls_back_when_pointer_write_fails() -> None:
         await _create(store, outbox=outbox, scope_id=_SCOPE)
     # The proposal write is rolled back with the failed pointer — no undiscoverable proposal.
     assert await store.get("org-a", "pp_1") is None
+
+
+async def test_create_idempotent_replay_does_not_resurrect_deleted_pointer() -> None:
+    store = InMemoryPatchProposalStore()
+    outbox = InMemoryPatchProposalOutbox()
+    # A genuine create records the generating pointer atomically.
+    first, created = await _create_full(store, outbox=outbox, scope_id=_SCOPE)
+    assert created is True
+    assert (await outbox.get(first.id)) is not None
+    # Advance ready -> approval_pending: the dispatch pointer is intentionally deleted (there is no
+    # background work while awaiting a human).
+    ready_v = await _ready(store, first.id, outbox=outbox, scope_id=_SCOPE)
+    await store.transition(
+        "org-a",
+        first.id,
+        PatchStatus.approval_pending,
+        expected_version=ready_v,
+        now=_T0,
+        outbox=outbox,
+        scope_id=_SCOPE,
+    )
+    assert (await outbox.get(first.id)) is None
+    # The idempotent replay of the SAME create returns created=False and must NOT resurrect the
+    # retired pointer (the proposal already advanced past generating).
+    replay, replay_created = await _create_full(store, outbox=outbox, scope_id=_SCOPE)
+    assert replay_created is False
+    assert replay.status is PatchStatus.approval_pending
+    assert (await outbox.get(first.id)) is None
+    # A genuinely fresh proposal still records its generating pointer atomically.
+    fresh, fresh_created = await _create_full(
+        store, outbox=outbox, scope_id=_SCOPE, pid="pp_2", idem="idem-2", run="run-2"
+    )
+    assert fresh_created is True
+    fresh_entry = await outbox.get("pp_2")
+    assert fresh_entry is not None and fresh_entry.status_hint is PatchOutboxStatus.generating
 
 
 # --- transition seam: status-hint lifecycle ------------------------------------------

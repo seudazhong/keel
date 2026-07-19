@@ -34,7 +34,7 @@ from sqlalchemy.exc import DBAPIError, ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, create_async_engine
 
 from keel_core.approvals import PostgresApprovalStore
-from keel_core.patch.models import PatchStatus
+from keel_core.patch.models import PatchProposal, PatchStatus
 from keel_core.patch.outbox import PatchOutboxStatus, PostgresPatchProposalOutbox
 from keel_core.patch.store import ApprovalDraft, PostgresPatchProposalStore
 from keel_core.runtime_db import provision_runtime_login
@@ -98,17 +98,17 @@ def _exp() -> datetime:
     return datetime.now(UTC) + timedelta(hours=1)
 
 
-async def _create_proposal(
+async def _create_full(
     store: PostgresPatchProposalStore,
     outbox: PostgresPatchProposalOutbox | None,
     *,
+    pid: str,
+    idem: str,
     org: str = "org-a",
     project: str = "proj-a",
     run: str = "run-1",
-    idem: str | None = None,
-) -> str:
-    pid = f"pp_{uuid.uuid4().hex}"
-    proposal, _ = await store.create(
+) -> tuple[PatchProposal, bool]:
+    return await store.create(
         proposal_id=pid,
         org_id=org,
         project_id=project,
@@ -119,11 +119,32 @@ async def _create_proposal(
         base_ref="main",
         source_ref="",
         task_digest="d",
-        idempotency_key=idem or f"idem-{uuid.uuid4().hex}",
+        idempotency_key=idem,
         fingerprint="fp",
         expires_at=_exp(),
         outbox=outbox,
         scope_id=_SCOPE if outbox is not None else None,
+    )
+
+
+async def _create_proposal(
+    store: PostgresPatchProposalStore,
+    outbox: PostgresPatchProposalOutbox | None,
+    *,
+    org: str = "org-a",
+    project: str = "proj-a",
+    run: str = "run-1",
+    idem: str | None = None,
+) -> str:
+    pid = f"pp_{uuid.uuid4().hex}"
+    proposal, _ = await _create_full(
+        store,
+        outbox,
+        pid=pid,
+        idem=idem or f"idem-{uuid.uuid4().hex}",
+        org=org,
+        project=project,
+        run=run,
     )
     return proposal.id
 
@@ -406,6 +427,57 @@ async def test_proposal_create_rolls_back_on_pointer_failure(migrated_db: AsyncE
         )
     # The proposal INSERT is rolled back with the failed pointer write (both or neither).
     assert await store.get("org-a", pid) is None
+
+
+async def test_create_idempotent_replay_does_not_resurrect_deleted_pointer(
+    migrated_db: AsyncEngine,
+) -> None:
+    await _seed_org_project(migrated_db, "org-a", "proj-a")
+    store = PostgresPatchProposalStore(migrated_db)
+    outbox = PostgresPatchProposalOutbox(migrated_db)
+    approvals = PostgresApprovalStore(migrated_db, _SCOPE)
+    pid = f"pp_{uuid.uuid4().hex}"
+    idem = f"idem-{uuid.uuid4().hex}"
+    run = f"run-{uuid.uuid4().hex}"
+
+    # 1) Genuine create records the generating pointer in the same transaction as the proposal.
+    first, created = await _create_full(store, outbox, pid=pid, idem=idem, run=run)
+    assert created is True
+    assert (await outbox.get(pid)) is not None
+
+    # 2) Advance ready -> approval_pending: the dispatch pointer is deleted in that single txn.
+    ready_v = await _make_ready(store, "org-a", pid)
+    _, approval_id, _ = await store.transition_to_approval_pending(
+        "org-a",
+        pid,
+        approvals=approvals,
+        outbox=outbox,
+        scope_id=_SCOPE,
+        draft=_draft(run=run),
+        expected_version=ready_v,
+    )
+    assert (await outbox.get(pid)) is None
+
+    # 3) The idempotent replay of the SAME create returns created=False and must NOT re-insert the
+    #    retired pointer (the proposal already advanced past generating).
+    replay, replay_created = await _create_full(store, outbox, pid=pid, idem=idem, run=run)
+    assert replay_created is False
+    assert replay.status is PatchStatus.approval_pending
+    assert replay.approval_id == approval_id
+    assert (await outbox.get(pid)) is None
+
+    # 4) A genuinely fresh proposal still records its generating pointer atomically.
+    fresh_pid = f"pp_{uuid.uuid4().hex}"
+    fresh, fresh_created = await _create_full(
+        store,
+        outbox,
+        pid=fresh_pid,
+        idem=f"idem-{uuid.uuid4().hex}",
+        run=f"run-{uuid.uuid4().hex}",
+    )
+    assert fresh_created is True
+    fresh_entry = await outbox.get(fresh_pid)
+    assert fresh_entry is not None and fresh_entry.status_hint is PatchOutboxStatus.generating
 
 
 # --- ready -> approval_pending single transaction ------------------------------------
