@@ -318,12 +318,17 @@ class PatchCoordinator:
             # A permanent generation failure: fail the proposal (deleting its dispatch pointer) and
             # the run, then rethrow. A permanent provider failure (cost-ceiling stop, malformed
             # completion, a permanent transfer rejection) may still have consumed tokens: charge
-            # that partial usage onto the run as a fenced delta (cumulative = prior attempts + this
-            # outcome) and mirror the cumulative onto the proposal, so a terminal failure neither
-            # loses nor double-counts cost. A failure that carries no usage charges nothing.
+            # that partial usage onto the run as a fenced delta and mirror the cumulative onto the
+            # proposal, so a terminal failure neither loses nor double-counts cost. A failure that
+            # carries no usage charges nothing.
+            #
+            # ``prior_cost`` is read from the proposal, never a pre-cleanup ``runs.get``: the P2
+            # invariant already mirrors the run's cumulative cost onto the proposal after every
+            # transient release, so the proposal is authoritative here. Avoiding the extra read
+            # keeps the permanent-failure cleanup (proposal fail + pointer delete + run terminalize)
+            # from depending on a fresh run fetch that could itself fail.
             failure_cost = _run_cost_from_usage(getattr(exc, "usage", None))
-            run_record = await self.runs.get(run_id)
-            prior_cost = run_record.cost_usd if run_record is not None else 0.0
+            prior_cost = proposal.cost_usd
             await self.store.transition(
                 org_id,
                 proposal.id,

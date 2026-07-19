@@ -181,6 +181,27 @@ class _ScriptedGeneration:
         )
 
 
+class _GetTrackingRunStore(InMemoryRunStore):
+    """In-memory run store that counts ``get`` calls (and can be told to fail them).
+
+    Proves the permanent generation-failure path never issues a pre-cleanup ``runs.get``: the P2
+    invariant mirrors the run's cumulative cost onto the proposal, so the permanent catch reads
+    ``proposal.cost_usd`` and cleans up (fail proposal, delete pointer, terminalize) without a fresh
+    run fetch that could itself fail.
+    """
+
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__()
+        self.get_calls = 0
+        self.fail = fail
+
+    async def get(self, run_id: RunId) -> Any:
+        self.get_calls += 1
+        if self.fail:
+            raise RuntimeError("runs.get injected failure")
+        return await super().get(run_id)
+
+
 def _build_outcome(
     artifacts: _MemArtifacts,
     request,  # type: ignore[no-untyped-def]
@@ -703,6 +724,38 @@ async def test_transient_then_permanent_charges_cumulatively_without_double_coun
     assert r2.cost_usd == pytest.approx(0.03)  # 0.01 (prior partial) + 0.02 (this failure)
     assert gen.calls == 2
     assert await coord.outbox.get(handle.proposal_id) is None
+
+
+@pytest.mark.asyncio
+async def test_permanent_failure_cleanup_does_not_read_run_and_survives_get_failure() -> None:
+    # The permanent catch must not depend on a pre-cleanup ``runs.get``: it derives ``prior_cost``
+    # from the proposal (the P2 mirror). Injecting a failing ``runs.get`` before the terminal
+    # attempt must not disturb the cleanup — the run is still charged + terminalized and the pointer
+    # is retired.
+    artifacts = _MemArtifacts()
+    gen = _ScriptedGeneration(
+        artifacts,
+        [PatchProviderError("permanent failure", usage=Usage(prompt_tokens=4, cost_usd=0.04))],
+    )
+    runs = _GetTrackingRunStore()
+    coord = _coordinator(artifacts, _FakeWriteback(), _target(), generation=gen, runs=runs)
+    req = _request()
+    handle = await coord.request_generation(req)
+
+    runs.fail = True  # any runs.get from here on raises
+    calls_before = runs.get_calls
+    with pytest.raises(PatchProviderError):  # the generation error, never a runs.get RuntimeError
+        await coord.execute_generation("o", handle.run_id, req, worker_id="w1")
+    assert runs.get_calls == calls_before  # the permanent catch issued no runs.get
+
+    proposal = await coord.store.get("o", handle.proposal_id)
+    assert proposal is not None and proposal.status is PatchStatus.failed
+    assert proposal.cost_usd == pytest.approx(0.04)
+    assert await coord.outbox.get(handle.proposal_id) is None
+    runs.fail = False  # re-enable reads to assert the run was still charged + terminalized
+    run = await coord.runs.get(handle.run_id)
+    assert run is not None and run.status is RunStatus.failed
+    assert run.cost_usd == pytest.approx(0.04)
 
 
 @pytest.mark.asyncio
