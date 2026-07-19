@@ -600,6 +600,30 @@ class ProjectService:
         return await self._store.list_active_worktrees(org_id, project_id=project_id)
 
     # --- run associations ------------------------------------------------------------
+    async def authorize_project(
+        self,
+        org_id: str,
+        actor_user_id: str,
+        project_id: str,
+        *,
+        capability: Capability,
+        agent_id: str | None = None,
+    ) -> Project:
+        """Load a project and authorize an explicit ``capability`` on it (fail closed).
+
+        The single public seam a downstream coordinator (review, patch) authorizes against so it
+        never reaches into private membership/grant helpers. A project that does not exist *in this
+        org* raises :class:`ProjectNotFoundError` (never leaking a foreign project's existence); a
+        project the actor/Agent cannot access at ``capability`` raises :class:`PermissionDenied`.
+        Re-invocable at worker claim time so access revoked between request and execution fails
+        closed.
+        """
+        project = await self._load_project(org_id, project_id)
+        await self._authorize_resource(
+            org_id, actor_user_id, project, capability, agent_id=agent_id
+        )
+        return project
+
     async def authorize_review(
         self,
         org_id: str,
@@ -615,11 +639,21 @@ class ProjectService:
         coding-storage handle. Re-invoked at worker claim time so access revoked between request
         and execution fails closed — an actor/Agent that lost ``use`` cannot have a review run.
         """
-        project = await self._load_project(org_id, project_id)
-        await self._authorize_resource(
-            org_id, actor_user_id, project, capability, agent_id=agent_id
+        return await self.authorize_project(
+            org_id, actor_user_id, project_id, capability=capability, agent_id=agent_id
         )
-        return project
+
+    def safe_clone_url(self, clone_url: str, full_name: str) -> str:
+        """Re-validate + pin a *stored* clone URL to the expected repo on an allow-listed host.
+
+        The narrow public accessor over :meth:`GitHubIntegration.safe_clone_url` so a downstream
+        coordinator never has to reach into the private ``_github`` integration and never trusts a
+        persisted URL as-is: it is normalized + pinned again at authorization time. Fails closed
+        when no GitHub integration is configured.
+        """
+        if self._github is None:
+            raise ProjectValidationError("GitHub integration is not configured")
+        return self._github.safe_clone_url(clone_url, full_name)
 
     async def get_project_repository(self, org_id: str, project_id: str) -> GitHubRepository | None:
         """The GitHub repository bound to a project (its installation/full_name), or ``None``.

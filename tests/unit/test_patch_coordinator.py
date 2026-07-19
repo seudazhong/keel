@@ -23,9 +23,14 @@ import pytest
 
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.coding.models import ArtifactRecord, ArtifactRetention, CodingRunId, ProjectId
+from keel_core.errors import PermissionDenied
 from keel_core.patch.approval import PatchApprovalService
 from keel_core.patch.bundle import PatchBundleWriter
-from keel_core.patch.coordinator import PatchCoordinator, ProjectBinding
+from keel_core.patch.coordinator import (
+    DEFAULT_PATCH_AGENT_ID,
+    PatchCoordinator,
+    ProjectBinding,
+)
 from keel_core.patch.errors import (
     PatchLeaseLost,
     PatchProviderError,
@@ -51,7 +56,12 @@ from keel_core.patch.store import InMemoryPatchProposalStore
 from keel_core.patch.writeback import WritebackResult, WritebackTarget
 from keel_core.protocols import Usage
 from keel_core.runs import InMemoryRunStore, RunLease, RunStatus
+from keel_core.scoping import derive_agent_scope
 from keel_core.types import RunId
+
+# The canonical per-Agent scope every default-request proposal (org "o", no explicit Agent) runs
+# under — the in-memory analog of a Postgres run store bound to this scope.
+_DEFAULT_SCOPE = derive_agent_scope("o", DEFAULT_PATCH_AGENT_ID)
 
 
 class _MemArtifacts:
@@ -104,24 +114,27 @@ class _FakeAuthorizer:
         self._target = target
         self.associated: list[str] = []
 
-    async def authorize_generation(self, org_id, actor, project_id, *, agent_id, run_id):  # type: ignore[no-untyped-def]
+    def _binding(self, org_id: str, agent_id: str | None, run_id: str) -> ProjectBinding:
+        # Mirror the real authorizer: derive the canonical per-Agent scope so two orgs/Agents get
+        # distinct, isolated scopes (and a default request lands on ``_DEFAULT_SCOPE``).
         return ProjectBinding(
             project_handle="proj",
-            scope_id="agent:o/patch",
+            scope_id=derive_agent_scope(org_id, agent_id or DEFAULT_PATCH_AGENT_ID),
             coding_run_id=run_id,
             target=self._target,
         )
+
+    async def authorize_generation(self, org_id, actor, project_id, *, agent_id, run_id):  # type: ignore[no-untyped-def]
+        return self._binding(org_id, agent_id, run_id)
 
     async def authorize_read(self, org_id, actor, project_id):  # type: ignore[no-untyped-def]
         return None
 
+    async def authorize_approval(self, org_id, actor, project_id):  # type: ignore[no-untyped-def]
+        return None
+
     async def authorize_writeback(self, org_id, actor, project_id, *, agent_id, run_id):  # type: ignore[no-untyped-def]
-        return ProjectBinding(
-            project_handle="proj",
-            scope_id="agent:o/patch",
-            coding_run_id=run_id,
-            target=self._target,
-        )
+        return self._binding(org_id, agent_id, run_id)
 
     async def associate_run(self, org_id, actor, project_id, run_id, *, agent_id):  # type: ignore[no-untyped-def]
         self.associated.append(run_id)
@@ -292,6 +305,30 @@ class _ContendedRunStore(InMemoryRunStore):
         return None
 
 
+class _RunFactory:
+    """A per-scope in-memory run store factory (memoized).
+
+    The in-memory analog of ``lambda scope: PostgresRunStore(engine, scope)``: each scope gets its
+    own isolated store, so two Agents/orgs can never see each other's runs. Seedable so a test can
+    inject a specific store (contended / get-tracking) for the default scope while other scopes get
+    fresh isolated stores on demand."""
+
+    def __init__(self, seed: dict[str, InMemoryRunStore] | None = None) -> None:
+        self._stores: dict[str, InMemoryRunStore] = dict(seed or {})
+
+    def __call__(self, scope_id: str) -> InMemoryRunStore:
+        store = self._stores.get(scope_id)
+        if store is None:
+            store = InMemoryRunStore()
+            self._stores[scope_id] = store
+        return store
+
+
+async def _run_get(coord: PatchCoordinator, run_id: str, *, scope: str = _DEFAULT_SCOPE) -> Any:
+    """Read a run via the coordinator's public per-scope factory (memoized -> same store)."""
+    return await coord.run_store_factory(scope).get(run_id)
+
+
 class _ScopeSpyFactory:
     """A per-scope approval-store factory that records every scope it is asked to resolve.
 
@@ -318,9 +355,9 @@ def _target() -> WritebackTarget:
     )
 
 
-def _request(idem: str = "k1") -> PatchProposalRequest:
+def _request(idem: str = "k1", *, org: str = "o") -> PatchProposalRequest:
     return PatchProposalRequest(
-        org_id="o",
+        org_id=org,
         project_id="p",
         actor="u",
         task="do it",
@@ -338,13 +375,14 @@ def _coordinator(
     runs: InMemoryRunStore | None = None,
     generation: Any | None = None,
     approval_factory: Any | None = None,
+    authorizer: Any | None = None,
 ) -> PatchCoordinator:
     factory = approval_factory or _ScopeSpyFactory()
     return PatchCoordinator(
         store=InMemoryPatchProposalStore(),
         outbox=InMemoryPatchProposalOutbox(),
-        runs=runs or InMemoryRunStore(),
-        authorizer=_FakeAuthorizer(target),
+        run_store_factory=_RunFactory({_DEFAULT_SCOPE: runs or InMemoryRunStore()}),
+        authorizer=authorizer or _FakeAuthorizer(target),
         generation=generation or _FakeGeneration(artifacts),  # type: ignore[arg-type]
         approval_factory=factory,
         writeback=writeback,  # type: ignore[arg-type]
@@ -496,7 +534,7 @@ async def test_generation_auto_advances_and_charges_run_cost() -> None:
     proposal = await coord.execute_generation("o", handle.run_id, req, worker_id="w1")
     assert proposal.status is PatchStatus.approval_pending and proposal.approval_id
     assert proposal.cost_usd == pytest.approx(0.02)
-    run = await coord.runs.get(handle.run_id)
+    run = await _run_get(coord, handle.run_id)
     assert run is not None and run.status is RunStatus.completed
     assert run.cost_usd == pytest.approx(0.02)  # the run row is the authoritative charge ledger
     assert await coord.outbox.get(handle.proposal_id) is None
@@ -597,7 +635,7 @@ async def test_lease_lost_leaves_proposal_and_run_untouched() -> None:
     proposal = await coord.store.get("o", handle.proposal_id)
     assert proposal is not None and proposal.status is PatchStatus.generating
     assert proposal.cost_usd == 0.0
-    run = await coord.runs.get(handle.run_id)
+    run = await _run_get(coord, handle.run_id)
     # lease still held, run never terminalized
     assert run is not None and run.status is RunStatus.running
     entry = await coord.outbox.get(handle.proposal_id)
@@ -629,7 +667,7 @@ async def test_provider_unavailable_releases_partial_cost_then_retry_accrues_cum
     p1 = await coord.store.get("o", handle.proposal_id)
     assert p1 is not None and p1.status is PatchStatus.generating
     assert p1.cost_usd == pytest.approx(0.01)
-    r1 = await coord.runs.get(handle.run_id)
+    r1 = await _run_get(coord, handle.run_id)
     assert r1 is not None and r1.status is RunStatus.queued and r1.cost_usd == pytest.approx(0.01)
     entry = await coord.outbox.get(handle.proposal_id)
     assert entry is not None and entry.status_hint is PatchOutboxStatus.generating
@@ -638,7 +676,7 @@ async def test_provider_unavailable_releases_partial_cost_then_retry_accrues_cum
     p2 = await coord.execute_generation("o", handle.run_id, req, worker_id="w1")
     assert p2.status is PatchStatus.approval_pending
     assert p2.cost_usd == pytest.approx(0.03)
-    r2 = await coord.runs.get(handle.run_id)
+    r2 = await _run_get(coord, handle.run_id)
     assert r2 is not None and r2.status is RunStatus.completed
     assert r2.cost_usd == pytest.approx(0.03)
     assert gen.calls == 2
@@ -660,7 +698,7 @@ async def test_permanent_generation_error_fails_and_retires_pointer() -> None:
     assert proposal is not None and proposal.status is PatchStatus.failed
     # A failure that carries no usage charges nothing (cost stays zero).
     assert proposal.cost_usd == pytest.approx(0.0)
-    run = await coord.runs.get(handle.run_id)
+    run = await _run_get(coord, handle.run_id)
     assert run is not None and run.status is RunStatus.failed
     assert run.cost_usd == pytest.approx(0.0)
     assert await coord.outbox.get(handle.proposal_id) is None
@@ -686,7 +724,7 @@ async def test_permanent_provider_error_charges_partial_usage_on_run_and_proposa
     proposal = await coord.store.get("o", handle.proposal_id)
     assert proposal is not None and proposal.status is PatchStatus.failed
     assert proposal.cost_usd == pytest.approx(0.05)
-    run = await coord.runs.get(handle.run_id)
+    run = await _run_get(coord, handle.run_id)
     assert run is not None and run.status is RunStatus.failed
     assert run.cost_usd == pytest.approx(0.05)  # the run row is the authoritative charge ledger
     assert await coord.outbox.get(handle.proposal_id) is None
@@ -711,7 +749,7 @@ async def test_transient_then_permanent_charges_cumulatively_without_double_coun
 
     with pytest.raises(PatchProviderUnavailable):
         await coord.execute_generation("o", handle.run_id, req, worker_id="w1")
-    r1 = await coord.runs.get(handle.run_id)
+    r1 = await _run_get(coord, handle.run_id)
     assert r1 is not None and r1.status is RunStatus.queued and r1.cost_usd == pytest.approx(0.01)
 
     with pytest.raises(PatchProviderError):
@@ -719,7 +757,7 @@ async def test_transient_then_permanent_charges_cumulatively_without_double_coun
     proposal = await coord.store.get("o", handle.proposal_id)
     assert proposal is not None and proposal.status is PatchStatus.failed
     assert proposal.cost_usd == pytest.approx(0.03)
-    r2 = await coord.runs.get(handle.run_id)
+    r2 = await _run_get(coord, handle.run_id)
     assert r2 is not None and r2.status is RunStatus.failed
     assert r2.cost_usd == pytest.approx(0.03)  # 0.01 (prior partial) + 0.02 (this failure)
     assert gen.calls == 2
@@ -753,7 +791,7 @@ async def test_permanent_failure_cleanup_does_not_read_run_and_survives_get_fail
     assert proposal.cost_usd == pytest.approx(0.04)
     assert await coord.outbox.get(handle.proposal_id) is None
     runs.fail = False  # re-enable reads to assert the run was still charged + terminalized
-    run = await coord.runs.get(handle.run_id)
+    run = await _run_get(coord, handle.run_id)
     assert run is not None and run.status is RunStatus.failed
     assert run.cost_usd == pytest.approx(0.04)
 
@@ -794,3 +832,137 @@ async def test_writeback_permanent_error_fails_and_retires_pointer() -> None:
     proposal = await coord.store.get("o", handle.proposal_id)
     assert proposal is not None and proposal.status is PatchStatus.failed
     assert await coord.outbox.get(handle.proposal_id) is None
+
+
+# --- P3a-3: authorizer hardening, optional deps, per-scope run factory --------------------
+
+
+class _RoleAuthorizer(_FakeAuthorizer):
+    """Authorizer double that gates approval/writeback on ``write`` (only a listed writer).
+
+    Models the real capability matrix: read/deny require only ``read`` (any actor); an *approval*
+    and the trusted *writeback* require ``write`` (a writer). Generation is left open here — the
+    test exercises the decision gate, not generation admission."""
+
+    def __init__(self, target: WritebackTarget | None, *, writers: set[str]) -> None:
+        super().__init__(target)
+        self._writers = set(writers)
+
+    async def authorize_approval(self, org_id, actor, project_id):  # type: ignore[no-untyped-def]
+        if actor not in self._writers:
+            raise PermissionDenied("approval requires the 'write' capability")
+
+    async def authorize_writeback(self, org_id, actor, project_id, *, agent_id, run_id):  # type: ignore[no-untyped-def]
+        if actor not in self._writers:
+            raise PermissionDenied("writeback requires the 'write' capability")
+        return self._binding(org_id, agent_id, run_id)
+
+
+class _WrongScopeAuthorizer(_FakeAuthorizer):
+    """Returns a binding whose scope is NOT the proposal's canonical per-Agent scope."""
+
+    async def authorize_generation(self, org_id, actor, project_id, *, agent_id, run_id):  # type: ignore[no-untyped-def]
+        return ProjectBinding(
+            project_handle="proj",
+            scope_id="agent:someone-else/patch",
+            coding_run_id=run_id,
+            target=self._target,
+        )
+
+
+async def _drive_to_approval(coord: PatchCoordinator, req: PatchProposalRequest) -> Any:
+    handle = await coord.request_generation(req)
+    await coord.execute_generation(req.org_id, handle.run_id, req, worker_id="w1")
+    return handle
+
+
+@pytest.mark.asyncio
+async def test_read_only_actor_can_deny_but_not_approve() -> None:
+    # The decision gate: an approval unlocks the remote side effect so it needs ``write``; a
+    # denial is read-only. A read-only actor can decline a proposal but can never approve it,
+    # while a writer can. Reauthorization happens BEFORE the durable approval resolves.
+    artifacts = _MemArtifacts()
+    coord = _coordinator(
+        artifacts,
+        _FakeWriteback(),
+        _target(),
+        authorizer=_RoleAuthorizer(_target(), writers={"boss"}),
+    )
+
+    handle_a = await _drive_to_approval(coord, _request("kA"))
+    with pytest.raises(PermissionDenied):
+        await coord.decide("o", handle_a.proposal_id, approve=True, actor="viewer")
+    # The failed authorization left the proposal untouched (still awaiting approval).
+    still = await coord.store.get("o", handle_a.proposal_id)
+    assert still is not None and still.status is PatchStatus.approval_pending
+    granted = await coord.decide("o", handle_a.proposal_id, approve=True, actor="boss")
+    assert granted.applied and granted.status is PatchStatus.approved
+
+    handle_b = await _drive_to_approval(coord, _request("kB"))
+    denied = await coord.decide("o", handle_b.proposal_id, approve=False, actor="viewer")
+    assert denied.applied and denied.status is PatchStatus.denied
+
+
+@pytest.mark.asyncio
+async def test_server_only_coordinator_runs_control_plane_but_refuses_execution() -> None:
+    # A server coordinator wires request/read/decide/cancel WITHOUT generation/writeback/artifacts.
+    # The control plane works; calling an execution entrypoint raises an explicit PatchStateError
+    # instead of crashing on a ``None`` attribute.
+    coord = PatchCoordinator(
+        store=InMemoryPatchProposalStore(),
+        outbox=InMemoryPatchProposalOutbox(),
+        run_store_factory=_RunFactory({_DEFAULT_SCOPE: InMemoryRunStore()}),
+        authorizer=_FakeAuthorizer(_target()),
+        approval_factory=_ScopeSpyFactory(),
+    )
+    req = _request()
+    handle = await coord.request_generation(req)
+    assert handle.created and handle.status is PatchStatus.generating
+
+    with pytest.raises(PatchStateError):
+        await coord.execute_generation("o", handle.run_id, req, worker_id="w1")
+    with pytest.raises(PatchStateError):
+        await coord.execute_writeback("o", handle.proposal_id, worker_id="w1")
+
+    got = await coord.get("o", handle.proposal_id, actor="u")
+    assert got.status is PatchStatus.generating
+    cancelled = await coord.cancel("o", handle.proposal_id, actor="u")
+    assert cancelled.status is PatchStatus.cancelled
+    assert await coord.outbox.get(handle.proposal_id) is None
+
+
+@pytest.mark.asyncio
+async def test_run_store_factory_isolates_scopes_and_orgs() -> None:
+    # Each canonical per-Agent scope gets its own run store: a run created under one scope is
+    # invisible under another, and proposals are org-isolated in the store.
+    artifacts = _MemArtifacts()
+    coord = _coordinator(artifacts, _FakeWriteback(), _target())
+    h1 = await coord.request_generation(_request("k1", org="o"))
+    h2 = await coord.request_generation(_request("k2", org="o2"))
+
+    scope1 = derive_agent_scope("o", DEFAULT_PATCH_AGENT_ID)
+    scope2 = derive_agent_scope("o2", DEFAULT_PATCH_AGENT_ID)
+    assert scope1 != scope2
+
+    assert await coord.run_store_factory(scope1).get(h1.run_id) is not None
+    assert await coord.run_store_factory(scope2).get(h2.run_id) is not None
+    # cross-scope runs are invisible
+    assert await coord.run_store_factory(scope1).get(h2.run_id) is None
+    assert await coord.run_store_factory(scope2).get(h1.run_id) is None
+    # cross-org proposals are invisible
+    assert await coord.store.get("o2", h1.proposal_id) is None
+    assert await coord.store.get("o", h2.proposal_id) is None
+
+
+@pytest.mark.asyncio
+async def test_request_rejects_non_canonical_scope() -> None:
+    # If the authorizer resolves a scope that is not the proposal's canonical per-Agent scope, the
+    # request fails closed BEFORE any durable run/proposal is created.
+    artifacts = _MemArtifacts()
+    coord = _coordinator(
+        artifacts, _FakeWriteback(), _target(), authorizer=_WrongScopeAuthorizer(_target())
+    )
+    with pytest.raises(PatchValidationError):
+        await coord.request_generation(_request())
+    assert await coord.store.list_for_project("o", "p") == []
+    assert await coord.run_store_factory(_DEFAULT_SCOPE).get("k1") is None

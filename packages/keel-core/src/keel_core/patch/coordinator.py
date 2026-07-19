@@ -46,6 +46,7 @@ from keel_core.approvals import ApprovalStore
 from keel_core.coding.protocols import ArtifactStore
 from keel_core.protocols import Usage
 from keel_core.runs import RunBudgetSpec, RunCost, RunStatus, RunStore
+from keel_core.scoping import derive_agent_scope
 
 from .approval import (
     DEFAULT_APPROVAL_TTL_SECONDS,
@@ -106,6 +107,8 @@ class PatchAuthorizer(Protocol):
 
     async def authorize_read(self, org_id: str, actor: str, project_id: str) -> None: ...
 
+    async def authorize_approval(self, org_id: str, actor: str, project_id: str) -> None: ...
+
     async def authorize_writeback(
         self, org_id: str, actor: str, project_id: str, *, agent_id: str | None, run_id: str
     ) -> ProjectBinding: ...
@@ -165,15 +168,22 @@ def _run_cost_from_usage(usage: object | None) -> RunCost:
 class PatchCoordinator:
     store: PatchProposalStore
     outbox: PatchProposalOutbox
-    runs: RunStore
+    # A per-scope durable run store: a shared in-memory double, or a Postgres store bound to the
+    # exact scope. Every run operation resolves the proposal's canonical per-Agent scope first, so a
+    # cross-scope run can never be created, claimed, charged, or read; there is no global run scan.
+    run_store_factory: Callable[[str], RunStore]
     authorizer: PatchAuthorizer
-    generation: PatchGenerationService
     # A per-scope durable approval store: the shared in-memory double, or a Postgres store bound to
     # the proposal's canonical scope. There is no single bound approval — every approval operation
     # resolves the exact scope first, so a cross-scope decision can never leak.
     approval_factory: Callable[[str], ApprovalStore]
-    writeback: PatchWritebackService
-    artifacts: ArtifactStore
+    # Optional execution dependencies. A *server* coordinator wires only request/read/decide/cancel
+    # and omits these; a *worker* coordinator supplies them. Calling execute_generation /
+    # execute_writeback without the matching dependency raises an explicit PatchStateError rather
+    # than crashing on a ``None`` attribute.
+    generation: PatchGenerationService | None = None
+    writeback: PatchWritebackService | None = None
+    artifacts: ArtifactStore | None = None
     audit: PatchAuditSink = _LoggingAudit()
     ttl_seconds: int = DEFAULT_PATCH_TTL_SECONDS
     lease_seconds: int = DEFAULT_PATCH_LEASE_SECONDS
@@ -193,7 +203,16 @@ class PatchCoordinator:
             agent_id=request.agent_id,
             run_id=run_id,
         )
-        await self.runs.create(
+        # M4 proposals always run under the canonical per-Agent scope derived from the immutable
+        # org_id + (effective) agent_id. Verify the authorizer resolved exactly that scope before
+        # creating any durable row, so a mis-scoped binding fails closed instead of stranding a run
+        # and proposal under a scope the coordinator can't re-derive.
+        canonical_scope = derive_agent_scope(
+            request.org_id, request.agent_id or DEFAULT_PATCH_AGENT_ID
+        )
+        if binding.scope_id != canonical_scope:
+            raise PatchValidationError("authorized scope does not match the canonical Agent scope")
+        await self.run_store_factory(binding.scope_id).create(
             run_id=run_id,
             scope_id=binding.scope_id,
             org_id=request.org_id,
@@ -253,6 +272,7 @@ class PatchCoordinator:
         now: datetime | None = None,
     ) -> PatchProposal:
         moment = now or datetime.now(UTC)
+        generation = self._require_generation()
         proposal = await self.store.get_by_run(org_id, run_id)
         if proposal is None:
             raise PatchValidationError("no proposal bound to this run")
@@ -274,14 +294,17 @@ class PatchCoordinator:
             agent_id=proposal.agent_id,
             run_id=run_id,
         )
-        await self.runs.mark_queued(run_id, now=moment)
-        lease = await self.runs.claim(
+        # Bind every run operation to the proposal's canonical scope (which the authorizer just
+        # re-derived); a stale/foreign binding can never reach another scope's run row.
+        run_store = self.run_store_factory(binding.scope_id)
+        await run_store.mark_queued(run_id, now=moment)
+        lease = await run_store.claim(
             run_id, worker_id=worker_id, now=moment, lease_seconds=self.lease_seconds
         )
         if lease is None:
             raise PatchStateError("patch generation run is leased by another worker")
         try:
-            outcome = await self.generation.generate(
+            outcome = await generation.generate(
                 request,
                 proposal_id=proposal.id,
                 run_id=run_id,
@@ -299,7 +322,7 @@ class PatchCoordinator:
             # the lease back to the queue (the proposal stays ``generating`` for a retry) and apply
             # the partial usage as a cumulative delta, then mirror that cumulative onto the proposal
             # so no partial cost is lost. Rethrow for the P3 retry mapping.
-            released = await self.runs.release(
+            released = await run_store.release(
                 lease,
                 to_status=RunStatus.queued,
                 cost=_run_cost_from_usage(exc.usage),
@@ -343,7 +366,7 @@ class PatchCoordinator:
                 outbox=self.outbox,
                 scope_id=binding.scope_id,
             )
-            await self.runs.terminalize(
+            await run_store.terminalize(
                 lease,
                 status=RunStatus.failed,
                 stop_reason="generation_failed",
@@ -358,7 +381,7 @@ class PatchCoordinator:
         # ``generating`` proposal (a resumed attempt would fail to re-claim a terminal run). The
         # proposal cost is derived from the run's cumulative charge (prior partial attempts + this
         # outcome) so a provider-unavailable retry neither loses nor double-counts cost.
-        run_record = await self.runs.get(run_id)
+        run_record = await run_store.get(run_id)
         prior_cost = run_record.cost_usd if run_record is not None else 0.0
         outcome_cost = _run_cost_from_usage(outcome.usage)
         run_branch = run_branch_for(proposal.id)
@@ -382,7 +405,7 @@ class PatchCoordinator:
             outbox=self.outbox,
             scope_id=binding.scope_id,
         )
-        await self.runs.terminalize(
+        await run_store.terminalize(
             lease,
             status=RunStatus.completed,
             stop_reason="generated",
@@ -449,7 +472,7 @@ class PatchCoordinator:
         nothing. ``expected_version`` is intentionally omitted so a concurrent second caller (or a
         reconciler re-drive) observes ``approval_pending`` and takes the idempotent fast path: the
         same approval id, no second version bump, no attempt to re-delete the retired pointer."""
-        scope_id = await self._scope_for(org_id, proposal)
+        scope_id = self._scope_for(org_id, proposal)
         draft = self._approval_draft(proposal, now=now)
         updated, approval_id, created = await self.store.transition_to_approval_pending(
             org_id,
@@ -494,7 +517,14 @@ class PatchCoordinator:
     ) -> DecisionResult:
         moment = now or datetime.now(UTC)
         proposal = await self._require(org_id, proposal_id)
-        await self.authorizer.authorize_read(org_id, actor, proposal.project_id)
+        # Reauthorize the deciding actor BEFORE resolving the durable approval: an *approval*
+        # unlocks the remote push/Draft-PR side effect, so it requires ``write``; a *denial* is
+        # read-only, so a read-only member can decline but never approve. This runs ahead of the
+        # idempotent terminal fast path so a read-only actor can't even idempotently re-approve.
+        if approve:
+            await self.authorizer.authorize_approval(org_id, actor, proposal.project_id)
+        else:
+            await self.authorizer.authorize_read(org_id, actor, proposal.project_id)
         if proposal.status in {
             PatchStatus.approved,
             PatchStatus.denied,
@@ -511,7 +541,7 @@ class PatchCoordinator:
             raise PatchApprovalError("proposal has no bound approval")
         # Resolve the exact canonical scope and bind the approval service to it — a decision can
         # only ever resolve an approval in the proposal's own scope, never a cross-scope guess.
-        scope_id = await self._scope_for(org_id, proposal)
+        scope_id = self._scope_for(org_id, proposal)
         approval = self._approval_service(scope_id)
         applied = await approval.decide(
             proposal, proposal.approval_id, approve=approve, resolved_by=actor, now=moment
@@ -575,6 +605,7 @@ class PatchCoordinator:
         self, org_id: str, proposal_id: str, *, worker_id: str, now: datetime | None = None
     ) -> PatchProposal:
         moment = now or datetime.now(UTC)
+        writeback, artifacts = self._require_writeback()
         proposal = await self._require(org_id, proposal_id)
         if proposal.status is PatchStatus.draft_pr_created:
             return proposal  # idempotent
@@ -600,13 +631,13 @@ class PatchCoordinator:
                 updates={"remote_branch": proposal.remote_branch or run_branch_for(proposal.id)},
                 now=moment,
             )
-        manifest = PatchBundleReader(self.artifacts).read_manifest(
+        manifest = PatchBundleReader(artifacts).read_manifest(
             project_id=binding.project_handle,
             coding_run_id=binding.coding_run_id,
             bundle_sha256=proposal.bundle_sha256,
         )
         try:
-            result = await self.writeback.write(
+            result = await writeback.write(
                 proposal,
                 project_handle=binding.project_handle,
                 target=binding.target,
@@ -711,7 +742,7 @@ class PatchCoordinator:
             return proposal
         # A terminal ``cancelled`` retires the dispatch pointer (no background work), in the same
         # transaction as the proposal transition and under the proposal's own canonical scope.
-        scope_id = await self._scope_for(org_id, proposal)
+        scope_id = self._scope_for(org_id, proposal)
         return await self.store.transition(
             org_id,
             proposal.id,
@@ -731,11 +762,26 @@ class PatchCoordinator:
             raise PatchNotFound(f"proposal not found: {proposal_id}")
         return proposal
 
-    async def _scope_for(self, org_id: str, proposal: PatchProposal) -> str:
-        run = await self.runs.get(proposal.run_id)
-        if run is not None:
-            return str(run.scope_id)
-        return f"agent:{org_id}/{proposal.agent_id}"
+    def _require_generation(self) -> PatchGenerationService:
+        """The generation dependency, or an explicit error on a server-only coordinator."""
+        if self.generation is None:
+            raise PatchStateError("this coordinator is not wired for patch generation")
+        return self.generation
+
+    def _require_writeback(self) -> tuple[PatchWritebackService, ArtifactStore]:
+        """The writeback dependencies, or an explicit error on a server-only coordinator."""
+        if self.writeback is None or self.artifacts is None:
+            raise PatchStateError("this coordinator is not wired for patch writeback")
+        return self.writeback, self.artifacts
+
+    def _scope_for(self, org_id: str, proposal: PatchProposal) -> str:
+        """The proposal's canonical per-Agent scope, derived from immutable org_id + agent_id.
+
+        M4 proposals always run under this scope (verified at request time), so it can be recomputed
+        deterministically without a global run scan — a per-scope run store never needs to be probed
+        just to discover which scope a proposal belongs to.
+        """
+        return derive_agent_scope(org_id, proposal.agent_id)
 
 
 __all__ = [

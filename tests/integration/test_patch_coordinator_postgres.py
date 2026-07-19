@@ -25,7 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.approvals import PostgresApprovalStore
-from keel_core.patch.coordinator import PatchCoordinator, ProjectBinding
+from keel_core.patch.coordinator import DEFAULT_PATCH_AGENT_ID, PatchCoordinator, ProjectBinding
 from keel_core.patch.generation import GenerationOutcome
 from keel_core.patch.models import (
     ChangedFile,
@@ -41,7 +41,8 @@ from keel_core.patch.outbox import PatchOutboxStatus, PostgresPatchProposalOutbo
 from keel_core.patch.store import PostgresPatchProposalStore
 from keel_core.patch.writeback import WritebackResult, WritebackTarget
 from keel_core.protocols import Usage
-from keel_core.runs import InMemoryRunStore, RunStatus
+from keel_core.runs import InMemoryRunStore, PostgresRunStore, RunStatus
+from keel_core.scoping import derive_agent_scope
 
 pytestmark = pytest.mark.integration
 
@@ -138,10 +139,10 @@ class _Authorizer:
     def __init__(self) -> None:
         self.scopes: list[str] = []
 
-    async def authorize_generation(self, org_id, actor, project_id, *, agent_id, run_id):  # type: ignore[no-untyped-def]
+    def _binding(self, org_id: str, agent_id: str | None, run_id: str) -> ProjectBinding:
         return ProjectBinding(
             project_handle="proj",
-            scope_id=_SCOPE,
+            scope_id=derive_agent_scope(org_id, agent_id or DEFAULT_PATCH_AGENT_ID),
             coding_run_id=run_id,
             target=WritebackTarget(
                 full_name="org-a/repo",
@@ -151,13 +152,17 @@ class _Authorizer:
             ),
         )
 
+    async def authorize_generation(self, org_id, actor, project_id, *, agent_id, run_id):  # type: ignore[no-untyped-def]
+        return self._binding(org_id, agent_id, run_id)
+
     async def authorize_read(self, org_id, actor, project_id):  # type: ignore[no-untyped-def]
         return None
 
+    async def authorize_approval(self, org_id, actor, project_id):  # type: ignore[no-untyped-def]
+        return None
+
     async def authorize_writeback(self, org_id, actor, project_id, *, agent_id, run_id):  # type: ignore[no-untyped-def]
-        return await self.authorize_generation(
-            org_id, actor, project_id, agent_id=agent_id, run_id=run_id
-        )
+        return self._binding(org_id, agent_id, run_id)
 
     async def associate_run(self, org_id, actor, project_id, run_id, *, agent_id):  # type: ignore[no-untyped-def]
         return None
@@ -196,14 +201,31 @@ class _ScopeSpyFactory:
         return PostgresApprovalStore(self._engine, scope_id)
 
 
+class _RunFactory:
+    """Per-scope in-memory run store factory (memoized) for the coordinator's run substrate."""
+
+    def __init__(self) -> None:
+        self._stores: dict[str, InMemoryRunStore] = {}
+
+    def __call__(self, scope_id: str) -> InMemoryRunStore:
+        store = self._stores.get(scope_id)
+        if store is None:
+            store = InMemoryRunStore()
+            self._stores[scope_id] = store
+        return store
+
+
 def _coordinator(
-    engine: AsyncEngine, script: list[Any]
+    engine: AsyncEngine,
+    script: list[Any],
+    *,
+    run_store_factory: Any | None = None,
 ) -> tuple[PatchCoordinator, _ScopeSpyFactory]:
     factory = _ScopeSpyFactory(engine)
     coord = PatchCoordinator(
         store=PostgresPatchProposalStore(engine),
         outbox=PostgresPatchProposalOutbox(engine),
-        runs=InMemoryRunStore(),
+        run_store_factory=run_store_factory or _RunFactory(),
         authorizer=_Authorizer(),
         generation=_Generation(script),  # type: ignore[arg-type]
         approval_factory=factory,
@@ -213,10 +235,10 @@ def _coordinator(
     return coord, factory
 
 
-def _request() -> PatchProposalRequest:
+def _request(org: str = "org-a", project: str = "proj-a") -> PatchProposalRequest:
     return PatchProposalRequest(
-        org_id="org-a",
-        project_id="proj-a",
+        org_id=org,
+        project_id=project,
         actor="alice",
         task="fix the bug",
         base_ref="main",
@@ -250,7 +272,7 @@ async def test_coordinator_generate_reaches_approval_pending_and_deletes_pointer
     record = await approvals.get(proposal.approval_id)
     assert record is not None and record.status == "pending"
     assert await coord.outbox.get(handle.proposal_id) is None
-    run = await coord.runs.get(handle.run_id)
+    run = await coord.run_store_factory(_SCOPE).get(handle.run_id)
     assert run is not None and run.status is RunStatus.completed
     assert run.cost_usd == pytest.approx(0.02)
     # Every approval operation resolved the proposal's exact canonical scope.
@@ -321,7 +343,7 @@ async def test_coordinator_provider_unavailable_partial_cost_then_retry_cumulati
     p1 = await coord.store.get("org-a", handle.proposal_id)
     assert p1 is not None and p1.status is PatchStatus.generating
     assert p1.cost_usd == pytest.approx(0.01)
-    r1 = await coord.runs.get(handle.run_id)
+    r1 = await coord.run_store_factory(_SCOPE).get(handle.run_id)
     assert r1 is not None and r1.status is RunStatus.queued and r1.cost_usd == pytest.approx(0.01)
     entry = await coord.outbox.get(handle.proposal_id)
     assert entry is not None and entry.status_hint is PatchOutboxStatus.generating
@@ -330,8 +352,68 @@ async def test_coordinator_provider_unavailable_partial_cost_then_retry_cumulati
     p2 = await coord.execute_generation("org-a", handle.run_id, req, worker_id="w1")
     assert p2.status is PatchStatus.approval_pending
     assert p2.cost_usd == pytest.approx(0.03)
-    r2 = await coord.runs.get(handle.run_id)
+    r2 = await coord.run_store_factory(_SCOPE).get(handle.run_id)
     assert (
         r2 is not None and r2.status is RunStatus.completed and r2.cost_usd == pytest.approx(0.03)
     )
+    assert await coord.outbox.get(handle.proposal_id) is None
+
+
+async def test_run_store_factory_isolates_scope_on_postgres(migrated_db: AsyncEngine) -> None:
+    # The per-scope run factory over live Postgres: a run created for one Agent scope is invisible
+    # under another, and proposals stay org-isolated — no global run/proposal scan.
+    await _seed_org_project(migrated_db, "org-a", "proj-a")
+    await _seed_org_project(migrated_db, "org-b", "proj-b")
+
+    def pg_factory(scope_id: str) -> PostgresRunStore:
+        return PostgresRunStore(migrated_db, scope_id)
+
+    coord, _ = _coordinator(migrated_db, [], run_store_factory=pg_factory)
+    handle_a = await coord.request_generation(_request("org-a", "proj-a"))
+    handle_b = await coord.request_generation(_request("org-b", "proj-b"))
+
+    scope_a = derive_agent_scope("org-a", DEFAULT_PATCH_AGENT_ID)
+    scope_b = derive_agent_scope("org-b", DEFAULT_PATCH_AGENT_ID)
+    assert scope_a != scope_b
+
+    assert await PostgresRunStore(migrated_db, scope_a).get(handle_a.run_id) is not None
+    assert await PostgresRunStore(migrated_db, scope_b).get(handle_b.run_id) is not None
+    # cross-scope runs are invisible (the get is scope-filtered in SQL)
+    assert await PostgresRunStore(migrated_db, scope_a).get(handle_b.run_id) is None
+    assert await PostgresRunStore(migrated_db, scope_b).get(handle_a.run_id) is None
+    # cross-org proposals are invisible in the Postgres proposal store
+    assert await coord.store.get("org-b", handle_a.proposal_id) is None
+    assert await coord.store.get("org-a", handle_b.proposal_id) is None
+
+
+async def test_server_only_coordinator_refuses_execution_on_postgres(
+    migrated_db: AsyncEngine,
+) -> None:
+    # A server coordinator over live Postgres wires request/read/decide/cancel WITHOUT generation
+    # or writeback deps. The control plane works; execution entrypoints fail closed with
+    # PatchStateError.
+    from keel_core.patch.errors import PatchStateError
+
+    await _seed_org_project(migrated_db, "org-a", "proj-a")
+    coord = PatchCoordinator(
+        store=PostgresPatchProposalStore(migrated_db),
+        outbox=PostgresPatchProposalOutbox(migrated_db),
+        run_store_factory=_RunFactory(),
+        authorizer=_Authorizer(),
+        approval_factory=_ScopeSpyFactory(migrated_db),
+    )
+    req = _request()
+    handle = await coord.request_generation(req)
+    assert handle.created and handle.status is PatchStatus.generating
+
+    with pytest.raises(PatchStateError):
+        await coord.execute_generation("org-a", handle.run_id, req, worker_id="w1")
+    with pytest.raises(PatchStateError):
+        await coord.execute_writeback("org-a", handle.proposal_id, worker_id="w1")
+
+    # Read + terminal cancel still work and retire the pointer without any execution dependency.
+    got = await coord.get("org-a", handle.proposal_id, actor="alice")
+    assert got.status is PatchStatus.generating
+    cancelled = await coord.cancel("org-a", handle.proposal_id, actor="alice")
+    assert cancelled.status is PatchStatus.cancelled
     assert await coord.outbox.get(handle.proposal_id) is None
