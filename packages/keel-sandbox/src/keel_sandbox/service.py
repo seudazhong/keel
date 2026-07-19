@@ -571,56 +571,65 @@ def _register_transfer_routes(
 
     @app.post("/v1/transfer/upload/{namespace}")
     async def transfer_upload(namespace: str, raw_request: Request) -> Response:
-        body = await _read_bounded_body(raw_request, max_archive)
-        if body is None:
-            return JSONResponse({"detail": "request body too large"}, status_code=413)
-        denied = _authenticate(raw_request, body)
-        if denied is not None:
-            return denied
-        try:
-            result = await transfer_service.upload(namespace, body)
-        except TransferNamespaceError:
-            return JSONResponse({"detail": "invalid namespace"}, status_code=400)
-        except PatchBoundsExceeded:
-            return JSONResponse({"detail": "snapshot exceeds bounds"}, status_code=413)
-        except (PatchPolicyViolation, PatchValidationError):
-            return JSONResponse({"detail": "snapshot rejected"}, status_code=422)
-        except TransferIOError:
-            return JSONResponse({"detail": "sandbox transfer failure"}, status_code=500)
-        payload = _json_bytes(
-            {
-                "namespace": result.namespace,
-                "files": result.manifest.file_count,
-                "total_bytes": result.manifest.total_bytes,
-            }
-        )
-        headers = _sign_response(
-            response_signer, raw_request, request_body=body, response_body=payload
-        )
-        return Response(content=payload, media_type="application/json", headers=headers)
+        # Hold the process-global transfer slot across the bounded body read and the whole
+        # upload so concurrent requests (any namespace) cannot multiply peak in-memory snapshot
+        # bytes. The slot is released only after the response body is built, while ``body`` and
+        # the parsed snapshot are still referenced.
+        async with transfer_service.transfer_slot():
+            body = await _read_bounded_body(raw_request, max_archive)
+            if body is None:
+                return JSONResponse({"detail": "request body too large"}, status_code=413)
+            denied = _authenticate(raw_request, body)
+            if denied is not None:
+                return denied
+            try:
+                result = await transfer_service.upload(namespace, body)
+            except TransferNamespaceError:
+                return JSONResponse({"detail": "invalid namespace"}, status_code=400)
+            except PatchBoundsExceeded:
+                return JSONResponse({"detail": "snapshot exceeds bounds"}, status_code=413)
+            except (PatchPolicyViolation, PatchValidationError):
+                return JSONResponse({"detail": "snapshot rejected"}, status_code=422)
+            except TransferIOError:
+                return JSONResponse({"detail": "sandbox transfer failure"}, status_code=500)
+            payload = _json_bytes(
+                {
+                    "namespace": result.namespace,
+                    "files": result.manifest.file_count,
+                    "total_bytes": result.manifest.total_bytes,
+                    "cleanup_pending": result.cleanup_pending,
+                }
+            )
+            headers = _sign_response(
+                response_signer, raw_request, request_body=body, response_body=payload
+            )
+            return Response(content=payload, media_type="application/json", headers=headers)
 
     @app.post("/v1/transfer/export/{namespace}")
     async def transfer_export(namespace: str, raw_request: Request) -> Response:
-        body = await _read_bounded_body(raw_request, max_control_body)
-        if body is None:
-            return JSONResponse({"detail": "request body too large"}, status_code=413)
-        denied = _authenticate(raw_request, body)
-        if denied is not None:
-            return denied
-        try:
-            result = await transfer_service.export(namespace)
-        except TransferNamespaceError:
-            return JSONResponse({"detail": "namespace not found"}, status_code=404)
-        except PatchBoundsExceeded:
-            return JSONResponse({"detail": "snapshot exceeds bounds"}, status_code=413)
-        except (PatchPolicyViolation, PatchValidationError):
-            return JSONResponse({"detail": "snapshot rejected"}, status_code=422)
-        except TransferIOError:
-            return JSONResponse({"detail": "sandbox transfer failure"}, status_code=500)
-        headers = _sign_response(
-            response_signer, raw_request, request_body=body, response_body=result.archive
-        )
-        return Response(content=result.archive, media_type="application/gzip", headers=headers)
+        # Hold the process-global transfer slot across the whole export so the serialized archive
+        # bytes held in memory are bounded the same way concurrent uploads are.
+        async with transfer_service.transfer_slot():
+            body = await _read_bounded_body(raw_request, max_control_body)
+            if body is None:
+                return JSONResponse({"detail": "request body too large"}, status_code=413)
+            denied = _authenticate(raw_request, body)
+            if denied is not None:
+                return denied
+            try:
+                result = await transfer_service.export(namespace)
+            except TransferNamespaceError:
+                return JSONResponse({"detail": "namespace not found"}, status_code=404)
+            except PatchBoundsExceeded:
+                return JSONResponse({"detail": "snapshot exceeds bounds"}, status_code=413)
+            except (PatchPolicyViolation, PatchValidationError):
+                return JSONResponse({"detail": "snapshot rejected"}, status_code=422)
+            except TransferIOError:
+                return JSONResponse({"detail": "sandbox transfer failure"}, status_code=500)
+            headers = _sign_response(
+                response_signer, raw_request, request_body=body, response_body=result.archive
+            )
+            return Response(content=result.archive, media_type="application/gzip", headers=headers)
 
     @app.post("/v1/transfer/delete/{namespace}")
     async def transfer_delete(namespace: str, raw_request: Request) -> Response:

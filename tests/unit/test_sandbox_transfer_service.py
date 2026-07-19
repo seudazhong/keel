@@ -203,6 +203,116 @@ async def test_bounds_are_enforced(tmp_path: Path) -> None:
     assert not (tmp_path / "namespaces" / _NS / "big.txt").exists()
 
 
+# --- Global transfer semaphore (bounds peak concurrent in-memory snapshot bytes) ------
+
+
+def test_max_concurrent_transfers_must_be_positive(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        SandboxTransferService(_provider(tmp_path), max_concurrent_transfers=0)
+
+
+def test_transfer_slot_is_stable_and_reflects_limit(tmp_path: Path) -> None:
+    service = SandboxTransferService(_provider(tmp_path), max_concurrent_transfers=3)
+    assert service.max_concurrent_transfers == 3
+    assert service.transfer_slot() is service.transfer_slot()
+
+
+async def test_transfer_slot_blocks_beyond_limit(tmp_path: Path) -> None:
+    service = SandboxTransferService(_provider(tmp_path), max_concurrent_transfers=1)
+    slot = service.transfer_slot()
+    await slot.acquire()
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(slot.acquire(), timeout=0.05)
+    finally:
+        slot.release()
+    # Released -> immediately acquirable again.
+    await asyncio.wait_for(slot.acquire(), timeout=0.5)
+    slot.release()
+
+
+async def test_transfer_slot_gates_across_namespaces(tmp_path: Path) -> None:
+    # The gate is namespace-agnostic: even transfers of *different* namespaces contend for it,
+    # so concurrent requests cannot multiply peak in-memory snapshot bytes.
+    service = SandboxTransferService(_provider(tmp_path), max_concurrent_transfers=1)
+    state = {"current": 0, "max": 0}
+
+    async def worker(namespace: str) -> None:
+        async with service.transfer_slot():
+            state["current"] += 1
+            state["max"] = max(state["max"], state["current"])
+            await asyncio.sleep(0.02)
+            state["current"] -= 1
+
+    await asyncio.gather(*(worker(f"ws_{c * 32}") for c in "abcd"))
+    assert state["max"] == 1
+
+
+# --- Post-commit backup cleanup is best-effort (never a retryable failure) -------------
+
+
+async def test_backup_cleanup_failure_returns_success_and_is_swept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = SandboxTransferService(_provider(tmp_path))
+    base = tmp_path / "namespaces"
+    await service.upload(_NS, _archive({"v1.txt": b"1"}))
+
+    real_rmtree = shutil.rmtree
+    state = {"fail_backup": True}
+
+    def flaky_rmtree(path: object, *args: object, **kwargs: object) -> None:
+        name = os.path.basename(str(path))
+        if state["fail_backup"] and name.startswith(".keel-transfer-backup."):
+            raise OSError("injected backup cleanup failure")
+        return real_rmtree(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("keel_sandbox.transfer.shutil.rmtree", flaky_rmtree)
+
+    # The swap commits; only the post-commit backup removal fails. The upload still SUCCEEDS
+    # (a retry would redo a committed swap) and reports cleanup_pending.
+    result = await service.upload(_NS, _archive({"v2.txt": b"2"}))
+    assert result.cleanup_pending is True
+    root = base / _NS
+    assert (root / "v2.txt").read_bytes() == b"2"
+    assert not (root / "v1.txt").exists()
+    leftover = [p.name for p in base.iterdir() if p.name.startswith(".keel-transfer-backup.")]
+    assert len(leftover) == 1  # exactly one deferred backup, not accumulating without bound
+
+    # A later same-namespace upload sweeps the stale backup and commits cleanly.
+    state["fail_backup"] = False
+    result2 = await service.upload(_NS, _archive({"v3.txt": b"3"}))
+    assert result2.cleanup_pending is False
+    assert (root / "v3.txt").read_bytes() == b"3"
+    residue = [p.name for p in base.iterdir() if p.name != _NS]
+    assert residue == []
+
+
+async def test_delete_sweeps_stale_backup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = SandboxTransferService(_provider(tmp_path))
+    base = tmp_path / "namespaces"
+    await service.upload(_NS, _archive({"v1.txt": b"1"}))
+
+    real_rmtree = shutil.rmtree
+    state = {"fail_backup": True}
+
+    def flaky_rmtree(path: object, *args: object, **kwargs: object) -> None:
+        name = os.path.basename(str(path))
+        if state["fail_backup"] and name.startswith(".keel-transfer-backup."):
+            raise OSError("injected backup cleanup failure")
+        return real_rmtree(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr("keel_sandbox.transfer.shutil.rmtree", flaky_rmtree)
+    result = await service.upload(_NS, _archive({"v2.txt": b"2"}))
+    assert result.cleanup_pending is True
+    assert any(p.name.startswith(".keel-transfer-backup.") for p in base.iterdir())
+
+    # Deleting the namespace also retires the leftover backup.
+    state["fail_backup"] = False
+    await service.delete(_NS)
+    assert [p.name for p in base.iterdir()] == []
+
+
 def _archive_with_path(path: str, data: bytes) -> bytes:
     import gzip
     import io

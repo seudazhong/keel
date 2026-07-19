@@ -381,5 +381,86 @@ def test_apply_requires_existing_directory(tmp_path: Path) -> None:
         apply_export_to_worktree(tmp_path / "missing", export)
 
 
+# --- Apply: NFC + casefold collision guard (fail closed BEFORE any mutation) ----------
+
+
+def _iter_names(root: Path) -> list[str]:
+    return sorted(p.name for p in root.iterdir())
+
+
+def test_apply_rejects_case_only_collision_before_mutation(tmp_path: Path) -> None:
+    # An export whose only difference from an existing worktree path is letter case denotes the
+    # same file on a case-insensitive filesystem; applying it (write "file.txt", delete the
+    # omitted "File.txt") would destroy the just-written bytes. The guard fails closed up front.
+    (tmp_path / "File.txt").write_bytes(b"original\n")
+    export, _ = build_snapshot_archive([SnapshotFile("file.txt", b"attacker\n", False, False)])
+    with pytest.raises(PatchPolicyViolation):
+        apply_export_to_worktree(tmp_path, export)
+    # Nothing was written and nothing was deleted: exactly one file with its original bytes.
+    assert _iter_names(tmp_path) == ["File.txt"]
+    assert (tmp_path / "File.txt").read_bytes() == b"original\n"
+
+
+def test_apply_rejects_nfc_nfd_collision_before_mutation(tmp_path: Path) -> None:
+    import unicodedata
+
+    nfd_name = "cafe\u0301.txt"  # 'e' + combining acute accent
+    nfc_name = unicodedata.normalize("NFC", nfd_name)  # single 'é' codepoint
+    assert nfc_name != nfd_name
+    (tmp_path / nfc_name).write_bytes(b"original\n")
+    export, _ = build_snapshot_archive([SnapshotFile(nfd_name, b"attacker\n", False, False)])
+    with pytest.raises(PatchPolicyViolation):
+        apply_export_to_worktree(tmp_path, export)
+    assert _iter_names(tmp_path) == [nfc_name]
+    assert (tmp_path / nfc_name).read_bytes() == b"original\n"
+
+
+def test_apply_allows_exact_spelling_update(tmp_path: Path) -> None:
+    # The guard must not fire on a legitimate same-spelling update (no false positive).
+    (tmp_path / "File.txt").write_bytes(b"old\n")
+    export, _ = build_snapshot_archive([SnapshotFile("File.txt", b"new\n", False, False)])
+    result = apply_export_to_worktree(tmp_path, export)
+    assert result.written == ("File.txt",)
+    assert (tmp_path / "File.txt").read_bytes() == b"new\n"
+
+
+def test_parse_rejects_case_colliding_paths() -> None:
+    archive = _craft_archive([_reg("File.txt", b"a"), _reg("file.txt", b"b")])
+    with pytest.raises(PatchValidationError):
+        parse_snapshot_archive(archive)
+
+
+def test_parse_rejects_nfc_nfd_colliding_paths() -> None:
+    import unicodedata
+
+    nfd_name = "cafe\u0301.txt"
+    nfc_name = unicodedata.normalize("NFC", nfd_name)
+    archive = _craft_archive([_reg(nfc_name, b"a"), _reg(nfd_name, b"b")])
+    with pytest.raises(PatchValidationError):
+        parse_snapshot_archive(archive)
+
+
+def test_build_rejects_case_colliding_paths() -> None:
+    with pytest.raises(PatchValidationError):
+        build_snapshot_archive(
+            [
+                SnapshotFile("File.txt", b"a", False, False),
+                SnapshotFile("file.txt", b"b", False, False),
+            ]
+        )
+
+
+def test_scan_rejects_case_colliding_paths(tmp_path: Path) -> None:
+    # A case-sensitive filesystem can legitimately hold both spellings; the snapshot scanner
+    # still refuses them because the destination sandbox/worktree may be case-insensitive.
+    (tmp_path / "File.txt").write_bytes(b"a")
+    second = tmp_path / "file.txt"
+    if second.exists():
+        pytest.skip("case-insensitive filesystem cannot hold both spellings")
+    second.write_bytes(b"b")
+    with pytest.raises(PatchValidationError):
+        scan_directory_for_snapshot(tmp_path)
+
+
 def test_default_bounds_handle_large_tree() -> None:
     assert DEFAULT_SNAPSHOT_BOUNDS.max_files >= 10_000

@@ -8,6 +8,7 @@ caller's nonce.
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import io
 import tarfile
@@ -15,6 +16,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
+import pytest
 
 from keel_core.patch import transfer as core_transfer
 from keel_core.patch.transfer import SnapshotBounds, build_snapshot_archive
@@ -93,7 +95,12 @@ async def test_upload_happy_path_returns_signed_response(tmp_path: Path) -> None
     async with _client(transport) as client:
         resp = await client.post(path, content=body, headers=headers)
     assert resp.status_code == 200
-    assert resp.json() == {"namespace": _NS, "files": 1, "total_bytes": 6}
+    assert resp.json() == {
+        "namespace": _NS,
+        "files": 1,
+        "total_bytes": 6,
+        "cleanup_pending": False,
+    }
     assert verifier.verify(
         resp.headers,
         resp.content,
@@ -292,3 +299,51 @@ async def test_namespace_isolation_between_scopes(tmp_path: Path) -> None:
     assert parsed.files["f.txt"].data == b"AAA"
     assert (tmp_path / "namespaces" / ns_a / "f.txt").read_bytes() == b"AAA"
     assert (tmp_path / "namespaces" / ns_b / "f.txt").read_bytes() == b"BBB"
+
+
+async def test_upload_route_gates_concurrency_across_namespaces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The route holds a process-global transfer slot around the whole upload, so even concurrent
+    # uploads to *different* namespaces cannot run their (memory-heavy) body-read + materialize
+    # steps at the same time when the limit is 1.
+    provider = DirectoryWorkspaceProvider(
+        tmp_path / "namespaces",
+        lambda root: UnsafeLocalDevExecutionEnvironment(root),
+    )
+    service = SandboxTransferService(provider, max_concurrent_transfers=1)
+    state = {"current": 0, "max": 0}
+    real_upload = service.upload
+
+    async def recording_upload(namespace: str, archive: bytes) -> object:
+        state["current"] += 1
+        state["max"] = max(state["max"], state["current"])
+        try:
+            await asyncio.sleep(0.02)
+            return await real_upload(namespace, archive)
+        finally:
+            state["current"] -= 1
+
+    monkeypatch.setattr(service, "upload", recording_upload)
+    app = create_app(
+        UnsafeLocalDevExecutionEnvironment(tmp_path / "default"),
+        isolation_verified=True,
+        shared_secret=_SECRET,
+        workspace_provider=provider,
+        transfer_service=service,
+    )
+    transport = httpx.ASGITransport(app=app)
+    signer = RpcRequestSigner(_SECRET)
+    body = _archive({"a.txt": b"x"})
+    namespaces = [f"ws_{c * 32}" for c in "abcd"]
+
+    async def do_upload(namespace: str) -> int:
+        path = f"/v1/transfer/upload/{namespace}"
+        headers = signer.headers(body, method="POST", path=path, nonce=_nonce(namespace[:12]))
+        async with _client(transport) as client:
+            resp = await client.post(path, content=body, headers=headers)
+        return resp.status_code
+
+    codes = await asyncio.gather(*(do_upload(ns) for ns in namespaces))
+    assert all(code == 200 for code in codes)
+    assert state["max"] == 1

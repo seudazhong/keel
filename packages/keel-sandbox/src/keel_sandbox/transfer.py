@@ -14,22 +14,34 @@ per-scope ``ws_<hex>`` namespace directory owned by the sandbox:
 Concurrency contract
 --------------------
 Every operation on a namespace holds a per-namespace :class:`asyncio.Lock`, so uploads,
-exports, and deletes for one namespace are serialized within the process. The *commit point*
-of an upload is the single ``os.replace(staging, target)`` rename: because extraction happens
-in a sibling staging directory, a concurrent reader (a file RPC or an export) observes either
-the entire previous tree or the entire new tree — never a partially-extracted tree. Sequencing
-transfers against file RPCs *across* requests (a lease must not run tools while a transfer is in
-flight) is the control plane's responsibility under the lease protocol (P3a-2 seam); this
-service guarantees only intra-process atomicity and per-namespace serialization.
+exports, and deletes for one namespace are serialized within the process. Independently, a
+process-global :class:`asyncio.Semaphore` (see ``transfer_slot`` / ``max_concurrent_transfers``)
+bounds how many transfers may be validating/materializing/exporting a snapshot at once *across
+all namespaces*: it is held by the HTTP route across the bounded body read and the upload/export
+so concurrent requests cannot multiply peak in-memory snapshot bytes without limit. The route
+acquires the global slot before the per-namespace lock (a consistent order, so no deadlock).
+
+The *commit point* of an upload is the single ``os.replace(staging, target)`` rename: because
+extraction happens in a sibling staging directory, a concurrent reader (a file RPC or an export)
+observes either the entire previous tree or the entire new tree — never a partially-extracted
+tree. After the commit the new tree is authoritative and is never re-swapped; if the orphaned
+backup cannot be removed, the upload still succeeds with ``UploadResult.cleanup_pending=True``
+(a retry would redo a committed swap), a warning is logged, and the next same-namespace upload or
+delete sweeps the leftover backup — so stale directories cannot accumulate unboundedly.
+
+Sequencing transfers against file RPCs *across* requests (a lease must not run tools while a
+transfer is in flight) is the control plane's responsibility under the lease protocol (P3a-2
+seam); this service guarantees only intra-process atomicity and per-namespace serialization.
 
 No source bytes or error detail are logged here; failures raise typed exceptions the route
-layer maps to status codes.
+layer maps to status codes, and deferred-cleanup warnings carry only the opaque temp-dir name.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import re
 import shutil
@@ -47,6 +59,8 @@ from keel_core.patch.transfer import (
     parse_snapshot_archive,
 )
 
+logger = logging.getLogger(__name__)
+
 # The same opaque, validated namespace token the executor uses.
 _WORKSPACE_NAMESPACE = re.compile(r"^ws_[0-9a-f]{1,64}$")
 
@@ -55,6 +69,12 @@ _STAGING_PREFIX = ".keel-transfer-staging"
 _BACKUP_PREFIX = ".keel-transfer-backup"
 
 _STAGED_FILE_MODE = 0o644
+
+# Global (cross-namespace) ceiling on transfers being validated/materialized/exported at once.
+# Each in-flight transfer can hold up to the uncompressed snapshot bound in memory, so this
+# bounds peak memory to ``DEFAULT_MAX_CONCURRENT_TRANSFERS * max_total_bytes`` rather than
+# letting concurrent requests multiply it without limit. Deliberately small; tune per host.
+DEFAULT_MAX_CONCURRENT_TRANSFERS = 2
 
 
 class TransferError(Exception):
@@ -73,6 +93,10 @@ class TransferIOError(TransferError):
 class UploadResult:
     namespace: str
     manifest: SnapshotManifest
+    # True when the new tree was committed but the previous tree's backup could not be removed;
+    # the upload still succeeded (the swap must not be retried) and a later same-namespace
+    # operation sweeps the leftover backup. See ``_atomic_swap``.
+    cleanup_pending: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,14 +131,34 @@ class SandboxTransferService:
         locator: NamespaceLocator,
         *,
         bounds: SnapshotBounds = DEFAULT_SNAPSHOT_BOUNDS,
+        max_concurrent_transfers: int = DEFAULT_MAX_CONCURRENT_TRANSFERS,
     ) -> None:
+        if max_concurrent_transfers <= 0:
+            raise ValueError("max_concurrent_transfers must be a positive integer")
         self._locator = locator
         self._bounds = bounds
         self._locks: dict[str, asyncio.Lock] = {}
+        self._max_concurrent_transfers = max_concurrent_transfers
+        self._transfer_semaphore = asyncio.Semaphore(max_concurrent_transfers)
 
     @property
     def bounds(self) -> SnapshotBounds:
         return self._bounds
+
+    @property
+    def max_concurrent_transfers(self) -> int:
+        return self._max_concurrent_transfers
+
+    def transfer_slot(self) -> asyncio.Semaphore:
+        """The process-global transfer gate the route holds across body-read + upload/export.
+
+        Acquired at the HTTP boundary (not inside the per-namespace methods) so the bounded
+        request-body buffer is counted too, and so a single slot is never taken twice for one
+        request. It is namespace-agnostic: concurrent transfers of *different* namespaces are
+        limited just as much as same-namespace ones, bounding total in-memory snapshot bytes.
+        """
+
+        return self._transfer_semaphore
 
     # -- public async API (serialized per namespace) ---------------------------------
 
@@ -157,12 +201,17 @@ class SandboxTransferService:
         if target is None:
             raise TransferNamespaceError("namespace could not be provisioned")
         base = self._locator.namespace_base
+        # Retire any staging/backup left by a prior interrupted or cleanup-deferred transfer of
+        # this namespace before starting a new one, bounding leftover accumulation. Best-effort
+        # and namespace-scoped; runs under the per-namespace lock so it never races a concurrent
+        # same-namespace transfer, and never touches another namespace's temp dirs.
+        self._sweep_stale_transfer_dirs(base, namespace)
         token = uuid.uuid4().hex
         staging = base / f"{_STAGING_PREFIX}.{namespace}.{token}"
         backup = base / f"{_BACKUP_PREFIX}.{namespace}.{token}"
         try:
             self._materialize(parsed, staging)
-            self._atomic_swap(target, staging, backup)
+            cleanup_pending = self._atomic_swap(target, staging, backup)
         except BaseException:
             # The swap was not committed (or its own rollback ran); remove any staging tree so
             # a failed upload leaves the previous namespace intact. Suppress cleanup errors so
@@ -171,7 +220,32 @@ class SandboxTransferService:
                 if staging.exists():
                     shutil.rmtree(staging)
             raise
-        return UploadResult(namespace=namespace, manifest=parsed.manifest)
+        return UploadResult(
+            namespace=namespace, manifest=parsed.manifest, cleanup_pending=cleanup_pending
+        )
+
+    def _sweep_stale_transfer_dirs(self, base: Path, namespace: str) -> None:
+        """Best-effort removal of leftover staging/backup dirs from prior ``namespace`` transfers.
+
+        Only this namespace's own prefixed temp dirs are touched, so a concurrent transfer of a
+        different namespace is never disturbed. Never raises: a sweep failure is logged (no source
+        bytes, just the opaque temp-dir name) and left for the next attempt, so deferred cleanup
+        can never fail an otherwise valid request. ``rmtree`` refuses to follow a top-level
+        symlink/junction, so a planted alias is not traversed.
+        """
+
+        prefixes = (f"{_STAGING_PREFIX}.{namespace}.", f"{_BACKUP_PREFIX}.{namespace}.")
+        try:
+            entries = list(os.scandir(base))
+        except OSError:
+            return
+        for entry in entries:
+            if not entry.name.startswith(prefixes):
+                continue
+            try:
+                shutil.rmtree(entry.path)
+            except OSError:
+                logger.warning("sandbox transfer could not sweep stale temp dir %s", entry.name)
 
     def _materialize(self, parsed: ParsedSnapshot, staging: Path) -> None:
         try:
@@ -199,7 +273,18 @@ class SandboxTransferService:
         with os.fdopen(fd, "wb", closefd=True) as handle:
             handle.write(data)
 
-    def _atomic_swap(self, target: Path, staging: Path, backup: Path) -> None:
+    def _atomic_swap(self, target: Path, staging: Path, backup: Path) -> bool:
+        """Swap ``staging`` into ``target``; return whether backup cleanup was deferred.
+
+        Pre-commit failures (staging the backup, or the commit rename) raise ``TransferIOError``
+        with the previous tree restored, so the caller may safely retry. Once the commit rename
+        succeeds the new tree is authoritative and must never be re-swapped; if the now-orphaned
+        backup cannot be removed the upload still SUCCEEDS (retrying would redo a committed swap
+        and could accumulate backups). A warning is logged (the opaque temp-dir name only, never
+        source bytes) and ``True`` is returned so the caller records ``cleanup_pending`` and a
+        later same-namespace operation sweeps the leftover backup.
+        """
+
         try:
             os.replace(target, backup)
         except OSError as exc:
@@ -211,12 +296,17 @@ class SandboxTransferService:
             with contextlib.suppress(OSError):
                 os.replace(backup, target)
             raise TransferIOError("could not commit staged namespace") from exc
-        # Committed. The previous tree now lives only in ``backup``; remove it and surface any
-        # failure (never ``ignore_errors``; ``rmtree`` unlinks symlinks without following them).
+        # Committed. The previous tree now lives only in ``backup``; try to remove it but never
+        # fail the committed upload on cleanup (never ``ignore_errors``; ``rmtree`` unlinks
+        # symlinks without following them).
         try:
             shutil.rmtree(backup)
-        except OSError as exc:
-            raise TransferIOError("could not remove replaced namespace backup") from exc
+        except OSError:
+            logger.warning(
+                "sandbox transfer committed; deferred backup cleanup for %s", backup.name
+            )
+            return True
+        return False
 
     # -- export ----------------------------------------------------------------------
 
@@ -233,6 +323,9 @@ class SandboxTransferService:
 
     def _delete_sync(self, namespace: str) -> DeleteResult:
         base = self._locator.namespace_base
+        # Retire any leftover staging/backup for this namespace as well, so a deleted namespace
+        # leaves nothing behind (bounds accumulation; best-effort and namespace-scoped).
+        self._sweep_stale_transfer_dirs(base, namespace)
         child = base / namespace
         try:
             os.lstat(child)
@@ -250,6 +343,7 @@ class SandboxTransferService:
 
 
 __all__ = [
+    "DEFAULT_MAX_CONCURRENT_TRANSFERS",
     "DeleteResult",
     "ExportResult",
     "NamespaceLocator",

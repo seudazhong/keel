@@ -84,6 +84,32 @@ async def test_upload_happy_path_verifies_and_parses(monkeypatch: pytest.MonkeyP
     client = _client(handler)
     ack = await client.upload_snapshot(_NS, _archive({"a.txt": b"x"}))
     assert (ack.namespace, ack.files, ack.total_bytes) == (_NS, 2, 9)
+    # Absent from the payload => backward-compatible default of False.
+    assert ack.cleanup_pending is False
+    await client.aclose()
+
+
+async def test_upload_ack_reports_cleanup_pending() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = b'{"namespace":"%s","files":1,"total_bytes":1,"cleanup_pending":true}' % _NS.encode()
+        return _signed(request, 200, body)
+
+    client = _client(handler)
+    ack = await client.upload_snapshot(_NS, _archive({"a.txt": b"x"}))
+    assert ack.cleanup_pending is True
+    await client.aclose()
+
+
+async def test_upload_ack_rejects_non_bool_cleanup_pending() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = (
+            b'{"namespace":"%s","files":1,"total_bytes":1,"cleanup_pending":"yes"}' % _NS.encode()
+        )
+        return _signed(request, 200, body)
+
+    client = _client(handler)
+    with pytest.raises(SandboxTransferProtocolError):
+        await client.upload_snapshot(_NS, _archive({"a.txt": b"x"}))
     await client.aclose()
 
 

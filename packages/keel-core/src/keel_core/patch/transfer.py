@@ -12,7 +12,9 @@ Design invariants (fail closed, P5):
   (recording only the included files); any symlink, hardlink, junction, reparse point,
   device, FIFO, or other special entry fails the build closed (never silently skipped).
 * Every path is validated as canonical POSIX (relative, forward-slash, no drive, no
-  traversal, no NUL, bounded length, no duplicate/casefold collision) on build and parse.
+  traversal, no NUL, bounded length, no duplicate or case/Unicode-normalization (NFC+casefold)
+  collision) on build and parse, and an export whose path is only a case/normalization variant
+  of an existing worktree path is rejected before any file is mutated.
 * The gzip+tar stream is byte-deterministic (fixed mtime/uid/gid/uname/gname, GNU format,
   no pax/sparse) so an identical tree always yields identical bytes.
 * Parsing an untrusted archive validates the *entire* stream before a caller mutates any
@@ -30,6 +32,7 @@ import io
 import os
 import stat
 import tarfile
+import unicodedata
 import zlib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -40,13 +43,17 @@ from .models import is_forbidden_path
 
 # --- Snapshot bounds (fail closed; distinct from changed-file bounds) ----------------
 
-# A full-tree snapshot must comfortably hold the whole Keel checkout (>800 files today),
-# so these are deliberately larger than and independent of ``MAX_CHANGED_FILES`` (200) and
-# the diff byte ceilings in :mod:`keel_core.patch.models`.
+# A full-tree snapshot must comfortably hold the whole Keel checkout: the git-tracked working
+# tree is ~812 files / ~10 MB with a largest file well under 1 MB, so these ceilings keep a
+# generous (~6x) margin while staying small enough that a bounded number of concurrent
+# transfers cannot exhaust memory (see the sandbox transfer semaphore). They are deliberately
+# larger than and independent of ``MAX_CHANGED_FILES`` (200) and the diff byte ceilings in
+# :mod:`keel_core.patch.models`. Callers needing different limits pass an explicit
+# :class:`SnapshotBounds` (the seam is preserved).
 MAX_SNAPSHOT_FILES = 10_000
-MAX_SNAPSHOT_FILE_BYTES = 25_000_000
-MAX_SNAPSHOT_TOTAL_BYTES = 512_000_000
-MAX_SNAPSHOT_ARCHIVE_BYTES = 256_000_000
+MAX_SNAPSHOT_FILE_BYTES = 16_000_000
+MAX_SNAPSHOT_TOTAL_BYTES = 64_000_000
+MAX_SNAPSHOT_ARCHIVE_BYTES = 32_000_000
 MAX_SNAPSHOT_PATH_CHARS = 1_024
 
 # Deterministic tar/gzip metadata. Fixed so an identical tree yields byte-identical output.
@@ -192,6 +199,22 @@ def validate_snapshot_path(
     return value
 
 
+def _normalized_path_key(path: str) -> str:
+    """A case- and Unicode-normalization-insensitive collision key for a validated path.
+
+    A real case-insensitive or normalizing filesystem (Windows/NTFS, macOS/APFS) treats two
+    paths that differ only in letter case or Unicode normalization form (NFC vs NFD) as the
+    *same* file. Keying by the exact string would therefore let an export path that is a
+    case/normalization variant of an existing worktree path be written and then have its
+    variant deleted, destroying the just-written bytes. Both variance axes are folded here
+    (normalize to NFC, casefold, then re-normalize the casefolded output) so an identical
+    key means the two spellings collide on such a filesystem.
+    """
+
+    folded = unicodedata.normalize("NFC", path).casefold()
+    return unicodedata.normalize("NFC", folded)
+
+
 def _is_binary(data: bytes) -> bool:
     return b"\x00" in data[:_BINARY_SNIFF_BYTES]
 
@@ -272,7 +295,7 @@ def scan_directory_for_snapshot(
         path = validate_snapshot_path(rel, bounds=bounds)
         if is_forbidden_path(path):
             continue
-        key = path.casefold()
+        key = _normalized_path_key(path)
         if key in seen:
             raise PatchValidationError("snapshot contains a duplicate or case-colliding path")
         if len(files) >= bounds.max_files:
@@ -319,7 +342,7 @@ def build_snapshot_archive(
     total = 0
     for item in ordered:
         validate_snapshot_path(item.path, bounds=bounds)
-        key = item.path.casefold()
+        key = _normalized_path_key(item.path)
         if key in seen:
             raise PatchValidationError("snapshot contains a duplicate or case-colliding path")
         seen[key] = item.path
@@ -419,7 +442,7 @@ def _iter_validated_members(archive: object, *, bounds: SnapshotBounds) -> Itera
             path = validate_snapshot_path(member.name, bounds=bounds)
             if is_forbidden_path(path):
                 raise PatchPolicyViolation("snapshot archive contains a forbidden path")
-            key = path.casefold()
+            key = _normalized_path_key(path)
             if key in seen:
                 raise PatchValidationError(
                     "snapshot archive contains a duplicate or case-colliding path"
@@ -495,6 +518,25 @@ def _overwrite_file(target: Path, data: bytes) -> None:
         handle.write(data)
 
 
+def _reject_cross_rename_collisions(
+    before: Mapping[str, SnapshotFile], export: Mapping[str, SnapshotFile]
+) -> None:
+    """Reject a worktree/export path pair that collides only by case or Unicode normalization.
+
+    Such a pair denotes the same file on a case-insensitive/normalizing filesystem, so applying
+    the export (write the export spelling, delete the worktree spelling) would destroy the bytes
+    just written. Detected up front so :func:`apply_export_to_worktree` never writes-then-deletes.
+    """
+
+    before_by_key = {_normalized_path_key(path): path for path in before}
+    for path in export:
+        original = before_by_key.get(_normalized_path_key(path))
+        if original is not None and original != path:
+            raise PatchPolicyViolation(
+                "export path collides with an existing path by case or Unicode normalization"
+            )
+
+
 def apply_export_to_worktree(
     worktree: os.PathLike[str] | str,
     archive: object,
@@ -506,6 +548,10 @@ def apply_export_to_worktree(
     The *entire* archive is parsed and validated, and every policy rule is checked against
     the current worktree, *before* any file is mutated:
 
+    * an export path that collides with an existing worktree path only by letter case or
+      Unicode normalization (NFC vs NFD) is a :class:`PatchPolicyViolation` — on a
+      case-insensitive/normalizing filesystem the two are the same file, so applying the
+      rename would delete the bytes just written;
     * an existing binary must be byte-identical (the model may not modify binaries);
     * a new binary, or a text file becoming binary, is a :class:`PatchPolicyViolation`;
     * a binary omitted from the export is left untouched;
@@ -520,6 +566,14 @@ def apply_export_to_worktree(
 
     parsed = parse_snapshot_archive(archive, bounds=bounds)
     before = {item.path: item for item in scan_directory_for_snapshot(worktree_path, bounds=bounds)}
+
+    # Fail closed on any case-only / normalization-only rename between the worktree and the
+    # export BEFORE mutating anything: on a case-insensitive or normalizing filesystem such a
+    # pair is the same file, so writing the export spelling and then deleting the (differently
+    # spelled) worktree entry would unlink the bytes just written. Each side is already free of
+    # internal collisions (scan/parse dedup on the same key), so only the cross-set overlap of a
+    # shared key with a differing exact spelling has to be rejected here.
+    _reject_cross_rename_collisions(before, parsed.files)
 
     to_write: list[SnapshotFile] = []
     unchanged_binaries: list[str] = []

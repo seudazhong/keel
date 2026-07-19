@@ -74,6 +74,10 @@ class UploadAck:
     namespace: str
     files: int
     total_bytes: int
+    # The sandbox committed the new tree but deferred removing the previous tree's backup; the
+    # upload succeeded and must not be retried. Optional for backward compatibility (older
+    # sandboxes omit it), defaulting to False.
+    cleanup_pending: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,7 +245,15 @@ class SandboxTransferClient:
             raise SandboxTransferProtocolError("malformed upload acknowledgement") from exc
         if not isinstance(namespace, str) or not _is_int(files) or not _is_int(total_bytes):
             raise SandboxTransferProtocolError("malformed upload acknowledgement")
-        return UploadAck(namespace=namespace, files=files, total_bytes=total_bytes)
+        cleanup_pending = data.get("cleanup_pending", False)
+        if not isinstance(cleanup_pending, bool):
+            raise SandboxTransferProtocolError("malformed upload acknowledgement")
+        return UploadAck(
+            namespace=namespace,
+            files=files,
+            total_bytes=total_bytes,
+            cleanup_pending=cleanup_pending,
+        )
 
     @staticmethod
     def _parse_delete_ack(namespace: str, content: bytes) -> DeleteAck:
