@@ -36,16 +36,25 @@ handed to generation, the worktree, the sandbox, an artifact, or a log.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
+from sqlalchemy.exc import SQLAlchemyError
+
 from keel_core.approvals import ApprovalStore
 from keel_core.coding.protocols import ArtifactStore
 from keel_core.protocols import Usage
-from keel_core.runs import RunBudgetSpec, RunCost, RunStatus, RunStore
+from keel_core.runs import (
+    RunBudgetSpec,
+    RunCost,
+    RunLease,
+    RunLeaseLostError,
+    RunStore,
+)
 from keel_core.scoping import derive_agent_scope
 
 from .approval import (
@@ -67,7 +76,7 @@ from .errors import (
     PatchValidationError,
     PatchWritebackError,
 )
-from .generation import PatchGenerationService
+from .generation import GenerationOutcome, PatchGenerationService
 from .models import (
     PatchProposal,
     PatchProposalRequest,
@@ -171,6 +180,84 @@ def _run_cost_from_usage(usage: object | None) -> RunCost:
     raise PatchValidationError("provider usage is not a Usage accounting record")
 
 
+PATCH_RUN_RENEW_MIN_INTERVAL_SECONDS = 1.0
+PATCH_RUN_RENEW_MAX_INTERVAL_SECONDS = 30.0
+
+
+def _run_renew_interval(lease_seconds: float) -> float:
+    """A run-lease renewal interval strictly *below* ``lease_seconds`` (never at the expiry).
+
+    Uses ``min(lease/3, cap)`` bounded to a small floor, guaranteed strictly less than the lease
+    even for a tiny lease (a 1s lease yields 0.5s), so a renewal can never land exactly on expiry.
+    """
+    if lease_seconds <= 0:
+        return PATCH_RUN_RENEW_MIN_INTERVAL_SECONDS
+    interval = min(lease_seconds / 3.0, PATCH_RUN_RENEW_MAX_INTERVAL_SECONDS)
+    interval = max(PATCH_RUN_RENEW_MIN_INTERVAL_SECONDS, interval)
+    if interval >= lease_seconds:
+        interval = lease_seconds / 2.0
+    return interval
+
+
+@dataclass
+class _RunLeaseKeeper:
+    """Renews the run lease before expiry; flags the lease lost on any failed renewal.
+
+    Generation blocks on slow provider/transfer I/O, so a run whose lease is reclaimed or expires
+    mid-flight must be abandoned *before* any terminal write lands under a stale fence. The keeper
+    renews the lease on a bounded cadence strictly below the lease TTL; a ``False`` return (the
+    lease was superseded) or a typed :class:`~sqlalchemy.exc.SQLAlchemyError` marks the lease lost
+    and retains the cause. ``lost`` is folded into the author interrupt (so generation aborts
+    promptly) and re-checked after the keeper is deterministically stopped, so the atomic finalize
+    transaction never runs — nor a completed generation gets exported — under a lost lease."""
+
+    run_store: RunStore
+    lease: RunLease
+    interval_seconds: float
+    lost: bool = False
+    error: BaseException | None = None
+    _task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._loop())
+
+    async def _loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self.interval_seconds)
+                try:
+                    renewed = await self.run_store.renew(
+                        self.lease, lease_seconds=self.lease.lease_seconds
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except SQLAlchemyError as exc:
+                    # A typed database failure renewing the lease is treated as a lost lease (fail
+                    # closed); retain the cause so the abort chains it rather than swallowing it.
+                    logger.warning("patch run lease renewal failed run=%s", self.lease.run_id)
+                    self.lost = True
+                    self.error = exc
+                    return
+                if not renewed:
+                    self.lost = True
+                    return
+        except asyncio.CancelledError:
+            raise
+
+    async def stop(self) -> None:
+        """Cancel + await the keeper deterministically (call BEFORE any finalize transaction).
+
+        ``_loop`` never lets a non-``CancelledError`` escape (a renewal ``SQLAlchemyError`` is
+        caught and recorded), so awaiting the cancelled task can only raise ``CancelledError``."""
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+
 @dataclass
 class PatchCoordinator:
     store: PatchProposalStore
@@ -195,6 +282,10 @@ class PatchCoordinator:
     ttl_seconds: int = DEFAULT_PATCH_TTL_SECONDS
     lease_seconds: int = DEFAULT_PATCH_LEASE_SECONDS
     approval_ttl_seconds: int = DEFAULT_APPROVAL_TTL_SECONDS
+    # Run-lease renewal cadence for the generation keeper. ``None`` derives a bounded interval
+    # strictly below ``lease_seconds``; a test overrides it (with a tiny value) to prove renewal,
+    # lost-renewal aborts, and external cancellation deterministically.
+    run_renew_interval_seconds: float | None = None
 
     # --- request ----------------------------------------------------------------------
     async def request_generation(
@@ -276,6 +367,7 @@ class PatchCoordinator:
         request: PatchProposalRequest,
         *,
         worker_id: str,
+        interrupt: Callable[[], bool] | None = None,
         now: datetime | None = None,
     ) -> PatchProposal:
         moment = now or datetime.now(UTC)
@@ -310,6 +402,20 @@ class PatchCoordinator:
         )
         if lease is None:
             raise PatchStateError("patch generation run is leased by another worker")
+        scope_id = binding.scope_id
+        # Start the run-lease keeper immediately after claim: generation blocks on slow provider /
+        # transfer I/O, and a lost/superseded lease reaching us mid-flight must abort *before* any
+        # terminal write. Its ``lost`` flag is folded into the author interrupt (so generation
+        # aborts promptly) and re-checked after the keeper is deterministically stopped.
+        interval = self.run_renew_interval_seconds
+        if interval is None:
+            interval = _run_renew_interval(float(self.lease_seconds))
+        keeper = _RunLeaseKeeper(run_store=run_store, lease=lease, interval_seconds=interval)
+        keeper.start()
+
+        def _combined_interrupt() -> bool:
+            return bool(interrupt is not None and interrupt()) or keeper.lost
+
         try:
             outcome = await generation.generate(
                 request,
@@ -317,108 +423,51 @@ class PatchCoordinator:
                 run_id=run_id,
                 coding_run_id=binding.coding_run_id,
                 project_handle=binding.project_handle,
+                interrupt=_combined_interrupt,
                 now=moment,
             )
         except PatchLeaseLost:
-            # The lease was reclaimed/expired mid-generation. Leave the proposal AND the run
-            # untouched so the current lease owner (or a reclaim) can finish the attempt; a stale
-            # lease must never terminalize the run or the proposal.
+            # The lease was reclaimed/expired mid-generation (or our keeper folded a lost fence into
+            # the interrupt). Stop the keeper and leave the proposal AND the run untouched so the
+            # current owner (or a reclaim) can finish; a stale lease must never terminalize either.
+            await keeper.stop()
             raise
         except PatchProviderUnavailable as exc:
-            # Transient upstream failure. The run row is the authoritative charge ledger: release
-            # the lease back to the queue (the proposal stays ``generating`` for a retry) and apply
-            # the partial usage as a cumulative delta, then mirror that cumulative onto the proposal
-            # so no partial cost is lost. Rethrow for the P3 retry mapping.
-            released = await run_store.release(
-                lease,
-                to_status=RunStatus.queued,
-                cost=_run_cost_from_usage(exc.usage),
-                now=moment,
-            )
-            await self.store.transition(
-                org_id,
-                proposal.id,
-                PatchStatus.generating,
-                expected_version=proposal.version,
-                updates={"cost_usd": released.cost_usd},
-                now=moment,
+            await keeper.stop()
+            # A lost lease preempts a transient finalize: never release/charge under a stale fence.
+            self._raise_if_lease_lost(keeper)
+            # Transient upstream failure. Atomically release the lease back to the queue (proposal
+            # stays ``generating`` for a retry), charge the partial usage as a cumulative delta on
+            # the run, and mirror that cumulative onto the proposal — all in one transaction so no
+            # partial cost is lost and the pointer stays ``generating``. Rethrow for P3 retry.
+            await self._finalize_transient(
+                org_id, proposal, run_store, lease, exc, scope_id, moment
             )
             raise
         except PatchError as exc:
-            # A permanent generation failure: fail the proposal (deleting its dispatch pointer) and
-            # the run, then rethrow. A permanent provider failure (cost-ceiling stop, malformed
-            # completion, a permanent transfer rejection) may still have consumed tokens: charge
-            # that partial usage onto the run as a fenced delta and mirror the cumulative onto the
-            # proposal, so a terminal failure neither loses nor double-counts cost. A failure that
-            # carries no usage charges nothing.
-            #
-            # ``prior_cost`` is read from the proposal, never a pre-cleanup ``runs.get``: the P2
-            # invariant already mirrors the run's cumulative cost onto the proposal after every
-            # transient release, so the proposal is authoritative here. Avoiding the extra read
-            # keeps the permanent-failure cleanup (proposal fail + pointer delete + run terminalize)
-            # from depending on a fresh run fetch that could itself fail.
-            failure_cost = _run_cost_from_usage(getattr(exc, "usage", None))
-            prior_cost = proposal.cost_usd
-            await self.store.transition(
-                org_id,
-                proposal.id,
-                PatchStatus.failed,
-                expected_version=proposal.version,
-                updates={
-                    "error_kind": type(exc).__name__,
-                    "error_message": str(exc)[:500],
-                    "cost_usd": prior_cost + failure_cost.cost_usd,
-                },
-                now=moment,
-                outbox=self.outbox,
-                scope_id=binding.scope_id,
-            )
-            await run_store.terminalize(
-                lease,
-                status=RunStatus.failed,
-                stop_reason="generation_failed",
-                error_kind=type(exc).__name__,
-                error_message=str(exc)[:500],
-                cost=failure_cost,
-                now=moment,
-            )
+            await keeper.stop()
+            self._raise_if_lease_lost(keeper)
+            # A permanent generation failure: atomically fail the proposal (deleting its dispatch
+            # pointer) and the run, then rethrow. A permanent provider failure (cost-ceiling stop,
+            # malformed completion, a permanent transfer rejection) may still have consumed tokens;
+            # that partial usage is charged onto the run as a fenced delta and mirrored onto the
+            # proposal, so a terminal failure neither loses nor double-counts cost (no usage => 0).
+            # The finalize derives the proposal cost from the run's cumulative charge inside the
+            # transaction — never a pre-cleanup ``runs.get`` that could itself fail.
+            await self._finalize_failed(org_id, proposal, run_store, lease, exc, scope_id, moment)
             raise
-        # Success. Persist the proposal ``ready`` (updating its pointer hint) BEFORE terminalizing
-        # the run, so a crash can never leave a *completed* run behind an unrecoverable
-        # ``generating`` proposal (a resumed attempt would fail to re-claim a terminal run). The
-        # proposal cost is derived from the run's cumulative charge (prior partial attempts + this
-        # outcome) so a provider-unavailable retry neither loses nor double-counts cost.
-        run_record = await run_store.get(run_id)
-        prior_cost = run_record.cost_usd if run_record is not None else 0.0
-        outcome_cost = _run_cost_from_usage(outcome.usage)
-        run_branch = run_branch_for(proposal.id)
-        updated = await self.store.transition(
-            org_id,
-            proposal.id,
-            PatchStatus.ready,
-            expected_version=proposal.version,
-            updates={
-                "base_sha": outcome.base_sha,
-                "head_sha": outcome.head_sha,
-                "bundle_sha256": outcome.bundle_sha256,
-                "diff_sha256": outcome.diff_sha256,
-                "changed_path_digest": outcome.changed_path_digest,
-                "changed_files": outcome.changed_files,
-                "test_status": outcome.test_status,
-                "remote_branch": run_branch,
-                "cost_usd": prior_cost + outcome_cost.cost_usd,
-            },
-            now=moment,
-            outbox=self.outbox,
-            scope_id=binding.scope_id,
-        )
-        await run_store.terminalize(
-            lease,
-            status=RunStatus.completed,
-            stop_reason="generated",
-            result_ref=outcome.bundle_sha256,
-            cost=outcome_cost,
-            now=moment,
+        await keeper.stop()
+        # A completed generation must NOT be finalized (ready) under a lost lease: abort instead so
+        # the run row that a reclaimer now owns is never terminalized behind its back.
+        self._raise_if_lease_lost(keeper)
+        # Success. Atomically terminalize the run ``completed`` and move the proposal
+        # ``generating -> ready`` (updating its pointer hint), deriving the proposal cost from the
+        # run's cumulative charge (prior partial attempts + this outcome) inside the SAME
+        # transaction — a crash can never leave a *completed* run behind a still-``generating``
+        # proposal (nor the reverse), and a provider-unavailable retry neither loses nor
+        # double-counts cost.
+        updated = await self._finalize_ready(
+            org_id, proposal, run_store, lease, outcome, scope_id, moment
         )
         self.audit.record(
             action="ready",
@@ -434,6 +483,111 @@ class PatchCoordinator:
         # terminal state the caller observes is ``approval_pending`` (pointer retired, approval
         # bound). A reconciler can re-drive this idempotently after a crash.
         return await self._advance_ready_to_approval_pending(org_id, updated, now=moment)
+
+    def _raise_if_lease_lost(self, keeper: _RunLeaseKeeper) -> None:
+        """Abort via ``PatchLeaseLost`` (chaining the typed cause) when the keeper lost the fence.
+
+        Called after the keeper is stopped and before any finalize: a lost lease must never
+        terminalize/release the run or transition the proposal — the run row now belongs to a
+        reclaimer, so we leave everything for it to finish and rethrow for the job/retry layer."""
+        if keeper.lost:
+            raise PatchLeaseLost(
+                "patch generation run lease was lost during generation"
+            ) from keeper.error
+
+    async def _finalize_ready(
+        self,
+        org_id: str,
+        proposal: PatchProposal,
+        run_store: RunStore,
+        lease: RunLease,
+        outcome: GenerationOutcome,
+        scope_id: str,
+        now: datetime,
+    ) -> PatchProposal:
+        try:
+            updated, _ = await self.store.finalize_generation_ready(
+                org_id,
+                proposal.id,
+                run_store=run_store,
+                lease=lease,
+                cost=_run_cost_from_usage(outcome.usage),
+                updates={
+                    "base_sha": outcome.base_sha,
+                    "head_sha": outcome.head_sha,
+                    "bundle_sha256": outcome.bundle_sha256,
+                    "diff_sha256": outcome.diff_sha256,
+                    "changed_path_digest": outcome.changed_path_digest,
+                    "changed_files": outcome.changed_files,
+                    "test_status": outcome.test_status,
+                    "remote_branch": run_branch_for(proposal.id),
+                },
+                result_ref=outcome.bundle_sha256,
+                stop_reason="generated",
+                outbox=self.outbox,
+                scope_id=scope_id,
+                expected_version=proposal.version,
+                now=now,
+            )
+        except RunLeaseLostError as exc:
+            raise PatchLeaseLost("patch generation run lease was lost before finalize") from exc
+        return updated
+
+    async def _finalize_transient(
+        self,
+        org_id: str,
+        proposal: PatchProposal,
+        run_store: RunStore,
+        lease: RunLease,
+        exc: PatchProviderUnavailable,
+        scope_id: str,
+        now: datetime,
+    ) -> None:
+        try:
+            await self.store.release_generation_transient(
+                org_id,
+                proposal.id,
+                run_store=run_store,
+                lease=lease,
+                cost=_run_cost_from_usage(exc.usage),
+                scope_id=scope_id,
+                expected_version=proposal.version,
+                now=now,
+            )
+        except RunLeaseLostError as lease_exc:
+            raise PatchLeaseLost(
+                "patch generation run lease was lost before finalize"
+            ) from lease_exc
+
+    async def _finalize_failed(
+        self,
+        org_id: str,
+        proposal: PatchProposal,
+        run_store: RunStore,
+        lease: RunLease,
+        exc: PatchError,
+        scope_id: str,
+        now: datetime,
+    ) -> None:
+        try:
+            await self.store.finalize_generation_failed(
+                org_id,
+                proposal.id,
+                run_store=run_store,
+                lease=lease,
+                cost=_run_cost_from_usage(getattr(exc, "usage", None)),
+                error_kind=type(exc).__name__,
+                error_message=str(exc)[:500],
+                stop_reason="generation_failed",
+                outbox=self.outbox,
+                scope_id=scope_id,
+                expected_version=proposal.version,
+                now=now,
+            )
+        except RunLeaseLostError as lease_exc:
+            raise PatchLeaseLost(
+                "patch generation run lease was lost before finalize"
+            ) from lease_exc
 
     # --- approval ---------------------------------------------------------------------
     def _approval_service(self, scope_id: str) -> PatchApprovalService:

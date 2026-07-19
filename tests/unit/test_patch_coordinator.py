@@ -154,7 +154,15 @@ class _FakeGeneration:
         self.calls = 0
 
     async def generate(
-        self, request, *, proposal_id, run_id, coding_run_id, project_handle, now=None
+        self,
+        request,
+        *,
+        proposal_id,
+        run_id,
+        coding_run_id,
+        project_handle,
+        now=None,
+        interrupt=None,
     ):  # type: ignore[no-untyped-def]
         self.calls += 1
         return _build_outcome(
@@ -182,7 +190,15 @@ class _ScriptedGeneration:
         self.calls = 0
 
     async def generate(
-        self, request, *, proposal_id, run_id, coding_run_id, project_handle, now=None
+        self,
+        request,
+        *,
+        proposal_id,
+        run_id,
+        coding_run_id,
+        project_handle,
+        now=None,
+        interrupt=None,
     ):  # type: ignore[no-untyped-def]
         self.calls += 1
         behavior = self._script.pop(0)
@@ -382,11 +398,12 @@ def _coordinator(
     generation: Any | None = None,
     approval_factory: Any | None = None,
     authorizer: Any | None = None,
+    outbox: InMemoryPatchProposalOutbox | None = None,
 ) -> PatchCoordinator:
     factory = approval_factory or _ScopeSpyFactory()
     return PatchCoordinator(
         store=InMemoryPatchProposalStore(),
-        outbox=InMemoryPatchProposalOutbox(),
+        outbox=outbox or InMemoryPatchProposalOutbox(),
         run_store_factory=_RunFactory({_DEFAULT_SCOPE: runs or InMemoryRunStore()}),
         authorizer=authorizer or _FakeAuthorizer(target),
         generation=generation or _FakeGeneration(artifacts),  # type: ignore[arg-type]
@@ -1124,3 +1141,87 @@ async def test_writeback_fails_when_approval_not_granted() -> None:
         await coord.execute_writeback("o", handle.proposal_id, worker_id="w1")
     assert writeback.calls == 0
     assert authz.writebacks == []
+
+
+# --- P3b-0: atomic generation finalize is all-or-nothing (run + proposal + pointer) --------
+
+
+class _PointerFailureOutbox(InMemoryPatchProposalOutbox):
+    """In-memory outbox whose pointer *mirror* op fails, to prove finalize rolls everything back.
+
+    The ``generating`` pointer is still recorded normally at create (``record_in_connection``);
+    only the finalize-time mirror op fails, landing AFTER the run has been terminalized and the
+    proposal transitioned inside the same in-memory transaction — so a raised failure must restore
+    the run, the proposal, AND the pointer (never a completed/failed run behind a
+    still-``generating`` proposal, and never a half-applied pointer)."""
+
+    def __init__(self, *, fail_hint: bool = False, fail_delete: bool = False) -> None:
+        super().__init__()
+        self.fail_hint = fail_hint
+        self.fail_delete = fail_delete
+
+    async def set_status_hint_in_connection(
+        self, conn: Any, proposal_id: str, status: Any, *, now: Any = None
+    ) -> None:  # type: ignore[override]
+        if self.fail_hint:
+            raise RuntimeError("pointer hint update failed")
+        await super().set_status_hint_in_connection(conn, proposal_id, status, now=now)
+
+    async def delete_in_connection(self, conn: Any, proposal_id: str) -> None:  # type: ignore[override]
+        if self.fail_delete:
+            raise RuntimeError("pointer delete failed")
+        await super().delete_in_connection(conn, proposal_id)
+
+
+@pytest.mark.asyncio
+async def test_finalize_ready_rolls_back_run_and_proposal_when_pointer_fails() -> None:
+    # Success finalize composes: run terminalize(completed) + proposal generating->ready + pointer
+    # hint ready, atomically. If the pointer mirror fails, the WHOLE unit rolls back — the run is
+    # NOT left completed behind a still-generating proposal, and no cost is mirrored.
+    artifacts = _MemArtifacts()
+    outbox = _PointerFailureOutbox(fail_hint=True)
+    coord = _coordinator(artifacts, _FakeWriteback(), _target(), outbox=outbox)
+    req = _request()
+    handle = await coord.request_generation(req)
+
+    with pytest.raises(RuntimeError, match="pointer hint update failed"):
+        await coord.execute_generation("o", handle.run_id, req, worker_id="w1")
+
+    # Proposal fully rolled back: still generating, version unchanged, no cost mirrored.
+    proposal = await coord.store.get("o", handle.proposal_id)
+    assert proposal is not None and proposal.status is PatchStatus.generating
+    assert proposal.version == 1 and proposal.cost_usd == pytest.approx(0.0)
+    # Run rolled back: still running (NOT terminalized completed), no charge.
+    run = await _run_get(coord, handle.run_id)
+    assert run is not None and run.status is RunStatus.running
+    assert run.cost_usd == pytest.approx(0.0)
+    # Pointer rolled back: still the generating dispatch intent.
+    entry = await coord.outbox.get(handle.proposal_id)
+    assert entry is not None and entry.status_hint is PatchOutboxStatus.generating
+
+
+@pytest.mark.asyncio
+async def test_finalize_failed_rolls_back_run_and_proposal_when_pointer_fails() -> None:
+    # The permanent-failure finalize composes: run terminalize(failed) + proposal generating->failed
+    # + pointer delete, atomically. If the pointer delete fails, the whole unit rolls back — the run
+    # is NOT left failed behind a still-generating proposal, and the pointer survives.
+    artifacts = _MemArtifacts()
+    outbox = _PointerFailureOutbox(fail_delete=True)
+    gen = _ScriptedGeneration(
+        artifacts, [PatchProviderError("permanent failure", usage=Usage(cost_usd=0.05))]
+    )
+    coord = _coordinator(artifacts, _FakeWriteback(), _target(), generation=gen, outbox=outbox)
+    req = _request()
+    handle = await coord.request_generation(req)
+
+    with pytest.raises(RuntimeError, match="pointer delete failed"):
+        await coord.execute_generation("o", handle.run_id, req, worker_id="w1")
+
+    proposal = await coord.store.get("o", handle.proposal_id)
+    assert proposal is not None and proposal.status is PatchStatus.generating
+    assert proposal.version == 1 and proposal.cost_usd == pytest.approx(0.0)
+    run = await _run_get(coord, handle.run_id)
+    assert run is not None and run.status is RunStatus.running
+    assert run.cost_usd == pytest.approx(0.0)
+    entry = await coord.outbox.get(handle.proposal_id)
+    assert entry is not None and entry.status_hint is PatchOutboxStatus.generating

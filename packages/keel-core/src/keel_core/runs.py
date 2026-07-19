@@ -1189,6 +1189,142 @@ async def mark_checkpoint_in_transaction(
     raise RunLeaseLostError(lease.run_id)
 
 
+# Fenced release/terminalize assignment fragments, shared verbatim by the ``PostgresRunStore``
+# methods and the in-connection helpers below so a run finalized inside a *foreign* transaction
+# (e.g. the atomic patch-generation finalize) enforces the exact same status/lease/usage/iteration
+# semantics as a standalone ``release``/``terminalize`` — never a divergent hand-rolled UPDATE.
+_RELEASE_ASSIGNMENTS = (
+    "status = :to_status, worker_id = NULL, lease_token = NULL, "
+    "lease_expires_at = NULL, suspend_checkpoint = false, "
+    "prompt_tokens = prompt_tokens + :ptok, "
+    "completion_tokens = completion_tokens + :ctok, cost_usd = cost_usd + :cost, "
+    "iterations = iterations + :iters, updated_at = :now"
+)
+_TERMINALIZE_ASSIGNMENTS = (
+    "status = :status, stop_reason = :stop_reason, worker_id = NULL, "
+    "lease_token = NULL, lease_expires_at = NULL, suspend_checkpoint = false, "
+    "finished_at = :now, "
+    "prompt_tokens = prompt_tokens + :ptok, "
+    "completion_tokens = completion_tokens + :ctok, cost_usd = cost_usd + :cost, "
+    "iterations = iterations + :iters, "
+    "result_ref = :result_ref, error_kind = :error_kind, "
+    "error_message = :error_message, updated_at = :now"
+)
+
+
+async def _fenced_run_update_in_connection(
+    conn: AsyncConnection,
+    scope_id: ScopeId,
+    lease: RunLease,
+    *,
+    assignments: str,
+    params: Mapping[str, Any],
+    expected_status: str = "running",
+) -> RunRecord:
+    """Fenced run UPDATE inside the caller's transaction (no commit; caller owns the scope GUC).
+
+    Optimistically bumps ``version`` and fences on ``scope_id`` + ``lease_token`` +
+    ``status = expected_status`` exactly like :meth:`PostgresRunStore._fenced_update`, raising
+    :class:`RunLeaseLostError` (which rolls back the caller's whole transaction) when a
+    lost/superseded lease matches no row."""
+    row = (
+        (
+            await conn.execute(
+                text(
+                    f"UPDATE runs SET {assignments}, version = version + 1 "
+                    "WHERE scope_id = :scope AND id = :id AND lease_token = :token "
+                    f"AND status = '{expected_status}' RETURNING {_RUN_COLUMNS}"
+                ),
+                {"scope": scope_id, "id": lease.run_id, "token": lease.token, **params},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        raise RunLeaseLostError(lease.run_id)
+    return _to_record(row)
+
+
+async def release_in_transaction(
+    conn: AsyncConnection,
+    scope_id: ScopeId,
+    lease: RunLease,
+    *,
+    to_status: RunStatus,
+    now: datetime | None = None,
+    cost: RunCost | None = None,
+) -> RunRecord:
+    """Cooperative lease release back to the queue/waiting_approval inside the caller's transaction.
+
+    Applies ``cost`` as a fenced cumulative delta (the run row is the authoritative charge ledger)
+    and returns the updated record so a composing caller (the patch-generation transient-outage
+    finalize) can mirror the run's cumulative cost onto its proposal in the SAME transaction."""
+    if to_status not in (RunStatus.queued, RunStatus.waiting_approval):
+        raise RunStateError(f"release target must be queued/waiting_approval, got {to_status}")
+    now = now or _now()
+    cost = cost or RunCost()
+    return await _fenced_run_update_in_connection(
+        conn,
+        scope_id,
+        lease,
+        assignments=_RELEASE_ASSIGNMENTS,
+        params={
+            "to_status": to_status.value,
+            "ptok": cost.prompt_tokens,
+            "ctok": cost.completion_tokens,
+            "cost": cost.cost_usd,
+            "iters": cost.iterations,
+            "now": now,
+        },
+    )
+
+
+async def terminalize_in_transaction(
+    conn: AsyncConnection,
+    scope_id: ScopeId,
+    lease: RunLease,
+    *,
+    status: RunStatus,
+    stop_reason: str,
+    now: datetime | None = None,
+    cost: RunCost | None = None,
+    result_ref: str | None = None,
+    error_kind: str | None = None,
+    error_message: str | None = None,
+) -> RunRecord:
+    """Terminalize a run (completed/failed/...) inside the caller's transaction (no commit here).
+
+    Applies ``cost`` as a fenced cumulative delta and returns the terminal record so a composing
+    caller (the atomic patch-generation success/failure finalize) can persist the proposal + its
+    dispatch pointer in the SAME transaction — the run can never be terminal while the proposal
+    stays ``generating`` (or vice versa). Unlike :meth:`PostgresRunStore.terminalize` there is no
+    already-terminal idempotent fallback: a lost lease raises :class:`RunLeaseLostError` and rolls
+    back the whole unit (the composing caller only ever finalizes a freshly-claimed running run)."""
+    if status not in TERMINAL_STATUSES:
+        raise RunStateError(f"{status} is not terminal")
+    now = now or _now()
+    cost = cost or RunCost()
+    return await _fenced_run_update_in_connection(
+        conn,
+        scope_id,
+        lease,
+        assignments=_TERMINALIZE_ASSIGNMENTS,
+        params={
+            "status": status.value,
+            "stop_reason": stop_reason,
+            "now": now,
+            "ptok": cost.prompt_tokens,
+            "ctok": cost.completion_tokens,
+            "cost": cost.cost_usd,
+            "iters": cost.iterations,
+            "result_ref": result_ref,
+            "error_kind": error_kind,
+            "error_message": error_message,
+        },
+    )
+
+
 async def purge_scope(engine: AsyncEngine, scope_id: str) -> int:
     """Erase every durable run + control row for a scope (idempotent). Rows removed."""
     async with engine.begin() as conn:
@@ -1557,39 +1693,6 @@ class PostgresRunStore:
             )
         return result.rowcount == 1
 
-    async def _fenced_update(
-        self,
-        lease: RunLease,
-        *,
-        assignments: str,
-        params: Mapping[str, Any],
-        expected_status: str = "running",
-    ) -> RunRecord:
-        async with self._engine.begin() as conn:
-            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
-            row = (
-                (
-                    await conn.execute(
-                        text(
-                            f"UPDATE runs SET {assignments}, version = version + 1 "
-                            "WHERE scope_id = :scope AND id = :id AND lease_token = :token "
-                            f"AND status = '{expected_status}' RETURNING {_RUN_COLUMNS}"
-                        ),
-                        {
-                            "scope": self._scope_id,
-                            "id": lease.run_id,
-                            "token": lease.token,
-                            **params,
-                        },
-                    )
-                )
-                .mappings()
-                .one_or_none()
-            )
-        if row is None:
-            raise RunLeaseLostError(lease.run_id)
-        return _to_record(row)
-
     async def release(
         self,
         lease: RunLease,
@@ -1598,28 +1701,12 @@ class PostgresRunStore:
         now: datetime | None = None,
         cost: RunCost | None = None,
     ) -> RunRecord:
-        if to_status not in (RunStatus.queued, RunStatus.waiting_approval):
-            raise RunStateError(f"release target must be queued/waiting_approval, got {to_status}")
         now = now or _now()
-        cost = cost or RunCost()
-        return await self._fenced_update(
-            lease,
-            assignments=(
-                "status = :to_status, worker_id = NULL, lease_token = NULL, "
-                "lease_expires_at = NULL, suspend_checkpoint = false, "
-                "prompt_tokens = prompt_tokens + :ptok, "
-                "completion_tokens = completion_tokens + :ctok, cost_usd = cost_usd + :cost, "
-                "iterations = iterations + :iters, updated_at = :now"
-            ),
-            params={
-                "to_status": to_status.value,
-                "ptok": cost.prompt_tokens,
-                "ctok": cost.completion_tokens,
-                "cost": cost.cost_usd,
-                "iters": cost.iterations,
-                "now": now,
-            },
-        )
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            return await release_in_transaction(
+                conn, self._scope_id, lease, to_status=to_status, now=now, cost=cost
+            )
 
     async def terminalize(
         self,
@@ -1633,36 +1720,22 @@ class PostgresRunStore:
         error_kind: str | None = None,
         error_message: str | None = None,
     ) -> RunRecord:
-        if status not in TERMINAL_STATUSES:
-            raise RunStateError(f"{status} is not terminal")
         now = now or _now()
-        cost = cost or RunCost()
         try:
-            return await self._fenced_update(
-                lease,
-                assignments=(
-                    "status = :status, stop_reason = :stop_reason, worker_id = NULL, "
-                    "lease_token = NULL, lease_expires_at = NULL, suspend_checkpoint = false, "
-                    "finished_at = :now, "
-                    "prompt_tokens = prompt_tokens + :ptok, "
-                    "completion_tokens = completion_tokens + :ctok, cost_usd = cost_usd + :cost, "
-                    "iterations = iterations + :iters, "
-                    "result_ref = :result_ref, error_kind = :error_kind, "
-                    "error_message = :error_message, updated_at = :now"
-                ),
-                params={
-                    "status": status.value,
-                    "stop_reason": stop_reason,
-                    "now": now,
-                    "ptok": cost.prompt_tokens,
-                    "ctok": cost.completion_tokens,
-                    "cost": cost.cost_usd,
-                    "iters": cost.iterations,
-                    "result_ref": result_ref,
-                    "error_kind": error_kind,
-                    "error_message": error_message,
-                },
-            )
+            async with self._engine.begin() as conn:
+                await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+                return await terminalize_in_transaction(
+                    conn,
+                    self._scope_id,
+                    lease,
+                    status=status,
+                    stop_reason=stop_reason,
+                    now=now,
+                    cost=cost,
+                    result_ref=result_ref,
+                    error_kind=error_kind,
+                    error_message=error_message,
+                )
         except RunLeaseLostError:
             # Idempotent terminalization: a run already terminal returns the authoritative row.
             current = await self.get(lease.run_id)
@@ -1878,4 +1951,6 @@ __all__ = [
     "can_transition",
     "mark_checkpoint_in_transaction",
     "purge_scope",
+    "release_in_transaction",
+    "terminalize_in_transaction",
 ]

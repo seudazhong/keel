@@ -17,7 +17,7 @@ repository is intentionally thin and truthful.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
@@ -31,6 +31,17 @@ from keel_core.approvals import (
     InMemoryApprovalStore,
     PostgresApprovalStore,
     insert_pending_or_get_in_transaction,
+)
+from keel_core.runs import (
+    InMemoryRunStore,
+    PostgresRunStore,
+    RunCost,
+    RunLease,
+    RunRecord,
+    RunStatus,
+    RunStore,
+    release_in_transaction,
+    terminalize_in_transaction,
 )
 from keel_core.scoping import validate_scope_id
 
@@ -171,6 +182,76 @@ class PatchProposalStore(Protocol):
         there is never a residual approval, half-transition, or orphaned pointer."""
         ...
 
+    async def finalize_generation_ready(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        run_store: RunStore,
+        lease: RunLease,
+        cost: RunCost,
+        updates: Mapping[str, Any],
+        result_ref: str,
+        stop_reason: str,
+        outbox: PatchProposalOutbox,
+        scope_id: str,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[PatchProposal, RunRecord]:
+        """Atomically complete a successful generation: run ``completed`` + proposal ``ready``.
+
+        In ONE transaction: terminalize the freshly-claimed run (fenced by its lease token, applying
+        ``cost`` as a cumulative delta), move the proposal ``generating -> ready`` (mirroring the
+        run's authoritative cumulative cost onto ``cost_usd`` and the supplied outcome ``updates``),
+        and set its dispatch pointer hint to ``ready``. Closes the P2 cross-await window: a crash
+        can never leave a *completed* run behind a still-``generating`` proposal (nor the reverse).
+        A lost lease raises :class:`~keel_core.runs.RunLeaseLostError` and rolls the unit back.
+        Returns ``(proposal, run_record)``."""
+        ...
+
+    async def finalize_generation_failed(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        run_store: RunStore,
+        lease: RunLease,
+        cost: RunCost,
+        error_kind: str,
+        error_message: str,
+        stop_reason: str,
+        outbox: PatchProposalOutbox,
+        scope_id: str,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[PatchProposal, RunRecord]:
+        """Atomically fail a generation: run ``failed`` + proposal ``failed`` + pointer deleted.
+
+        Terminalizes the run ``failed`` (charging any partial ``cost`` cumulatively) and moves the
+        proposal ``generating -> failed`` (mirroring the run's cumulative cost, recording the
+        error), and deletes its dispatch pointer — all or nothing."""
+        ...
+
+    async def release_generation_transient(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        run_store: RunStore,
+        lease: RunLease,
+        cost: RunCost,
+        scope_id: str,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[PatchProposal, RunRecord]:
+        """Atomically release a run to the queue on transient outage; proposal stays ``generating``.
+
+        Releases the run lease back to ``queued`` (charging the partial ``cost`` cumulatively) and
+        mirrors the run's cumulative cost onto the still-``generating`` proposal — no status change,
+        no version bump, the dispatch pointer stays ``generating`` — so a retry re-claims and
+        resumes without losing the partial charge. Returns ``(proposal, run_record)``."""
+        ...
+
     async def expire_due(self, now: datetime, limit: int) -> list[tuple[str, str]]: ...
 
 
@@ -251,6 +332,92 @@ async def _apply_outbox_transition(
         )
     elif target == PatchStatus.approval_pending or target in TERMINAL_STATUSES:
         await outbox.delete_in_connection(conn, proposal.id)
+
+
+async def apply_transition_in_connection(
+    conn: AsyncConnection,
+    org_id: str,
+    proposal_id: str,
+    target: PatchStatus,
+    *,
+    expected_version: int | None = None,
+    updates: Mapping[str, Any] | None = None,
+    outbox: PatchProposalOutbox | None = None,
+    scope_id: str | None = None,
+    now: datetime,
+) -> PatchProposal:
+    """Apply a fenced proposal status transition (and mirror its pointer) on the caller's conn.
+
+    The caller MUST already own the transaction and have set the org RLS GUC (and, for an
+    ``approved`` pointer write, a validated ``scope_id`` + scope GUC). Selects the row ``FOR
+    UPDATE``, enforces the optional ``expected_version`` fence, applies the legal transition
+    (bumping the version + stamping the status timestamp only when the status actually changes),
+    and mirrors the change onto the outbox pointer — all within the caller's unit of work. Lets
+    ``IntegrityError`` propagate so the composing caller can roll back and translate it. This is the
+    shared primitive behind :meth:`PostgresPatchProposalStore.transition` and atomic finalize."""
+    clean = _validate_updates(updates)
+    if outbox is not None and not isinstance(outbox, PostgresPatchProposalOutbox):
+        raise PatchValidationError("PostgresPatchProposalStore requires a Postgres outbox")
+    current = (
+        (
+            await conn.execute(
+                text(
+                    f"SELECT {_COLS} FROM patch_proposals "
+                    "WHERE id = :id AND org_id = :org FOR UPDATE"
+                ),
+                {"id": proposal_id, "org": org_id},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if current is None:
+        raise ProposalNotFoundInStore(f"proposal not found: {proposal_id}")
+    proposal = _to_proposal(current)
+    if expected_version is not None and proposal.version != expected_version:
+        raise StaleProposalVersion(
+            f"stale proposal version {expected_version} (current {proposal.version})"
+        )
+    assignments: dict[str, Any] = dict(clean)
+    bump_version = proposal.status != target
+    if bump_version:
+        ensure_transition(proposal.status, target)
+        ts_col = _STATUS_TIMESTAMP.get(target)
+        if ts_col is not None and ts_col not in assignments:
+            assignments[ts_col] = now
+    set_parts = ["status = :__status", "updated_at = :__now"]
+    bind: dict[str, Any] = {
+        "__status": target.value,
+        "__now": now,
+        "id": proposal_id,
+        "org": org_id,
+    }
+    if bump_version:
+        set_parts.append("version = version + 1")
+    for i, (key, value) in enumerate(assignments.items()):
+        param = f"__u{i}"
+        set_parts.append(f"{key} = :{param}")
+        bind[param] = value
+    row = (
+        (
+            await conn.execute(
+                text(
+                    "UPDATE patch_proposals SET "
+                    + ", ".join(set_parts)
+                    + f" WHERE id = :id AND org_id = :org RETURNING {_COLS}"
+                ),
+                bind,
+            )
+        )
+        .mappings()
+        .one()
+    )
+    updated = _to_proposal(row)
+    # Mirror the transition onto the dispatch pointer in the SAME transaction, so the durable
+    # status and its global pointer can never diverge (both commit / roll back together).
+    if outbox is not None:
+        await _apply_outbox_transition(conn, outbox, updated, target, scope_id, now)
+    return updated
 
 
 # --- In-memory -----------------------------------------------------------------------
@@ -526,6 +693,168 @@ class InMemoryPatchProposalStore:
             outbox._txn_restore(outbox_snap)
             raise
 
+    async def _finalize_generation(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        run_store: RunStore,
+        run_op: Callable[[InMemoryRunStore, datetime], Awaitable[RunRecord]],
+        target: PatchStatus,
+        updates: Mapping[str, Any] | None,
+        outbox: PatchProposalOutbox | None,
+        scope_id: str,
+        expected_version: int | None,
+        now: datetime | None,
+    ) -> tuple[PatchProposal, RunRecord]:
+        """Atomic run-finalize + proposal-transition + pointer mirror, with all-or-nothing rollback.
+
+        Snapshots the proposal store, the run store, and the outbox, runs the fenced run operation
+        (terminalize/release) FIRST — so the proposal's mirrored ``cost_usd`` is derived from the
+        run's authoritative cumulative charge — then applies the proposal transition + pointer, and
+        restores all three on any failure (a lost run lease, a stale proposal version, a conflict).
+        The durable analog composes the identical run + proposal + pointer writes in one PG txn."""
+        if not isinstance(run_store, InMemoryRunStore):
+            raise PatchValidationError("InMemoryPatchProposalStore requires an in-memory run store")
+        if outbox is not None and not isinstance(outbox, InMemoryPatchProposalOutbox):
+            raise PatchValidationError("InMemoryPatchProposalStore requires an in-memory outbox")
+        validate_scope_id(scope_id)
+        moment = now or _now()
+        row = self._rows.get(proposal_id)
+        if row is None or row.org_id != org_id:
+            raise ProposalNotFoundInStore(f"proposal not found: {proposal_id}")
+        if expected_version is not None and row.version != expected_version:
+            raise StaleProposalVersion(
+                f"stale proposal version {expected_version} (current {row.version})"
+            )
+        store_snap = self._txn_snapshot()
+        run_snap = run_store._txn_snapshot()
+        outbox_snap = outbox._txn_snapshot() if outbox is not None else None
+        try:
+            run_record = await run_op(run_store, moment)
+            merged = dict(updates or {})
+            merged["cost_usd"] = run_record.cost_usd
+            clean = _validate_updates(merged)
+            updated = self._apply_transition(org_id, proposal_id, row, target, clean, moment)
+            if outbox is not None:
+                await _apply_outbox_transition(
+                    None, outbox, updated, target, scope_id, updated.updated_at
+                )
+        except BaseException:
+            self._txn_restore(store_snap)
+            run_store._txn_restore(run_snap)
+            if outbox is not None and outbox_snap is not None:
+                outbox._txn_restore(outbox_snap)
+            raise
+        return updated, run_record
+
+    async def finalize_generation_ready(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        run_store: RunStore,
+        lease: RunLease,
+        cost: RunCost,
+        updates: Mapping[str, Any],
+        result_ref: str,
+        stop_reason: str,
+        outbox: PatchProposalOutbox,
+        scope_id: str,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[PatchProposal, RunRecord]:
+        async def _op(rs: InMemoryRunStore, moment: datetime) -> RunRecord:
+            return await rs.terminalize(
+                lease,
+                status=RunStatus.completed,
+                stop_reason=stop_reason,
+                result_ref=result_ref,
+                cost=cost,
+                now=moment,
+            )
+
+        return await self._finalize_generation(
+            org_id,
+            proposal_id,
+            run_store=run_store,
+            run_op=_op,
+            target=PatchStatus.ready,
+            updates=updates,
+            outbox=outbox,
+            scope_id=scope_id,
+            expected_version=expected_version,
+            now=now,
+        )
+
+    async def finalize_generation_failed(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        run_store: RunStore,
+        lease: RunLease,
+        cost: RunCost,
+        error_kind: str,
+        error_message: str,
+        stop_reason: str,
+        outbox: PatchProposalOutbox,
+        scope_id: str,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[PatchProposal, RunRecord]:
+        async def _op(rs: InMemoryRunStore, moment: datetime) -> RunRecord:
+            return await rs.terminalize(
+                lease,
+                status=RunStatus.failed,
+                stop_reason=stop_reason,
+                error_kind=error_kind,
+                error_message=error_message,
+                cost=cost,
+                now=moment,
+            )
+
+        return await self._finalize_generation(
+            org_id,
+            proposal_id,
+            run_store=run_store,
+            run_op=_op,
+            target=PatchStatus.failed,
+            updates={"error_kind": error_kind, "error_message": error_message},
+            outbox=outbox,
+            scope_id=scope_id,
+            expected_version=expected_version,
+            now=now,
+        )
+
+    async def release_generation_transient(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        run_store: RunStore,
+        lease: RunLease,
+        cost: RunCost,
+        scope_id: str,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[PatchProposal, RunRecord]:
+        async def _op(rs: InMemoryRunStore, moment: datetime) -> RunRecord:
+            return await rs.release(lease, to_status=RunStatus.queued, cost=cost, now=moment)
+
+        return await self._finalize_generation(
+            org_id,
+            proposal_id,
+            run_store=run_store,
+            run_op=_op,
+            target=PatchStatus.generating,
+            updates=None,
+            outbox=None,
+            scope_id=scope_id,
+            expected_version=expected_version,
+            now=now,
+        )
+
     async def expire_due(self, now: datetime, limit: int) -> list[tuple[str, str]]:
         """Cross-org TTL scan (maintenance-only; the runtime reconciler uses the outbox instead)."""
         due = [
@@ -776,75 +1105,21 @@ class PostgresPatchProposalStore:
         outbox: PatchProposalOutbox | None = None,
         scope_id: str | None = None,
     ) -> PatchProposal:
-        clean = _validate_updates(updates)
-        if outbox is not None and not isinstance(outbox, PostgresPatchProposalOutbox):
-            raise PatchValidationError("PostgresPatchProposalStore requires a Postgres outbox")
         moment = now or _now()
         try:
             async with self._engine.begin() as conn:
                 await conn.execute(_SET_ORG, {"org": org_id})
-                current = (
-                    (
-                        await conn.execute(
-                            text(
-                                f"SELECT {_COLS} FROM patch_proposals "
-                                "WHERE id = :id AND org_id = :org FOR UPDATE"
-                            ),
-                            {"id": proposal_id, "org": org_id},
-                        )
-                    )
-                    .mappings()
-                    .one_or_none()
+                return await apply_transition_in_connection(
+                    conn,
+                    org_id,
+                    proposal_id,
+                    target,
+                    expected_version=expected_version,
+                    updates=updates,
+                    outbox=outbox,
+                    scope_id=scope_id,
+                    now=moment,
                 )
-                if current is None:
-                    raise ProposalNotFoundInStore(f"proposal not found: {proposal_id}")
-                proposal = _to_proposal(current)
-                if expected_version is not None and proposal.version != expected_version:
-                    raise StaleProposalVersion(
-                        f"stale proposal version {expected_version} (current {proposal.version})"
-                    )
-                assignments: dict[str, Any] = {}
-                for key, value in clean.items():
-                    assignments[key] = value
-                bump_version = proposal.status != target
-                if bump_version:
-                    ensure_transition(proposal.status, target)
-                    ts_col = _STATUS_TIMESTAMP.get(target)
-                    if ts_col is not None and ts_col not in assignments:
-                        assignments[ts_col] = moment
-                set_parts = ["status = :__status", "updated_at = :__now"]
-                bind: dict[str, Any] = {
-                    "__status": target.value,
-                    "__now": moment,
-                    "id": proposal_id,
-                    "org": org_id,
-                }
-                if bump_version:
-                    set_parts.append("version = version + 1")
-                for i, (key, value) in enumerate(assignments.items()):
-                    param = f"__u{i}"
-                    set_parts.append(f"{key} = :{param}")
-                    bind[param] = value
-                row = (
-                    (
-                        await conn.execute(
-                            text(
-                                "UPDATE patch_proposals SET "
-                                + ", ".join(set_parts)
-                                + f" WHERE id = :id AND org_id = :org RETURNING {_COLS}"
-                            ),
-                            bind,
-                        )
-                    )
-                    .mappings()
-                    .one()
-                )
-                updated = _to_proposal(row)
-                # Mirror the transition onto the dispatch pointer in the SAME transaction, so the
-                # durable status and its global pointer can never diverge (both commit / roll back).
-                if outbox is not None:
-                    await _apply_outbox_transition(conn, outbox, updated, target, scope_id, moment)
-                return updated
         except IntegrityError as exc:  # branch-collision partial unique index
             raise ProposalConflictError("remote branch already reserved for this project") from exc
 
@@ -944,6 +1219,172 @@ class PostgresPatchProposalStore:
             # 5) ... and delete the dispatch pointer (no background work while awaiting a human).
             await outbox.delete_in_connection(conn, proposal_id)
             return updated, resolved_id, created
+
+    async def _finalize_generation(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        run_store: RunStore,
+        run_op: Callable[[AsyncConnection, datetime], Awaitable[RunRecord]],
+        target: PatchStatus,
+        updates: Mapping[str, Any] | None,
+        outbox: PatchProposalOutbox | None,
+        scope_id: str,
+        expected_version: int | None,
+        now: datetime | None,
+    ) -> tuple[PatchProposal, RunRecord]:
+        """Atomic run-finalize + proposal-transition + pointer mirror in ONE engine transaction.
+
+        Sets both the org (``patch_proposals`` RLS) and scope (``runs`` RLS + any pointer write)
+        GUCs — proven to coexist by :meth:`transition_to_approval_pending` — then terminalizes or
+        releases the run FIRST (a fenced in-connection UPDATE returning its authoritative cumulative
+        cost), mirrors that cost onto the proposal's ``cost_usd``, and applies the proposal
+        transition + its dispatch pointer through :func:`apply_transition_in_connection`. A lost run
+        lease raises :class:`~keel_core.runs.RunLeaseLostError`; the whole transaction rolls back so
+        a crash never strands a terminal run behind a ``generating`` proposal (or the reverse)."""
+        if not isinstance(run_store, PostgresRunStore):
+            raise PatchValidationError("PostgresPatchProposalStore requires a Postgres run store")
+        if run_store.scope_id != scope_id:
+            raise PatchValidationError("run store scope does not match the generation scope")
+        if outbox is not None and not isinstance(outbox, PostgresPatchProposalOutbox):
+            raise PatchValidationError("PostgresPatchProposalStore requires a Postgres outbox")
+        validate_scope_id(scope_id)
+        moment = now or _now()
+        try:
+            async with self._engine.begin() as conn:
+                await conn.execute(_SET_ORG, {"org": org_id})
+                await conn.execute(_SET_SCOPE, {"scope": scope_id})
+                run_record = await run_op(conn, moment)
+                merged = dict(updates or {})
+                merged["cost_usd"] = run_record.cost_usd
+                updated = await apply_transition_in_connection(
+                    conn,
+                    org_id,
+                    proposal_id,
+                    target,
+                    expected_version=expected_version,
+                    updates=merged,
+                    outbox=outbox,
+                    scope_id=scope_id,
+                    now=moment,
+                )
+                return updated, run_record
+        except IntegrityError as exc:  # branch-collision partial unique index (ready path)
+            raise ProposalConflictError("remote branch already reserved for this project") from exc
+
+    async def finalize_generation_ready(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        run_store: RunStore,
+        lease: RunLease,
+        cost: RunCost,
+        updates: Mapping[str, Any],
+        result_ref: str,
+        stop_reason: str,
+        outbox: PatchProposalOutbox,
+        scope_id: str,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[PatchProposal, RunRecord]:
+        async def _op(conn: AsyncConnection, moment: datetime) -> RunRecord:
+            return await terminalize_in_transaction(
+                conn,
+                scope_id,
+                lease,
+                status=RunStatus.completed,
+                stop_reason=stop_reason,
+                result_ref=result_ref,
+                cost=cost,
+                now=moment,
+            )
+
+        return await self._finalize_generation(
+            org_id,
+            proposal_id,
+            run_store=run_store,
+            run_op=_op,
+            target=PatchStatus.ready,
+            updates=updates,
+            outbox=outbox,
+            scope_id=scope_id,
+            expected_version=expected_version,
+            now=now,
+        )
+
+    async def finalize_generation_failed(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        run_store: RunStore,
+        lease: RunLease,
+        cost: RunCost,
+        error_kind: str,
+        error_message: str,
+        stop_reason: str,
+        outbox: PatchProposalOutbox,
+        scope_id: str,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[PatchProposal, RunRecord]:
+        async def _op(conn: AsyncConnection, moment: datetime) -> RunRecord:
+            return await terminalize_in_transaction(
+                conn,
+                scope_id,
+                lease,
+                status=RunStatus.failed,
+                stop_reason=stop_reason,
+                error_kind=error_kind,
+                error_message=error_message,
+                cost=cost,
+                now=moment,
+            )
+
+        return await self._finalize_generation(
+            org_id,
+            proposal_id,
+            run_store=run_store,
+            run_op=_op,
+            target=PatchStatus.failed,
+            updates={"error_kind": error_kind, "error_message": error_message},
+            outbox=outbox,
+            scope_id=scope_id,
+            expected_version=expected_version,
+            now=now,
+        )
+
+    async def release_generation_transient(
+        self,
+        org_id: str,
+        proposal_id: str,
+        *,
+        run_store: RunStore,
+        lease: RunLease,
+        cost: RunCost,
+        scope_id: str,
+        expected_version: int | None = None,
+        now: datetime | None = None,
+    ) -> tuple[PatchProposal, RunRecord]:
+        async def _op(conn: AsyncConnection, moment: datetime) -> RunRecord:
+            return await release_in_transaction(
+                conn, scope_id, lease, to_status=RunStatus.queued, cost=cost, now=moment
+            )
+
+        return await self._finalize_generation(
+            org_id,
+            proposal_id,
+            run_store=run_store,
+            run_op=_op,
+            target=PatchStatus.generating,
+            updates=None,
+            outbox=None,
+            scope_id=scope_id,
+            expected_version=expected_version,
+            now=now,
+        )
 
     async def expire_due(self, now: datetime, limit: int) -> list[tuple[str, str]]:
         """Cross-org scan for proposals past their TTL (maintenance reconciler path only).
