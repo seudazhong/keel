@@ -140,6 +140,11 @@ def _readiness_app(*, shared: bool, queue: bool, sandbox_ready: bool = True) -> 
                 "is_super": False,
                 "can_bypass_rls": False,
                 "owns_tables": False,
+                "can_create_schema": False,
+                "can_delete_identity": False,
+                "can_execute_erase": False,
+                "can_write_control": False,
+                "extra_roles": [],
             }
 
     class _FakeConn:

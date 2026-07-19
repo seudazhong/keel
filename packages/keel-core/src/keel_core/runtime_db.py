@@ -10,10 +10,15 @@ non-owner, non-bypass ``keel_runtime`` group (migrations 0011/0013/0015/0019/002
 This module is the code seam that makes that split real and fail-closed:
 
 * :func:`verify_runtime_principal` — a pure catalog read that asserts the *connected* runtime
-  principal is least-privilege (not a superuser, cannot ``BYPASSRLS`` directly or via role
-  membership, and does not effectively own the application tables). The server/worker call it
-  at startup + readiness in cloud mode so an over-privileged runtime connection is rejected
-  rather than silently defeating RLS for every tenant.
+  principal is least-privilege: not a superuser, cannot ``BYPASSRLS`` directly or via role
+  membership, does not effectively own the application tables, cannot ``CREATE`` in schema
+  ``public`` (no DDL, even on an old/upgraded cluster where ``PUBLIC`` retained ``CREATE``),
+  is a member of *only* the runtime group (nothing in its ``SET ROLE`` closure but itself and
+  ``keel_runtime``), and holds none of the cross-tenant erasure privileges (no effective DELETE
+  on the global identity tables, no EXECUTE on the ``keel_erase_*`` functions) nor write access
+  to the ``alembic_version`` migration control table. The server/worker call it at startup +
+  readiness so an over-privileged runtime connection is rejected rather than silently defeating
+  RLS / the identity-erasure split for every tenant.
 * :func:`provision_runtime_login` — an idempotent operator/provisioning primitive that creates
   (or repairs) a dedicated ``LOGIN`` role and grants it the ``keel_runtime`` group. It connects
   as the owner/migrator principal and is the real path an operator uses to mint the runtime
@@ -47,6 +52,22 @@ DEFAULT_RUNTIME_LOGIN = "keel_runtime_login"
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MAX_IDENT_LEN = 63  # Postgres NAMEDATALEN - 1
 
+# A superuser owner's SET ROLE closure is effectively *every* role, so cap how many unexpected
+# memberships describe_violation() spells out (the count is always reported in full).
+_MAX_MEMBERSHIPS_SHOWN = 5
+
+# Global identity tables whose DELETE cascades across orgs: a runtime login must never hold
+# effective DELETE here (cross-tenant erasure goes through the keel_erase_* SECURITY DEFINER
+# functions only — migrations 0013/0020). Qualified so search_path cannot redirect the check.
+_IDENTITY_TABLES = ("public.users", "public.oidc_identities", "public.organizations")
+
+# The cross-tenant erasure functions (SECURITY DEFINER, owned by keel_maintenance); a runtime
+# login must not hold effective EXECUTE on either (migrations 0013/0020).
+_ERASE_FUNCTIONS = ("public.keel_erase_user(text)", "public.keel_erase_organization(text)")
+
+# The Alembic migration control table: the runtime login may read it but must never mutate it.
+_CONTROL_TABLE = "public.alembic_version"
+
 
 def _validate_identifier(name: str, *, kind: str) -> str:
     candidate = name.strip()
@@ -64,17 +85,41 @@ def _validate_identifier(name: str, *, kind: str) -> str:
 
 @dataclass(frozen=True)
 class RuntimePrincipalReport:
-    """Least-privilege facts about the connected runtime principal (no credentials)."""
+    """Least-privilege facts about the connected runtime principal (no credentials).
+
+    Every flag is an *effective* privilege computed over the ``SET ROLE`` membership closure of
+    ``current_user`` (``pg_has_role(..., 'MEMBER')`` / ``has_*_privilege``), so a privilege that
+    is reachable only by escalating into another group — or granted via ``PUBLIC`` on an
+    un-hardened / upgraded cluster — is still counted against the principal. ``least_privilege``
+    is the single fail-closed predicate the server/worker gate on.
+    """
 
     principal: str
     is_superuser: bool
     can_bypass_rls: bool
     owns_tables: bool
+    # Extended M3A hardening checks (default to the safe/least-privilege value so existing
+    # constructors and older catalog rows keep working; inspect_runtime_principal always sets
+    # every field explicitly).
+    can_create_in_schema: bool = False
+    unexpected_memberships: tuple[str, ...] = ()
+    can_delete_identity_tables: bool = False
+    can_execute_erase_functions: bool = False
+    can_write_control_table: bool = False
 
     @property
     def least_privilege(self) -> bool:
-        """True when RLS actually binds this principal (not super/bypass/owner)."""
-        return not (self.is_superuser or self.can_bypass_rls or self.owns_tables)
+        """True only when RLS *and* the DDL / identity-erasure / control-table boundaries bind."""
+        return not (
+            self.is_superuser
+            or self.can_bypass_rls
+            or self.owns_tables
+            or self.can_create_in_schema
+            or bool(self.unexpected_memberships)
+            or self.can_delete_identity_tables
+            or self.can_execute_erase_functions
+            or self.can_write_control_table
+        )
 
     def describe_violation(self) -> str:
         """Human summary of why the principal is over-privileged (empty when it is not)."""
@@ -85,25 +130,50 @@ class RuntimePrincipalReport:
             reasons.append("can BYPASSRLS (directly or via role membership)")
         if self.owns_tables:
             reasons.append("effectively owns application tables")
+        if self.can_create_in_schema:
+            reasons.append("can CREATE in schema public (DDL / object creation)")
+        if self.unexpected_memberships:
+            shown = list(self.unexpected_memberships[:_MAX_MEMBERSHIPS_SHOWN])
+            hidden = len(self.unexpected_memberships) - len(shown)
+            joined = ", ".join(shown)
+            if hidden > 0:
+                joined = f"{joined}, +{hidden} more"
+            reasons.append(f"is a member of role(s) beyond the runtime group: {joined}")
+        if self.can_delete_identity_tables:
+            reasons.append("can DELETE the global identity tables (cross-tenant erasure path)")
+        if self.can_execute_erase_functions:
+            reasons.append("can EXECUTE the keel_erase_* SECURITY DEFINER functions")
+        if self.can_write_control_table:
+            reasons.append("can write the alembic_version migration control table")
         return ", ".join(reasons)
 
 
-async def inspect_runtime_principal(conn: AsyncConnection) -> RuntimePrincipalReport:
+async def inspect_runtime_principal(
+    conn: AsyncConnection, *, group_role: str = RUNTIME_GROUP_ROLE
+) -> RuntimePrincipalReport:
     """Read the connected principal's privilege facts from the catalog (never raises on policy).
 
-    All checks are pure ``pg_catalog`` reads over the *membership closure* of ``current_user``
-    (``pg_has_role(..., 'MEMBER')``), so a principal that could ``SET ROLE`` into a superuser /
-    bypass / owner role is treated as over-privileged too, not just one that holds the attribute
-    directly. ``MEMBER`` (not ``USAGE``) is deliberate: ``SET ROLE`` capability follows role
-    *membership* regardless of ``INHERIT``, so a ``NOINHERIT`` login that is merely a member of a
-    superuser / ``BYPASSRLS`` / table-owner role — and could ``SET ROLE`` to escalate — is still
-    caught. No credential or connection URL is touched.
+    All checks are pure ``pg_catalog`` / effective-privilege reads over the *membership closure*
+    of ``current_user`` (``pg_has_role(..., 'MEMBER')`` and ``has_*_privilege(current_user, ...)``,
+    both of which follow role membership *and* ``PUBLIC``), so a principal that could ``SET ROLE``
+    into a superuser / bypass / owner role — or reach a privilege via ``PUBLIC`` on an un-hardened
+    cluster — is treated as over-privileged too, not just one that holds it directly. ``MEMBER``
+    (not ``USAGE``) is deliberate: ``SET ROLE`` capability follows role *membership* regardless of
+    ``INHERIT``, so a ``NOINHERIT`` login that is merely a member of a privileged role — and could
+    ``SET ROLE`` to escalate — is still caught. ``group_role`` is the one membership that is
+    *expected* (the runtime group); every other role in the closure is reported as unexpected.
+    Object-specific checks are guarded by ``to_regclass`` / ``to_regprocedure`` so a cluster on
+    which an identity table or erase function does not yet exist reads ``false`` rather than
+    erroring. No credential or connection URL is touched.
     """
+    group = _validate_identifier(group_role, kind="runtime group role")
+    identity_values = ", ".join(f"('{t}')" for t in _IDENTITY_TABLES)
+    erase_values = ", ".join(f"('{p}')" for p in _ERASE_FUNCTIONS)
     row = (
         (
             await conn.execute(
                 text(
-                    """
+                    f"""
                     SELECT
                       current_user AS principal,
                       COALESCE((
@@ -118,9 +188,39 @@ async def inspect_runtime_principal(conn: AsyncConnection) -> RuntimePrincipalRe
                         SELECT bool_or(pg_has_role(current_user, c.relowner, 'MEMBER'))
                         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                         WHERE n.nspname = 'public' AND c.relkind = 'r'
-                      ), false) AS owns_tables
+                      ), false) AS owns_tables,
+                      has_schema_privilege(current_user, 'public', 'CREATE') AS can_create_schema,
+                      COALESCE((
+                        SELECT bool_or(
+                          CASE WHEN to_regclass(v.t) IS NOT NULL
+                               THEN has_table_privilege(current_user, to_regclass(v.t), 'DELETE')
+                               ELSE false END)
+                        FROM (VALUES {identity_values}) AS v(t)
+                      ), false) AS can_delete_identity,
+                      COALESCE((
+                        SELECT bool_or(
+                          CASE WHEN to_regprocedure(v.p) IS NOT NULL
+                               THEN has_function_privilege(current_user, to_regprocedure(v.p),
+                                                           'EXECUTE')
+                               ELSE false END)
+                        FROM (VALUES {erase_values}) AS v(p)
+                      ), false) AS can_execute_erase,
+                      COALESCE((
+                        SELECT bool_or(
+                          CASE WHEN to_regclass('{_CONTROL_TABLE}') IS NOT NULL
+                               THEN has_table_privilege(current_user, '{_CONTROL_TABLE}', v.priv)
+                               ELSE false END)
+                        FROM (VALUES ('INSERT'), ('UPDATE'), ('DELETE')) AS v(priv)
+                      ), false) AS can_write_control,
+                      COALESCE((
+                        SELECT array_agg(r.rolname ORDER BY r.rolname) FROM pg_roles r
+                        WHERE pg_has_role(current_user, r.oid, 'MEMBER')
+                          AND r.rolname <> current_user
+                          AND r.rolname <> :group
+                      ), ARRAY[]::text[]) AS extra_roles
                     """
-                )
+                ),
+                {"group": group},
             )
         )
         .mappings()
@@ -131,24 +231,33 @@ async def inspect_runtime_principal(conn: AsyncConnection) -> RuntimePrincipalRe
         is_superuser=bool(row["is_super"]),
         can_bypass_rls=bool(row["can_bypass_rls"]),
         owns_tables=bool(row["owns_tables"]),
+        can_create_in_schema=bool(row["can_create_schema"]),
+        unexpected_memberships=tuple(row["extra_roles"] or ()),
+        can_delete_identity_tables=bool(row["can_delete_identity"]),
+        can_execute_erase_functions=bool(row["can_execute_erase"]),
+        can_write_control_table=bool(row["can_write_control"]),
     )
 
 
-async def verify_runtime_principal(conn: AsyncConnection) -> str:
+async def verify_runtime_principal(
+    conn: AsyncConnection, *, group_role: str = RUNTIME_GROUP_ROLE
+) -> str:
     """Assert the connected principal is a least-privilege runtime login; return its name.
 
     Fails closed (:class:`RuntimePrincipalError`) when the principal is a superuser, can
-    ``BYPASSRLS``, or effectively owns the application tables — any of which silently defeats
-    ``FORCE ROW LEVEL SECURITY``. Used by the server/worker cloud-mode startup + readiness gate
-    so the data plane is never served from an RLS-exempt connection.
+    ``BYPASSRLS``, effectively owns the application tables, can ``CREATE`` in schema ``public``,
+    is a member of any role other than ``group_role``, can DELETE the global identity tables /
+    EXECUTE the ``keel_erase_*`` functions, or can write ``alembic_version`` — any of which
+    defeats ``FORCE ROW LEVEL SECURITY`` or the identity-erasure / migration-control boundaries.
+    Used by the server/worker startup + readiness gate so the data plane is never served from an
+    RLS-exempt / over-privileged connection.
     """
-    report = await inspect_runtime_principal(conn)
+    report = await inspect_runtime_principal(conn, group_role=group_role)
     if not report.least_privilege:
         raise RuntimePrincipalError(
             f"runtime principal {report.principal!r} {report.describe_violation()} - refusing "
             "to serve the data plane from an RLS-exempt connection; point KEEL_DATABASE_URL at "
-            f"a dedicated login that is a member of only {RUNTIME_GROUP_ROLE} (see "
-            "docs/OPERATIONS.md)"
+            f"a dedicated login that is a member of only {group_role} (see docs/OPERATIONS.md)"
         )
     return report.principal
 
@@ -167,8 +276,12 @@ async def provision_runtime_login(
     is created only when absent, then its attributes + password are (re)set and the
     ``keel_runtime`` group membership ensured. Attributes are pinned least-privilege
     (``NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE`` + ``LOGIN`` + ``INHERIT`` so it inherits
-    the group's DML). It is deliberately made a member of ONLY ``group_role`` — never the schema
-    owner or a maintenance role — so it cannot ``SET ROLE`` to escalate.
+    the group's DML). It is made a member of ONLY ``group_role``: after granting the group this
+    actively enumerates the login's direct memberships and REVOKEs every *other* one (e.g. a
+    stale ``keel_maintenance_exec`` grant from a prior provisioning), so it can never ``SET ROLE``
+    into the schema owner or a maintenance role to escalate. A membership that cannot be revoked
+    is not swallowed — provisioning fails closed (sanitized) rather than returning an
+    over-privileged login.
 
     The ``group_role`` must already exist (migration 0011/0020 creates it, or the operator
     provisioned it on managed Postgres); a missing group fails closed with
@@ -244,6 +357,35 @@ async def provision_runtime_login(
             # Ensure the runtime group membership (so it inherits the group's DML). GRANT is a
             # no-op when already a member.
             await conn.execute(text(f"GRANT {id_group} TO {id_login}"))
+
+            # Make the login a member of ONLY the runtime group. A pre-existing login might
+            # already belong to another (possibly privileged) role -- e.g. keel_maintenance_exec,
+            # whose EXECUTE on the cross-tenant erase functions a runtime login must never reach --
+            # and merely GRANTing keel_runtime would leave that escalation path in place.
+            # Enumerate the login's DIRECT memberships from the catalog and REVOKE every one that
+            # is not the target group. quote_ident makes each catalog-sourced role name safe to
+            # emit for any name. A failed REVOKE is deliberately NOT caught here: it propagates out
+            # of this transaction and provisioning fails closed (sanitized below) rather than
+            # returning a login that still holds an extra membership.
+            extra_memberships = (
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT quote_ident(g.rolname) AS id_extra "
+                            "FROM pg_auth_members m "
+                            "JOIN pg_roles g ON g.oid = m.roleid "
+                            "JOIN pg_roles l ON l.oid = m.member "
+                            "WHERE l.rolname = :login AND g.rolname <> :grp "
+                            "ORDER BY g.rolname"
+                        ),
+                        {"login": login, "grp": group},
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for id_extra in extra_memberships:
+                await conn.execute(text(f"REVOKE {str(id_extra)} FROM {id_login}"))
     except RuntimePrincipalError:
         raise
     except SQLAlchemyError as exc:

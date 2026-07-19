@@ -429,3 +429,144 @@ async def test_runtime_login_connects_password_less_via_pgpass(
         await engine.dispose()
         async with migrated_db.begin() as conn:
             await conn.execute(text(f"DROP ROLE IF EXISTS {login}"))
+
+
+async def _direct_memberships(engine: AsyncEngine, login: str) -> set[str]:
+    """The set of roles ``login`` is a DIRECT member of (pg_auth_members), read as the owner."""
+    async with engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT g.rolname FROM pg_auth_members m "
+                    "JOIN pg_roles g ON g.oid = m.roleid "
+                    "JOIN pg_roles l ON l.oid = m.member WHERE l.rolname = :login"
+                ),
+                {"login": login},
+            )
+        ).fetchall()
+    return {r[0] for r in rows}
+
+
+async def _maintenance_exec_available(engine: AsyncEngine) -> bool:
+    async with engine.connect() as conn:
+        found = await conn.scalar(
+            text("SELECT 1 FROM pg_roles WHERE rolname = 'keel_maintenance_exec'")
+        )
+    return bool(found)
+
+
+async def test_runtime_login_public_create_is_detected(
+    migrated_db: AsyncEngine, runtime_login_engine: AsyncEngine
+) -> None:
+    """Simulate an old/upgraded cluster where ``PUBLIC`` retained ``CREATE`` on ``public`` (the
+    PostgreSQL < 15 default): the runtime login can then create objects via the ``PUBLIC`` grant
+    even though 0020 revoked its direct ``CREATE``. The gate must catch the *effective*
+    ``has_schema_privilege(current_user, 'public', 'CREATE')`` and reject; once the PUBLIC grant
+    is removed (0020's posture) the same login is least-privilege again."""
+    try:
+        async with migrated_db.begin() as conn:
+            await conn.execute(text("GRANT CREATE ON SCHEMA public TO PUBLIC"))
+        async with runtime_login_engine.connect() as conn:
+            report = await inspect_runtime_principal(conn)
+            assert report.can_create_in_schema is True
+            assert report.least_privilege is False
+            with pytest.raises(RuntimePrincipalError):
+                await verify_runtime_principal(conn)
+    finally:
+        async with migrated_db.begin() as conn:
+            await conn.execute(text("REVOKE CREATE ON SCHEMA public FROM PUBLIC"))
+
+    # Back to the 0020 posture: no effective CREATE, gate accepts again.
+    async with runtime_login_engine.connect() as conn:
+        report = await inspect_runtime_principal(conn)
+        assert report.can_create_in_schema is False
+        assert await verify_runtime_principal(conn) == _RUNTIME_LOGIN
+
+
+async def test_runtime_login_cannot_delete_identity_or_mutate_control(
+    runtime_login_engine: AsyncEngine,
+) -> None:
+    """The least-privilege login holds none of the cross-tenant erasure / migration-control
+    privileges: the report flags are all clear, ``alembic_version`` SELECT is retained (schema
+    version reads ``0020``), and real identity DELETE / ``keel_erase_*`` EXECUTE / control-table
+    DML are all refused at the privilege layer (independent of RLS)."""
+    async with runtime_login_engine.connect() as conn:
+        report = await inspect_runtime_principal(conn)
+        assert report.can_delete_identity_tables is False
+        assert report.can_execute_erase_functions is False
+        assert report.can_write_control_table is False
+        assert report.can_create_in_schema is False
+        assert report.unexpected_memberships == ()
+        # SELECT on the control table is kept: a read-only view of the schema version (= 0020).
+        head = await conn.scalar(text("SELECT version_num FROM alembic_version"))
+        assert head == "0020_runtime_role_hardening"
+
+    denied = (
+        "DELETE FROM users",
+        "SELECT keel_erase_user('does-not-matter')",
+        "SELECT keel_erase_organization('does-not-matter')",
+        "INSERT INTO alembic_version (version_num) VALUES ('0000_forged')",
+        "UPDATE alembic_version SET version_num = '0000_forged'",
+        "DELETE FROM alembic_version",
+    )
+    for stmt in denied:
+        async with runtime_login_engine.connect() as conn:
+            with pytest.raises((ProgrammingError, DBAPIError)):
+                await conn.execute(text(stmt))
+
+
+async def test_provision_runtime_login_strips_dangerous_membership(
+    migrated_db: AsyncEngine,
+) -> None:
+    """A login that a prior/mistaken provisioning left a member of ``keel_maintenance_exec`` (a
+    ``SET ROLE`` path to the cross-tenant erase functions) is (a) rejected by the gate before
+    repair — the report names the extra membership and effective erase EXECUTE — and (b) actively
+    stripped back to *only* ``keel_runtime`` by ``provision_runtime_login``. There is no silent
+    acceptance of the extra membership; the strip runs inside the provisioning transaction."""
+    if not await _runtime_group_available(migrated_db):
+        pytest.skip("keel_runtime role not provisioned in this database")
+    if not await _maintenance_exec_available(migrated_db):
+        pytest.skip("keel_maintenance_exec role not provisioned in this database")
+    if not await _can_create_login(migrated_db):
+        pytest.skip("test principal cannot CREATE ROLE")
+
+    login = "keel_runtime_login_danger_test"
+    pw = "danger-test-pw"  # noqa: S105 - throwaway local test-role password
+    async with migrated_db.begin() as conn:
+        await conn.execute(text(f"DROP ROLE IF EXISTS {login}"))
+        await conn.execute(text(f"CREATE ROLE {login} LOGIN PASSWORD '{pw}'"))
+        # Drift: the login belongs to the runtime group AND the maintenance executor.
+        await conn.execute(text(f"GRANT keel_runtime TO {login}"))
+        await conn.execute(text(f"GRANT keel_maintenance_exec TO {login}"))
+
+    url = make_url(os.environ["KEEL_TEST_DATABASE_URL"]).set(username=login, password=pw)
+    engine = create_async_engine(url)
+    try:
+        # Before repair: the gate rejects it (dangerous membership + effective erase EXECUTE).
+        async with engine.connect() as conn:
+            report = await inspect_runtime_principal(conn)
+            assert "keel_maintenance_exec" in report.unexpected_memberships
+            assert report.can_execute_erase_functions is True
+            assert report.least_privilege is False
+            with pytest.raises(RuntimePrincipalError):
+                await verify_runtime_principal(conn)
+        await engine.dispose()
+
+        # Repair via the real provisioning primitive: it strips every non-runtime membership.
+        await provision_runtime_login(
+            migrated_db, password=pw, login_name=login, group_role="keel_runtime"
+        )
+        assert await _direct_memberships(migrated_db, login) == {"keel_runtime"}
+
+        # After repair: least-privilege and accepted; erase EXECUTE no longer reachable.
+        engine = create_async_engine(url)
+        async with engine.connect() as conn:
+            report = await inspect_runtime_principal(conn)
+            assert report.unexpected_memberships == ()
+            assert report.can_execute_erase_functions is False
+            assert report.least_privilege is True
+            assert await verify_runtime_principal(conn) == login
+    finally:
+        await engine.dispose()
+        async with migrated_db.begin() as conn:
+            await conn.execute(text(f"DROP ROLE IF EXISTS {login}"))

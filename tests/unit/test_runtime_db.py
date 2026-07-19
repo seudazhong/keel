@@ -47,26 +47,48 @@ def test_runtime_principal_report_least_privilege() -> None:
 
 
 @pytest.mark.parametrize(
-    ("is_super", "bypass", "owns", "needle"),
+    ("kwargs", "needle"),
     [
-        (True, False, False, "superuser"),
-        (False, True, False, "BYPASSRLS"),
-        (False, False, True, "owns application tables"),
+        ({"is_superuser": True}, "superuser"),
+        ({"can_bypass_rls": True}, "BYPASSRLS"),
+        ({"owns_tables": True}, "owns application tables"),
+        ({"can_create_in_schema": True}, "CREATE in schema public"),
+        ({"can_delete_identity_tables": True}, "DELETE the global identity tables"),
+        ({"can_execute_erase_functions": True}, "keel_erase_* SECURITY DEFINER"),
+        ({"can_write_control_table": True}, "alembic_version"),
+        ({"unexpected_memberships": ("keel_maintenance_exec",)}, "keel_maintenance_exec"),
     ],
 )
-def test_runtime_principal_report_violations(
-    is_super: bool, bypass: bool, owns: bool, needle: str
-) -> None:
+def test_runtime_principal_report_violations(kwargs: dict[str, object], needle: str) -> None:
     from keel_core.runtime_db import RuntimePrincipalReport
 
-    report = RuntimePrincipalReport(
-        principal="keel",
-        is_superuser=is_super,
-        can_bypass_rls=bypass,
-        owns_tables=owns,
-    )
+    base: dict[str, object] = {
+        "is_superuser": False,
+        "can_bypass_rls": False,
+        "owns_tables": False,
+    }
+    report = RuntimePrincipalReport(principal="keel", **{**base, **kwargs})  # type: ignore[arg-type]
     assert report.least_privilege is False
     assert needle in report.describe_violation()
+
+
+def test_runtime_principal_report_caps_membership_list() -> None:
+    """A superuser owner's SET ROLE closure is every role; the message must cap + count them."""
+    from keel_core.runtime_db import RuntimePrincipalReport
+
+    memberships = tuple(f"role_{i:02d}" for i in range(12))
+    report = RuntimePrincipalReport(
+        principal="keel",
+        is_superuser=False,
+        can_bypass_rls=False,
+        owns_tables=False,
+        unexpected_memberships=memberships,
+    )
+    described = report.describe_violation()
+    assert report.least_privilege is False
+    assert "role_00" in described and "role_04" in described  # first five shown
+    assert "role_05" not in described  # sixth is elided
+    assert "+7 more" in described  # 12 total - 5 shown
 
 
 async def test_provision_runtime_login_rejects_empty_password() -> None:
@@ -138,3 +160,69 @@ async def test_provision_runtime_login_sanitizes_db_error_without_leaking_passwo
         traceback.format_exception(type(excinfo.value), excinfo.value, excinfo.value.__traceback__)
     )
     assert leaked_pw not in formatted
+
+
+async def test_provision_runtime_login_fails_sanitized_when_membership_revoke_fails() -> None:
+    """The membership strip must fail closed: if REVOKEing an extra membership raises, provisioning
+    surfaces a sanitized ``RuntimePrincipalError`` (no silent success that would leave the login
+    still holding the extra role). The REVOKE runs inside the same transaction as the rest of
+    provisioning, so it is caught by the same ``SQLAlchemyError`` sanitizer.
+    """
+    from typing import Any
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from keel_core.errors import RuntimePrincipalError
+    from keel_core.runtime_db import provision_runtime_login
+
+    class _Result:
+        def __init__(self, rows: list[Any]) -> None:
+            self._rows = rows
+
+        def mappings(self) -> _Result:
+            return self
+
+        def one(self) -> Any:
+            return self._rows[0]
+
+        def scalars(self) -> _Result:
+            return self
+
+        def all(self) -> list[Any]:
+            return self._rows
+
+    class _Conn:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def scalar(self, *a: object, **k: object) -> int:
+            return 1  # group exists
+
+        async def execute(self, *a: object, **k: object) -> _Result:
+            self.calls += 1
+            if self.calls == 1:  # quote_ident/quote_literal row
+                return _Result(
+                    [{"id_login": "l", "lit_login": "'l'", "id_group": "g", "lit_pw": "'p'"}]
+                )
+            if self.calls in (2, 3, 4):  # CREATE DO block, ALTER ROLE, GRANT group
+                return _Result([])
+            if self.calls == 5:  # membership enumeration -> one extra role to strip
+                return _Result(["keel_maintenance_exec"])
+            raise SQLAlchemyError("REVOKE keel_maintenance_exec denied")  # the strip REVOKE
+
+        async def __aenter__(self) -> _Conn:
+            return self
+
+        async def __aexit__(self, *a: object) -> bool:
+            return False
+
+    class _Engine:
+        def begin(self) -> _Conn:
+            return _Conn()
+
+    engine: Any = _Engine()
+    throwaway = "revoke-unit-pw"  # noqa: S105 - fake secret for the mocked provisioning path
+    with pytest.raises(RuntimePrincipalError) as excinfo:
+        await provision_runtime_login(engine, password=throwaway, login_name="keel_runtime_login")
+    assert "keel_runtime_login" in str(excinfo.value)
+    assert "SQLAlchemyError" in str(excinfo.value)
