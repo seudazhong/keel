@@ -23,6 +23,7 @@ proposed commit for a later human-approved writeback:
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -76,7 +77,12 @@ class PatchAuthor(Protocol):
     """Drives the generation agent to edit the disposable worktree (no network/secrets/socket)."""
 
     async def author(
-        self, *, worktree_path: Path, request: PatchProposalRequest, coding_run_id: str
+        self,
+        *,
+        worktree_path: Path,
+        request: PatchProposalRequest,
+        coding_run_id: str,
+        interrupt: Callable[[], bool] | None = None,
     ) -> AuthorResult: ...
 
 
@@ -129,6 +135,7 @@ class PatchGenerationService:
         coding_run_id: str,
         project_handle: str,
         now: datetime | None = None,
+        interrupt: Callable[[], bool] | None = None,
     ) -> GenerationOutcome:
         created = now or datetime.now(UTC)
         handle = ProjectId(project_handle)
@@ -143,7 +150,10 @@ class PatchGenerationService:
         try:
             # 1) Controlled editing inside the disposable, writable worktree.
             author_result = await self.author.author(
-                worktree_path=worktree.path, request=request, coding_run_id=coding_run_id
+                worktree_path=worktree.path,
+                request=request,
+                coding_run_id=coding_run_id,
+                interrupt=interrupt,
             )
 
             # 2) Deterministic commit; an empty change is never a valid proposal.

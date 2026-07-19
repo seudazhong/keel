@@ -69,7 +69,7 @@ class _WritingAuthor:
     def __init__(self, writes: dict[str, str]) -> None:
         self._writes = writes
 
-    async def author(self, *, worktree_path: Path, request, coding_run_id):  # type: ignore[no-untyped-def]
+    async def author(self, *, worktree_path: Path, request, coding_run_id, interrupt=None):  # type: ignore[no-untyped-def]
         for rel, content in self._writes.items():
             target = worktree_path / rel
             target.parent.mkdir(parents=True, exist_ok=True)
