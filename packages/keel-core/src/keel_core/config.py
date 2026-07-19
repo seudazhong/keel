@@ -257,6 +257,15 @@ class Settings(BaseSettings):
     # review never runs under an unenforceable budget.
     review_model_prices: str = ""
 
+    # Controlled patch proposals (WS-PP). ``patch_enabled`` gates whether this worker process
+    # participates in durable patch generation/writeback at all. When true (default) a worker that
+    # cannot reach the shared project-storage volume the patch worktrees live on FAILS STARTUP
+    # (crash-loops) — mirroring review — rather than claim ``patch.generate``/``patch.writeback``
+    # jobs it cannot execute. When explicitly false, the worker neither builds a patch coordinator
+    # factory nor runs the patch reconciler, and the capability-gap skip leaves any patch job queued
+    # for a capable worker. Patch shares ``project_storage_root`` with review.
+    patch_enabled: bool = True
+
     # psycopg3 driver works for both sync (Alembic) and async (app) engines.
     database_url: str = "postgresql+psycopg://keel:keel@localhost:5432/keel"
     redis_url: str = "redis://localhost:6379/0"

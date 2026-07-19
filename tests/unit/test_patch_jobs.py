@@ -39,15 +39,20 @@ from keel_core.patch.errors import (
 )
 from keel_core.patch.jobs import (
     PATCH_GENERATE_KIND,
+    PATCH_GENERATE_METADATA_VERSION,
+    PATCH_GENERATE_REQUEST_MARKER,
     PATCH_WRITEBACK_KIND,
     PatchGenerateJobPayload,
     PatchJobHandlers,
     PatchWritebackJobPayload,
     _JobHeartbeatKeeper,
+    load_generate_metadata,
     patch_generate_idempotency_key,
     patch_writeback_idempotency_key,
+    persist_generate_metadata,
 )
 from keel_core.patch.models import PatchProposalRequest, PatchStatus
+from keel_core.state import InMemoryEventStore
 
 
 def _request(idem: str = "k1") -> PatchProposalRequest:
@@ -321,6 +326,79 @@ def test_idempotency_keys_are_stable_and_kind_scoped() -> None:
     assert patch_writeback_idempotency_key("prop-7") == f"{PATCH_WRITEBACK_KIND}:prop-7"
     # generation and writeback keys never collide for the same proposal
     assert patch_generate_idempotency_key("p") != patch_writeback_idempotency_key("p")
+
+
+# --- durable generate-request metadata (reconstruction seam) -------------------------
+
+
+def _raw_metadata_event(payload: dict[str, Any], *, run_id: str = "run-1") -> Any:
+    from datetime import UTC, datetime
+
+    from keel_core.events import Event, EventType
+
+    return Event(
+        type=EventType.run_started,
+        seq=0,
+        session_id=run_id,
+        scope_id="agent:o/patch",
+        run_id=run_id,
+        ts=datetime.now(UTC),
+        payload={PATCH_GENERATE_REQUEST_MARKER: payload, "dedup_key": f"m:{run_id}"},
+    )
+
+
+async def test_generate_metadata_round_trips_through_event_log() -> None:
+    events = InMemoryEventStore()
+    payload = PatchGenerateJobPayload.model_validate(
+        _gen_payload_dict(test_commands=["pytest -q", "ruff check ."])
+    )
+    await persist_generate_metadata(events, scope_id="agent:o/patch", payload=payload)
+    loaded = await load_generate_metadata(events, "run-1")
+    assert loaded == payload
+    # A JSONB store/read lowers the immutable tuple to a list; the loaded payload is a tuple again.
+    assert loaded is not None
+    assert loaded.test_commands == ("pytest -q", "ruff check .")
+
+
+async def test_generate_metadata_persist_is_idempotent() -> None:
+    events = InMemoryEventStore()
+    payload = PatchGenerateJobPayload.model_validate(_gen_payload_dict())
+    await persist_generate_metadata(events, scope_id="agent:o/patch", payload=payload)
+    # A replayed/idempotent re-admission is a no-op (the winner's copy is authoritative).
+    await persist_generate_metadata(events, scope_id="agent:o/patch", payload=payload)
+    assert await load_generate_metadata(events, "run-1") == payload
+
+
+def test_generate_payload_coerces_jsonb_list_test_commands_to_tuple() -> None:
+    payload = PatchGenerateJobPayload.model_validate(_gen_payload_dict(test_commands=["a", "b"]))
+    assert payload.test_commands == ("a", "b")
+    # A non-list (a bare string) is left untouched and fails closed under strict validation.
+    with pytest.raises(ValidationError):
+        PatchGenerateJobPayload.model_validate(_gen_payload_dict(test_commands="pytest"))
+
+
+async def test_load_generate_metadata_missing_returns_none() -> None:
+    assert await load_generate_metadata(InMemoryEventStore(), "run-absent") is None
+
+
+async def test_load_generate_metadata_version_mismatch_fails_closed() -> None:
+    events = InMemoryEventStore()
+    good = _gen_payload_dict()
+    await events.append(
+        _raw_metadata_event({"version": PATCH_GENERATE_METADATA_VERSION + 1, "payload": good})
+    )
+    # An unknown/legacy metadata version never runs generation under a payload we cannot trust.
+    assert await load_generate_metadata(events, "run-1") is None
+
+
+async def test_load_generate_metadata_invalid_payload_fails_closed() -> None:
+    events = InMemoryEventStore()
+    bad = _gen_payload_dict()
+    del bad["run_id"]  # no longer validates against the strict schema
+    await events.append(
+        _raw_metadata_event({"version": PATCH_GENERATE_METADATA_VERSION, "payload": bad})
+    )
+    assert await load_generate_metadata(events, "run-1") is None
 
 
 # --- job-lease heartbeat keeper ------------------------------------------------------
