@@ -17,6 +17,18 @@ from .errors import (
     PatchValidationError,
     PatchWritebackError,
 )
+from .jobs import (
+    PATCH_GENERATE_KIND,
+    PATCH_GENERATE_MAX_ATTEMPTS,
+    PATCH_WRITEBACK_KIND,
+    PATCH_WRITEBACK_MAX_ATTEMPTS,
+    PatchGenerateJobPayload,
+    PatchJobContext,
+    PatchJobHandlers,
+    PatchWritebackJobPayload,
+    patch_generate_idempotency_key,
+    patch_writeback_idempotency_key,
+)
 from .models import (
     LEGAL_TRANSITIONS,
     TERMINAL_STATUSES,
@@ -54,6 +66,10 @@ from .store import ApprovalDraft
 
 __all__ = [
     "LEGAL_TRANSITIONS",
+    "PATCH_GENERATE_KIND",
+    "PATCH_GENERATE_MAX_ATTEMPTS",
+    "PATCH_WRITEBACK_KIND",
+    "PATCH_WRITEBACK_MAX_ATTEMPTS",
     "TERMINAL_STATUSES",
     "ApprovalDraft",
     "ChangeKind",
@@ -64,6 +80,9 @@ __all__ = [
     "PatchBudget",
     "PatchBundleManifest",
     "PatchError",
+    "PatchGenerateJobPayload",
+    "PatchJobContext",
+    "PatchJobHandlers",
     "PatchLeaseLost",
     "PatchNotFound",
     "PatchOutboxEntry",
@@ -81,6 +100,7 @@ __all__ = [
     "PatchStatus",
     "PatchValidationError",
     "PatchWritebackError",
+    "PatchWritebackJobPayload",
     "PostgresPatchProposalOutbox",
     "ProposalId",
     "ProposedCommit",
@@ -92,6 +112,8 @@ __all__ = [
     "is_forbidden_path",
     "new_proposal_id",
     "normalize_repo_path",
+    "patch_generate_idempotency_key",
+    "patch_writeback_idempotency_key",
     "run_branch_for",
     "task_digest",
     "validate_commit_sha",
