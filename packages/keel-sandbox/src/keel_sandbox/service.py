@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import stat
@@ -11,8 +12,13 @@ from pathlib import Path
 from typing import Protocol
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
+from keel_core.patch.errors import (
+    PatchBoundsExceeded,
+    PatchPolicyViolation,
+    PatchValidationError,
+)
 from keel_core.tools.environment import (
     CommandRequest,
     EditRequest,
@@ -34,9 +40,16 @@ from keel_core.tools.rpc import (
 )
 from keel_core.tools.rpc_auth import (
     DEFAULT_REPLAY_WINDOW_SECONDS,
+    RPC_NONCE_HEADER,
     RpcRequestVerifier,
+    RpcResponseSigner,
 )
 from keel_sandbox.policy import EgressPolicy, PathPolicy
+from keel_sandbox.transfer import (
+    SandboxTransferService,
+    TransferIOError,
+    TransferNamespaceError,
+)
 
 # Defense in depth only. The executor's sanitized-workspace validation and the
 # container mount contract are the security boundary for shell path confinement.
@@ -54,6 +67,31 @@ def _failure(code: ExecutionErrorCode, message: str) -> ExecutionRpcResponse:
             error=ExecutionError(code=code, message=message),
         )
     )
+
+
+async def _read_bounded_body(request: Request, max_bytes: int) -> bytes | None:
+    """Read a request body, rejecting anything over ``max_bytes`` before buffering it whole.
+
+    A declared ``Content-Length`` over the ceiling is refused up front, and a chunked/streamed
+    body is capped as it arrives (``max_bytes + 1`` stop), so an oversized or unbounded upload
+    is rejected without allocating the full payload. Returns ``None`` when the body is too large
+    or the declared length is not a valid non-negative integer.
+    """
+
+    declared = request.headers.get("content-length")
+    if declared is not None:
+        try:
+            length = int(declared)
+        except ValueError:
+            return None
+        if length < 0 or length > max_bytes:
+            return None
+    buffer = bytearray()
+    async for chunk in request.stream():
+        buffer.extend(chunk)
+        if len(buffer) > max_bytes:
+            return None
+    return bytes(buffer)
 
 
 class WorkspaceProvider(Protocol):
@@ -133,6 +171,15 @@ class DirectoryWorkspaceProvider:
     def namespaced_shell_isolated(self) -> bool:
         return self._shell_isolated
 
+    @property
+    def namespace_base(self) -> Path:
+        """The validated real base directory that confines every namespace root.
+
+        Exposed as a public accessor (never a private ``_base`` reflection) so the transfer
+        service can create same-filesystem staging/backup siblings under the trusted base.
+        """
+        return self._base_real
+
     def _is_own_directory(self, child: Path) -> bool:
         """Whether ``child`` is a real, non-aliased directory owned by this base (no-follow).
 
@@ -161,6 +208,21 @@ class DirectoryWorkspaceProvider:
     def resolve(self, namespace: str | None) -> ExecutionEnvironment | None:
         if namespace is None:
             return self._default
+        child = self._provision_namespace(namespace)
+        if child is None:
+            return None
+        environment = self._cache.get(namespace)
+        if environment is None:
+            environment = self._factory(child)
+            self._cache[namespace] = environment
+        return environment
+
+    def _provision_namespace(self, namespace: str) -> Path | None:
+        """Exclusively provision + no-follow validate a namespace root, returning its path.
+
+        Shared by :meth:`resolve` and :meth:`namespace_directory` so the file executor and the
+        transfer service provision and re-validate a namespace root with identical semantics.
+        """
         if not _WORKSPACE_NAMESPACE.match(namespace):
             return None
         # The direct, un-followed child path (the namespace is a flat ``ws_<hex>`` token, so it
@@ -179,15 +241,31 @@ class DirectoryWorkspaceProvider:
             pass  # already present — validate below (it could be a planted alias/reparse point)
         except OSError:
             return None
-        # Re-validate on EVERY resolve (cache hit or miss) so a swap between validation and use
+        # Re-validate on EVERY call (cache hit or miss) so a swap between validation and use
         # is caught: the root must be our own real directory, not a symlink/junction/alias.
         if not self._is_own_directory(child):
             return None
-        environment = self._cache.get(namespace)
-        if environment is None:
-            environment = self._factory(child)
-            self._cache[namespace] = environment
-        return environment
+        return child
+
+    def namespace_directory(self, namespace: str) -> Path | None:
+        """Provision + no-follow validate a namespace root and return its confined path.
+
+        Returns ``None`` when the namespace is malformed or its root cannot be provisioned as
+        our own real directory (fail closed). Used by the transfer service to extract into /
+        export from the same confined root the file executor serves.
+        """
+        return self._provision_namespace(namespace)
+
+    def is_own_namespace_directory(self, namespace: str) -> bool:
+        """Whether an **existing** namespace root is our own real directory (no provisioning).
+
+        Unlike :meth:`namespace_directory` this never creates the directory, so the transfer
+        service can distinguish an absent namespace (idempotent delete / unknown export) from a
+        planted symlink/junction/alias that must fail closed.
+        """
+        if not _WORKSPACE_NAMESPACE.match(namespace):
+            return False
+        return self._is_own_directory(self._base / namespace)
 
     async def aclose(self) -> None:
         for environment in self._cache.values():
@@ -290,6 +368,7 @@ def create_app(
     allow_unauthenticated_local_test: bool = False,
     replay_window_seconds: int = DEFAULT_REPLAY_WINDOW_SECONDS,
     workspace_provider: WorkspaceProvider | None = None,
+    transfer_service: SandboxTransferService | None = None,
 ) -> FastAPI:
     """Create the authenticated service.
 
@@ -301,12 +380,20 @@ def create_app(
     and a scoped namespace that cannot be provisioned fails closed. Without a provider the
     executor serves the single ``environment`` and denies any scoped namespace at admission
     unless the admission policy explicitly declares scoped workspaces supported.
+
+    When a ``transfer_service`` is supplied the ``/v1/transfer/{upload,export,delete}/{namespace}``
+    routes are registered: each verifies the request HMAC (over the bounded body) before any
+    gzip decompression, and returns a keyed response signature bound to the caller's request.
     """
 
     verifier = RpcRequestVerifier(
         shared_secret,
         allow_unauthenticated_local_test=allow_unauthenticated_local_test,
         replay_window_seconds=replay_window_seconds,
+    )
+    response_signer = RpcResponseSigner(
+        shared_secret,
+        allow_unauthenticated_local_test=allow_unauthenticated_local_test,
     )
 
     @asynccontextmanager
@@ -427,4 +514,134 @@ def create_app(
             body = _failure(ExecutionErrorCode.failed, "sandbox executor failure")
             return JSONResponse(body.model_dump(mode="json"), status_code=500)
 
+    if transfer_service is not None:
+        _register_transfer_routes(
+            app,
+            transfer_service=transfer_service,
+            verifier=verifier,
+            response_signer=response_signer,
+            isolation_verified=isolation_verified,
+        )
+
     return app
+
+
+def _sign_response(
+    response_signer: RpcResponseSigner,
+    request: Request,
+    *,
+    request_body: bytes,
+    response_body: bytes,
+) -> dict[str, str]:
+    return response_signer.headers(
+        response_body,
+        request_nonce=request.headers.get(RPC_NONCE_HEADER, ""),
+        request_body=request_body,
+        method=request.method,
+        path=request.url.path,
+    )
+
+
+def _register_transfer_routes(
+    app: FastAPI,
+    *,
+    transfer_service: SandboxTransferService,
+    verifier: RpcRequestVerifier,
+    response_signer: RpcResponseSigner,
+    isolation_verified: bool,
+) -> None:
+    """Register the authenticated snapshot upload/export/delete routes.
+
+    Every route reads a bounded body (rejecting oversized/unbounded uploads before buffering),
+    verifies the request HMAC over that exact body *before* any gzip decompression, requires
+    verified isolation, maps typed transfer failures to fail-closed status codes, and signs the
+    response body with a key bound to the caller's request nonce.
+    """
+
+    max_archive = transfer_service.bounds.max_archive_bytes
+    # Export/delete carry only a tiny (possibly empty) request body; keep it strictly bounded.
+    max_control_body = 4096
+
+    def _authenticate(request: Request, body: bytes) -> JSONResponse | None:
+        if not verifier.verify(request.headers, body, method=request.method, path=request.url.path):
+            return JSONResponse({"detail": "authentication failed"}, status_code=401)
+        if not isolation_verified:
+            return JSONResponse({"detail": "sandbox isolation is not verified"}, status_code=503)
+        return None
+
+    @app.post("/v1/transfer/upload/{namespace}")
+    async def transfer_upload(namespace: str, raw_request: Request) -> Response:
+        body = await _read_bounded_body(raw_request, max_archive)
+        if body is None:
+            return JSONResponse({"detail": "request body too large"}, status_code=413)
+        denied = _authenticate(raw_request, body)
+        if denied is not None:
+            return denied
+        try:
+            result = await transfer_service.upload(namespace, body)
+        except TransferNamespaceError:
+            return JSONResponse({"detail": "invalid namespace"}, status_code=400)
+        except PatchBoundsExceeded:
+            return JSONResponse({"detail": "snapshot exceeds bounds"}, status_code=413)
+        except (PatchPolicyViolation, PatchValidationError):
+            return JSONResponse({"detail": "snapshot rejected"}, status_code=422)
+        except TransferIOError:
+            return JSONResponse({"detail": "sandbox transfer failure"}, status_code=500)
+        payload = _json_bytes(
+            {
+                "namespace": result.namespace,
+                "files": result.manifest.file_count,
+                "total_bytes": result.manifest.total_bytes,
+            }
+        )
+        headers = _sign_response(
+            response_signer, raw_request, request_body=body, response_body=payload
+        )
+        return Response(content=payload, media_type="application/json", headers=headers)
+
+    @app.post("/v1/transfer/export/{namespace}")
+    async def transfer_export(namespace: str, raw_request: Request) -> Response:
+        body = await _read_bounded_body(raw_request, max_control_body)
+        if body is None:
+            return JSONResponse({"detail": "request body too large"}, status_code=413)
+        denied = _authenticate(raw_request, body)
+        if denied is not None:
+            return denied
+        try:
+            result = await transfer_service.export(namespace)
+        except TransferNamespaceError:
+            return JSONResponse({"detail": "namespace not found"}, status_code=404)
+        except PatchBoundsExceeded:
+            return JSONResponse({"detail": "snapshot exceeds bounds"}, status_code=413)
+        except (PatchPolicyViolation, PatchValidationError):
+            return JSONResponse({"detail": "snapshot rejected"}, status_code=422)
+        except TransferIOError:
+            return JSONResponse({"detail": "sandbox transfer failure"}, status_code=500)
+        headers = _sign_response(
+            response_signer, raw_request, request_body=body, response_body=result.archive
+        )
+        return Response(content=result.archive, media_type="application/gzip", headers=headers)
+
+    @app.post("/v1/transfer/delete/{namespace}")
+    async def transfer_delete(namespace: str, raw_request: Request) -> Response:
+        body = await _read_bounded_body(raw_request, max_control_body)
+        if body is None:
+            return JSONResponse({"detail": "request body too large"}, status_code=413)
+        denied = _authenticate(raw_request, body)
+        if denied is not None:
+            return denied
+        try:
+            result = await transfer_service.delete(namespace)
+        except TransferNamespaceError:
+            return JSONResponse({"detail": "invalid namespace"}, status_code=400)
+        except TransferIOError:
+            return JSONResponse({"detail": "sandbox transfer failure"}, status_code=500)
+        payload = _json_bytes({"namespace": result.namespace, "deleted": result.deleted})
+        headers = _sign_response(
+            response_signer, raw_request, request_body=body, response_body=payload
+        )
+        return Response(content=payload, media_type="application/json", headers=headers)
+
+
+def _json_bytes(payload: dict[str, object]) -> bytes:
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")

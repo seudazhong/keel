@@ -21,6 +21,7 @@ import uvicorn
 from keel_core.config import read_secret_file
 from keel_core.tools import UnsafeLocalDevExecutionEnvironment
 from keel_sandbox.service import DirectoryWorkspaceProvider, create_app
+from keel_sandbox.transfer import SandboxTransferService
 
 DEFAULT_SANDBOX_HOST = "127.0.0.1"
 
@@ -59,6 +60,7 @@ def main() -> None:
     # a namespaces root the executor stays single-workspace and denies scoped namespaces.
     namespaces_root = os.getenv("KEEL_SANDBOX_NAMESPACES_ROOT")
     provider = None
+    transfer_service = None
     if namespaces_root:
         provider = DirectoryWorkspaceProvider(
             namespaces_root,
@@ -70,12 +72,16 @@ def main() -> None:
             # OS/container/microVM mount boundary exposing only that root. Defaults off.
             shell_isolated=_enabled("KEEL_SANDBOX_NAMESPACE_SHELL_ISOLATED"),
         )
+        # Snapshot upload/export/delete operate on the same confined ``ws_<hash>`` roots the
+        # executor serves; the transfer routes are only offered when scoped namespaces exist.
+        transfer_service = SandboxTransferService(provider)
     app = create_app(
         default_environment,
         isolation_verified=_enabled("KEEL_SANDBOX_ISOLATION_VERIFIED"),
         shared_secret=_rpc_secret(),
         allow_unauthenticated_local_test=_enabled("KEEL_SANDBOX_RPC_LOCAL_TEST_MODE"),
         workspace_provider=provider,
+        transfer_service=transfer_service,
     )
     uvicorn.run(
         app,
