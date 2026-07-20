@@ -13,7 +13,8 @@ The random ``state`` is itself the capability, so the table is not scope-partiti
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import text
@@ -26,6 +27,7 @@ class OAuthState:
 
     scope_id: str
     connector_id: str
+    metadata: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 def _now() -> datetime:
@@ -53,9 +55,15 @@ class InMemoryOAuthStateStore:
         self._ttl = ttl_seconds
         self._rows: dict[str, tuple[OAuthState, datetime]] = {}
 
-    async def put(self, state: str, scope_id: str, connector_id: str) -> None:
+    async def put(
+        self,
+        state: str,
+        scope_id: str,
+        connector_id: str,
+        metadata: dict[str, str] | None = None,
+    ) -> None:
         expires = _now() + timedelta(seconds=self._ttl)
-        self._rows[state] = (OAuthState(scope_id, connector_id), expires)
+        self._rows[state] = (OAuthState(scope_id, connector_id, metadata or {}), expires)
 
     async def consume(self, state: str) -> OAuthState | None:
         row = self._rows.pop(state, None)  # one-time: remove on read
@@ -78,17 +86,32 @@ class PostgresOAuthStateStore:
         self._engine = engine
         self._ttl = ttl_seconds
 
-    async def put(self, state: str, scope_id: str, connector_id: str) -> None:
+    async def put(
+        self,
+        state: str,
+        scope_id: str,
+        connector_id: str,
+        metadata: dict[str, str] | None = None,
+    ) -> None:
         expires = _now() + timedelta(seconds=self._ttl)
+        encoded_metadata = json.dumps(metadata or {}, separators=(",", ":"), sort_keys=True)
         async with self._engine.begin() as conn:
             await conn.execute(
                 text(
-                    "INSERT INTO oauth_states (state, scope_id, connector_id, expires_at) "
-                    "VALUES (:state, :scope, :cid, :exp) "
+                    "INSERT INTO oauth_states "
+                    "(state, scope_id, connector_id, metadata, expires_at) "
+                    "VALUES (:state, :scope, :cid, CAST(:metadata AS jsonb), :exp) "
                     "ON CONFLICT (state) DO UPDATE "
-                    "SET scope_id = :scope, connector_id = :cid, expires_at = :exp"
+                    "SET scope_id = :scope, connector_id = :cid, "
+                    "metadata = CAST(:metadata AS jsonb), expires_at = :exp"
                 ),
-                {"state": state, "scope": scope_id, "cid": connector_id, "exp": expires},
+                {
+                    "state": state,
+                    "scope": scope_id,
+                    "cid": connector_id,
+                    "metadata": encoded_metadata,
+                    "exp": expires,
+                },
             )
 
     async def consume(self, state: str) -> OAuthState | None:
@@ -97,14 +120,24 @@ class PostgresOAuthStateStore:
                 await conn.execute(
                     text(
                         "DELETE FROM oauth_states WHERE state = :state "
-                        "RETURNING scope_id, connector_id, expires_at"
+                        "RETURNING scope_id, connector_id, metadata, expires_at"
                     ),
                     {"state": state},
                 )
             ).one_or_none()
         if row is None or row.expires_at <= _now():
             return None
-        return OAuthState(row.scope_id, row.connector_id)
+        raw_metadata = row.metadata
+        if isinstance(raw_metadata, str):
+            decoded = json.loads(raw_metadata)
+            metadata = decoded if isinstance(decoded, dict) else {}
+        else:
+            metadata = raw_metadata if isinstance(raw_metadata, dict) else {}
+        return OAuthState(
+            str(row.scope_id),
+            str(row.connector_id),
+            {str(key): str(value) for key, value in metadata.items()},
+        )
 
     async def sweep_expired(self) -> int:
         """Delete expired rows (housekeeping). Returns the number removed."""

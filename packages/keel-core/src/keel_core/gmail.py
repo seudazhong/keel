@@ -15,7 +15,7 @@ import json
 from typing import TYPE_CHECKING, Any, Protocol
 
 from keel_core.connector_credentials import rewrap_provider_json, unwrap_legacy_or_enveloped
-from keel_core.connectors import ActionFn
+from keel_core.connectors import ActionFn, ConnectorActionUserError
 from keel_core.errors import KeelError
 from keel_core.protocols import ToolContext
 
@@ -51,6 +51,7 @@ def format_inbox(messages: list[dict[str, str]]) -> str:
 
 def _load_credentials(creds_json: str) -> Credentials:
     """Reconstruct OAuth credentials, refreshing an expired access token if possible."""
+    from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
 
@@ -59,7 +60,12 @@ def _load_credentials(creds_json: str) -> Credentials:
     )
     if not creds.valid:
         if creds.refresh_token:
-            creds.refresh(Request())  # type: ignore[no-untyped-call]
+            try:
+                creds.refresh(Request())  # type: ignore[no-untyped-call]
+            except RefreshError as exc:
+                raise ConnectorActionUserError(
+                    "Gmail authorization expired or was revoked. Reconnect Gmail in Connectors."
+                ) from exc
         else:
             raise GmailError("gmail credentials are invalid and have no refresh token")
     return creds

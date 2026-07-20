@@ -23,8 +23,10 @@ from arq.connections import RedisSettings
 from arq.worker import func
 
 from keel_core import __version__
+from keel_core.approvals import PostgresApprovalStore
 from keel_core.config import Settings, get_settings, load_env_file
-from keel_core.connector_contracts import ConnectorAction, ConnectorActionContext
+from keel_core.connector_actions import build_connector_actions
+from keel_core.connector_contracts import ConnectorAction
 from keel_core.consolidation.agent import (
     MEMORY_CONSOLIDATOR_AGENT_ID,
     build_consolidation_agent,
@@ -50,7 +52,7 @@ from keel_core.observability import configure_logging, configure_tracing
 from keel_core.runs import PostgresRunStore
 from keel_core.state import PostgresEventStore
 from keel_core.tools import build_service_execution_environment
-from keel_scheduler.store import ScheduleRow, due_tick
+from keel_scheduler.store import PostgresScheduleStore, ScheduleRow, due_tick
 from keel_worker.connectors import reconcile_connectors_tick, register_connector_jobs
 from keel_worker.jobs import dispatch_jobs, reconcile_job_dispatch_tick, run_job
 from keel_worker.knowledge import knowledge_job_registry
@@ -73,51 +75,22 @@ async def _enqueue_arq(redis: Any, name: str, *args: object, **options: object) 
     await redis.enqueue_job(name, *args, **options)
 
 
-def _connector_actions(
+async def _connector_actions(
     ctx: dict[str, Any], settings: Settings, scope_id: str
 ) -> tuple[ConnectorAction, ...]:
-    from keel_core.connector_registry import get_connector_registry
-    from keel_core.secrets import keyring_from_settings
-    from keel_core.tokens import PostgresTokenStore
-
-    registry = ctx.get("connector_registry") or get_connector_registry()
-    credential_store = ctx.get("connector_action_credentials")
-    engine = ctx.get("engine")
     repository = ctx.get("connector_repository")
-    if repository is None and engine is not None:
-        from keel_core.connector_repository import PostgresConnectorRepository
-
-        repository = PostgresConnectorRepository(engine, scope_id)
-    if (
-        credential_store is None
-        and engine is not None
-        and (settings.secret_key or settings.secret_keys)
-    ):
-        credential_store = PostgresTokenStore(
-            engine,
-            scope_id,
-            keyring_from_settings(settings),
-        )
-    idempotency_store = None
-    if engine is not None:
-        from keel_core.outbox import PostgresOutboundStore
-
-        idempotency_store = PostgresOutboundStore(engine)
-    action_context = (
-        ConnectorActionContext(
-            scope_id,
-            credential_store=credential_store,
-            idempotency_store=idempotency_store,
-        )
-        if repository is None
-        else ConnectorActionContext.with_repository(
-            scope_id,
-            repository,
-            credential_store=credential_store,
-            idempotency_store=idempotency_store,
-        )
+    use_existing = repository is not None and getattr(repository, "scope_id", None) == scope_id
+    return await build_connector_actions(
+        engine=ctx.get("engine"),
+        settings=settings,
+        scope_id=scope_id,
+        registry=ctx.get("connector_registry"),
+        repository=repository if use_existing else None,
+        credential_store=ctx.get("connector_action_credentials") if use_existing else None,
+        envelope_credential_store=(
+            ctx.get("connector_action_envelope_credentials") if use_existing else None
+        ),
     )
-    return registry.build_actions(action_context)
 
 
 def _digest_registry(
@@ -126,9 +99,7 @@ def _digest_registry(
     scope_id: str,
     actions: tuple[ConnectorAction, ...] | None = None,
 ) -> ToolRegistry:
-    connector_actions = (
-        actions if actions is not None else _connector_actions(ctx, settings, scope_id)
-    )
+    connector_actions = actions or ()
     idempotency_store = None
     engine = ctx.get("engine")
     if engine is not None:
@@ -144,8 +115,15 @@ def _digest_registry(
 
 async def _run_digest(ctx: dict[str, Any], row: ScheduleRow, settings: Settings) -> str:
     """Start an unattended digest run for a due schedule; suspend on a gated send."""
-    store, approvals, provider = ctx["store"], ctx["approvals"], ctx["provider"]
-    actions = _connector_actions(ctx, settings, row.scope_id)
+    schedules = ctx["schedules"]
+    if row.scope_id == _DURABLE_SCOPE or ctx.get("engine") is None:
+        store, approvals = ctx["store"], ctx["approvals"]
+    else:
+        engine = ctx["engine"]
+        store = PostgresEventStore(engine, row.scope_id)
+        approvals = PostgresApprovalStore(engine, row.scope_id)
+    provider = ctx["provider"]
+    actions = await _connector_actions(ctx, settings, row.scope_id)
     agent = build_digest_agent(row.scope_id, actions).model_copy(
         update={"model": settings.default_model}
     )
@@ -162,20 +140,24 @@ async def _run_digest(ctx: dict[str, Any], row: ScheduleRow, settings: Settings)
         approvals=approvals,
         expires_at=datetime.now(UTC) + timedelta(hours=settings.approval_timeout_hours),
     )
-    await ctx["schedules"].mark_run(row.id, row.next_run_at, result.reason.value)
+    await schedules.mark_run(row.id, row.next_run_at, result.reason.value)
     return result.reason.value
 
 
-async def run_agent(ctx: dict[str, Any], schedule_id: str) -> str:
+async def run_agent(ctx: dict[str, Any], schedule_id: str, scope_id: str | None = None) -> str:
     """Dispatch a due schedule to its agent runner (digest or memory consolidation)."""
     settings = get_settings()
-    row = await ctx["schedules"].get(schedule_id)
+    schedules = (
+        PostgresScheduleStore(ctx["engine"], scope_id) if scope_id is not None else ctx["schedules"]
+    )
+    row = await schedules.get(schedule_id)
     if row is None:
         return "missing"
+    scoped_ctx = ctx if schedules is ctx.get("schedules") else {**ctx, "schedules": schedules}
     if row.agent_id == MEMORY_CONSOLIDATOR_AGENT_ID:
-        return await consolidate_memory(ctx, row, settings)
+        return await consolidate_memory(scoped_ctx, row, settings)
     if row.agent_id == "digest":
-        return await _run_digest(ctx, row, settings)
+        return await _run_digest(scoped_ctx, row, settings)
     logger.warning("run_agent: unsupported agent_id %r (schedule %s)", row.agent_id, schedule_id)
     return "unsupported"
 
@@ -259,8 +241,14 @@ async def consolidate_memory(ctx: dict[str, Any], row: ScheduleRow, settings: Se
 async def resume_run(ctx: dict[str, Any], session_id: str, run_id: str, scope_id: str) -> str:
     """Continue a suspended run after its approval resolved (grant/deny/expire)."""
     settings = get_settings()
-    store, approvals, provider = ctx["store"], ctx["approvals"], ctx["provider"]
-    actions = _connector_actions(ctx, settings, scope_id)
+    if scope_id == _DURABLE_SCOPE or ctx.get("engine") is None:
+        store, approvals = ctx["store"], ctx["approvals"]
+    else:
+        engine = ctx["engine"]
+        store = PostgresEventStore(engine, scope_id)
+        approvals = PostgresApprovalStore(engine, scope_id)
+    provider = ctx["provider"]
+    actions = await _connector_actions(ctx, settings, scope_id)
     agent = build_digest_agent(scope_id, actions).model_copy(
         update={"model": settings.default_model}
     )
@@ -573,11 +561,16 @@ async def startup(ctx: dict[str, Any]) -> None:
     # The durable-scope (``web:local``) connector action credentials + repository are read by the
     # per-scope digest/agent tool actions (``_connector_actions``); keep them wired.
     connector_action_credentials = None
+    connector_action_envelope_credentials = None
     if keyring is not None:
         connector_action_credentials = PostgresTokenStore(engine, _DURABLE_SCOPE, keyring)
+        connector_action_envelope_credentials = ConnectorCredentialStore(
+            connector_action_credentials
+        )
     connector_repository = PostgresConnectorRepository(engine, _DURABLE_SCOPE)
     ctx["connector_repository"] = connector_repository
     ctx["connector_action_credentials"] = connector_action_credentials
+    ctx["connector_action_envelope_credentials"] = connector_action_envelope_credentials
 
     connector_service = build_connector_service(_DURABLE_SCOPE)
     ctx["connector_sync_service"] = connector_service

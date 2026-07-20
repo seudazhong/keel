@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 from keel_core.config import get_settings
 from keel_core.connector_contracts import (
@@ -24,6 +25,7 @@ from keel_core.connector_contracts import (
     ConnectorManifest,
     ConnectorOperationContext,
     ConnectorSetupResult,
+    ConnectorUnavailableError,
 )
 from keel_core.connector_credentials import CredentialEnvelope
 from keel_core.gmail import (
@@ -35,7 +37,10 @@ from keel_core.gmail import (
 
 INBOX_ACTION = ConnectorActionManifest(
     name="inbox_list",
-    description="List recent inbox messages.",
+    description=(
+        "List recent messages from the connected Gmail inbox. "
+        "Use this for requests to read or summarize Gmail."
+    ),
     input_schema={"type": "object", "properties": {}},
     semantics=ConnectorActionSemantics.read,
 )
@@ -77,8 +82,12 @@ def availability() -> None:
     import google_auth_oauthlib.flow  # noqa: F401
     import googleapiclient.discovery  # noqa: F401
 
+    path = Path(get_settings().gmail_client_secrets_path)
+    if not path.is_file():
+        raise ConnectorUnavailableError(f"Gmail OAuth client secrets file is missing at {path}.")
 
-def _flow(redirect_uri: str) -> object:
+
+def _flow(redirect_uri: str, *, code_verifier: str | None = None) -> object:
     from google_auth_oauthlib.flow import Flow
 
     settings = get_settings()
@@ -86,6 +95,8 @@ def _flow(redirect_uri: str) -> object:
         settings.gmail_client_secrets_path,
         scopes=list(GMAIL_SCOPES),
         redirect_uri=redirect_uri,
+        code_verifier=code_verifier,
+        autogenerate_code_verifier=code_verifier is None,
     )
 
 
@@ -104,7 +115,11 @@ class GmailProvider(BaseConnectorProvider):
             prompt="consent",
             include_granted_scopes="true",
         )
-        return ConnectorAuthStart(str(auth_url), str(state))
+        verifier = getattr(flow, "code_verifier", None)
+        metadata = (
+            {"_pkce_code_verifier": str(verifier)} if isinstance(verifier, str) and verifier else {}
+        )
+        return ConnectorAuthStart(str(auth_url), str(state), metadata)
 
     async def complete_auth(
         self,
@@ -115,8 +130,16 @@ class GmailProvider(BaseConnectorProvider):
         code = parameters.get("code", "").strip()
         if not code:
             raise ValueError("missing authorization code")
-        flow = _flow(callback_url)
-        flow.fetch_token(code=code)  # type: ignore[attr-defined]
+        verifier = parameters.get("_pkce_code_verifier", "").strip()
+        if not verifier:
+            raise ValueError("missing OAuth PKCE verifier")
+        flow = _flow(callback_url, code_verifier=verifier)
+        from oauthlib.oauth2 import OAuth2Error
+
+        try:
+            flow.fetch_token(code=code)  # type: ignore[attr-defined]
+        except OAuth2Error as exc:
+            raise ValueError(f"Gmail authorization failed: {exc.error}") from exc
         credentials = flow.credentials  # type: ignore[attr-defined]
         raw = credentials.to_json()
         import json

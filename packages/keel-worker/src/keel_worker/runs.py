@@ -24,6 +24,7 @@ from typing import Any
 
 from keel_core.approvals import ApprovalRecord, ApprovalStore, PostgresApprovalStore
 from keel_core.config import Settings, get_settings
+from keel_core.connector_actions import build_connector_actions
 from keel_core.errors import PermissionDenied
 from keel_core.identity import IdentityService, NotFoundError
 from keel_core.im_routing import (
@@ -454,12 +455,19 @@ async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> st
             # Capability parity with the server web runtime: the same file/shell + memory +
             # Knowledge tools + permissions, from the shared builders (one contract, two
             # surfaces).
+            connector_actions = await build_connector_actions(
+                engine=engine,
+                settings=settings,
+                scope_id=lease.scope_id,
+                registry=ctx.get("connector_registry"),
+            )
             tools, extra_names = build_interactive_registry(
                 environment,
                 engine=engine,
                 scope_id=lease.scope_id,
                 embedder=embedder,
                 caps=_capabilities(settings),
+                connector_actions=connector_actions,
             )
             agent_id, agent_name, persona = await _resolve_agent_profile(identity, record)
             # The model captured at admission (reproducibility) — not the worker's default.
@@ -483,7 +491,7 @@ async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> st
                 agent=agent,
                 provider=ctx["provider"],
                 registry=ToolRegistry(tools),
-                permissions=interactive_permissions(extra_names),
+                permissions=interactive_permissions(extra_names, connector_actions),
                 admit_fn=admit,
                 approval_ttl_hours=settings.approval_timeout_hours,
                 # Re-check Agent visibility / org membership / archived at claim (revoke fails

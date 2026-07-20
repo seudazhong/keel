@@ -8,9 +8,15 @@ from keel_core.outbox import InMemoryOutboundStore
 
 async def test_oauth_state_is_one_time() -> None:
     store = InMemoryOAuthStateStore(ttl_seconds=600)
-    await store.put("state-abc", "web:local", "gmail")
+    await store.put(
+        "state-abc",
+        "web:local",
+        "gmail",
+        {"_pkce_code_verifier": "verifier"},
+    )
     first = await store.consume("state-abc")
     assert first is not None and first.scope_id == "web:local" and first.connector_id == "gmail"
+    assert first.metadata == {"_pkce_code_verifier": "verifier"}
     # Consuming again returns nothing (single-use) — a replayed callback is rejected.
     assert await store.consume("state-abc") is None
 

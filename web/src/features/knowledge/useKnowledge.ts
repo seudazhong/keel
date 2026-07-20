@@ -44,7 +44,13 @@ export function useCreateKnowledgeBase() {
   return useMutation({
     mutationFn: (input: CreateKnowledgeBaseInput) =>
       api.post<KnowledgeBase>("/v1/knowledge-bases", input, idempotencyInit()),
-    onSuccess: () => void qc.invalidateQueries({ queryKey: knowledgeKeys.bases }),
+    onSuccess: (created) => {
+      qc.setQueryData<KnowledgeBase[]>(knowledgeKeys.bases, (rows) => [
+        ...(rows ?? []).filter((row) => row.id !== created.id),
+        created,
+      ]);
+      void qc.invalidateQueries({ queryKey: knowledgeKeys.bases });
+    },
   });
 }
 

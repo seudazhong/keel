@@ -14,6 +14,7 @@ access — the caller must additionally select an org the user is an active memb
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 from keel_core.errors import PermissionDenied
@@ -23,6 +24,7 @@ from keel_core.identity.models import (
     Agent,
     AgentKind,
     Capability,
+    ConflictError,
     IdentityValidationError,
     Membership,
     MembershipRole,
@@ -43,6 +45,8 @@ from keel_core.identity.store import IdentityStore
 # identity reads/writes still bind to a durable user (never the ambient ``web:local`` scope).
 LOCAL_ISSUER = "local"
 LOCAL_SUBJECT = "operator"
+LOCAL_ORG_SLUG = "local"
+LOCAL_ORG_NAME = "Personal workspace"
 
 
 @dataclass(frozen=True)
@@ -76,6 +80,8 @@ class IdentityService:
         self._authz = authz or AuthorizationService()
         self._audit = audit or LoggingAuditSink()
         self._allow_jit = allow_jit_provisioning
+        self._local_user_lock = asyncio.Lock()
+        self._local_org_lock = asyncio.Lock()
 
     @property
     def store(self) -> IdentityStore:
@@ -128,18 +134,54 @@ class IdentityService:
 
     async def ensure_local_user(self, *, display_name: str = "Local Operator") -> User:
         """Get-or-create the durable local-operator user (single-operator local profile)."""
-        identity = await self._store.get_identity(LOCAL_ISSUER, LOCAL_SUBJECT)
-        if identity is not None:
-            user = await self._store.get_user(identity.user_id)
-            if user is not None and user.is_active:
-                return user
-        user = await self._store.create_user(
-            display_name=validate_display_name(display_name), email=None
-        )
-        await self._store.link_identity(
-            user_id=user.id, issuer=LOCAL_ISSUER, subject=LOCAL_SUBJECT, email=None
-        )
-        return user
+        async with self._local_user_lock:
+            identity = await self._store.get_identity(LOCAL_ISSUER, LOCAL_SUBJECT)
+            if identity is not None:
+                user = await self._store.get_user(identity.user_id)
+                if user is not None and user.is_active:
+                    return user
+            user = await self._store.create_user(
+                display_name=validate_display_name(display_name), email=None
+            )
+            try:
+                await self._store.link_identity(
+                    user_id=user.id, issuer=LOCAL_ISSUER, subject=LOCAL_SUBJECT, email=None
+                )
+            except ConflictError:
+                identity = await self._store.get_identity(LOCAL_ISSUER, LOCAL_SUBJECT)
+                linked = (
+                    await self._store.get_user(identity.user_id) if identity is not None else None
+                )
+                if linked is not None and linked.is_active:
+                    return linked
+                raise
+            return user
+
+    async def ensure_local_org(self, user_id: str) -> OrgContext:
+        """Get-or-create the local preview user's stable personal organization."""
+        async with self._local_org_lock:
+            org = await self._store.get_org_by_slug(LOCAL_ORG_SLUG)
+            if org is not None and org.status is OrganizationStatus.active:
+                membership = await self._store.get_membership(org.id, user_id)
+                if membership is None or not membership.is_active:
+                    try:
+                        membership = await self._store.create_membership(
+                            org_id=org.id,
+                            user_id=user_id,
+                            role=MembershipRole.owner,
+                        )
+                    except ConflictError:
+                        membership = await self._store.get_membership(org.id, user_id)
+                if membership is not None and membership.is_active:
+                    return OrgContext(organization=org, membership=membership)
+            try:
+                return await self.create_org(
+                    user_id,
+                    slug=LOCAL_ORG_SLUG,
+                    display_name=LOCAL_ORG_NAME,
+                )
+            except ConflictError:
+                return await self.select_org(user_id, LOCAL_ORG_SLUG)
 
     # --- org selection ---------------------------------------------------------------
     async def select_org(self, user_id: str, org_ref: str) -> OrgContext:

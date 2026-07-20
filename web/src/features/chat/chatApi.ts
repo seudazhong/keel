@@ -3,7 +3,7 @@ import { openSse, type SseHandle } from "./sseClient";
 import type { SseEvent } from "./types";
 
 export function eventsUrl(sessionId: string, after: number): string {
-  return `/v1/sessions/${sessionId}/events?after=${after}`;
+  return `/v1/sessions/${encodeURIComponent(sessionId)}/events?after=${after}`;
 }
 
 function jsonHeaders(): HeadersInit {
@@ -13,14 +13,26 @@ function jsonHeaders(): HeadersInit {
 export async function postMessage(
   sessionId: string,
   content: string,
+  signal?: AbortSignal,
 ): Promise<{ session_id: string; run_id: string }> {
-  const res = await fetch(`/v1/sessions/${sessionId}/messages`, {
+  const res = await fetch(`/v1/sessions/${encodeURIComponent(sessionId)}/messages`, {
     method: "POST",
     headers: jsonHeaders(),
     body: JSON.stringify({ content }),
+    signal,
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return (await res.json()) as { session_id: string; run_id: string };
+}
+
+export async function getHistory(sessionId: string, signal?: AbortSignal): Promise<SseEvent[]> {
+  const res = await fetch(`/v1/sessions/${encodeURIComponent(sessionId)}/history`, {
+    headers: authHeaders(),
+    signal,
+  });
+  if (res.status === 404) return [];
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as SseEvent[];
 }
 
 export async function resolveApproval(

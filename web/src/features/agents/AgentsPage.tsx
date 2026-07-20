@@ -4,28 +4,19 @@ import { Badge } from "../../components/ui/badge";
 import { Banner } from "../../components/ui/banner";
 import { Button } from "../../components/ui/button";
 import { Card } from "../../components/ui/card";
-import { Chip } from "../../components/ui/chip";
 import { Skeleton } from "../../components/ui/skeleton";
+import { safeApiErrorMessage } from "../../lib/api";
 import { useTranslation } from "../../lib/i18n";
-import { AgentSwitcher } from "./AgentSwitcher";
-import type { Agent, AgentInput } from "./types";
+import type { Agent, AgentKind, CreateAgentInput, UpdateAgentInput } from "./types";
 import {
+  useArchiveAgent,
   useAgents,
   useCreateAgent,
-  useDeleteAgent,
-  useSetActiveAgent,
   useUpdateAgent,
 } from "./useAgents";
 
 const inputClass =
   "w-full rounded-sm border border-border bg-surface px-3 py-2 text-sm outline-none focus:border-accent";
-
-function parseTools(raw: string): string[] {
-  return raw
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
 
 function AgentForm({
   initial,
@@ -38,17 +29,24 @@ function AgentForm({
   submitLabel: string;
   pending: boolean;
   onCancel: () => void;
-  onSubmit: (input: AgentInput) => void;
+  onSubmit: (input: CreateAgentInput | UpdateAgentInput) => void;
 }) {
   const { t } = useTranslation();
   const [name, setName] = useState(initial?.name ?? "");
-  const [description, setDescription] = useState(initial?.description ?? "");
-  const [model, setModel] = useState(initial?.model ?? "");
-  const [tools, setTools] = useState(initial?.tools.join(", ") ?? "");
+  const [kind, setKind] = useState<AgentKind>(initial?.kind ?? "personal");
+  const [persona, setPersona] = useState(initial?.persona ?? "");
 
   function handleSubmit(e: FormEvent) {
     e.preventDefault();
-    onSubmit({ name: name.trim(), description: description.trim(), model: model.trim(), tools: parseTools(tools) });
+    if (initial) {
+      onSubmit({
+        expected_version: initial.version,
+        name: name.trim(),
+        persona: persona.trim(),
+      });
+    } else {
+      onSubmit({ kind, name: name.trim(), persona: persona.trim() });
+    }
   }
 
   return (
@@ -57,21 +55,27 @@ function AgentForm({
         {t("agents.form.name")}
         <input className={inputClass} value={name} onChange={(e) => setName(e.target.value)} required />
       </label>
+      {!initial && (
+        <label className="text-xs font-semibold text-text-soft">
+          {t("agents.form.kind")}
+          <select
+            className={inputClass}
+            value={kind}
+            onChange={(e) => setKind(e.target.value as AgentKind)}
+          >
+            <option value="personal">{t("agents.kind.personal")}</option>
+            <option value="team">{t("agents.kind.team")}</option>
+          </select>
+        </label>
+      )}
       <label className="text-xs font-semibold text-text-soft">
-        {t("agents.form.description")}
-        <input
-          className={inputClass}
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
+        {t("agents.form.persona")}
+        <textarea
+          className={`${inputClass} min-h-32 resize-y`}
+          value={persona}
+          onChange={(e) => setPersona(e.target.value)}
+          placeholder={t("agents.form.personaPlaceholder")}
         />
-      </label>
-      <label className="text-xs font-semibold text-text-soft">
-        {t("agents.form.model")}
-        <input className={inputClass} value={model} onChange={(e) => setModel(e.target.value)} />
-      </label>
-      <label className="text-xs font-semibold text-text-soft">
-        {t("agents.form.tools")}
-        <input className={inputClass} value={tools} onChange={(e) => setTools(e.target.value)} />
       </label>
       <div className="flex justify-end gap-2">
         <Button type="button" onClick={onCancel}>
@@ -90,8 +94,7 @@ export function AgentsPage() {
   const agents = useAgents();
   const create = useCreateAgent();
   const update = useUpdateAgent();
-  const del = useDeleteAgent();
-  const setActive = useSetActiveAgent();
+  const archive = useArchiveAgent();
 
   const [creating, setCreating] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -101,12 +104,14 @@ export function AgentsPage() {
       <Topbar
         title={t("agents.title")}
         sub={t("agents.subtitle")}
-        right={<AgentSwitcher />}
       />
       <div className="w-full max-w-[900px] p-[22px]">
         <Banner tone="info" className="mb-4">
-          <span>🧪</span>
-          <div>{t("agents.preview.banner")}</div>
+          <span>ℹ️</span>
+          <div>
+            <p>{t("agents.preview.banner")}</p>
+            <p className="mt-1">{t("agents.preview.limit")}</p>
+          </div>
         </Banner>
 
         {agents.isLoading && <Skeleton className="h-40" />}
@@ -140,7 +145,7 @@ export function AgentsPage() {
                     onCancel={() => setEditingId(null)}
                     onSubmit={(input) =>
                       update.mutate(
-                        { id: agent.id, input },
+                        { id: agent.id, input: input as UpdateAgentInput },
                         { onSuccess: () => setEditingId(null) },
                       )
                     }
@@ -152,38 +157,39 @@ export function AgentsPage() {
                     <div>
                       <div className="flex items-center gap-2">
                         <b className="text-sm">{agent.name}</b>
-                        {agent.active && <Badge tone="green">{t("agents.active")}</Badge>}
+                        <Badge tone={agent.status === "active" ? "green" : "amber"}>
+                          {agent.status}
+                        </Badge>
+                        <Badge>
+                          {t(
+                            agent.kind === "personal"
+                              ? "agents.kind.personal"
+                              : "agents.kind.team",
+                          )}
+                        </Badge>
                       </div>
-                      <p className="mt-1 text-sm text-text-muted">{agent.description}</p>
-                      <p className="mt-1 text-xs text-text-muted">{agent.model}</p>
-                      <div className="mt-2 flex flex-wrap gap-1.5">
-                        {agent.tools.map((tool) => (
-                          <Chip key={tool}>{tool}</Chip>
-                        ))}
-                      </div>
+                      <p className="mt-2 whitespace-pre-wrap text-sm text-text-muted">
+                        {agent.persona || t("agents.persona.empty")}
+                      </p>
+                      <p className="mt-2 text-xs text-text-muted">
+                        {agent.id} · v{agent.version}
+                      </p>
                     </div>
                     <div className="flex shrink-0 gap-2">
-                      {!agent.active && (
-                        <Button
-                          className="text-xs"
-                          disabled={setActive.isPending}
-                          onClick={() => setActive.mutate(agent.id)}
-                        >
-                          {t("agents.setActive")}
-                        </Button>
-                      )}
                       <Button className="text-xs" onClick={() => setEditingId(agent.id)}>
                         {t("common.edit")}
                       </Button>
                       <Button
                         variant="danger"
                         className="text-xs"
-                        disabled={del.isPending}
+                        disabled={archive.isPending || agent.status !== "active"}
                         onClick={() => {
-                          if (window.confirm(t("agents.confirmDelete"))) del.mutate(agent.id);
+                          if (window.confirm(t("agents.confirmArchive"))) {
+                            archive.mutate({ id: agent.id, version: agent.version });
+                          }
                         }}
                       >
-                        {t("common.delete")}
+                        {t("agents.archive")}
                       </Button>
                     </div>
                   </div>
@@ -193,9 +199,12 @@ export function AgentsPage() {
           </div>
         )}
 
-        {(create.isError || update.isError || del.isError || setActive.isError) && (
+        {(create.isError || update.isError || archive.isError) && (
           <Banner tone="danger" className="mb-4">
-            {t("agents.mutateError")}
+            {safeApiErrorMessage(
+              create.error ?? update.error ?? archive.error,
+              t("agents.mutateError"),
+            )}
           </Banner>
         )}
 
@@ -205,7 +214,11 @@ export function AgentsPage() {
               submitLabel={t("agents.form.create")}
               pending={create.isPending}
               onCancel={() => setCreating(false)}
-              onSubmit={(input) => create.mutate(input, { onSuccess: () => setCreating(false) })}
+              onSubmit={(input) =>
+                create.mutate(input as CreateAgentInput, {
+                  onSuccess: () => setCreating(false),
+                })
+              }
             />
           </Card>
         ) : (

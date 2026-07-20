@@ -82,6 +82,7 @@ export function SessionsPage() {
                   <th className="px-4 py-2.5 font-medium">会话</th>
                   <th className="px-4 py-2.5 font-medium">消息</th>
                   <th className="px-4 py-2.5 font-medium">最近</th>
+                  <th className="px-4 py-2.5 font-medium" />
                 </tr>
               </thead>
               <tbody>
@@ -102,6 +103,14 @@ export function SessionsPage() {
                     </td>
                     <td className="px-4 py-3 text-text-soft">{s.messages}</td>
                     <td className="px-4 py-3 text-text-muted">{fmtDate(s.updated_at)}</td>
+                    <td className="px-4 py-3 text-right">
+                      <Link
+                        to={`/chat/${encodeURIComponent(s.id)}`}
+                        className="rounded-sm bg-accent px-2.5 py-1.5 text-xs font-semibold text-white hover:opacity-90"
+                      >
+                        Continue
+                      </Link>
+                    </td>
                   </tr>
                 ))}
               </tbody>

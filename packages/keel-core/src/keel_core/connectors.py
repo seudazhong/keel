@@ -28,6 +28,10 @@ from keel_core.types import ContentTaint, PermissionDecision
 ActionFn = Callable[[dict[str, Any], ToolContext], Awaitable[str]]
 
 
+class ConnectorActionUserError(Exception):
+    """A connector failure whose message is safe and actionable for the end user."""
+
+
 @runtime_checkable
 class Connector(Protocol):
     """An external account bound to a scope. Owns auth/lifecycle, never a tool path."""
@@ -71,14 +75,19 @@ class ConnectorTool:
         return self._schema
 
     async def run(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
-        if self.outbound:
-            return await self._run_outbound(args, ctx)
-        # Inbound: external content is untrusted -> taint it (G17).
-        output = await self._action(args, ctx)
-        return ToolResult(ok=True, output=output, taint=ContentTaint.tainted)
+        try:
+            if self.outbound:
+                return await self._run_outbound(args, ctx)
+            # Inbound: external content is untrusted -> taint it (G17).
+            output = await self._action(args, ctx)
+            return ToolResult(ok=True, output=output, taint=ContentTaint.tainted)
+        except ConnectorActionUserError as exc:
+            return ToolResult(ok=False, output=str(exc), taint=ContentTaint.clean)
 
     async def _run_outbound(self, args: dict[str, Any], ctx: ToolContext) -> ToolResult:
         key = str(args.get("idempotency_key", ""))
+        if not key and ctx.tool_call_id:
+            key = f"{ctx.session_id}:{ctx.tool_call_id}"
         if not key:
             if self._idempotency_required:
                 raise ValueError(f"{self.name} requires an idempotency_key")

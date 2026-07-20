@@ -46,17 +46,18 @@ async def _run_one(
     approve: ApproveFn | None,
 ) -> ToolResult:
     try:
-        decision = permissions.evaluate(request.call.name, request.call.arguments, ctx)
+        call_ctx = ctx.model_copy(update={"tool_call_id": request.call.id})
+        decision = permissions.evaluate(request.call.name, request.call.arguments, call_ctx)
         if decision is PermissionDecision.deny:
             return ToolResult(ok=False, output="permission denied")
         if decision is PermissionDecision.ask:
             approved = False
             if approve is not None:
-                verdict = approve(request.call, ctx)
+                verdict = approve(request.call, call_ctx)
                 approved = verdict if isinstance(verdict, bool) else await verdict
             if not approved:
                 return ToolResult(ok=False, output="approval required")
-        return await request.tool.run(request.call.arguments, ctx)
+        return await request.tool.run(request.call.arguments, call_ctx)
     except Exception as exc:  # noqa: BLE001 - gate/approve/tool failure must not crash the run
         return ToolResult(ok=False, output=f"tool error: {exc.__class__.__name__}")
 

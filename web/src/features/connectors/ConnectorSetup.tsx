@@ -93,6 +93,11 @@ export function ConnectorSetup({ connector, compact = false }: { connector: Conn
       {!connector.available && (
         <p className="text-xs text-red">{connector.availability_error ?? "Provider unavailable"}</p>
       )}
+      {connector.binding?.error_summary && (
+        <p role="alert" className="rounded-sm border border-red/30 bg-red/10 p-2 text-xs text-red">
+          {connector.binding.error_summary}
+        </p>
+      )}
       {connector.next_action && (
         <p className="rounded-sm border border-border p-2 text-xs text-text-soft">
           <strong>{connector.next_action.label}:</strong> {connector.next_action.instructions}

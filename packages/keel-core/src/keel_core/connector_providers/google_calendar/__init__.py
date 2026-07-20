@@ -501,7 +501,10 @@ class GoogleCalendarProvider(BaseConnectorProvider):
     def build_actions(self, context: ConnectorActionContext) -> tuple[ConnectorAction, ...]:
         if context.credential_store is None:
             raise RuntimeError("encrypted connector credential storage is unavailable")
-        store = cast(CredentialStore, context.credential_store)
+        store = cast(
+            CredentialStore,
+            context.envelope_credential_store or context.credential_store,
+        )
 
         async def list_events(arguments: dict[str, Any], tool_context: ToolContext) -> str:
             del tool_context

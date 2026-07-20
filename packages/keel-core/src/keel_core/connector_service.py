@@ -369,6 +369,7 @@ class ConnectorService:
             provider_enabled = provider_status.enabled
             binding = bindings.get(manifest.id)
             targets = await self.repository.list_targets(manifest.id) if binding is not None else []
+            legacy_only = binding is None and manifest.id in legacy
             connected = (
                 binding is not None
                 and binding.status
@@ -376,10 +377,10 @@ class ConnectorService:
                     ConnectorBindingStatus.connected,
                     ConnectorBindingStatus.degraded,
                 }
-            ) or manifest.id in legacy
+            ) or legacy_only
             configured = (
                 binding is not None and binding.status is not ConnectorBindingStatus.revoked
-            ) or manifest.id in legacy
+            ) or legacy_only
             operational_binding = (
                 binding is not None
                 and binding.status
@@ -387,7 +388,7 @@ class ConnectorService:
                     ConnectorBindingStatus.connected,
                     ConnectorBindingStatus.degraded,
                 }
-            ) or manifest.id in legacy
+            ) or legacy_only
             updated_at = binding.updated_at if binding is not None else legacy.get(manifest.id)
             rows.append(
                 {

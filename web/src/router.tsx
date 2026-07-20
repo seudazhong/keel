@@ -2,6 +2,7 @@ import { createBrowserRouter, Navigate } from "react-router-dom";
 import { AppShell } from "./components/AppShell";
 import { ApprovalsPage } from "./features/approvals/ApprovalsPage";
 import { AgentsPage } from "./features/agents/AgentsPage";
+import { ChatEntry } from "./features/chat/ChatEntry";
 import { ChatPage } from "./features/chat/ChatPage";
 import { ConnectorsPage } from "./features/connectors/ConnectorsPage";
 import { KnowledgePage } from "./features/knowledge/KnowledgePage";
@@ -24,7 +25,8 @@ export const router = createBrowserRouter([
       // sidebar prompt and the /onboarding route so deep links keep working.
       { index: true, element: <Navigate to="/chat" replace /> },
       { path: "onboarding", element: <OnboardingPage /> },
-      { path: "chat", element: <ChatPage /> },
+      { path: "chat", element: <ChatEntry /> },
+      { path: "chat/:sessionId", element: <ChatPage /> },
       { path: "sessions", element: <SessionsPage /> },
       { path: "sessions/:id", element: <SessionDetailPage /> },
       { path: "agents", element: <AgentsPage /> },

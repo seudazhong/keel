@@ -35,6 +35,7 @@ from keel_core.coding.storage_root import (
     verify_shared_storage,
 )
 from keel_core.config import Settings, get_settings, load_env_file
+from keel_core.connector_actions import build_connector_actions
 from keel_core.connector_credentials import ConnectorCredentialStore
 from keel_core.connector_schedule_index import PostgresConnectorScheduleIndex
 from keel_core.connector_webhook_routes import (
@@ -389,6 +390,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
         knowledge_search_query_max_chars=settings.knowledge_search_query_max_chars,
         knowledge_search_k_max=settings.knowledge_search_k_max,
         knowledge_tool_output_max_chars=settings.knowledge_tool_output_max_chars,
+        connector_actions=await build_connector_actions(
+            engine=engine,
+            settings=settings,
+            scope_id=_DURABLE_SCOPE,
+        ),
     )
     # Durable approvals raised by unattended (scheduled) runs — the Approvals page +
     # API read this; approving enqueues a resume_run onto the worker's arq queue (G5).

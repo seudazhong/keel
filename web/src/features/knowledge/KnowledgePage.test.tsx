@@ -38,6 +38,7 @@ test("creates a KB and exposes document lifecycle actions with real job status",
   });
   fireEvent.click(screen.getByRole("button", { name: "Create KB" }));
   expect(await screen.findByRole("button", { name: /Support notes/ })).toBeInTheDocument();
+  expect(screen.getByText(/Support notes.*created and selected/)).toBeInTheDocument();
 
   fireEvent.change(screen.getByLabelText("Title"), { target: { value: "Escalation guide" } });
   fireEvent.change(screen.getByLabelText("Content"), {

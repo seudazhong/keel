@@ -21,9 +21,16 @@ from dataclasses import dataclass
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.agents import AgentSpec, Scope
+from keel_core.connector_contracts import (
+    ConnectorAction,
+    ConnectorActionIdempotency,
+    ConnectorActionSemantics,
+)
+from keel_core.connectors import ConnectorTool
 from keel_core.embeddings import Embedder
 from keel_core.knowledge import KnowledgeSearcher, KnowledgeSearchTool
 from keel_core.memory import MemoryAppendTool, MemoryReplaceTool, MemoryRethinkTool
+from keel_core.outbox import PostgresOutboundStore
 from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.protocols import Tool
 from keel_core.search import ArchivalInsertTool, ArchivalSearchTool, SessionSearchTool
@@ -157,6 +164,7 @@ def build_interactive_registry(
     scope_id: ScopeId,
     embedder: Embedder | None,
     caps: InteractiveCapabilities | None = None,
+    connector_actions: tuple[ConnectorAction, ...] = (),
 ) -> tuple[list[Tool], tuple[str, ...]]:
     """Build the shared interactive tool list + the extra (memory/Knowledge) tool names.
 
@@ -172,17 +180,42 @@ def build_interactive_registry(
     if engine is not None:
         extra += build_interactive_memory_tools(engine, embedder, caps)
         extra += build_interactive_knowledge_tools(engine, scope_id, embedder, caps)
+        outbound_store = PostgresOutboundStore(engine)
+        extra += [
+            ConnectorTool(
+                name=action.manifest.name,
+                description=action.manifest.description,
+                action=action.action,
+                outbound=action.manifest.semantics is ConnectorActionSemantics.outbound,
+                idempotency_required=(
+                    action.manifest.idempotency is ConnectorActionIdempotency.required
+                ),
+                idempotency_store=outbound_store,
+                input_schema=dict(action.manifest.input_schema),
+            )
+            for action in connector_actions
+        ]
     tools += extra
     return tools, tuple(tool.name for tool in extra)
 
 
 def interactive_permissions(
     read_only_allow: tuple[str, ...] = (),
+    connector_actions: tuple[ConnectorAction, ...] = (),
 ) -> RuleBasedPermissionEngine:
     """Read-only + own-scope tools allowed; mutating tools require an approval (ask)."""
+    outbound = {
+        action.manifest.name
+        for action in connector_actions
+        if action.manifest.semantics is ConnectorActionSemantics.outbound
+    }
     rules = [Rule(name, PermissionDecision.allow) for name in READ_ONLY_TOOLS]
-    rules += [Rule(name, PermissionDecision.allow) for name in read_only_allow]
-    rules += [Rule(name, PermissionDecision.ask) for name in MUTATING_TOOLS]
+    rules += [
+        Rule(name, PermissionDecision.allow) for name in read_only_allow if name not in outbound
+    ]
+    rules += [
+        Rule(name, PermissionDecision.ask) for name in MUTATING_TOOLS + tuple(sorted(outbound))
+    ]
     return RuleBasedPermissionEngine(rules, default=PermissionDecision.ask)
 
 

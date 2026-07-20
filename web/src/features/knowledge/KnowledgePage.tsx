@@ -5,6 +5,7 @@ import { Banner } from "../../components/ui/banner";
 import { Button } from "../../components/ui/button";
 import { Card } from "../../components/ui/card";
 import { Skeleton } from "../../components/ui/skeleton";
+import { safeApiErrorMessage } from "../../lib/api";
 import {
   useCreateKnowledgeBase,
   useCreateKnowledgeDocument,
@@ -49,11 +50,11 @@ function sourceHref(sourceUri: string | null): string | null {
   }
 }
 
-function boundedError(isError: boolean) {
-  return isError ? (
+function boundedError(error: unknown) {
+  return error ? (
     <Banner tone="danger">
       <span>⚠️</span>
-      <span>Request failed. Check your input or try again.</span>
+      <span>{safeApiErrorMessage(error, "Request failed. Check your input or try again.")}</span>
     </Banner>
   ) : null;
 }
@@ -241,13 +242,17 @@ export function KnowledgePage() {
         : undefined,
     [detail.data, editableVersion],
   );
-  const mutationFailed =
-    createBase.isError ||
-    deleteBase.isError ||
-    createDocument.isError ||
-    updateDocument.isError ||
-    reindexDocument.isError ||
-    deleteDocument.isError;
+  const requestError =
+    bases.error ??
+    documents.error ??
+    detail.error ??
+    job.error ??
+    createBase.error ??
+    deleteBase.error ??
+    createDocument.error ??
+    updateDocument.error ??
+    reindexDocument.error ??
+    deleteDocument.error;
 
   async function addBase(event: FormEvent) {
     event.preventDefault();
@@ -323,7 +328,12 @@ export function KnowledgePage() {
         right={<Badge tone="violet">scope: personal</Badge>}
       />
       <div className="space-y-4 p-[22px]">
-        {boundedError(bases.isError || documents.isError || detail.isError || job.isError || mutationFailed)}
+        {boundedError(requestError)}
+        {createBase.isSuccess && (
+          <Banner tone="success">
+            Knowledge base “{createBase.data.name}” was created and selected.
+          </Banner>
+        )}
         <div className="grid gap-4 xl:grid-cols-[260px_minmax(0,1fr)_minmax(320px,0.8fr)]">
           <section className="space-y-3" aria-label="Knowledge bases">
             <div className="text-sm font-semibold text-text-soft">Knowledge bases</div>

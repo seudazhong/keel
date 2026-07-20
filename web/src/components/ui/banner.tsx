@@ -5,6 +5,7 @@ const tones = {
   warn: "bg-amber/10 border-amber/30 text-amber",
   danger: "bg-red/10 border-red/30 text-red",
   info: "bg-accent/10 border-accent/30 text-accent",
+  success: "bg-green/10 border-green/30 text-green",
 };
 
 export function Banner({

@@ -178,7 +178,11 @@ class OAuthProvider(BaseConnectorProvider):
     async def begin_auth(
         self, context: ConnectorOperationContext, callback_url: str
     ) -> ConnectorAuthStart:
-        return ConnectorAuthStart("https://provider.invalid/authorize?state=state-1", "state-1")
+        return ConnectorAuthStart(
+            "https://provider.invalid/authorize?state=state-1",
+            "state-1",
+            {"_pkce_code_verifier": "verifier-1"},
+        )
 
     async def complete_auth(
         self,
@@ -188,7 +192,11 @@ class OAuthProvider(BaseConnectorProvider):
     ) -> ConnectorSetupResult:
         assert context.binding is not None
         assert context.binding.status is ConnectorBindingStatus.authorizing
-        assert parameters == {"state": "state-1", "ticket": "ticket-1"}
+        assert parameters == {
+            "state": "state-1",
+            "ticket": "ticket-1",
+            "_pkce_code_verifier": "verifier-1",
+        }
         return ConnectorSetupResult(
             ConnectorBindingDraft(display_name="OAuth fixture"),
             CredentialEnvelope("oauth", {"refresh_token": "encrypted-at-rest"}),

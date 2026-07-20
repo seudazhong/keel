@@ -4,6 +4,7 @@ import { Banner } from "../../components/ui/banner";
 import { Button } from "../../components/ui/button";
 import { Card } from "../../components/ui/card";
 import { Skeleton } from "../../components/ui/skeleton";
+import { safeApiErrorMessage } from "../../lib/api";
 import { useRunSchedule, useSchedules, useToggleSchedule } from "./useSchedules";
 
 function fmtDate(iso: string | null): string {
@@ -21,9 +22,9 @@ function fmtTrigger(kind: string, intervalS: number, spec: string): string {
 }
 
 export function SchedulesPage() {
-  const { data, isLoading, isError, refetch } = useSchedules();
   const toggle = useToggleSchedule();
   const run = useRunSchedule();
+  const { data, isLoading, isError, refetch } = useSchedules(run.data);
 
   return (
     <>
@@ -33,6 +34,22 @@ export function SchedulesPage() {
         right={<Badge tone="violet">scope: personal</Badge>}
       />
       <div className="w-full max-w-[900px] p-[22px]">
+        {run.isSuccess && (
+          <Banner tone="success" className="mb-4">
+            Run queued for {run.data.schedule_id} at {fmtDate(run.data.queued_at)}. This table will
+            refresh while the worker processes it.
+          </Banner>
+        )}
+        {run.isError && (
+          <Banner tone="danger" className="mb-4">
+            Could not queue the schedule: {safeApiErrorMessage(run.error, "request failed")}
+          </Banner>
+        )}
+        {toggle.isError && (
+          <Banner tone="danger" className="mb-4">
+            Could not update the schedule: {safeApiErrorMessage(toggle.error, "request failed")}
+          </Banner>
+        )}
         {isLoading && <Skeleton className="h-28" />}
 
         {isError && (
@@ -95,10 +112,10 @@ export function SchedulesPage() {
                         <Button
                           variant="primary"
                           className="px-2.5 py-1 text-xs"
-                          disabled={run.isPending}
+                          disabled={run.isPending && run.variables === s.id}
                           onClick={() => run.mutate(s.id)}
                         >
-                          立即运行
+                          {run.isPending && run.variables === s.id ? "正在排队…" : "立即运行"}
                         </Button>
                       </td>
                     </tr>

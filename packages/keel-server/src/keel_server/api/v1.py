@@ -46,6 +46,7 @@ from keel_core.events import EventType
 from keel_core.identity import NotFoundError
 from keel_core.jobs import JobStatus, JobStore, JobValidationError
 from keel_core.loop import admit
+from keel_core.memory import PostgresMemoryStore
 from keel_core.protocols import EventStore
 from keel_core.run_service import DurableRunService
 from keel_core.runs import (
@@ -94,6 +95,15 @@ def _jobs(request: Request) -> JobStore:
     if store.scope_id != scope:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "jobs scope misconfigured")
     return store
+
+
+def _schedule_store(request: Request, scope_id: ScopeId):  # type: ignore[no-untyped-def]
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "datastore unavailable")
+    from keel_scheduler.store import PostgresScheduleStore
+
+    return PostgresScheduleStore(engine, scope_id)
 
 
 def _shared_substrate(request: Request) -> bool:
@@ -256,7 +266,7 @@ def _idempotency_key(request: Request, body: CreateMessageRequest) -> str:
 
 
 @router.post(
-    "/sessions/{session_id}/messages",
+    "/sessions/{session_id:path}/messages",
     response_model=CreateMessageResponse,
     status_code=status.HTTP_202_ACCEPTED,
     summary="Admit a user message and schedule a run",
@@ -456,14 +466,11 @@ async def cancel_job(job_id: str, request: Request) -> JobResponse:
 
 
 @router.get("/schedules", summary="List the scope's schedules (management view)")
-async def list_schedules(request: Request) -> list[dict[str, object]]:
-    engine = getattr(request.app.state, "engine", None)
-    scope = getattr(request.app.state, "durable_scope", "web:local")
-    if engine is None:
-        return []
-    from keel_scheduler.store import PostgresScheduleStore
-
-    store = PostgresScheduleStore(engine, scope)
+async def list_schedules(
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> list[dict[str, object]]:
+    store = _schedule_store(request, auth.scope_id)
     return [
         {
             "id": r.id,
@@ -483,32 +490,36 @@ async def list_schedules(request: Request) -> list[dict[str, object]]:
 @router.post(
     "/schedules/{schedule_id}/toggle",
     summary="Pause/resume a schedule",
-    dependencies=[Depends(require_role(Role.operator))],
 )
 async def toggle_schedule(
-    schedule_id: str, request: Request, body: dict[str, Any]
+    schedule_id: str,
+    request: Request,
+    body: dict[str, Any],
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
 ) -> dict[str, object]:
-    engine = getattr(request.app.state, "engine", None)
-    scope = getattr(request.app.state, "durable_scope", "web:local")
-    if engine is None:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "datastore unavailable")
-    from keel_scheduler.store import PostgresScheduleStore
-
     enabled = bool(body.get("enabled", True))
-    ok = await PostgresScheduleStore(engine, scope).set_enabled(schedule_id, enabled)
-    return {"ok": ok, "enabled": enabled}
+    store = _schedule_store(request, auth.scope_id)
+    if await store.get(schedule_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "schedule not found")
+    await store.set_enabled(schedule_id, enabled)
+    return {"ok": True, "enabled": enabled}
 
 
 @router.post(
     "/schedules/{schedule_id}/run",
     summary="Trigger a schedule's run now",
-    dependencies=[Depends(require_role(Role.operator))],
 )
-async def run_schedule(schedule_id: str, request: Request) -> dict[str, bool]:
+async def run_schedule(
+    schedule_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
+) -> dict[str, bool]:
+    if await _schedule_store(request, auth.scope_id).get(schedule_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "schedule not found")
     enqueue = getattr(request.app.state, "enqueue", None)
     if enqueue is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "job queue unavailable")
-    await enqueue("run_agent", schedule_id)
+    await enqueue("run_agent", schedule_id, auth.scope_id)
     return {"ok": True}
 
 
@@ -639,7 +650,7 @@ def _resume_cursor(request: Request, after: int | None) -> int | None:
 
 
 @router.get(
-    "/sessions/{session_id}/events",
+    "/sessions/{session_id:path}/events",
     summary="Stream session events (SSE, replayable via after=)",
 )
 async def stream_events(
@@ -952,7 +963,7 @@ async def search_sessions_endpoint(
     ]
 
 
-@router.get("/sessions/{session_id}/history", summary="Durable event history for a session")
+@router.get("/sessions/{session_id:path}/history", summary="Durable event history for a session")
 async def session_history(
     session_id: str,
     request: Request,
@@ -1025,6 +1036,19 @@ async def list_memory_proposals(
     return [_proposal_dict(p) for p in await store.list_proposals(status=status_filter)]
 
 
+@router.get("/memory/blocks", summary="List the scope's current core-memory blocks")
+async def list_memory_blocks(
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> list[dict[str, object]]:
+    """Return the current block values that interactive memory tools read and update."""
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "datastore unavailable")
+    rows = await PostgresMemoryStore(engine, auth.scope_id).snapshot()
+    return [{"key": key, "value": value, "version": version} for key, value, version in rows]
+
+
 @router.post(
     "/memory/proposals/{proposal_id}/approve",
     summary="Approve a proposal (atomically apply it to core memory)",
@@ -1062,8 +1086,11 @@ async def run_consolidation(
     auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.operator))],
 ) -> dict[str, bool]:
     """Manually trigger the derived scope's consolidation schedule (same path as the tick)."""
+    schedule_id = consolidation_schedule_id(auth.scope_id)
+    if await _schedule_store(request, auth.scope_id).get(schedule_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "consolidation schedule not found")
     enqueue = getattr(request.app.state, "enqueue", None)
     if enqueue is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "job queue unavailable")
-    await enqueue("run_agent", consolidation_schedule_id(auth.scope_id))
+    await enqueue("run_agent", schedule_id, auth.scope_id)
     return {"ok": True}

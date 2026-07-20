@@ -11,6 +11,7 @@ from keel_core.config import Settings
 from keel_core.job_dispatch import JobDispatchOutbox
 from keel_core.jobs import CancelMode, JobRecord, JobStore, JobValidationError
 
+from .chunking import normalize_document_text
 from .jobs import (
     KNOWLEDGE_DELETE_CANCEL_MODE,
     KNOWLEDGE_DELETE_KIND,
@@ -115,6 +116,7 @@ class KnowledgeService:
         )
         self._chunk_target = settings.knowledge_chunk_target_chars
         self._chunk_overlap = settings.knowledge_chunk_overlap_chars
+        self._document_max_bytes = settings.knowledge_document_max_bytes
 
     @property
     def scope_id(self) -> str:
@@ -326,13 +328,17 @@ class KnowledgeService:
         mime_type = (
             "text/markdown" if command.source_type is KnowledgeSourceType.markdown else "text/plain"
         )
+        content = normalize_document_text(
+            command.content,
+            max_bytes=self._document_max_bytes,
+        )
         return KnowledgeDocumentVersionCreate(
             kb_id=kb_id,
             document_id=document_id,
             title=command.title,
             source_type=command.source_type,
             source_uri=command.source_uri,
-            content=command.content,
+            content=content,
             mime_type=mime_type,
             chunking_version=KNOWLEDGE_CHUNKING_VERSION,
             target_chars=self._chunk_target,

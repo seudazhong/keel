@@ -98,6 +98,21 @@ async def test_outbound_connector_is_idempotent() -> None:
     assert len(calls) == 1  # at-most-once: the second call replays, doesn't re-send
 
 
+async def test_outbound_connector_derives_idempotency_from_tool_call_id() -> None:
+    calls: list[dict[str, object]] = []
+
+    async def send(args: dict[str, object], ctx: ToolContext) -> str:
+        calls.append(args)
+        return "sent"
+
+    tool = ConnectorTool(name="mail_send", description="", action=send, outbound=True)
+    ctx = _ctx(ContentTaint.clean).model_copy(update={"tool_call_id": "call-1"})
+    first = await tool.run({"to": "x"}, ctx)
+    replay = await tool.run({"to": "x"}, ctx)
+    assert first.output == replay.output == "sent"
+    assert len(calls) == 1
+
+
 async def test_outbound_connector_can_require_idempotency() -> None:
     async def send(args: dict[str, object], ctx: ToolContext) -> str:
         return "sent"

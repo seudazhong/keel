@@ -12,9 +12,11 @@ distinguishes:
   ``web:local`` scope.
 
 The identity API depends on :func:`require_user` (a durable user) and :func:`require_org`
-(an org the user is an active member of, selected via the ``X-Keel-Org`` header). Org
-selection rejects spoofing: a non-member gets the same 404 as an unknown org. There is no
-global mutable actor state — every actor is derived per-request from the credential.
+(an org the user is an active member of, selected via the ``X-Keel-Org`` header). The
+single-operator local preview lazily provisions its stable personal org when no header is
+present; authenticated users must always select one explicitly. Org selection rejects
+spoofing: a non-member gets the same 404 as an unknown org. There is no global mutable actor
+state — every actor is derived per-request from the credential.
 """
 
 from __future__ import annotations
@@ -233,10 +235,22 @@ class ResolvedOrg:
 async def require_org(
     request: Request,
     actor: Annotated[Actor, Depends(require_user)],
+    request_actor: Annotated[Actor, Depends(resolve_actor)],
     x_keel_org: Annotated[str | None, Header(alias="X-Keel-Org")] = None,
 ) -> ResolvedOrg:
     """Resolve the org selected via ``X-Keel-Org`` that the user actively belongs to."""
     if not x_keel_org or not x_keel_org.strip():
+        if request_actor.kind is ActorKind.local and not _cloud_mode(request):
+            service = _identity_service(request)
+            if service is None:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE, "identity service unavailable"
+                )
+            assert actor.user_id is not None
+            return ResolvedOrg(
+                actor=actor,
+                context=await service.ensure_local_org(actor.user_id),
+            )
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST, "select an organization via the X-Keel-Org header"
         )

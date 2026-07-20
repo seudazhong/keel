@@ -118,6 +118,57 @@ test("configured staged connector keeps setup and authorization controls visible
   expect(screen.getByLabelText("Client secret")).toBeInTheDocument();
 });
 
+test("an expired connector explains that browser reauthorization is required", async () => {
+  server.use(
+    http.get("/v1/connectors", () =>
+      HttpResponse.json([
+        makeConnectorFixture({
+          id: "gmail",
+          name: "Gmail",
+          auth_kind: "oauth",
+          configured: true,
+          connected: false,
+          health: "error",
+          auth_action: {
+            label: "Connect",
+            callback_parameters: [{ id: "code", required: true }],
+            requires_setup: false,
+            help_text: null,
+          },
+          next_action: {
+            kind: "authorize",
+            label: "Reconnect: Connect",
+            instructions: "Restart browser authorization to restore this connector.",
+          },
+          binding: {
+            id: "gmail-binding",
+            status: "error",
+            display_name: "Gmail",
+            external_account_id: null,
+            external_tenant_id: null,
+            metadata: {},
+            last_success_at: null,
+            error_code: "error",
+            error_summary:
+              "Gmail authorization expired or was revoked. Reconnect Gmail in Connectors.",
+            renewal_expires_at: null,
+            next_sync_at: null,
+            next_renewal_at: null,
+            targets: {},
+          },
+        }),
+      ]),
+    ),
+  );
+  renderWithClient(<ConnectorsPage />);
+  expect(
+    await screen.findByText(
+      "Gmail authorization expired or was revoked. Reconnect Gmail in Connectors.",
+    ),
+  ).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Connect" })).toBeEnabled();
+});
+
 test("revoking a connector removes it from the connected list", async () => {
   renderWithClient(<ConnectorsPage />);
   await screen.findByText("gmail.readonly");

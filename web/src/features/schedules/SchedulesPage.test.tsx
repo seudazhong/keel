@@ -25,11 +25,16 @@ test("立即运行 triggers the run endpoint", async () => {
   server.use(
     http.post("/v1/schedules/:id/run", () => {
       ran = true;
-      return HttpResponse.json({ ok: true });
+      return HttpResponse.json({
+        ok: true,
+        schedule_id: "digest:web:local",
+        queued_at: "2026-07-16T00:00:00Z",
+      });
     }),
   );
   renderWithClient(<SchedulesPage />);
   await screen.findByText("digest");
   fireEvent.click(screen.getByRole("button", { name: "立即运行" }));
   await waitFor(() => expect(ran).toBe(true));
+  expect(await screen.findByText(/Run queued for digest:web:local/)).toBeInTheDocument();
 });

@@ -129,6 +129,14 @@ def test_project_requires_org_header(client: TestClient) -> None:
     assert resp.status_code in (400, 403, 404)
 
 
+def test_local_preview_provisions_personal_org_without_header(client: TestClient) -> None:
+    listed = client.get("/v1/projects")
+    assert listed.status_code == 200
+    profile = client.get("/v1/identity/me")
+    assert profile.status_code == 200
+    assert profile.json()["organizations"][0]["organization"]["slug"] == "local"
+
+
 def _sign(body: bytes) -> str:
     return "sha256=" + hmac.new(_WEBHOOK_SECRET.encode(), body, hashlib.sha256).hexdigest()
 

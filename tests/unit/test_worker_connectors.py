@@ -108,9 +108,9 @@ async def test_worker_discovers_provider_local_actions_without_provider_branches
         "connector_registry": provider_registry,
         "connector_repository": repository,
     }
-    assert _connector_actions(ctx, Settings(), "scope:test") == ()
+    assert await _connector_actions(ctx, Settings(), "scope:test") == ()
 
-    actions = _connector_actions(
+    actions = await _connector_actions(
         {
             **ctx,
             "connector_action_credentials": object(),
@@ -121,6 +121,42 @@ async def test_worker_discovers_provider_local_actions_without_provider_branches
     assert [action.manifest.name for action in actions] == ["calendar_create"]
     assert actions[0].manifest.idempotency is ConnectorActionIdempotency.required
     assert actions[0].manifest.approval is ConnectorActionApproval.tainted
+    assert (
+        await actions[0].action(
+            {},
+            ToolContext(scope_id="scope:test", session_id="session"),
+        )
+        == binding.id
+    )
+    refreshed = await repository.get_binding("worker_fixture")
+    assert refreshed is not None
+    assert refreshed.status is ConnectorBindingStatus.connected
+    assert refreshed.last_success_at is not None
+
+
+async def test_connector_health_write_failure_does_not_fail_the_external_action() -> None:
+    class HealthFailingRepository(InMemoryConnectorRepository):
+        async def record_health(self, connector_id, binding_id, health):  # type: ignore[no-untyped-def]
+            raise RuntimeError("health store unavailable")
+
+    provider_registry = ConnectorRegistry(
+        (ConnectorRegistration(Provider.manifest, Provider, "tests.worker_fixture"),)
+    )
+    repository = HealthFailingRepository("scope:test")
+    binding = await repository.upsert_binding(
+        "worker_fixture",
+        ConnectorBindingDraft(),
+        ConnectorBindingStatus.connected,
+    )
+    actions = await _connector_actions(
+        {
+            "connector_registry": provider_registry,
+            "connector_repository": repository,
+            "connector_action_credentials": object(),
+        },
+        Settings(),
+        "scope:test",
+    )
     assert (
         await actions[0].action(
             {},

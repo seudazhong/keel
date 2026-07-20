@@ -47,6 +47,10 @@ x-app: &app
 
 x-app-env: &app-env
   KEEL_REDIS_URL: redis://redis:6379/0
+  # Local Ollama CPU embedding can take longer than the global 10s provider default,
+  # especially for multi-chunk Knowledge documents. Smaller batches keep each request bounded.
+  KEEL_EMBEDDING_TIMEOUT_SECONDS: "60"
+  KEEL_KNOWLEDGE_EMBEDDING_BATCH_SIZE: "8"
   # Shared project/coding storage root: server and worker MUST mount the SAME volume
   # here so a worker-written review artifact is readable by the server report APIs (WS-R).
   KEEL_PROJECT_STORAGE_ROOT: /var/lib/keel/projects

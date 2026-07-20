@@ -12,10 +12,10 @@ function renderPage() {
   );
 }
 
-test("lists imported projects and labels project import as a UI-contract preview", async () => {
+test("lists durable projects and explains the GitHub App import requirement", async () => {
   renderPage();
   expect(await screen.findByText("Keel", { selector: "b" })).toBeInTheDocument();
-  expect(screen.getByText(/does not clone or index a real repository/)).toBeInTheDocument();
+  expect(screen.getByText(/performs a real repository fetch/)).toBeInTheDocument();
 });
 
 test("importing a project adds it to the list", async () => {
@@ -24,12 +24,14 @@ test("importing a project adds it to the list", async () => {
 
   fireEvent.click(screen.getByRole("button", { name: "+ Import project" }));
   fireEvent.change(screen.getByLabelText(/^Name/), { target: { value: "Docs site" } });
+  expect(screen.getByLabelText("Slug")).toHaveValue("docs-site");
   fireEvent.change(screen.getByLabelText(/Repository/), {
-    target: { value: "https://github.com/example/docs" },
+    target: { value: "example/docs" },
   });
   fireEvent.click(screen.getByRole("button", { name: "Import" }));
 
   await waitFor(() => {
     expect(screen.getByText("Docs site", { selector: "b" })).toBeInTheDocument();
   });
+  expect(screen.getByText("Imported Docs site.")).toBeInTheDocument();
 });

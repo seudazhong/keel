@@ -34,6 +34,7 @@ import {
   type ReactNode,
 } from "react";
 import { onAuthError, setAuthSnapshot, type Credential } from "./authState";
+import { clearRememberedChatSessions } from "../chat/chatSession";
 
 const STORAGE_KEY = "keel.auth.v1";
 
@@ -71,6 +72,8 @@ export interface AuthContextValue {
   readonly credential: Credential | null;
   readonly org: string | null;
   readonly agent: string | null;
+  /** Increments whenever credentials or workspace selection change, isolating query caches. */
+  readonly cacheGeneration: number;
   /** True once the server has rejected a request for missing/invalid auth. */
   readonly needsAuth: boolean;
   /** True when local preview (or a usable credential) currently grants access. */
@@ -98,9 +101,17 @@ function normalizeMode(parsed: Partial<PersistedAuthState>, credential: Credenti
 }
 
 function loadPersisted(): PersistedAuthState {
+  function loaded(state: PersistedAuthState): PersistedAuthState {
+    setAuthSnapshot({
+      credential: state.credential,
+      org: state.org,
+      agent: state.agent,
+    });
+    return state;
+  }
   try {
     const raw = sessionStorage.getItem(STORAGE_KEY);
-    if (!raw) return DEFAULT_STATE;
+    if (!raw) return loaded(DEFAULT_STATE);
     const parsed = JSON.parse(raw) as Partial<PersistedAuthState>;
     const credential =
       parsed.credential &&
@@ -108,15 +119,15 @@ function loadPersisted(): PersistedAuthState {
       typeof parsed.credential.secret === "string"
         ? parsed.credential
         : null;
-    return {
+    return loaded({
       mode: normalizeMode(parsed, credential),
       credential,
       org: typeof parsed.org === "string" ? parsed.org : null,
       agent: typeof parsed.agent === "string" ? parsed.agent : null,
       cloudAuthRequired: parsed.cloudAuthRequired === true,
-    };
+    });
   } catch {
-    return DEFAULT_STATE;
+    return loaded(DEFAULT_STATE);
   }
 }
 
@@ -131,16 +142,21 @@ function persist(state: PersistedAuthState): void {
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<PersistedAuthState>(() => loadPersisted());
+  const [cacheGeneration, setCacheGeneration] = useState(0);
   const stateRef = useRef(state);
   const [needsAuth, setNeedsAuth] = useState(false);
 
-  // Keep the framework-agnostic fetch layer in sync with the live state (headers only ever
-  // come from `credential`/`org`/`agent` — local preview sends no credential header at all).
-  useEffect(() => {
-    stateRef.current = state;
-    setAuthSnapshot({ credential: state.credential, org: state.org, agent: state.agent });
-    persist(state);
-  }, [state]);
+  const commitState = useCallback((next: PersistedAuthState) => {
+    stateRef.current = next;
+    setAuthSnapshot({
+      credential: next.credential,
+      org: next.org,
+      agent: next.agent,
+    });
+    persist(next);
+    setCacheGeneration((value) => value + 1);
+    setState(next);
+  }, []);
 
   // The server has truthfully rejected a request for auth: clear any credential, drop out of
   // local preview, and remember that local preview must stay blocked for the rest of this tab
@@ -155,26 +171,27 @@ export function AuthProvider({ children }: { children: ReactNode }) {
           credential: null,
           cloudAuthRequired: true,
         };
-        stateRef.current = cleared;
-        setAuthSnapshot({ credential: null, org: cleared.org, agent: cleared.agent });
-        persist(cleared);
-        setState(cleared);
+        clearRememberedChatSessions();
+        commitState(cleared);
         setNeedsAuth(true);
       }
     });
     return () => onAuthError(null);
-  }, []);
+  }, [commitState]);
 
   const enterLocalPreview = useCallback((input: { org: string | null; agent: string | null }) => {
-    setState((prev) =>
-      // Fail closed: once the server has said auth is required, local preview is impossible —
-      // never silently grant it again for the rest of this tab session.
-      prev.cloudAuthRequired
-        ? prev
-        : { ...prev, mode: "local-preview", credential: null, org: input.org, agent: input.agent },
-    );
+    const previous = stateRef.current;
+    if (previous.cloudAuthRequired) return;
+    clearRememberedChatSessions();
+    commitState({
+      ...previous,
+      mode: "local-preview",
+      credential: null,
+      org: input.org,
+      agent: input.agent,
+    });
     setNeedsAuth(false);
-  }, []);
+  }, [commitState]);
 
   const signIn = useCallback(
     (input: { credential: Credential | null; org: string | null; agent: string | null }) => {
@@ -182,37 +199,44 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         enterLocalPreview({ org: input.org, agent: input.agent });
         return;
       }
-      setState((prev) => ({
-        ...prev,
+      clearRememberedChatSessions();
+      commitState({
+        ...stateRef.current,
         mode: "credential",
         credential: input.credential,
         org: input.org,
         agent: input.agent,
-      }));
+      });
       setNeedsAuth(false);
     },
-    [enterLocalPreview],
+    [commitState, enterLocalPreview],
   );
 
   const setOrg = useCallback((org: string | null) => {
-    setState((prev) => ({ ...prev, org }));
-  }, []);
+    clearRememberedChatSessions();
+    commitState({ ...stateRef.current, org });
+  }, [commitState]);
 
   const setAgent = useCallback((agent: string | null) => {
-    setState((prev) => ({ ...prev, agent }));
-  }, []);
+    clearRememberedChatSessions();
+    commitState({ ...stateRef.current, agent });
+  }, [commitState]);
 
   const signOut = useCallback(() => {
     // Always returns to the choice screen — sign-out never silently re-enters local preview,
     // even in a non-cloud deployment; the caller must explicitly choose again.
-    setState((prev) => ({ ...SIGNED_OUT, cloudAuthRequired: prev.cloudAuthRequired }));
+    clearRememberedChatSessions();
+    commitState({
+      ...SIGNED_OUT,
+      cloudAuthRequired: stateRef.current.cloudAuthRequired,
+    });
     setNeedsAuth(false);
     try {
       sessionStorage.removeItem(STORAGE_KEY);
     } catch {
       // ignore
     }
-  }, []);
+  }, [commitState]);
 
   const value = useMemo<AuthContextValue>(
     () => ({
@@ -220,6 +244,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       credential: state.credential,
       org: state.org,
       agent: state.agent,
+      cacheGeneration,
       needsAuth,
       isAuthenticated: state.mode === "local-preview" || (state.mode === "credential" && state.credential !== null),
       cloudAuthRequired: state.cloudAuthRequired,
@@ -229,7 +254,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setAgent,
       signOut,
     }),
-    [state, needsAuth, signIn, enterLocalPreview, setOrg, setAgent, signOut],
+    [state, cacheGeneration, needsAuth, signIn, enterLocalPreview, setOrg, setAgent, signOut],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

@@ -12,6 +12,9 @@ function mockFetch(body: unknown, ok = true) {
 describe("chatApi", () => {
   it("builds the events url with the replay cursor", () => {
     expect(eventsUrl("s", 3)).toBe("/v1/sessions/s/events?after=3");
+    expect(eventsUrl("im/telegram/bot/chat", 3)).toBe(
+      "/v1/sessions/im%2Ftelegram%2Fbot%2Fchat/events?after=3",
+    );
   });
 
   it("posts a message and returns the run", async () => {
@@ -21,6 +24,18 @@ describe("chatApi", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "/v1/sessions/s/messages",
       expect.objectContaining({ method: "POST", body: JSON.stringify({ content: "hello" }) }),
+    );
+  });
+
+  it("encodes slash-delimited IM session ids when posting", async () => {
+    const fetchMock = mockFetch({
+      session_id: "im/telegram/bot/chat",
+      run_id: "r1",
+    });
+    await postMessage("im/telegram/bot/chat", "hello");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/im%2Ftelegram%2Fbot%2Fchat/messages",
+      expect.objectContaining({ method: "POST" }),
     );
   });
 

@@ -458,6 +458,7 @@ class ConnectorChange:
 class ConnectorAuthStart:
     url: str
     state: str
+    metadata: dict[str, str] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -611,6 +612,7 @@ class ConnectorOperationContext:
 class ConnectorActionContext:
     scope_id: str
     credential_store: Any | None = None
+    envelope_credential_store: Any | None = None
     idempotency_store: OutboundIdempotencyStore | None = None
     _state_loader: Callable[[str], Awaitable[ConnectorOperationContext]] | None = field(
         default=None,
@@ -624,6 +626,7 @@ class ConnectorActionContext:
         repository: ConnectorStateReader,
         *,
         credential_store: Any | None = None,
+        envelope_credential_store: Any | None = None,
         idempotency_store: OutboundIdempotencyStore | None = None,
     ) -> ConnectorActionContext:
         if repository.scope_id != scope_id:
@@ -660,6 +663,7 @@ class ConnectorActionContext:
         return cls(
             scope_id,
             credential_store=credential_store,
+            envelope_credential_store=envelope_credential_store,
             idempotency_store=idempotency_store,
             _state_loader=load,
         )

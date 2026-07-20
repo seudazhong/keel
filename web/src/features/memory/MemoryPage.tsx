@@ -4,9 +4,11 @@ import { Banner } from "../../components/ui/banner";
 import { Button } from "../../components/ui/button";
 import { Card } from "../../components/ui/card";
 import { Skeleton } from "../../components/ui/skeleton";
+import { safeApiErrorMessage } from "../../lib/api";
 import type { MemoryProposal, MemoryProposalStatus } from "./types";
 import {
   useApproveMemoryProposal,
+  useMemoryBlocks,
   useMemoryProposals,
   useRejectMemoryProposal,
   useRunConsolidation,
@@ -95,6 +97,7 @@ function ProposalCard({
 }
 
 export function MemoryPage() {
+  const blocks = useMemoryBlocks();
   const proposals = useMemoryProposals();
   const approve = useApproveMemoryProposal();
   const reject = useRejectMemoryProposal();
@@ -105,7 +108,7 @@ export function MemoryPage() {
     <>
       <Topbar
         title="Memory"
-        sub="· Consolidation proposals"
+        sub="· Current memory and consolidation proposals"
         right={
           <Button
             variant="primary"
@@ -120,19 +123,22 @@ export function MemoryPage() {
         <Banner tone="info" className="mb-4">
           <span>ℹ️</span>
           <div>
-            This page reviews consolidation proposals. A full API for directly listing and editing
-            memory blocks is not available yet, so this UI does not simulate block editing.
+            Memory is stored in named blocks. Several remembered facts can live as separate lines
+            in the same block; consolidation proposals are reviewed separately below.
           </div>
         </Banner>
 
         {consolidation.isSuccess && (
-          <Banner tone="info" className="mb-4">
-            Consolidation was queued. New proposals will appear after processing.
+          <Banner tone="success" className="mb-4">
+            Consolidation queued at {fmtDate(consolidation.data.queued_at)}. The worker may report
+            “skipped” when there are not enough new messages; schedule status will update on the
+            Schedules page.
           </Banner>
         )}
         {consolidation.isError && (
           <Banner tone="danger" className="mb-4">
-            Could not start consolidation: {consolidation.error.message}
+            Could not start consolidation:{" "}
+            {safeApiErrorMessage(consolidation.error, "request failed")}
           </Banner>
         )}
         {mutationError && (
@@ -141,6 +147,42 @@ export function MemoryPage() {
           </Banner>
         )}
 
+        <div className="mb-6">
+          <h2 className="mb-3 text-base font-semibold">Current memory</h2>
+          {blocks.isLoading && <Skeleton className="h-32" />}
+          {blocks.isError && (
+            <Banner tone="danger">
+              <div>
+                Could not load current memory.
+                <button className="ml-2 underline" onClick={() => void blocks.refetch()}>
+                  Retry
+                </button>
+              </div>
+            </Banner>
+          )}
+          {blocks.data?.length === 0 && (
+            <Card className="p-5 text-sm text-text-muted">
+              No core memory has been saved yet.
+            </Card>
+          )}
+          {blocks.data && blocks.data.length > 0 && (
+            <div className="grid gap-3 md:grid-cols-2">
+              {blocks.data.map((block) => (
+                <Card key={block.key} className="p-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <h3 className="font-semibold">{block.key}</h3>
+                    <Badge>version {block.version}</Badge>
+                  </div>
+                  <pre className="mt-3 whitespace-pre-wrap break-words text-sm text-text-soft">
+                    {block.value}
+                  </pre>
+                </Card>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <h2 className="mb-3 text-base font-semibold">Consolidation proposals</h2>
         {proposals.isLoading && <Skeleton className="h-64" />}
         {proposals.isError && (
           <Banner tone="danger">

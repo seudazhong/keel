@@ -12,6 +12,14 @@ export class ApiError extends Error {
   }
 }
 
+export function safeApiErrorMessage(error: unknown, fallback: string): string {
+  if (!(error instanceof ApiError)) return fallback;
+  if ((error.status >= 400 && error.status < 500) || error.status === 503) {
+    return error.message;
+  }
+  return fallback;
+}
+
 const MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 /**
@@ -42,20 +50,27 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, withAuth(init));
   if (!res.ok) {
     // Let the auth layer surface the sign-in/context screen on a rejected credential/context.
-    notifyAuthError(res.status);
+    if (res.status === 401) notifyAuthError(res.status);
     let detail: unknown;
     try {
       detail = await res.json();
     } catch {
       detail = undefined;
     }
-    const message =
-      typeof detail === "object" &&
-      detail !== null &&
-      "detail" in detail &&
-      typeof detail.detail === "string"
-        ? detail.detail
-        : `HTTP ${res.status}`;
+    let message = `HTTP ${res.status}`;
+    if (typeof detail === "object" && detail !== null && "detail" in detail) {
+      const value = detail.detail;
+      if (typeof value === "string") {
+        message = value;
+      } else if (
+        typeof value === "object" &&
+        value !== null &&
+        "message" in value &&
+        typeof value.message === "string"
+      ) {
+        message = value.message;
+      }
+    }
     // The message/detail come from the server body only — never the request headers — so a
     // credential/token is never echoed back into an error surfaced to the UI or logs.
     throw new ApiError(res.status, message, detail);
@@ -78,6 +93,8 @@ export const api = {
   get: <T>(path: string, init?: RequestInit) => req<T>(path, init),
   post: <T>(path: string, body?: unknown, init?: RequestInit) =>
     req<T>(path, jsonInit("POST", body, init)),
+  patch: <T>(path: string, body: unknown, init?: RequestInit) =>
+    req<T>(path, jsonInit("PATCH", body, init)),
   put: <T>(path: string, body: unknown, init?: RequestInit) =>
     req<T>(path, jsonInit("PUT", body, init)),
   del: <T>(path: string, init?: RequestInit) => req<T>(path, { ...init, method: "DELETE" }),

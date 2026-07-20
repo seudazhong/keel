@@ -9,8 +9,8 @@ import type {
   KnowledgeVersion,
 } from "../features/knowledge/types";
 import type { Job } from "../features/jobs/types";
-import type { MemoryProposal } from "../features/memory/types";
-import type { Project } from "../features/projects/types";
+import type { MemoryBlock, MemoryProposal } from "../features/memory/types";
+import type { GitHubInstallation, Project } from "../features/projects/types";
 import type { DiffFile, Run, RunApproval } from "../features/projects/runs/types";
 import type { Schedule } from "../features/schedules/types";
 import type { SessionSummary } from "../features/sessions/types";
@@ -247,12 +247,27 @@ const defaultMemoryProposals: MemoryProposal[] = [
   },
 ];
 
+const defaultMemoryBlocks: MemoryBlock[] = [
+  {
+    key: "human",
+    value: "Name: Dazhong\nPrefers Chinese responses",
+    version: 2,
+  },
+  {
+    key: "persona",
+    value: "Be concise and practical.",
+    version: 1,
+  },
+];
+
 let memoryProposals = defaultMemoryProposals.map((proposal) => ({ ...proposal }));
+let memoryBlocks = defaultMemoryBlocks.map((block) => ({ ...block }));
 
 export const sampleMemoryProposals = defaultMemoryProposals;
 
 export function resetMemory(): void {
   memoryProposals = defaultMemoryProposals.map((proposal) => ({ ...proposal }));
+  memoryBlocks = defaultMemoryBlocks.map((block) => ({ ...block }));
 }
 
 function recordIdempotency(request: Request) {
@@ -305,21 +320,25 @@ export function resetSchedules(): void {
 const defaultAgents: Agent[] = [
   {
     id: "agent_personal",
+    org_id: "org_local",
+    kind: "personal",
+    owner_user_id: "usr_local",
     name: "Personal assistant",
-    description: "General-purpose day-to-day helper for email, calendar, and notes.",
-    model: "github_copilot/claude-sonnet-4.5",
-    tools: ["calendar_list", "email_send"],
-    active: true,
+    persona: "General-purpose day-to-day helper for email, calendar, and notes.",
+    status: "active",
+    version: 1,
     created_at: now,
     updated_at: now,
   },
   {
     id: "agent_researcher",
+    org_id: "org_local",
+    kind: "team",
+    owner_user_id: "usr_local",
     name: "Researcher",
-    description: "Digs through knowledge bases and cites sources.",
-    model: "github_copilot/gpt-4o",
-    tools: ["knowledge_search"],
-    active: false,
+    persona: "Dig through knowledge bases and cite sources.",
+    status: "active",
+    version: 2,
     created_at: now,
     updated_at: now,
   },
@@ -338,23 +357,43 @@ export const sampleAgents = defaultAgents;
 const defaultProjects: Project[] = [
   {
     id: "proj_keel",
-    name: "Keel",
-    description: "Personal assistant monorepo used for the coding-agent preview.",
-    repository: "https://github.com/example/keel",
+    org_id: "org_local",
+    slug: "keel",
+    display_name: "Keel",
+    source: "github",
+    visibility: "private",
+    status: "active",
     default_branch: "main",
-    agent_id: "agent_researcher",
+    github_repository_id: 1001,
+    version: 1,
     created_at: now,
     updated_at: now,
   },
   {
     id: "proj_marketing",
-    name: "Marketing site",
-    description: "Public marketing site content.",
-    repository: "https://github.com/example/marketing-site",
+    org_id: "org_local",
+    slug: "marketing-site",
+    display_name: "Marketing site",
+    source: "github",
+    visibility: "private",
+    status: "active",
     default_branch: "main",
-    agent_id: null,
+    github_repository_id: 1002,
+    version: 1,
     created_at: now,
     updated_at: now,
+  },
+];
+
+const githubInstallations: GitHubInstallation[] = [
+  {
+    id: "ghi_1",
+    org_id: "org_local",
+    installation_id: 42,
+    app_id: 7,
+    account_login: "example",
+    account_type: "Organization",
+    status: "active",
   },
 ];
 
@@ -578,7 +617,13 @@ export const handlers = [
     );
     return HttpResponse.json({ ok: true, enabled: body.enabled });
   }),
-  http.post("/v1/schedules/:id/run", () => HttpResponse.json({ ok: true })),
+  http.post("/v1/schedules/:id/run", ({ params }) =>
+    HttpResponse.json({
+      ok: true,
+      schedule_id: String(params.id),
+      queued_at: now,
+    }),
+  ),
   http.get("/v1/admin/overview", () =>
     HttpResponse.json({
       sessions: 7,
@@ -615,6 +660,7 @@ export const handlers = [
     source.set(id, updated);
     return HttpResponse.json(updated);
   }),
+  http.get("/v1/memory/blocks", () => HttpResponse.json(memoryBlocks)),
   http.get("/v1/memory/proposals", () => HttpResponse.json(memoryProposals)),
   http.post("/v1/memory/proposals/:proposalId/approve", ({ params }) => {
     const id = String(params.proposalId);
@@ -636,6 +682,18 @@ export const handlers = [
         ? { ...row, status: "applied", resolved_at: now, resolved_by: "web" }
         : row,
     );
+    if (proposal.status === "pending") {
+      const existing = memoryBlocks.find((block) => block.key === proposal.block);
+      const next: MemoryBlock = {
+        key: proposal.block,
+        value: proposal.proposed_value,
+        version: (existing?.version ?? 0) + 1,
+      };
+      memoryBlocks = [
+        ...memoryBlocks.filter((block) => block.key !== proposal.block),
+        next,
+      ];
+    }
     return HttpResponse.json({
       ok: true,
       status: "applied",
@@ -664,7 +722,13 @@ export const handlers = [
     );
     return HttpResponse.json({ ok: true, status: "rejected", version: null });
   }),
-  http.post("/v1/memory/consolidation/run", () => HttpResponse.json({ ok: true })),
+  http.post("/v1/memory/consolidation/run", () =>
+    HttpResponse.json({
+      ok: true,
+      schedule_id: "memory-consolidation:web:local",
+      queued_at: now,
+    }),
+  ),
   http.get("/v1/knowledge-bases", () => HttpResponse.json(knowledgeBases)),
   http.post("/v1/knowledge-bases", async ({ request }) => {
     const missing = recordIdempotency(request);
@@ -856,52 +920,59 @@ export const handlers = [
     });
   }),
 
-  http.get("/v1/agents", () => HttpResponse.json(agents)),
-  http.post("/v1/agents", async ({ request }) => {
+  http.get("/v1/identity/agents", () => HttpResponse.json(agents)),
+  http.post("/v1/identity/agents", async ({ request }) => {
     const body = (await request.json()) as {
+      kind: "personal" | "team";
       name: string;
-      description: string;
-      model: string;
-      tools: string[];
+      persona: string;
     };
     const agent: Agent = {
       id: `agent_new_${++agentMutation}`,
+      org_id: "org_local",
+      kind: body.kind,
+      owner_user_id: "usr_local",
       name: body.name,
-      description: body.description,
-      model: body.model,
-      tools: body.tools,
-      active: false,
+      persona: body.persona,
+      status: "active",
+      version: 1,
       created_at: now,
       updated_at: now,
     };
     agents = [...agents, agent];
     return HttpResponse.json(agent, { status: 201 });
   }),
-  http.put("/v1/agents/:id", async ({ params, request }) => {
+  http.patch("/v1/identity/agents/:id", async ({ params, request }) => {
     const id = String(params.id);
     const existing = agents.find((a) => a.id === id);
     if (!existing) return HttpResponse.json({ detail: "not found" }, { status: 404 });
     const body = (await request.json()) as {
+      expected_version: number;
       name: string;
-      description: string;
-      model: string;
-      tools: string[];
+      persona: string;
     };
-    const updated: Agent = { ...existing, ...body, updated_at: now };
+    const updated: Agent = {
+      ...existing,
+      name: body.name,
+      persona: body.persona,
+      version: existing.version + 1,
+      updated_at: now,
+    };
     agents = agents.map((a) => (a.id === id ? updated : a));
     return HttpResponse.json(updated);
   }),
-  http.delete("/v1/agents/:id", ({ params }) => {
+  http.post("/v1/identity/agents/:id/archive", ({ params }) => {
     const id = String(params.id);
-    agents = agents.filter((a) => a.id !== id);
-    return HttpResponse.json({ ok: true });
-  }),
-  http.post("/v1/agents/:id/activate", ({ params }) => {
-    const id = String(params.id);
-    const target = agents.find((a) => a.id === id);
-    if (!target) return HttpResponse.json({ detail: "not found" }, { status: 404 });
-    agents = agents.map((a) => ({ ...a, active: a.id === id, updated_at: now }));
-    return HttpResponse.json(agents.find((a) => a.id === id));
+    const existing = agents.find((a) => a.id === id);
+    if (!existing) return HttpResponse.json({ detail: "not found" }, { status: 404 });
+    const archived = {
+      ...existing,
+      status: "archived",
+      version: existing.version + 1,
+      updated_at: now,
+    };
+    agents = agents.map((agent) => (agent.id === id ? archived : agent));
+    return HttpResponse.json(archived);
   }),
 
   http.get("/v1/projects", () => HttpResponse.json(projects)),
@@ -911,19 +982,25 @@ export const handlers = [
       ? HttpResponse.json(project)
       : HttpResponse.json({ detail: "not found" }, { status: 404 });
   }),
-  http.post("/v1/projects", async ({ request }) => {
+  http.get("/v1/projects/github/installations", () => HttpResponse.json(githubInstallations)),
+  http.post("/v1/projects/import", async ({ request }) => {
     const body = (await request.json()) as {
-      name: string;
-      repository: string;
-      default_branch: string;
+      slug: string;
+      display_name: string;
+      installation_id: number;
+      repo_full_name: string;
     };
     const project: Project = {
       id: `proj_new_${++projectMutation}`,
-      name: body.name,
-      description: "",
-      repository: body.repository,
-      default_branch: body.default_branch || "main",
-      agent_id: null,
+      org_id: "org_local",
+      slug: body.slug,
+      display_name: body.display_name,
+      source: "github",
+      visibility: "private",
+      status: "active",
+      default_branch: "main",
+      github_repository_id: 2000 + projectMutation,
+      version: 1,
       created_at: now,
       updated_at: now,
     };
@@ -931,10 +1008,18 @@ export const handlers = [
     runs[project.id] = [];
     return HttpResponse.json(project, { status: 201 });
   }),
-  http.delete("/v1/projects/:id", ({ params }) => {
+  http.post("/v1/projects/:id/delete", ({ params }) => {
     const id = String(params.id);
-    projects = projects.filter((p) => p.id !== id);
-    return HttpResponse.json({ ok: true });
+    const existing = projects.find((project) => project.id === id);
+    if (!existing) return HttpResponse.json({ detail: "not found" }, { status: 404 });
+    const deleted: Project = {
+      ...existing,
+      status: "deleted",
+      version: existing.version + 1,
+      updated_at: now,
+    };
+    projects = projects.filter((project) => project.id !== id);
+    return HttpResponse.json(deleted);
   }),
   http.get("/v1/projects/:id/runs", ({ params }) =>
     HttpResponse.json(runs[String(params.id)] ?? []),

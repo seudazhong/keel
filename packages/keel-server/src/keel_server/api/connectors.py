@@ -254,7 +254,12 @@ async def _mint_connect_url(request: Request, connector_id: str, auth: EndpointA
             status.HTTP_400_BAD_REQUEST,
             "connector authorization start returned invalid instructions",
         )
-    await _connector_auth_state_store(request).put(start.state, auth.scope_id, connector_id)
+    await _connector_auth_state_store(request).put(
+        start.state,
+        auth.scope_id,
+        connector_id,
+        start.metadata,
+    )
     return start.url
 
 
@@ -351,6 +356,7 @@ async def connector_callback(
     consumed: OAuthState | None = await _connector_auth_state_store(request).consume(state)
     if consumed is None or consumed.connector_id != connector_id:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid or expired authorization state")
+    parameters.update(consumed.metadata)
     try:
         # The callback is intentionally unauthenticated (the browser returning from the provider
         # carries no API key/JWT). Trust and scope are anchored in the one-time ``state`` minted by

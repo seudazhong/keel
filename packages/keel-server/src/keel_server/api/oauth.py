@@ -64,12 +64,16 @@ def _oauth_state_store(request: Request) -> Any:
     return store
 
 
-def _flow(redirect_uri: str) -> Any:
+def _flow(redirect_uri: str, *, code_verifier: str | None = None) -> Any:
     from google_auth_oauthlib.flow import Flow
 
     settings = get_settings()
     return Flow.from_client_secrets_file(
-        settings.gmail_client_secrets_path, scopes=list(GMAIL_SCOPES), redirect_uri=redirect_uri
+        settings.gmail_client_secrets_path,
+        scopes=list(GMAIL_SCOPES),
+        redirect_uri=redirect_uri,
+        code_verifier=code_verifier,
+        autogenerate_code_verifier=code_verifier is None,
     )
 
 
@@ -95,7 +99,16 @@ async def _mint_consent_url(request: Request, auth: EndpointAuth) -> str:
     auth_url, state = flow.authorization_url(
         access_type="offline", prompt="consent", include_granted_scopes="true"
     )
-    await _oauth_state_store(request).put(state, auth.scope_id, GMAIL_CONNECTOR_ID)
+    verifier = getattr(flow, "code_verifier", None)
+    metadata = (
+        {"_pkce_code_verifier": str(verifier)} if isinstance(verifier, str) and verifier else {}
+    )
+    await _oauth_state_store(request).put(
+        state,
+        auth.scope_id,
+        GMAIL_CONNECTOR_ID,
+        metadata,
+    )
     return str(auth_url)
 
 
@@ -171,7 +184,10 @@ async def gmail_oauth_callback(
     if engine is None or not code:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing code or datastore")
 
-    flow = _flow(_callback_uri(request))
+    verifier = consumed.metadata.get("_pkce_code_verifier", "").strip()
+    if not verifier:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "missing OAuth PKCE verifier")
+    flow = _flow(_callback_uri(request), code_verifier=verifier)
     flow.fetch_token(code=code)
     store = PostgresTokenStore(engine, consumed.scope_id, keyring_from_settings(get_settings()))
     await store.put(consumed.connector_id, flow.credentials.to_json())

@@ -11,6 +11,7 @@ import pytest
 import pytest_asyncio
 from fastapi import FastAPI
 from httpx import ASGITransport
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from keel_core.consolidation import MemoryProposalStore
@@ -95,6 +96,8 @@ async def test_list_approve_reject_and_run(
     assert approved.status_code == 200
     assert approved.json() == {"ok": True, "status": "applied", "version": 1}
     assert await memory.get("human") == "likes tea"
+    blocks = (await client.get("/v1/memory/blocks")).json()
+    assert blocks == [{"key": "human", "value": "likes tea", "version": 1}]
 
     rejected = await client.post(f"/v1/memory/proposals/{pid_persona}/reject")
     assert rejected.status_code == 200
@@ -107,9 +110,23 @@ async def test_list_approve_reject_and_run(
     still_pending = (await client.get("/v1/memory/proposals", params={"status": "pending"})).json()
     assert still_pending == []
 
+    schedule_id = f"memory-consolidation:{scope}"
+    async with migrated_db.begin() as conn:
+        await conn.execute(text("select set_config('app.scope_id', :s, true)"), {"s": scope})
+        await conn.execute(
+            text(
+                "INSERT INTO schedules "
+                "(id, scope_id, agent_id, session_id, trigger_kind, spec, next_run_at, "
+                "interval_s, enabled) VALUES "
+                "(:id, :scope, 'memory-consolidator', :session, 'interval', '86400', "
+                "now(), 86400, true)"
+            ),
+            {"id": schedule_id, "scope": scope, "session": schedule_id},
+        )
     ran = await client.post("/v1/memory/consolidation/run")
+    assert ran.status_code == 200
     assert ran.json() == {"ok": True}
-    assert enqueued == [("run_agent", f"memory-consolidation:{scope}")]
+    assert enqueued == [("run_agent", schedule_id, scope)]
 
 
 async def test_approve_already_resolved_returns_409(
@@ -194,5 +211,18 @@ async def test_rbac_viewer_read_operator_mutate(
     assert resp.status_code == 200
 
     # Operator can trigger a manual consolidation run.
+    schedule_id = f"memory-consolidation:{scope}"
+    async with migrated_db.begin() as conn:
+        await conn.execute(text("select set_config('app.scope_id', :s, true)"), {"s": scope})
+        await conn.execute(
+            text(
+                "INSERT INTO schedules "
+                "(id, scope_id, agent_id, session_id, trigger_kind, spec, next_run_at, "
+                "interval_s, enabled) VALUES "
+                "(:id, :scope, 'memory-consolidator', :session, 'interval', '86400', "
+                "now(), 86400, true)"
+            ),
+            {"id": schedule_id, "scope": scope, "session": schedule_id},
+        )
     resp = await client.post("/v1/memory/consolidation/run", headers=operator)
     assert resp.status_code == 200

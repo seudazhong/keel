@@ -121,6 +121,20 @@ async def _create_base(fixture: _ApiFixture, *, key: str = "create-base") -> dic
     return response.json()
 
 
+async def test_document_content_is_normalized_before_storage(
+    knowledge_client: _ApiFixture,
+) -> None:
+    created = await _create_base(knowledge_client, key="normalize-base")
+    kb_id = str(created["id"])
+    response = await knowledge_client.client.post(
+        f"/v1/knowledge-bases/{kb_id}/documents",
+        json=_document_body(" \r\nFirst line  \r\n\r\n\r\n\r\n\r\nSecond line \t\r\n"),
+        headers=_operator("normalize-document"),
+    )
+    assert response.status_code == 202
+    assert response.json()["version"]["content"] == "First line\n\n\nSecond line"
+
+
 async def _activate_version(
     fixture: _ApiFixture,
     kb_id: str,

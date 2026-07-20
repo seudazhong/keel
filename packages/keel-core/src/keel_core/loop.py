@@ -1353,7 +1353,8 @@ async def resume(
         # never write a result the fresh owner would double-apply. Leave the batch pending.
         if interrupt is not None and interrupt():
             return RunResult(run_id=run_id, reason=StopReason.interrupted)
-        decision = permissions.evaluate(call.name, call.arguments, ctx)
+        call_ctx = ctx.model_copy(update={"tool_call_id": call.id})
+        decision = permissions.evaluate(call.name, call.arguments, call_ctx)
         granted = decision is PermissionDecision.allow
         if decision is PermissionDecision.ask and call.id in approval_of:
             # Preserve the *exact* durable decision: only an explicitly granted approval runs;
@@ -1363,7 +1364,7 @@ async def resume(
         if granted:
             tool = registry.get(call.name)
             result = (
-                await tool.run(call.arguments, ctx)
+                await tool.run(call.arguments, call_ctx)
                 if tool is not None
                 else ToolResult(ok=False, output="unknown tool")
             )

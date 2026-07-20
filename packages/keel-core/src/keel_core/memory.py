@@ -138,6 +138,21 @@ class PostgresMemoryStore:
             ).all()
         return {str(row.key): int(row.version) for row in rows}
 
+    async def snapshot(self) -> list[tuple[str, str, int]]:
+        """Return a consistent key/value/version snapshot ordered by block name."""
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_SCOPE, {"scope": self._scope_id})
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT key, value, version FROM memory_blocks "
+                        "WHERE scope_id = :scope ORDER BY key"
+                    ),
+                    {"scope": self._scope_id},
+                )
+            ).all()
+        return [(str(row.key), str(row.value), int(row.version)) for row in rows]
+
 
 class _MemoryTool:
     writes = True

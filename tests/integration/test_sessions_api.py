@@ -90,6 +90,13 @@ async def test_sessions_endpoints(
     history = (await client.get(f"/v1/sessions/{sid}/history")).json()
     assert any(e["type"] == "message.token" for e in history)
 
+    im_sid = "im/telegram/test-bot/test-chat"
+    await admit(PostgresEventStore(engine, scope), im_sid, scope, "hello from IM")
+    im_history = (
+        await client.get("/v1/sessions/im%2Ftelegram%2Ftest-bot%2Ftest-chat/history")
+    ).json()
+    assert any(e["type"] == "message.token" for e in im_history)
+
 
 async def test_search_sessions(migrated_db: AsyncEngine) -> None:
     from keel_core.search import search_sessions

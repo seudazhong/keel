@@ -1,17 +1,26 @@
+export type AgentKind = "personal" | "team";
+
 export interface Agent {
   id: string;
+  org_id: string;
+  kind: AgentKind;
+  owner_user_id: string;
   name: string;
-  description: string;
-  model: string;
-  tools: string[];
-  active: boolean;
-  created_at: string;
-  updated_at: string;
+  persona: string;
+  status: string;
+  version: number;
+  created_at: string | null;
+  updated_at: string | null;
 }
 
-export interface AgentInput {
+export interface CreateAgentInput {
+  kind: AgentKind;
   name: string;
-  description: string;
-  model: string;
-  tools: string[];
+  persona: string;
+}
+
+export interface UpdateAgentInput {
+  expected_version: number;
+  name: string;
+  persona: string;
 }

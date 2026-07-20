@@ -17,9 +17,17 @@ export function SessionDetailPage() {
         title="会话回放"
         sub={`· ${id}`}
         right={
-          <Link to="/sessions" className="text-sm text-accent hover:underline">
-            ← 返回列表
-          </Link>
+          <div className="flex items-center gap-3 text-sm">
+            <Link
+              to={`/chat/${encodeURIComponent(id)}`}
+              className="rounded-sm bg-accent px-2.5 py-1.5 font-semibold text-white"
+            >
+              Continue conversation
+            </Link>
+            <Link to="/sessions" className="text-accent hover:underline">
+              ← 返回列表
+            </Link>
+          </div>
         }
       />
       <div className="min-h-0 flex-1 overflow-y-auto">

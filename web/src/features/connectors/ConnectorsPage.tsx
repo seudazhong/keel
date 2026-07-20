@@ -63,6 +63,12 @@ function ConnectedConnector({ connector }: { connector: Connector }) {
           </div>
         </Banner>
       )}
+      {connector.binding?.error_summary && (
+        <Banner tone="danger" className="mt-3">
+          <span>⚠️</span>
+          <div>{connector.binding.error_summary}</div>
+        </Banner>
+      )}
       <ConnectorTargets connector={connector} />
       <ConnectorResources connector={connector} />
       <div className="mt-3 flex flex-wrap gap-2">

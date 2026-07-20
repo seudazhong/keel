@@ -36,6 +36,7 @@ from keel_core import (
     make_tracer,
     run,
 )
+from keel_core.connector_contracts import ConnectorAction
 from keel_core.embeddings import Embedder, LiteLLMEmbedder
 from keel_core.eventbus import RedisEventStore
 from keel_core.events import Event, EventType
@@ -260,6 +261,7 @@ class AgentRuntime:
         knowledge_search_query_max_chars: int = 2_000,
         knowledge_search_k_max: int = 10,
         knowledge_tool_output_max_chars: int = 8_000,
+        connector_actions: tuple[ConnectorAction, ...] = (),
     ) -> None:
         self._engine = engine
         self._execution_environment = execution_environment or UnavailableExecutionEnvironment()
@@ -301,6 +303,7 @@ class AgentRuntime:
             scope_id=self._scope.id,
             embedder=embedder,
             caps=caps,
+            connector_actions=connector_actions,
         )
         self._agent = build_interactive_agent(
             scope_id=self._scope.id,
@@ -309,7 +312,7 @@ class AgentRuntime:
         )
         self._provider = provider or LiteLLMGateway()
         self._registry = ToolRegistry(tools)
-        self._permissions = interactive_permissions(extra_names)
+        self._permissions = interactive_permissions(extra_names, connector_actions)
         self._approvals = ApprovalRegistry()
         self._tracer = make_tracer()  # Langfuse if configured, else no-op
         self._runs: dict[RunId, asyncio.Task[None]] = {}

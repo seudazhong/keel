@@ -42,6 +42,8 @@ class ToolContext(BaseModel):
     # Trust of the *content* seen so far this run (G17). A trusted scope may still
     # ingest tainted content (an email body, a web page); outbound actions gate on it.
     content_taint: ContentTaint = ContentTaint.clean
+    # Stable provider tool-call id for durable idempotency. The executor fills this per call.
+    tool_call_id: str | None = None
 
 
 class ToolResult(BaseModel):

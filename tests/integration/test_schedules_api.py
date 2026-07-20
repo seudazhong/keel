@@ -80,5 +80,10 @@ async def test_schedules_endpoints(
     toggled = (await client.post(f"/v1/schedules/{sid}/toggle", json={"enabled": False})).json()
     assert toggled == {"ok": True, "enabled": False}
 
-    assert (await client.post(f"/v1/schedules/{sid}/run")).json() == {"ok": True}
-    assert enqueued == [("run_agent", sid)]
+    run = await client.post(f"/v1/schedules/{sid}/run")
+    assert run.status_code == 200
+    assert run.json() == {"ok": True}
+    assert enqueued == [("run_agent", sid, scope)]
+
+    missing = await client.post("/v1/schedules/does-not-exist/run")
+    assert missing.status_code == 404

@@ -1,7 +1,7 @@
 import { http, HttpResponse } from "msw";
 import { afterEach, expect, test } from "vitest";
 import type { Approval } from "../features/approvals/types";
-import { emptyAuth, setAuthSnapshot } from "../features/auth/authState";
+import { emptyAuth, onAuthError, setAuthSnapshot } from "../features/auth/authState";
 import { server } from "../test/setup";
 import { api } from "./api";
 
@@ -20,6 +20,25 @@ test("api.get throws on a non-2xx response", async () => {
     ),
   );
   await expect(api.get("/v1/approvals")).rejects.toThrow("datastore unavailable");
+});
+
+test("api surfaces structured domain error messages", async () => {
+  server.use(
+    http.post("/v1/things", () =>
+      HttpResponse.json(
+        {
+          detail: {
+            code: "knowledge_base_name_conflict",
+            message: "An active Knowledge Base already uses this name.",
+          },
+        },
+        { status: 409 },
+      ),
+    ),
+  );
+  await expect(api.post("/v1/things", {})).rejects.toThrow(
+    "An active Knowledge Base already uses this name.",
+  );
 });
 
 test("api attaches the credential + workspace headers from the auth snapshot", async () => {
@@ -57,4 +76,19 @@ test("api sends X-API-Key for an api-key credential and an idempotency key on mu
   await api.post("/v1/things", { a: 1 });
   expect(apiKey).toBe("vkey");
   expect(idem).toBeTruthy();
+});
+
+test("an expected 403 is surfaced without clearing a valid credential", async () => {
+  let rejected = false;
+  onAuthError(() => {
+    rejected = true;
+  });
+  server.use(
+    http.post("/v1/things", () =>
+      HttpResponse.json({ detail: "insufficient privilege" }, { status: 403 }),
+    ),
+  );
+  await expect(api.post("/v1/things", {})).rejects.toThrow("insufficient privilege");
+  expect(rejected).toBe(false);
+  onAuthError(null);
 });

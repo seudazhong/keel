@@ -15,6 +15,10 @@ test("lists sessions, then narrows via server-side search", async () => {
   await tick(1200); // let the (cold-start) list query resolve
   expect(screen.getByText("安排明天的行程")).toBeInTheDocument();
   expect(screen.getByText("It is your scheduled morning run…")).toBeInTheDocument();
+  expect(screen.getAllByRole("link", { name: "Continue" })[0]).toHaveAttribute(
+    "href",
+    "/chat/s1",
+  );
 
   fireEvent.change(screen.getByPlaceholderText(/混合检索/), { target: { value: "行程" } });
   await tick(700); // 250ms debounce + the search query

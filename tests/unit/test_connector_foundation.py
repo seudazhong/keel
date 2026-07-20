@@ -17,6 +17,7 @@ from keel_core.connector_contracts import (
     ConnectorActionIdempotency,
     ConnectorActionManifest,
     ConnectorActionSemantics,
+    ConnectorAuthAction,
     ConnectorAuthKind,
     ConnectorBindingDraft,
     ConnectorBindingStatus,
@@ -1010,6 +1011,41 @@ async def test_catalog_isolates_broken_provider_factory() -> None:
         registry.create("import_broken")
     with pytest.raises(ConnectorProviderUnavailableError, match="broken_sdk"):
         registry.create("broken")
+
+
+async def test_catalog_does_not_treat_staged_binding_as_legacy_connected() -> None:
+    manifest = ConnectorManifest(
+        id="staged",
+        name="Staged",
+        description="staged",
+        auth_kind=ConnectorAuthKind.github_app,
+        capabilities=(ConnectorCapability.read,),
+        auth_action=ConnectorAuthAction(
+            label="Install GitHub App",
+            requires_setup=True,
+        ),
+    )
+
+    class Provider(BaseConnectorProvider):
+        pass
+
+    Provider.manifest = manifest
+    repository = InMemoryConnectorRepository("scope:a")
+    await repository.upsert_binding(
+        "staged",
+        ConnectorBindingDraft(display_name="Configured App"),
+        ConnectorBindingStatus.configured,
+    )
+    rows = await ConnectorService(
+        ConnectorRegistry((ConnectorRegistration(manifest, Provider, "tests.staged"),)),
+        repository,
+    ).catalog({"staged": None})
+
+    row = rows[0]
+    assert row["configured"] is True
+    assert row["connected"] is False
+    assert row["operational"] is False
+    assert row["next_action"]["label"] == "Install GitHub App"
 
 
 async def test_local_forget_survives_unavailable_provider_but_remote_revoke_fails_closed() -> None:

@@ -6,6 +6,8 @@ monkeypatched, so these never touch the network.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from keel_core import gmail
@@ -17,6 +19,7 @@ from keel_core.connector_contracts import (
 )
 from keel_core.connector_credentials import CredentialEnvelope
 from keel_core.connector_providers import gmail as gmail_provider
+from keel_core.connectors import ConnectorActionUserError, ConnectorTool
 from keel_core.gmail import (
     GmailError,
     format_inbox,
@@ -63,6 +66,23 @@ async def test_action_raises_when_unauthorized() -> None:
     action = make_gmail_inbox_action(FakeTokenStore(None))
     with pytest.raises(GmailError, match="not authorized"):
         await action({}, _ctx())
+
+
+async def test_connector_tool_surfaces_reconnect_guidance() -> None:
+    async def expired(args: dict[str, Any], ctx: ToolContext) -> str:
+        raise ConnectorActionUserError(
+            "Gmail authorization expired or was revoked. Reconnect Gmail in Connectors."
+        )
+
+    result = await ConnectorTool(
+        name="inbox_list",
+        description="List inbox messages.",
+        action=expired,
+    ).run({}, _ctx())
+    assert result.ok is False
+    assert result.output == (
+        "Gmail authorization expired or was revoked. Reconnect Gmail in Connectors."
+    )
 
 
 async def test_action_fetches_and_persists_rotation(monkeypatch: pytest.MonkeyPatch) -> None:

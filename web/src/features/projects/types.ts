@@ -1,16 +1,31 @@
 export interface Project {
   id: string;
-  name: string;
-  description: string;
-  repository: string;
+  org_id: string;
+  slug: string;
+  display_name: string;
+  source: "blank" | "github";
+  visibility: "private" | "internal";
+  status: "active" | "archived" | "deleted";
   default_branch: string;
-  agent_id: string | null;
-  created_at: string;
-  updated_at: string;
+  github_repository_id: number | null;
+  version: number;
+  created_at: string | null;
+  updated_at: string | null;
 }
 
 export interface ProjectImportInput {
-  name: string;
-  repository: string;
-  default_branch: string;
+  slug: string;
+  display_name: string;
+  installation_id: number;
+  repo_full_name: string;
+}
+
+export interface GitHubInstallation {
+  id: string;
+  org_id: string;
+  installation_id: number;
+  app_id: number;
+  account_login: string;
+  account_type: string;
+  status: string;
 }

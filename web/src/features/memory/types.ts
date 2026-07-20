@@ -1,5 +1,11 @@
 export type MemoryProposalStatus = "pending" | "applied" | "rejected" | "stale";
 
+export interface MemoryBlock {
+  key: string;
+  value: string;
+  version: number;
+}
+
 export interface MemoryProposal {
   id: string;
   block: string;
@@ -18,4 +24,10 @@ export interface ProposalResolution {
   ok: boolean;
   status: "applied" | "rejected" | "stale" | "not_found" | "already_resolved";
   version: number | null;
+}
+
+export interface QueuedMemoryRun {
+  ok: boolean;
+  schedule_id: string;
+  queued_at: string;
 }
