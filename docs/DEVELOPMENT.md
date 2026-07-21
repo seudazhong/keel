@@ -10,6 +10,41 @@ uv sync --frozen
 uv run keel version
 ```
 
+## GitHub delivery workflow
+
+All repository changes use a short-lived branch and pull request. Do not develop or push directly
+on `main`, even when there is only one maintainer.
+
+Start each work item from the latest remote main and use a unique branch name per devbox/task:
+
+```powershell
+git fetch origin
+git switch main
+git pull --ff-only origin main
+git switch -c <feat|fix|docs|chore>/<topic>
+```
+
+Commit coherent changes as they are completed, then publish the branch and open a PR:
+
+```powershell
+git push -u origin HEAD
+gh pr create --base main --fill
+```
+
+The PR is the integration boundary. Resolve any conflict with the current `origin/main`, wait for
+all required CI checks, then merge and remove the remote branch:
+
+```powershell
+gh pr checks --watch
+gh pr merge --merge --delete-branch
+git switch main
+git pull --ff-only origin main
+```
+
+The PR author may merge after the required checks pass; a second approval is not required while the
+repository has one maintainer. Separate devboxes must use separate branches and must never share an
+uncommitted worktree.
+
 ## Backend checks
 
 These match the committed CI workflow:
