@@ -27,7 +27,7 @@ from keel_core.approvals import ApprovalRecord, ApprovalStore, PostgresApprovalS
 from keel_core.config import Settings, get_settings
 from keel_core.connector_actions import build_connector_actions
 from keel_core.errors import PermissionDenied
-from keel_core.identity import IdentityService, NotFoundError
+from keel_core.identity import AgentAccessLevel, IdentityService, NotFoundError
 from keel_core.im_routing import (
     ImChatKind,
     ImInboundContext,
@@ -258,7 +258,22 @@ def _im_visibility_check(
         if mapping_store is None:
             return True
         mapping = await mapping_store.get(im_ctx.mapping_id)
-        return im_ctx.matches_current_mapping(mapping)
+        if not im_ctx.matches_current_mapping(mapping):
+            return False
+        if mapping is not None and mapping.chat_kind is ImChatKind.group and identity is not None:
+            try:
+                org, agent = await identity.resolve_machine_binding(
+                    mapping.org_id, mapping.agent_id
+                )
+                await identity.authorize_channel_agent_access(
+                    org,
+                    agent,
+                    mapping.route_key,
+                    minimum=AgentAccessLevel.use,
+                )
+            except (NotFoundError, PermissionDenied):
+                return False
+        return True
 
     return _visible
 

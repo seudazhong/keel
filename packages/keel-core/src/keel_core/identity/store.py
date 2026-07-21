@@ -28,6 +28,9 @@ from keel_core.errors import PermissionDenied
 from keel_core.identity.models import (
     ADMIN_ROLES,
     Agent,
+    AgentAccess,
+    AgentAccessLevel,
+    AgentAccessPrincipalType,
     AgentKind,
     AgentStatus,
     Capability,
@@ -44,6 +47,8 @@ from keel_core.identity.models import (
     ResourceGrant,
     User,
     UserStatus,
+    agent_access_level_at_least,
+    new_agent_access_id,
     new_agent_id,
     new_grant_id,
     new_membership_id,
@@ -163,6 +168,42 @@ class IdentityStore(Protocol):
         self, org_id: str, grant_id: str, *, actor_user_id: str
     ) -> ResourceGrant | None: ...
 
+    # agent access (team Agents; R1B)
+    async def upsert_agent_access(
+        self,
+        *,
+        org_id: str,
+        agent_id: str,
+        principal_type: AgentAccessPrincipalType,
+        principal_id: str,
+        level: AgentAccessLevel,
+        grantor_user_id: str,
+    ) -> AgentAccess: ...
+    async def get_agent_access(
+        self,
+        org_id: str,
+        agent_id: str,
+        principal_type: AgentAccessPrincipalType,
+        principal_id: str,
+    ) -> AgentAccess | None: ...
+    async def list_agent_access(
+        self,
+        org_id: str,
+        *,
+        agent_id: str | None = None,
+        principal_type: AgentAccessPrincipalType | None = None,
+        principal_id: str | None = None,
+    ) -> list[AgentAccess]: ...
+    async def revoke_agent_access(
+        self,
+        org_id: str,
+        agent_id: str,
+        principal_type: AgentAccessPrincipalType,
+        principal_id: str,
+        *,
+        actor_user_id: str,
+    ) -> AgentAccess | None: ...
+
 
 # --- In-memory implementation --------------------------------------------------------
 
@@ -177,6 +218,7 @@ class InMemoryIdentityStore:
         self._memberships: dict[str, Membership] = {}
         self._agents: dict[str, Agent] = {}
         self._grants: dict[str, ResourceGrant] = {}
+        self._agent_access: dict[str, AgentAccess] = {}
 
     # users
     async def create_user(self, *, display_name: str, email: str | None) -> User:
@@ -624,6 +666,129 @@ class InMemoryIdentityStore:
         self._grants[grant_id] = updated
         return updated
 
+    # agent access (team Agents; R1B)
+    def _can_manage_agent_access(self, org_id: str, agent_id: str, actor_user_id: str) -> bool:
+        """Defense-in-depth revalidation mirroring the grants path: an active org admin/owner
+        membership OR an existing active ``manage``-level Agent Access edge for this exact
+        Agent may commit an Agent Access mutation (a concurrently-demoted/revoked actor is
+        refused, same posture as :meth:`create_grant`/:meth:`revoke_grant`)."""
+        if self._active_manage_membership(org_id, actor_user_id) is not None:
+            return True
+        for access in self._agent_access.values():
+            if (
+                access.org_id == org_id
+                and access.agent_id == agent_id
+                and access.principal_type is AgentAccessPrincipalType.user
+                and access.principal_id == actor_user_id
+                and access.is_active
+                and agent_access_level_at_least(access.level, AgentAccessLevel.manage)
+            ):
+                return True
+        return False
+
+    async def upsert_agent_access(
+        self,
+        *,
+        org_id: str,
+        agent_id: str,
+        principal_type: AgentAccessPrincipalType,
+        principal_id: str,
+        level: AgentAccessLevel,
+        grantor_user_id: str,
+    ) -> AgentAccess:
+        if not self._can_manage_agent_access(org_id, agent_id, grantor_user_id):
+            raise PermissionDenied(
+                "granting Agent Access requires an active org admin/owner membership or "
+                "manage-level access"
+            )
+        for access in self._agent_access.values():
+            if (
+                access.org_id == org_id
+                and access.agent_id == agent_id
+                and access.principal_type is principal_type
+                and access.principal_id == principal_id
+            ):
+                updated = replace(
+                    access,
+                    level=level,
+                    status=GrantStatus.active,
+                    grantor_user_id=grantor_user_id,
+                    revoked_at=None,
+                    updated_at=_now(),
+                )
+                self._agent_access[access.id] = updated
+                return updated
+        now = _now()
+        access = AgentAccess(
+            id=new_agent_access_id(),
+            org_id=org_id,
+            agent_id=agent_id,
+            principal_type=principal_type,
+            principal_id=principal_id,
+            level=level,
+            grantor_user_id=grantor_user_id,
+            created_at=now,
+            updated_at=now,
+        )
+        self._agent_access[access.id] = access
+        return access
+
+    async def get_agent_access(
+        self,
+        org_id: str,
+        agent_id: str,
+        principal_type: AgentAccessPrincipalType,
+        principal_id: str,
+    ) -> AgentAccess | None:
+        for access in self._agent_access.values():
+            if (
+                access.org_id == org_id
+                and access.agent_id == agent_id
+                and access.principal_type is principal_type
+                and access.principal_id == principal_id
+            ):
+                return access
+        return None
+
+    async def list_agent_access(
+        self,
+        org_id: str,
+        *,
+        agent_id: str | None = None,
+        principal_type: AgentAccessPrincipalType | None = None,
+        principal_id: str | None = None,
+    ) -> list[AgentAccess]:
+        return [
+            access
+            for access in self._agent_access.values()
+            if access.org_id == org_id
+            and (agent_id is None or access.agent_id == agent_id)
+            and (principal_type is None or access.principal_type is principal_type)
+            and (principal_id is None or access.principal_id == principal_id)
+        ]
+
+    async def revoke_agent_access(
+        self,
+        org_id: str,
+        agent_id: str,
+        principal_type: AgentAccessPrincipalType,
+        principal_id: str,
+        *,
+        actor_user_id: str,
+    ) -> AgentAccess | None:
+        access = await self.get_agent_access(org_id, agent_id, principal_type, principal_id)
+        if access is None:
+            return None
+        if not self._can_manage_agent_access(org_id, agent_id, actor_user_id):
+            raise PermissionDenied(
+                "revoking Agent Access requires an active org admin/owner membership or "
+                "manage-level access"
+            )
+        now = _now()
+        updated = replace(access, status=GrantStatus.revoked, revoked_at=now, updated_at=now)
+        self._agent_access[access.id] = updated
+        return updated
+
 
 # --- Postgres implementation ---------------------------------------------------------
 
@@ -637,6 +802,10 @@ _AGENT_COLS = (
 )
 _GRANT_COLS = (
     "id, org_id, agent_id, resource_type, resource_id, capability, grantor_user_id, "
+    "status, created_at, updated_at, revoked_at"
+)
+_AGENT_ACCESS_COLS = (
+    "id, org_id, agent_id, principal_type, principal_id, level, grantor_user_id, "
     "status, created_at, updated_at, revoked_at"
 )
 
@@ -715,6 +884,22 @@ def _to_grant(row: Any) -> ResourceGrant:
         resource_type=row["resource_type"],
         resource_id=row["resource_id"],
         capability=Capability(row["capability"]),
+        grantor_user_id=row["grantor_user_id"],
+        status=GrantStatus(row["status"]),
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+        revoked_at=row["revoked_at"],
+    )
+
+
+def _to_agent_access(row: Any) -> AgentAccess:
+    return AgentAccess(
+        id=row["id"],
+        org_id=row["org_id"],
+        agent_id=row["agent_id"],
+        principal_type=AgentAccessPrincipalType(row["principal_type"]),
+        principal_id=row["principal_id"],
+        level=AgentAccessLevel(row["level"]),
         grantor_user_id=row["grantor_user_id"],
         status=GrantStatus(row["status"]),
         created_at=row["created_at"],
@@ -1608,6 +1793,209 @@ class PostgresIdentityStore:
                 .one_or_none()
             )
         return None if row is None else _to_grant(row)
+
+    # --- agent access (tenant-owned; team Agents, R1B) --------------------------------
+    async def _require_agent_access_manager(
+        self, conn: Any, org_id: str, agent_id: str, actor_user_id: str
+    ) -> None:
+        """Re-check + row-lock the actor's authority to mutate ``agent_id``'s Agent Access.
+
+        Mirrors :meth:`_require_active_manager`: an active org admin/owner membership OR an
+        existing active ``manage``-level Agent Access edge for this exact Agent may commit —
+        a concurrently-demoted admin or concurrently-revoked manager is refused."""
+        admin_row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT role FROM memberships WHERE org_id = :org AND user_id = :user "
+                        "AND status = 'active' AND role IN ('owner', 'admin') FOR SHARE"
+                    ),
+                    {"org": org_id, "user": actor_user_id},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if admin_row is not None:
+            return
+        access_row = (
+            (
+                await conn.execute(
+                    text(
+                        "SELECT id FROM agent_access WHERE org_id = :org AND agent_id = :agent "
+                        "AND principal_type = 'user' AND principal_id = :user "
+                        "AND status = 'active' AND level = 'manage' FOR SHARE"
+                    ),
+                    {"org": org_id, "agent": agent_id, "user": actor_user_id},
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if access_row is not None:
+            return
+        raise PermissionDenied(
+            "managing Agent Access requires an active org admin/owner membership or "
+            "manage-level access"
+        )
+
+    async def upsert_agent_access(
+        self,
+        *,
+        org_id: str,
+        agent_id: str,
+        principal_type: AgentAccessPrincipalType,
+        principal_id: str,
+        level: AgentAccessLevel,
+        grantor_user_id: str,
+    ) -> AgentAccess:
+        access_id = new_agent_access_id()
+        try:
+            async with self._engine.begin() as conn:
+                await conn.execute(_SET_ORG, {"org": org_id})
+                await self._require_agent_access_manager(conn, org_id, agent_id, grantor_user_id)
+                await conn.execute(
+                    text(
+                        "INSERT INTO agent_access "
+                        "(id, org_id, agent_id, principal_type, principal_id, principal_user_id, "
+                        "level, grantor_user_id) "
+                        "VALUES (:id, :org, :agent, :ptype, :pid, :puser, :level, :grantor) "
+                        "ON CONFLICT (org_id, agent_id, principal_type, principal_id) "
+                        "DO UPDATE SET level = EXCLUDED.level, status = 'active', "
+                        "revoked_at = NULL, grantor_user_id = EXCLUDED.grantor_user_id, "
+                        "principal_user_id = EXCLUDED.principal_user_id, "
+                        "updated_at = now()"
+                    ),
+                    {
+                        "id": access_id,
+                        "org": org_id,
+                        "agent": agent_id,
+                        "ptype": principal_type.value,
+                        "pid": principal_id,
+                        "puser": (
+                            principal_id
+                            if principal_type is AgentAccessPrincipalType.user
+                            else None
+                        ),
+                        "level": level.value,
+                        "grantor": grantor_user_id,
+                    },
+                )
+                row = (
+                    (
+                        await conn.execute(
+                            text(
+                                f"SELECT {_AGENT_ACCESS_COLS} FROM agent_access "
+                                "WHERE org_id = :org AND agent_id = :agent "
+                                "AND principal_type = :ptype AND principal_id = :pid"
+                            ),
+                            {
+                                "org": org_id,
+                                "agent": agent_id,
+                                "ptype": principal_type.value,
+                                "pid": principal_id,
+                            },
+                        )
+                    )
+                    .mappings()
+                    .one()
+                )
+        except IntegrityError as exc:
+            raise ConflictError(
+                "agent access references an agent outside this organization"
+            ) from exc
+        return _to_agent_access(row)
+
+    async def get_agent_access(
+        self,
+        org_id: str,
+        agent_id: str,
+        principal_type: AgentAccessPrincipalType,
+        principal_id: str,
+    ) -> AgentAccess | None:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_ORG, {"org": org_id})
+            row = (
+                (
+                    await conn.execute(
+                        text(
+                            f"SELECT {_AGENT_ACCESS_COLS} FROM agent_access "
+                            "WHERE org_id = :org AND agent_id = :agent "
+                            "AND principal_type = :ptype AND principal_id = :pid"
+                        ),
+                        {
+                            "org": org_id,
+                            "agent": agent_id,
+                            "ptype": principal_type.value,
+                            "pid": principal_id,
+                        },
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return None if row is None else _to_agent_access(row)
+
+    async def list_agent_access(
+        self,
+        org_id: str,
+        *,
+        agent_id: str | None = None,
+        principal_type: AgentAccessPrincipalType | None = None,
+        principal_id: str | None = None,
+    ) -> list[AgentAccess]:
+        sql = f"SELECT {_AGENT_ACCESS_COLS} FROM agent_access WHERE org_id = :org"
+        params: dict[str, Any] = {"org": org_id}
+        if agent_id is not None:
+            sql += " AND agent_id = :agent"
+            params["agent"] = agent_id
+        if principal_type is not None:
+            sql += " AND principal_type = :ptype"
+            params["ptype"] = principal_type.value
+        if principal_id is not None:
+            sql += " AND principal_id = :pid"
+            params["pid"] = principal_id
+        sql += " ORDER BY created_at"
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_ORG, {"org": org_id})
+            rows = (await conn.execute(text(sql), params)).mappings().all()
+        return [_to_agent_access(row) for row in rows]
+
+    async def revoke_agent_access(
+        self,
+        org_id: str,
+        agent_id: str,
+        principal_type: AgentAccessPrincipalType,
+        principal_id: str,
+        *,
+        actor_user_id: str,
+    ) -> AgentAccess | None:
+        async with self._engine.begin() as conn:
+            await conn.execute(_SET_ORG, {"org": org_id})
+            await self._require_agent_access_manager(conn, org_id, agent_id, actor_user_id)
+            row = (
+                (
+                    await conn.execute(
+                        text(
+                            "UPDATE agent_access SET status = 'revoked', revoked_at = now(), "
+                            "updated_at = now() "
+                            "WHERE org_id = :org AND agent_id = :agent "
+                            "AND principal_type = :ptype AND principal_id = :pid "
+                            "AND status = 'active' "
+                            f"RETURNING {_AGENT_ACCESS_COLS}"
+                        ),
+                        {
+                            "org": org_id,
+                            "agent": agent_id,
+                            "ptype": principal_type.value,
+                            "pid": principal_id,
+                        },
+                    )
+                )
+                .mappings()
+                .one_or_none()
+            )
+        return None if row is None else _to_agent_access(row)
 
 
 __all__ = ["IdentityStore", "InMemoryIdentityStore", "PostgresIdentityStore"]

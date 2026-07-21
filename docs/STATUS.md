@@ -1,9 +1,9 @@
 # Keel implementation status
 
-> **Snapshot:** 2026-07-21
+> **Snapshot:** 2026-07-22
 > **Branch:** `main`
 > **Implementation baseline reviewed:** `10f6806`
-> **Migration head:** `0024_agent_config_snapshot`
+> **Migration head:** `0025_agent_access_sessions`
 > **Target:** [Product requirements](./PRD.md)
 > **Next work:** [Roadmap](./ROADMAP.md)
 
@@ -44,11 +44,11 @@ production operations remain incomplete.
 
 | Capability | C | T | D | P | Current truth |
 |---|:--:|:--:|:--:|:--:|---|
-| Durable chat/session/run pipeline | yes | yes | yes | partial | Worker-owned admission, replayable events, interrupt/steer/approval, recovery, explicit fail-closed permission construction, and an immutable per-run `AgentConfigSnapshot` bound into the admission fingerprint exist. Product use is still preview-oriented. |
+| Durable chat/session/run pipeline | yes | yes | yes | partial | Worker-owned admission, replayable events, interrupt/steer/approval, recovery, explicit fail-closed permission construction, an immutable per-run `AgentConfigSnapshot` bound into the admission fingerprint, and (R1B) session ownership/visibility enforced independent of the selected Agent's scope on every session read endpoint exist. Product use is still preview-oriented. |
 | Jobs, schedules, approvals, outboxes | yes | yes | yes | partial | Durable jobs and approvals are strong. Schedules still use legacy hard-coded agent behavior and zero-or-one trigger delivery. |
 | Memory and session recall | yes | yes | yes | partial | Core/archival memory, search, consolidation, proposals, and UI exist. Interactive tools mutate directly; consolidation reads scope-wide sessions and auto-commits high-confidence archival facts. |
 | Knowledge Base | yes | yes | yes | partial | Lifecycle, chunking, hybrid retrieval, citations, taint, connector ingest, and React management/search are present. |
-| Identity, organizations, Agents, grants | yes | yes | yes | partial | Backend and preview UI exist; no browser OIDC flow, Agent-access/session-visibility model, enforced one-org policy, or complete admin journey. Persisted Agent definition is still thin. |
+| Identity, organizations, Agents, grants | yes | yes | yes | partial | Backend and preview UI exist. R1B added first-class Agent Access edges (discover/use/manage; bare org membership no longer implies team-Agent access) and session ownership/visibility (private/agent_members/explicit), both API-only. No browser OIDC flow, enforced one-org policy, or complete admin journey (Agent Access/session-visibility UI). Persisted Agent definition is still thin. |
 | Per-user Keel Mailboxes | no | no | no | no | AgentMail and the Primary/Purpose mailbox UX are designed in ADR-0012/0013, but provisioning, inbound mail, drafts, notifications, and UI are not implemented. |
 | User ToDos and reminders | no | no | no | no | ADR-0012/0013 define ownership, UI, proposals, and Agent tools; no API, tools, persistence, reminders, or React surface exist. |
 | Event evolution and data lifecycle | yes | yes | yes | partial | Upcasters, rebuild checkpoints/tombstones, retention classes, durable erasure, identity purge, and complete migration-table classification exist. Product administration and external-provider erasure remain partial. |
@@ -59,7 +59,7 @@ production operations remain incomplete.
 | Managed projects and GitHub sync | yes | yes | yes | partial | API and React project/import surfaces exist; GitHub App setup is still operator-heavy. |
 | Read-only code review | yes | yes | yes | no | Durable API/worker/report path exists. No React review surface ships. |
 | Controlled patch proposals | yes | yes | partial | no | Proposal store, generation, sandbox transfer, jobs, outbox, approval, writeback, and reconciler exist. No public API/SDK/UI. |
-| IM routing | yes | yes | partial | no | OneBot/Telegram ingress, durable mappings/replies, webhook authentication, and worker routing exist; admin and cross-surface product journeys do not. |
+| IM routing | yes | yes | partial | no | OneBot/Telegram ingress, durable mappings/replies, webhook authentication, and worker routing exist; admission now wires channel session identity/visibility (R1B: private 1:1 chat owned by the run-as user, group chat bound to the channel with agent_members visibility). Admin and cross-surface product journeys do not exist. |
 | Runtime DB isolation | yes | yes | yes | n/a | Standard Compose uses the least-privilege runtime login; owner/RLS bypass is denied. |
 | Sandbox execution | yes | yes | yes | n/a | File operations run out of process. Compose uses one hardened container with per-scope namespaces; shell/build/test stays disabled. |
 | React application | yes | yes | yes | partial | Broad navigation and pages ship. Several pages are explicitly Preview or lack complete workflows. |
@@ -88,8 +88,10 @@ Review results do not yet have a React surface.
 
 1. **Browser identity:** no OIDC authorization-code/PKCE login or secure browser session.
 2. **Domain completeness:** Agent definitions are not yet the versioned home for model, tools,
-   resources, memory policy, budgets, and autonomy; Agent Access, Session Visibility, Routine, and
-   reusable multi-account Connection concepts are missing.
+   resources, memory policy, budgets, and autonomy; Routine and reusable multi-account Connection
+   concepts are missing. Agent Access and Session Visibility now exist as a durable model + API
+   (R1B) but have no admin UI, and session content has no audited org-admin "support access"
+   override (private is private, even from admins, in this PR).
 3. **Memory authority:** normal interactive Agents can directly call memory mutation tools;
    consolidation is not surface/trust-aware and auto-commits high-confidence archival facts. The
    proposal-first model is not yet enforced.

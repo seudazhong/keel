@@ -34,7 +34,7 @@ Five commitments drive the architecture:
 | Area | Current implementation | Target delta |
 |---|---|---|
 | Product profile | Trusted local/single-operator Compose preview. | Single-organization multi-user product, then production profile. |
-| Identity | Users, organizations, memberships, Agents, grants, OIDC JWT verification, API keys, local actor. Organization membership currently acts as team-Agent access. | Browser authorization-code/PKCE login, Agent-access/session-visibility model, secure session, complete admin UI. |
+| Identity | Users, organizations, memberships, Agents, grants, first-class Agent Access edges (discover/use/manage; R1B), session ownership/visibility (private/agent_members/explicit; R1B), OIDC JWT verification, API keys, local actor. | Browser authorization-code/PKCE login, secure session, complete admin UI for Agent Access/session-visibility/shares. |
 | Agent model | Persisted kind, owner, name, persona, status, version. Runs capture an immutable, schema-versioned `AgentConfigSnapshot` (version/name/persona/model/budget/permission-profile identifier/tool names/memory-policy/grant descriptors) at admission. | Agent-owned versioned tool/resource/memory/autonomy config the snapshot draws from directly (today it is assembled per-surface at admission), and Routine policy in the snapshot. |
 | Scope | `agent:<org>/<agent>` is derived for authenticated runs; `web:local` remains preview compatibility. | Scope remains internal and disappears from normal product UX. |
 | Runs | Postgres-owned worker execution with leases, controls, approvals, dispatch outbox, reconciliation, and an immutable per-run Agent config snapshot bound into the admission fingerprint. | Capability routing and immutable full Agent/Routine snapshots (richer grant/tool/routine fields; today's snapshot is extensible but not the full future model). |
@@ -102,14 +102,15 @@ must enforce a deployment tenant policy rather than rely on operator convention.
 ### 3.3 Agent
 
 An Agent is a persisted execution identity. Personal Agents are private to their owner. Team Agents
-currently follow organization membership and grants.
+require an explicit Agent Access edge (R1B) — organization membership alone is no longer sufficient.
 
 **Current:** persisted Agent records are intentionally small (kind, owner, name, persona, status,
 version). A run's admission separately assembles the rest of the executed configuration
 (model, tool set, permission profile, memory policy, budget, active grants) per surface and
 freezes it into the run's `AgentConfigSnapshot` — the worker executes from that frozen snapshot,
 never from the Agent's later-mutated `name`/`persona` (INVARIANTS.md C8). Revoking Agent
-visibility (archive, membership loss) still denies execution at claim time.
+visibility (archive, membership loss, or a revoked Agent Access edge) still denies execution at
+claim time.
 
 **Target:** an Agent version itself *owns* persona, model selection, tool policy, memory policy,
 default resources, budgets, and allowed Routine classes, so the run snapshot is stamped from one
@@ -117,16 +118,22 @@ first-class versioned Agent record rather than assembled per-surface at admissio
 
 ### 3.4 Agent access and session visibility
 
-**Current:** organization members can use team Agents; there is no separate user/channel-to-Agent
-access edge. Session authorization is primarily Agent-scope based.
+**Current (R1B):** a first-class `agent_access` edge — `(org, agent, user|channel principal) ->
+discover|use|manage` — gates team-Agent discovery/use; bare organization membership no longer
+implies either. Access levels are ordered (`manage` implies `use` implies `discover`); an org
+admin/owner keeps an explicit administrative path equivalent to an implicit `manage` edge, and a
+delegated `manage`-level holder may administer the Agent's own access list. Personal Agent access
+remains owner-private (no edges). Every session additively records `owner_user_id` or a channel
+identity (`channel_provider`/`channel_external_id`) plus a `visibility` policy — `private`
+(default), `agent_members` (any principal with an active Agent Access edge), or `explicit` (owner +
+`session_access` share rows) — checked independently of the selected Agent's scope on every session
+read endpoint (list/history/event-stream/run-detail). Using a team Agent does not grant read access
+to another user's private session created under that Agent. See `keel_core.identity.authz`,
+`keel_core.session_visibility`, and INVARIANTS.md C2/C6.
 
-**Target:**
-
-- `AgentAccess(user|channel, Agent, discover|use|manage)` controls team Agent access;
-- personal Agent access remains owner-private;
-- every Session records owner or channel plus visibility such as `private`, `agent_members`, or an
-  explicit share set;
-- using a team Agent does not grant read access to every private session created under that Agent.
+**Target:** an admin-facing UI for granting/revoking Agent Access and managing session
+visibility/shares (API-only today); org-admin "support access" to session content remains an
+explicit, audited, out-of-scope decision for a later PR rather than an implicit override.
 
 ### 3.5 Connection, resource, and grant
 
@@ -188,7 +195,10 @@ organization and Agent. `web:local` is a preview compatibility scope.
 
 Scope equality can prevent accidental cross-partition reads, but it cannot answer whether an actor
 or Agent is allowed to use a Project, Connection, or other resource. Product authorization always
-uses explicit identity and grants.
+uses explicit identity and grants. A Session's own ownership/visibility (R1B —
+`keel_core.session_visibility`) is a further, independent example: two sessions can share the same
+Agent scope while one is fully private to its owner and unreadable by any other Agent-authorized
+user.
 
 User-owned Mailbox/mail/Notification data uses a separate `owner_user_id` RLS axis. ToDos and
 reminders require both `org_id` and `owner_user_id`. These rows are not forced into an arbitrary
@@ -621,7 +631,8 @@ docs/              living canon, subsystem references, ADRs, and history
 
 The active ordering is in [Roadmap](./ROADMAP.md). The remaining load-bearing gaps are:
 
-1. Agent access, session visibility, and enforced single-organization policy;
+1. Enforced single-organization policy; an admin-facing UI for Agent Access/session-visibility/
+   shares (API-only foundation landed, R1B);
 2. versioned Agent and first-class Routine/Connection models;
 3. direct-memory mutation removal plus proposal-first learning;
 4. durable accepted-occurrence and ambiguous-effect reconciliation;

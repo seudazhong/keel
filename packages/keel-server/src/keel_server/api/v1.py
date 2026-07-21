@@ -26,6 +26,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field
 
 from keel_core.agent_config_snapshot import (
     AgentConfigSnapshot,
@@ -51,7 +52,13 @@ from keel_core.consolidation import (
 )
 from keel_core.errors import CrossScopeError
 from keel_core.events import EventType
-from keel_core.identity import NotFoundError
+from keel_core.identity import (
+    AgentAccessPrincipalType,
+    AuditAction,
+    AuditEvent,
+    IdentityService,
+    NotFoundError,
+)
 from keel_core.interactive import (
     LOCAL_PREVIEW_AGENT_ID,
     LOCAL_PREVIEW_AGENT_NAME,
@@ -74,7 +81,17 @@ from keel_core.runs import (
 )
 from keel_core.scoping import LOCAL_PREVIEW_SCOPE
 from keel_core.search import hybrid_search_sessions
-from keel_core.state import InMemoryEventStore, PostgresEventStore, list_sessions
+from keel_core.session_visibility import (
+    InMemorySessionAccessStore,
+    PostgresSessionAccessStore,
+    SessionAccessStore,
+    SessionVisibility,
+    can_view_session,
+    ensure_session_identity,
+    get_session_identity,
+    set_session_visibility,
+)
+from keel_core.state import InMemoryEventStore, PostgresEventStore, SessionSummary, list_sessions
 from keel_core.types import PermissionDecision, ScopeId
 from keel_server.auth import Role, require_role
 from keel_server.endpoint_auth import (
@@ -396,6 +413,26 @@ async def create_message(
     model = _admission_model(request)
     budget = RunBudgetSpec()
     snapshot = await _admission_snapshot(request, auth, model, budget)
+    # R1B: durably record this session's owner + default-private visibility BEFORE the
+    # admitted prompt (idempotent, atomic first-writer-wins insert) — a crash/retry between
+    # this call and the prompt append can never leave an ownerless or ambiguously-visible
+    # accepted session (keel_core.session_visibility.ensure_session_identity).
+    engine = getattr(request.app.state, "engine", None)
+    if engine is not None:
+        owner_user_id = auth.actor.user_id if auth.is_user else None
+        await ensure_session_identity(
+            engine,
+            auth.scope_id,
+            session_id,
+            org_id=auth.org_id,
+            owner_user_id=owner_user_id,
+            visibility=(
+                SessionVisibility.private
+                if owner_user_id is not None
+                else SessionVisibility.agent_members
+            ),
+        )
+        await _authorize_session_visibility(request, auth, session_id)
     try:
         result = await service.admit(
             org_id=auth.org_id,
@@ -450,6 +487,7 @@ async def interrupt_run(
         record = await store.get(run_id)
         if record is not None and record.scope_id == auth.scope_id:
             await _authorize_run(request, record, auth.scope_id)
+            await _authorize_session_visibility(request, auth, record.session_id)
             durable = await store.request_control(
                 run_id, kind=RunControlKind.interrupt, requested_by="web"
             )
@@ -476,6 +514,7 @@ async def steer_run(
     if record is None or record.scope_id != auth.scope_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown or terminal run")
     await _authorize_run(request, record, auth.scope_id)
+    await _authorize_session_visibility(request, auth, record.session_id)
     ok = await store.request_control(
         run_id, kind=RunControlKind.steer, requested_by="web", payload={"text": text_value}
     )
@@ -495,6 +534,7 @@ async def get_run(
     if record is None or record.scope_id != auth.scope_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
     await _authorize_run(request, record, auth.scope_id)
+    await _authorize_session_visibility(request, auth, record.session_id)
     try:
         snapshot = record.snapshot
     except AgentConfigSnapshotError:
@@ -719,6 +759,53 @@ async def set_model(request: Request, body: dict[str, Any]) -> dict[str, object]
     return {"ok": True, "current": model}
 
 
+def _session_access_store(request: Request, scope_id: ScopeId) -> SessionAccessStore:
+    """The explicit-share store bound to ``scope_id`` (Postgres, or the in-memory double)."""
+    engine = getattr(request.app.state, "engine", None)
+    if engine is not None:
+        return PostgresSessionAccessStore(engine)
+    store: SessionAccessStore | None = getattr(request.app.state, "session_access", None)
+    return store if store is not None else InMemorySessionAccessStore()
+
+
+async def _authorize_session_visibility(
+    request: Request, auth: EndpointAuth, session_id: str
+) -> None:
+    """Enforce R1B session ownership/visibility — independent of the selected Agent scope.
+
+    Using a team Agent (passing ``require_privilege``, which already re-authorizes at least
+    ``discover``-level Agent Access) never by itself grants reading another user's private
+    session: this additionally checks the session's own ``owner_user_id``/``visibility``/
+    explicit shares (:mod:`keel_core.session_visibility`). Denies with 404 (no existence
+    disclosure) rather than 403. Only applies to a real authenticated user against a
+    Postgres-backed durable substrate; the non-cloud local-preview single operator and
+    API-key machine credentials have no additional per-user session-ownership axis and keep
+    their existing single-tenant behavior.
+    """
+    if auth.scope_id == LOCAL_PREVIEW_SCOPE or not auth.is_user:
+        return
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        return
+    identity = await get_session_identity(engine, auth.scope_id, session_id)
+    if identity is None:
+        return  # no durable identity row yet; other checks (existence) handle the 404
+    actor_user_id = auth.actor.user_id
+    has_share = False
+    if identity.visibility is SessionVisibility.explicit and actor_user_id is not None:
+        share_store = _session_access_store(request, auth.scope_id)
+        has_share = await share_store.has_active_share(auth.scope_id, session_id, actor_user_id)
+    if not can_view_session(
+        identity,
+        actor_user_id=actor_user_id,
+        # require_privilege(viewer) already re-authorized at least discover-level Agent
+        # Access (or the local/machine bypass handled above) to reach this point.
+        has_active_agent_access=True,
+        has_explicit_share=has_share,
+    ):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+
+
 async def _session_in_scope(request: Request, session_id: str, scope_id: ScopeId) -> bool:
     """Whether ``session_id`` has any durable event in ``scope_id`` (ownership check).
 
@@ -793,6 +880,7 @@ async def stream_events(
     """
     if not await _session_in_scope(request, session_id, auth.scope_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    await _authorize_session_visibility(request, auth, session_id)
 
     # The resume cursor (SSE ``Last-Event-ID`` reconnect header, else ``after``) is honored on
     # BOTH the local-preview live path and the scoped durable path (finding 6), so a reconnect
@@ -1023,15 +1111,74 @@ async def reject_durable(
     return await _resolve_durable(request, approval_id, "denied", auth)
 
 
+def _summary_visible(summary: SessionSummary, actor_user_id: str | None) -> bool:
+    """Filter :func:`~keel_core.state.list_sessions` rows by R1B visibility (no extra query).
+
+    ``agent_members`` is satisfied by definition here: reaching this endpoint already
+    re-authorized at least ``discover``-level Agent Access. ``explicit`` sessions are
+    conservatively excluded (an owner match is checked first); a caller with an explicit
+    share still sees the session via a direct read (history/events), and the list endpoint
+    favors a fast, query-free filter over an N+1 share lookup per row.
+    """
+    if actor_user_id is not None and summary.owner_user_id == actor_user_id:
+        return True
+    if (
+        summary.org_id is None
+        and summary.owner_user_id is None
+        and summary.channel_provider is None
+    ):
+        return True  # legacy/not-yet-identity-aware row: pre-R1B Agent-scope gate only
+    return summary.visibility == "agent_members"
+
+
+async def _visible_session_ids(
+    request: Request, auth: EndpointAuth, session_ids: list[str]
+) -> set[str]:
+    """Which of ``session_ids`` the caller may see under R1B session visibility.
+
+    Used for surfaces without a cheap denormalized visibility column (session search hits);
+    bounded to the small result set already returned by the search/list query."""
+    if auth.scope_id == LOCAL_PREVIEW_SCOPE or not auth.is_user:
+        return set(session_ids)
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        return set(session_ids)
+    actor_user_id = auth.actor.user_id
+    visible: set[str] = set()
+    share_store: SessionAccessStore | None = None
+    for sid in session_ids:
+        identity = await get_session_identity(engine, auth.scope_id, sid)
+        if identity is None:
+            continue
+        has_share = False
+        if identity.visibility is SessionVisibility.explicit and actor_user_id is not None:
+            if share_store is None:
+                share_store = _session_access_store(request, auth.scope_id)
+            has_share = await share_store.has_active_share(auth.scope_id, sid, actor_user_id)
+        if can_view_session(
+            identity,
+            actor_user_id=actor_user_id,
+            has_active_agent_access=True,
+            has_explicit_share=has_share,
+        ):
+            visible.add(sid)
+    return visible
+
+
 @router.get("/sessions", summary="List the scope's sessions (newest first)")
 async def list_sessions_endpoint(
     request: Request,
     auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
 ) -> list[dict[str, object]]:
-    """Session summaries for the Sessions list (title preview + message count), scoped."""
+    """Session summaries for the Sessions list (title preview + message count), scoped.
+
+    Filtered by R1B session visibility (:mod:`keel_core.session_visibility`) — using the
+    scope's team Agent does not by itself surface another user's private sessions.
+    """
     engine = getattr(request.app.state, "engine", None)
     if engine is None:
         return []
+    actor_user_id = auth.actor.user_id if auth.is_user else None
     return [
         {
             "id": s.id,
@@ -1041,6 +1188,9 @@ async def list_sessions_endpoint(
             "updated_at": s.updated_at.isoformat(),
         }
         for s in await list_sessions(engine, auth.scope_id)
+        if auth.scope_id == LOCAL_PREVIEW_SCOPE
+        or not auth.is_user
+        or _summary_visible(s, actor_user_id)
     ]
 
 
@@ -1070,6 +1220,7 @@ async def search_sessions_endpoint(
         catchup_limit=catchup_limit,
     )
     response.headers["X-Keel-Search-Mode"] = recall_status.mode
+    visible_ids = await _visible_session_ids(request, auth, [hit.id for hit in hits])
     return [
         {
             "id": hit.id,
@@ -1079,6 +1230,7 @@ async def search_sessions_endpoint(
             "updated_at": hit.updated_at.isoformat() if hit.updated_at else None,
         }
         for hit in hits
+        if hit.id in visible_ids
     ]
 
 
@@ -1091,15 +1243,258 @@ async def session_history(
     """The session's durable event log (oldest first) for a read-only replay, scoped.
 
     The session must belong to the caller's derived scope: a cross-org/Agent session id has no
-    events here and answers 404 (no cross-scope read).
+    events here and answers 404 (no cross-scope read). Session visibility (R1B) is enforced
+    independent of the selected Agent scope — see :func:`_authorize_session_visibility`.
     """
     engine = getattr(request.app.state, "engine", None)
     if engine is None:
         return []
     if not await _session_in_scope(request, session_id, auth.scope_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    await _authorize_session_visibility(request, auth, session_id)
     store = PostgresEventStore(engine, auth.scope_id)
     return [event.model_dump(mode="json") async for event in store.read(session_id)]
+
+
+# --- session visibility / explicit shares (R1B) ---------------------------------------
+
+
+class UpdateSessionVisibilityRequest(BaseModel):
+    visibility: SessionVisibility
+
+
+class ShareSessionRequest(BaseModel):
+    user_id: str = Field(min_length=1, max_length=200)
+
+
+def _session_audit_service(request: Request) -> IdentityService:
+    identity = getattr(request.app.state, "identity", None)
+    if not isinstance(identity, IdentityService):
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "identity service unavailable")
+    return identity
+
+
+async def _actor_can_manage_agent(request: Request, auth: EndpointAuth) -> bool:
+    """Whether the actor holds "manage" authority on the scope's selected Agent.
+
+    org admin/owner, a personal Agent's owner, or a delegated ``manage``-level Agent Access
+    edge holder — the same authority :meth:`IdentityService.can_manage_agent_access` composes,
+    reused here to gate session-visibility/share mutation for a non-owner (R1B item 7)."""
+    if not auth.is_user or auth.org_id is None or auth.agent is None or auth.actor.user_id is None:
+        return False
+    identity = getattr(request.app.state, "identity", None)
+    if identity is None:
+        return False
+    membership = await identity.store.get_membership(auth.org_id, auth.actor.user_id)
+    access_edges = await identity.store.list_agent_access(
+        auth.org_id,
+        principal_type=AgentAccessPrincipalType.user,
+        principal_id=auth.actor.user_id,
+    )
+    decision = identity.authz.can_manage_agent(
+        auth.actor.user_id, membership, auth.agent, access_edges
+    )
+    return bool(decision)
+
+
+def _identity_response(identity_row: Any) -> dict[str, object]:
+    return {
+        "session_id": identity_row.session_id,
+        "owner_user_id": identity_row.owner_user_id,
+        "channel_provider": identity_row.channel_provider,
+        "channel_external_id": identity_row.channel_external_id,
+        "visibility": identity_row.visibility.value,
+    }
+
+
+@router.get(
+    "/sessions/{session_id:path}/visibility", summary="Read a session's ownership/visibility"
+)
+async def get_session_visibility(
+    session_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> dict[str, object]:
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    if not await _session_in_scope(request, session_id, auth.scope_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    await _authorize_session_visibility(request, auth, session_id)
+    identity = await get_session_identity(engine, auth.scope_id, session_id)
+    if identity is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    return _identity_response(identity)
+
+
+@router.patch(
+    "/sessions/{session_id:path}/visibility", summary="Change a session's visibility policy"
+)
+async def update_session_visibility(
+    session_id: str,
+    body: UpdateSessionVisibilityRequest,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> dict[str, object]:
+    """Mutating a session's visibility requires ownership or Agent-manage authority (R1B)."""
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    if not await _session_in_scope(request, session_id, auth.scope_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    await _authorize_session_visibility(request, auth, session_id)
+    identity = await get_session_identity(engine, auth.scope_id, session_id)
+    if identity is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    actor_user_id = auth.actor.user_id if auth.is_user else None
+    is_owner = actor_user_id is not None and identity.owner_user_id == actor_user_id
+    if not is_owner and not await _actor_can_manage_agent(request, auth):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "changing session visibility requires ownership or Agent-manage authority",
+        )
+    audit = _session_audit_service(request)
+    updated = await set_session_visibility(engine, auth.scope_id, session_id, body.visibility)
+    if updated is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    audit.audit.record(
+        AuditEvent(
+            AuditAction.session_visibility_changed,
+            actor_user_id,
+            auth.org_id,
+            session_id,
+            {"visibility": body.visibility.value},
+        )
+    )
+    return _identity_response(updated)
+
+
+@router.get("/sessions/{session_id:path}/shares", summary="List a session's explicit shares")
+async def list_session_shares(
+    session_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> list[dict[str, object]]:
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    if not await _session_in_scope(request, session_id, auth.scope_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    await _authorize_session_visibility(request, auth, session_id)
+    identity = await get_session_identity(engine, auth.scope_id, session_id)
+    if identity is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    actor_user_id = auth.actor.user_id if auth.is_user else None
+    is_owner = actor_user_id is not None and identity.owner_user_id == actor_user_id
+    if not is_owner and not await _actor_can_manage_agent(request, auth):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "listing session shares requires ownership or manage"
+        )
+    shares = await _session_access_store(request, auth.scope_id).list_shares(
+        auth.scope_id, session_id
+    )
+    return [
+        {
+            "id": s.id,
+            "user_id": s.user_id,
+            "granted_by_user_id": s.granted_by_user_id,
+            "status": s.status.value,
+            "created_at": s.created_at.isoformat() if s.created_at else None,
+        }
+        for s in shares
+        if s.is_active
+    ]
+
+
+@router.post(
+    "/sessions/{session_id:path}/shares",
+    summary="Grant a user explicit read access to a session",
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_session_share(
+    session_id: str,
+    body: ShareSessionRequest,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> dict[str, object]:
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    if not await _session_in_scope(request, session_id, auth.scope_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    await _authorize_session_visibility(request, auth, session_id)
+    identity = await get_session_identity(engine, auth.scope_id, session_id)
+    if identity is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    actor_user_id = auth.actor.user_id if auth.is_user else None
+    is_owner = actor_user_id is not None and identity.owner_user_id == actor_user_id
+    if not is_owner and not await _actor_can_manage_agent(request, auth):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "sharing a session requires ownership or manage"
+        )
+    audit = _session_audit_service(request)
+    grantor = actor_user_id or durable_actor_id(auth.actor)
+    share = await _session_access_store(request, auth.scope_id).create_share(
+        auth.scope_id, session_id, body.user_id, granted_by_user_id=grantor
+    )
+    audit.audit.record(
+        AuditEvent(
+            AuditAction.session_share_granted,
+            actor_user_id,
+            auth.org_id,
+            share.id,
+            {"session_id": session_id, "user_id": share.user_id},
+        )
+    )
+    return {
+        "id": share.id,
+        "user_id": share.user_id,
+        "granted_by_user_id": share.granted_by_user_id,
+        "status": share.status.value,
+    }
+
+
+@router.delete(
+    "/sessions/{session_id:path}/shares/{user_id}",
+    summary="Revoke a user's explicit session share",
+)
+async def revoke_session_share(
+    session_id: str,
+    user_id: str,
+    request: Request,
+    auth: Annotated[EndpointAuth, Depends(require_privilege(EndpointPrivilege.viewer))],
+) -> dict[str, object]:
+    engine = getattr(request.app.state, "engine", None)
+    if engine is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    if not await _session_in_scope(request, session_id, auth.scope_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    await _authorize_session_visibility(request, auth, session_id)
+    identity = await get_session_identity(engine, auth.scope_id, session_id)
+    if identity is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "session not found")
+    actor_user_id = auth.actor.user_id if auth.is_user else None
+    is_owner = actor_user_id is not None and identity.owner_user_id == actor_user_id
+    if not is_owner and not await _actor_can_manage_agent(request, auth):
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN, "revoking a session share requires ownership or manage"
+        )
+    audit = _session_audit_service(request)
+    revoked = await _session_access_store(request, auth.scope_id).revoke_share(
+        auth.scope_id, session_id, user_id
+    )
+    if revoked is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "share not found")
+    audit.audit.record(
+        AuditEvent(
+            AuditAction.session_share_revoked,
+            actor_user_id,
+            auth.org_id,
+            revoked.id,
+            {"session_id": session_id, "user_id": revoked.user_id},
+        )
+    )
+    return {"id": revoked.id, "user_id": revoked.user_id, "status": revoked.status.value}
 
 
 def _proposal_store(request: Request, scope_id: ScopeId) -> MemoryProposalStore:

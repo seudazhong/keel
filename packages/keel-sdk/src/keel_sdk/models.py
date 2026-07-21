@@ -126,6 +126,64 @@ class CreateGrantRequest(BaseModel):
     capability: str
 
 
+# --- Agent Access (R1B) — team-Agent discover/use/manage edges -----------------------
+
+
+class AgentAccessSummary(BaseModel):
+    """An explicit ``(org, agent, principal) -> level`` Agent Access edge."""
+
+    id: str
+    org_id: str
+    agent_id: str
+    principal_type: str  # "user" | "channel"
+    principal_id: str
+    level: str  # "discover" | "use" | "manage"
+    grantor_user_id: str
+    status: str
+
+
+class GrantAgentAccessRequest(BaseModel):
+    """Grant (or update) a user/channel's discover/use/manage edge on a team Agent."""
+
+    principal_type: str  # "user" | "channel"
+    principal_id: str
+    level: str  # "discover" | "use" | "manage"
+
+
+# --- Session ownership / visibility (R1B) — independent of Agent access --------------
+
+
+class SessionIdentitySummary(BaseModel):
+    """A session's ownership/channel identity + visibility policy."""
+
+    session_id: str
+    owner_user_id: str | None = None
+    channel_provider: str | None = None
+    channel_external_id: str | None = None
+    visibility: str  # "private" | "agent_members" | "explicit"
+
+
+class UpdateSessionVisibilityRequest(BaseModel):
+    """Change a session's visibility policy (requires ownership or Agent-manage authority)."""
+
+    visibility: str  # "private" | "agent_members" | "explicit"
+
+
+class SessionShareSummary(BaseModel):
+    """An explicit per-user session share edge."""
+
+    id: str
+    user_id: str
+    granted_by_user_id: str
+    status: str
+
+
+class ShareSessionRequest(BaseModel):
+    """Grant a user explicit read access to a session (``visibility = 'explicit'``)."""
+
+    user_id: str
+
+
 # --- Managed projects (M3.7) ---------------------------------------------------------
 
 
@@ -331,6 +389,7 @@ class ImMappingSummary(BaseModel):
     chat_kind: str
     agent_id: str
     scope_id: str
+    channel_principal_id: str
     run_as_user_id: str = ""
     policy: ImMappingPolicy
     status: str  # "active" | "disabled" | "revoked"

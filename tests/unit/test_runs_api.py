@@ -20,6 +20,7 @@ from keel_core.agent_config_snapshot import AgentConfigSnapshot
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.identity import MembershipRole, NotFoundError
 from keel_core.runs import InMemoryRunStore, RunBudgetSpec, RunStatus, RunSurface, action_hash
+from keel_core.state import SessionSummary
 from keel_server.app import create_app
 from keel_server.auth import Role
 from keel_server.identity_context import Actor, ActorKind, resolve_actor
@@ -30,6 +31,28 @@ _SCOPE = "web:local"
 def _run[T](coro: Awaitable[T]) -> T:
     """Drive a setup/verify coroutine to completion (the stores are plain in-memory dicts)."""
     return asyncio.run(coro)  # type: ignore[arg-type]
+
+
+def _session_summary(*, org_id: str | None, visibility: str) -> SessionSummary:
+    now = datetime.now(UTC)
+    return SessionSummary(
+        id="s1",
+        title=None,
+        messages=1,
+        created_at=now,
+        updated_at=now,
+        org_id=org_id,
+        owner_user_id=None,
+        channel_provider=None,
+        visibility=visibility,
+    )
+
+
+def test_session_summary_filter_matches_legacy_and_visibility_semantics() -> None:
+    assert v1._summary_visible(_session_summary(org_id=None, visibility="private"), "u1")
+    assert v1._summary_visible(_session_summary(org_id="o1", visibility="agent_members"), "u1")
+    assert not v1._summary_visible(_session_summary(org_id="o1", visibility="private"), "u1")
+    assert not v1._summary_visible(_session_summary(org_id="o1", visibility="explicit"), "u1")
 
 
 class _FakeRuntime:

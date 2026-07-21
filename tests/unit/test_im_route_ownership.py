@@ -28,7 +28,12 @@ from keel_core.identity import (
     OIDCVerifier,
     StaticJWKSProvider,
 )
-from keel_core.identity.models import AgentKind, MembershipRole
+from keel_core.identity.models import (
+    AgentAccessLevel,
+    AgentAccessPrincipalType,
+    AgentKind,
+    MembershipRole,
+)
 from keel_core.im_routing import (
     ImChannelMapping,
     ImChatKind,
@@ -603,9 +608,19 @@ def test_run_as_revoked_member_is_rejected() -> None:
 def test_team_agent_run_as_requires_member() -> None:
     client, svc = _seeded_client()
     org_id, agent_id, owner_id = _seed_org_agent(svc, slug="acme")  # team agent
-    # A plain member (read+use) is authorized to run a team Agent.
+    # A plain member additionally needs an active Agent Access edge to run a team Agent (R1B).
     member_id = _login_id(client, "moe")
     _run(svc.add_member(org_id, owner_id, member_id, MembershipRole.member))
+    _run(
+        svc.grant_agent_access(
+            org_id,
+            owner_id,
+            agent_id=agent_id,
+            principal_type=AgentAccessPrincipalType.user,
+            principal_id=member_id,
+            level=AgentAccessLevel.use,
+        )
+    )
     ok = client.post(
         "/v1/im/mappings",
         headers={"X-API-Key": "gkey", "X-Keel-Org": org_id},

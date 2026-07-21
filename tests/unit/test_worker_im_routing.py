@@ -14,7 +14,12 @@ from typing import Any
 
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.identity import IdentityService, InMemoryIdentityStore, LoggingAuditSink
-from keel_core.identity.models import AgentKind, MembershipRole
+from keel_core.identity.models import (
+    AgentAccessLevel,
+    AgentAccessPrincipalType,
+    AgentKind,
+    MembershipRole,
+)
 from keel_core.im_routing import (
     ImChatKind,
     ImInboundContext,
@@ -297,6 +302,15 @@ async def _identity_with_team_agent_and_member() -> tuple[IdentityService, str, 
     )
     runner = await svc.store.create_user(display_name="Runner", email=None)
     await svc.add_member(org.org_id, owner.id, runner.id, MembershipRole.member)
+    # R1B: the run-as member additionally needs an active Agent Access edge on the team Agent.
+    await svc.grant_agent_access(
+        org.org_id,
+        owner.id,
+        agent_id=agent.id,
+        principal_type=AgentAccessPrincipalType.user,
+        principal_id=runner.id,
+        level=AgentAccessLevel.use,
+    )
     return svc, org.org_id, owner.id, runner.id, agent.id
 
 

@@ -94,12 +94,76 @@ def test_full_org_agent_grant_flow(client: TestClient) -> None:
     assert team.status_code == 201, team.text
     team_id = team.json()["id"]
 
-    # Bob (member) sees + can select the team agent.
+    # Bob (member) has no Agent Access edge yet: cannot see or select the team agent.
+    listed = client.get("/v1/identity/agents", headers=_auth("bob", org_id))
+    assert listed.status_code == 200
+    assert listed.json() == []
+    denied_select = client.post(
+        f"/v1/identity/agents/{team_id}/select", headers=_auth("bob", org_id)
+    )
+    assert denied_select.status_code == 404
+
+    # A hidden Agent is not disclosed through its access-management endpoint.
+    self_grant = client.post(
+        f"/v1/identity/agents/{team_id}/access",
+        headers=_auth("bob", org_id),
+        json={"principal_type": "user", "principal_id": bob, "level": "use"},
+    )
+    assert self_grant.status_code == 404
+
+    # Alice (owner) grants Bob 'use' Agent Access.
+    access = client.post(
+        f"/v1/identity/agents/{team_id}/access",
+        headers=_auth("alice", org_id),
+        json={"principal_type": "user", "principal_id": bob, "level": "use"},
+    )
+    assert access.status_code == 201, access.text
+
+    # Bob (member) now sees + can select the team agent.
     listed = client.get("/v1/identity/agents", headers=_auth("bob", org_id))
     assert listed.status_code == 200
     assert {a["id"] for a in listed.json()} == {team_id}
     selected = client.post(f"/v1/identity/agents/{team_id}/select", headers=_auth("bob", org_id))
     assert selected.status_code == 200
+    visible_but_not_manager = client.post(
+        f"/v1/identity/agents/{team_id}/access",
+        headers=_auth("bob", org_id),
+        json={"principal_type": "user", "principal_id": bob, "level": "manage"},
+    )
+    assert visible_but_not_manager.status_code == 403
+
+    # Alice can list the access edges; revoking takes effect immediately.
+    edges = client.get(f"/v1/identity/agents/{team_id}/access", headers=_auth("alice", org_id))
+    assert edges.status_code == 200
+    assert {e["principal_id"] for e in edges.json()} == {bob}
+    revoke_access = client.request(
+        "DELETE",
+        f"/v1/identity/agents/{team_id}/access",
+        headers=_auth("alice", org_id),
+        params={"principal_type": "user", "principal_id": bob},
+    )
+    assert revoke_access.status_code == 200
+    assert revoke_access.json()["status"] == "revoked"
+    denied_after_revoke = client.post(
+        f"/v1/identity/agents/{team_id}/select", headers=_auth("bob", org_id)
+    )
+    assert denied_after_revoke.status_code == 404
+
+    channel_id = "slack:T1/C2"
+    channel_access = client.post(
+        f"/v1/identity/agents/{team_id}/access",
+        headers=_auth("alice", org_id),
+        json={"principal_type": "channel", "principal_id": channel_id, "level": "use"},
+    )
+    assert channel_access.status_code == 201
+    channel_revoke = client.request(
+        "DELETE",
+        f"/v1/identity/agents/{team_id}/access",
+        headers=_auth("alice", org_id),
+        params={"principal_type": "channel", "principal_id": channel_id},
+    )
+    assert channel_revoke.status_code == 200
+    assert channel_revoke.json()["status"] == "revoked"
 
     # Bob (member) cannot grant — needs admin/owner.
     denied = client.post(

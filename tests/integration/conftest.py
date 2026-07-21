@@ -123,6 +123,7 @@ async def migrated_db(pg_engine: AsyncEngine) -> AsyncIterator[AsyncEngine]:
                 "patch_proposal_outbox, patch_proposals, "
                 "project_quotas, projects, "
                 "erasure_steps, erasure_requests, event_tombstones, retention_policies, "
+                "session_access, agent_access, "
                 "resource_grants, agents, memberships, oidc_identities, organizations, users"
             )
         )

@@ -23,6 +23,7 @@ from keel_core.lifecycle.store import InMemoryErasureStore
 # a purge (memory blocks + versions, the five Knowledge tables) collapse onto one step.
 _ENTRY_TO_STEP = {
     "sessions": "events_and_sessions",
+    "session_access": "events_and_sessions",
     "events": "events_and_sessions",
     "message_embeddings": "message_embeddings",
     "archival": "archival",

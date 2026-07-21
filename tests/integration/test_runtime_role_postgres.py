@@ -499,7 +499,7 @@ async def test_runtime_login_cannot_delete_identity_or_mutate_control(
         assert report.unexpected_memberships == ()
         # SELECT on the control table is kept: a read-only view of the current schema version.
         head = await conn.scalar(text("SELECT version_num FROM alembic_version"))
-        assert head == "0024_agent_config_snapshot"
+        assert head == "0025_agent_access_sessions"
 
     denied = (
         "DELETE FROM users",

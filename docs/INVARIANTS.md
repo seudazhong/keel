@@ -52,9 +52,23 @@ actor membership
 
 RLS/scope equality is defense in depth and never sufficient authority.
 
+**Current status (R1B):** team-Agent discovery/use now requires an explicit `agent_access` edge
+(`keel_core.identity.authz`/`store`) — bare org membership (`read`/`use` capability) no longer
+implies it. An org admin/owner keeps an explicit administrative path (equivalent to an implicit
+`manage` edge); every other member/viewer needs an active `discover`/`use`/`manage` edge, and
+revocation is re-checked at admission (`IdentityService.select_agent`) and at worker claim
+(`keel_worker.runs._visibility_check` calls the same method). Session read (list/history/event
+stream/run detail) additionally enforces session ownership/visibility
+(`keel_core.session_visibility.can_view_session`) independent of the selected Agent's scope, so a
+team Agent never by itself discloses another user's private session. Routine policy and a richer
+deployment-capability axis are not yet part of this intersection.
+
 **Acceptance:** two users, private Agents, a team Agent, explicit Agent-access edges, private/team
 Connections, Knowledge, and Projects; every unauthorized Agent discovery, session read, or
-resource use/manage attempt is denied without existence disclosure.
+resource use/manage attempt is denied without existence disclosure. Covered by
+`tests/integration/test_r1b_agent_access_session_visibility.py` (discover/use/manage tiers,
+revocation at admission/claim, private/agent_members/explicit session visibility, cross-org
+non-disclosure) and `tests/unit/test_identity_authz.py`/`test_session_visibility.py`.
 
 ### C3 — No lost accepted Routine occurrence
 
@@ -91,6 +105,13 @@ User-owned objects that are not Agent-owned use their explicit User/Organization
 Mailbox/mail/Notification rows require the authenticated User context, and ToDos/reminders require
 both User and Organization context. Supplying an Agent scope can never substitute for either.
 
+**Current status (R1B):** session ownership/visibility (`keel_core.session_visibility`) is the
+session analogue of this invariant — a session additively carries `owner_user_id` /
+`channel_provider`/`channel_external_id` / `visibility`, checked independently of (in addition to)
+the derived Agent scope on every session read endpoint. A legacy session with neither an owner nor
+a channel identity (predates this feature, or a surface it does not yet touch) falls back to the
+pre-existing Agent-scope-only gate rather than a new, silent lockout.
+
 **Acceptance:** spoofed organization/Agent/scope headers, foreign run/session ids, and outbox pointer
 scope mismatches fail closed and do not reveal foreign existence. Foreign `app.user_id` access and
 User/Organization mismatches on mail, Notifications, and ToDos are denied under the runtime database
@@ -119,8 +140,11 @@ version/persona/model/budget/snapshot changed is rejected as a conflict rather t
 repaired (`keel_core.runs.admission_fingerprint`). The worker (`keel_worker.runs`) reconstructs a
 claimed run's name/persona/model/bounded config from this frozen record — never from the Agent's
 later-mutated fields — while still re-authorizing current Agent visibility/revocation at claim
-time (a revocation denies execution; a persona/model edit does not rewrite an admitted run). A
-snapshotted tool no longer available is dropped, never substituted (`AgentConfigSnapshot.
+time (a revocation denies execution; a persona/model edit does not rewrite an admitted run). Since
+R1B this re-check is `IdentityService.select_agent`, which composes org membership **and** the
+current `agent_access` edges (or the admin administrative path) — so a team-Agent access edge
+revoked between admission and claim fails the claim exactly like a membership revocation always
+did. A snapshotted tool no longer available is dropped, never substituted (`AgentConfigSnapshot.
 restrict_tools`); a legacy pre-R1B row (empty `snapshot_hash`) falls back to the prior
 live-Agent-lookup behavior. Routine policy and a richer effect-policy object are not yet part of
 the snapshot — the persisted Agent/Routine model this invariant ultimately depends on remains

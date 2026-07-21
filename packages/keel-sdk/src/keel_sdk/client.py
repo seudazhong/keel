@@ -7,6 +7,7 @@ from typing import Self
 import httpx
 
 from keel_sdk.models import (
+    AgentAccessSummary,
     AgentSummary,
     AssociateRunRequest,
     CreateAgentRequest,
@@ -18,6 +19,7 @@ from keel_sdk.models import (
     CreateProjectRequest,
     CreateReviewRequest,
     CreateReviewResponse,
+    GrantAgentAccessRequest,
     GrantProjectRequest,
     GrantSummary,
     ImMappingSummary,
@@ -31,8 +33,12 @@ from keel_sdk.models import (
     ProjectSummary,
     ReviewStatusSummary,
     RunAssociation,
+    SessionIdentitySummary,
+    SessionShareSummary,
+    ShareSessionRequest,
     SyncEntrySummary,
     UpdateProjectRequest,
+    UpdateSessionVisibilityRequest,
     WorktreeSummary,
 )
 
@@ -87,6 +93,12 @@ class KeelClient:
         headers = dict(self._headers)
         if org is not None:
             headers["X-Keel-Org"] = org
+        return headers
+
+    def _scope_headers(self, org: str, agent: str) -> dict[str, str]:
+        """Headers selecting both the org and the persisted Agent (session-scoped routes)."""
+        headers = self._org_headers(org)
+        headers["X-Keel-Agent"] = agent
         return headers
 
     async def get_me(self) -> MeResponse:
@@ -163,6 +175,97 @@ class KeelClient:
         )
         response.raise_for_status()
         return GrantSummary.model_validate(response.json())
+
+    # --- Agent Access (R1B) — team-Agent discover/use/manage edges -------------------
+    async def list_agent_access(self, org: str, agent_id: str) -> list[AgentAccessSummary]:
+        """List a team Agent's Agent Access edges (requires org admin/owner or manage access)."""
+        response = await self._client.get(
+            f"/v1/identity/agents/{agent_id}/access", headers=self._org_headers(org)
+        )
+        response.raise_for_status()
+        return [AgentAccessSummary.model_validate(item) for item in response.json()]
+
+    async def grant_agent_access(
+        self, org: str, agent_id: str, request: GrantAgentAccessRequest
+    ) -> AgentAccessSummary:
+        """Grant (or update) a user/channel's discover/use/manage edge on a team Agent."""
+        response = await self._client.post(
+            f"/v1/identity/agents/{agent_id}/access",
+            json=request.model_dump(),
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return AgentAccessSummary.model_validate(response.json())
+
+    async def revoke_agent_access(
+        self, org: str, agent_id: str, principal_type: str, principal_id: str
+    ) -> AgentAccessSummary:
+        """Revoke a user/channel's Agent Access edge on a team Agent."""
+        response = await self._client.request(
+            "DELETE",
+            f"/v1/identity/agents/{agent_id}/access",
+            params={"principal_type": principal_type, "principal_id": principal_id},
+            headers=self._org_headers(org),
+        )
+        response.raise_for_status()
+        return AgentAccessSummary.model_validate(response.json())
+
+    # --- Session ownership / visibility (R1B) — independent of Agent access ---------
+    async def get_session_visibility(
+        self, org: str, agent: str, session_id: str
+    ) -> SessionIdentitySummary:
+        """Read a session's ownership/channel identity + visibility policy."""
+        response = await self._client.get(
+            f"/v1/sessions/{session_id}/visibility", headers=self._scope_headers(org, agent)
+        )
+        response.raise_for_status()
+        return SessionIdentitySummary.model_validate(response.json())
+
+    async def update_session_visibility(
+        self, org: str, agent: str, session_id: str, request: UpdateSessionVisibilityRequest
+    ) -> SessionIdentitySummary:
+        """Change a session's visibility (requires ownership or Agent-manage authority)."""
+        response = await self._client.patch(
+            f"/v1/sessions/{session_id}/visibility",
+            json=request.model_dump(),
+            headers=self._scope_headers(org, agent),
+        )
+        response.raise_for_status()
+        return SessionIdentitySummary.model_validate(response.json())
+
+    async def list_session_shares(
+        self, org: str, agent: str, session_id: str
+    ) -> list[SessionShareSummary]:
+        """List a session's active explicit shares."""
+        response = await self._client.get(
+            f"/v1/sessions/{session_id}/shares", headers=self._scope_headers(org, agent)
+        )
+        response.raise_for_status()
+        return [SessionShareSummary.model_validate(item) for item in response.json()]
+
+    async def create_session_share(
+        self, org: str, agent: str, session_id: str, request: ShareSessionRequest
+    ) -> SessionShareSummary:
+        """Grant a user explicit read access to a session."""
+        response = await self._client.post(
+            f"/v1/sessions/{session_id}/shares",
+            json=request.model_dump(),
+            headers=self._scope_headers(org, agent),
+        )
+        response.raise_for_status()
+        return SessionShareSummary.model_validate(response.json())
+
+    async def revoke_session_share(
+        self, org: str, agent: str, session_id: str, user_id: str
+    ) -> SessionShareSummary:
+        """Revoke a user's explicit session share."""
+        response = await self._client.request(
+            "DELETE",
+            f"/v1/sessions/{session_id}/shares/{user_id}",
+            headers=self._scope_headers(org, agent),
+        )
+        response.raise_for_status()
+        return SessionShareSummary.model_validate(response.json())
 
     # --- Managed projects (M3.7) — additive methods ----------------------------------
     async def list_projects(

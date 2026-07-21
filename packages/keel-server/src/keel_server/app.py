@@ -816,6 +816,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             default_model=settings.default_model,
             identity=app.state.identity,
             snapshot_tool_names=_im_snapshot_tool_names,
+            engine=_im_engine,
         )
     # M3A runtime-role gate (WS-DB). When enforced (``KEEL_REQUIRE_RUNTIME_DB_PRINCIPAL``, implied
     # by ``cloud_mode``) the data plane MUST be served from a least-privilege, non-owner runtime

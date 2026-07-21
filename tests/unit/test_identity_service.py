@@ -6,6 +6,8 @@ import pytest
 
 from keel_core.errors import PermissionDenied
 from keel_core.identity import (
+    AgentAccessLevel,
+    AgentAccessPrincipalType,
     AgentKind,
     Capability,
     ConflictError,
@@ -124,15 +126,60 @@ async def test_personal_agent_isolation_and_team_sharing() -> None:
     # A peer member cannot even see Bob's personal agent (hidden -> not found).
     with pytest.raises(NotFoundError):
         await svc.get_agent(org, carol.id, personal.id)
-    assert {a.id for a in await svc.list_visible_agents(org, carol.id)} == {team.id}
-    # The org owner can see it (for management) but cannot silently *use* it.
+    with pytest.raises(NotFoundError):
+        await svc.list_agent_access(org, carol.id, agent_id=personal.id)
+    with pytest.raises(NotFoundError):
+        await svc.grant_agent_access(
+            org,
+            carol.id,
+            agent_id=personal.id,
+            principal_type=AgentAccessPrincipalType.user,
+            principal_id=carol.id,
+            level=AgentAccessLevel.discover,
+        )
+    with pytest.raises(NotFoundError):
+        await svc.revoke_agent_access(
+            org,
+            carol.id,
+            agent_id=personal.id,
+            principal_type=AgentAccessPrincipalType.user,
+            principal_id=carol.id,
+        )
+    # R1B: bare org membership does not grant team-Agent discovery — Carol has no edge yet.
+    assert {a.id for a in await svc.list_visible_agents(org, carol.id)} == set()
+    with pytest.raises(NotFoundError):
+        await svc.select_agent(org, bob.id, team.id)
+    # The org owner can see Bob's personal agent (for management) but cannot silently *use* it.
     with pytest.raises(PermissionDenied):
         await svc.select_agent(org, alice.id, personal.id)
-    # Team agent is usable by Bob (member).
+    # Alice (admin/owner) grants Bob 'use' Agent Access on the team Agent.
+    await svc.grant_agent_access(
+        org,
+        alice.id,
+        agent_id=team.id,
+        principal_type=AgentAccessPrincipalType.user,
+        principal_id=bob.id,
+        level=AgentAccessLevel.use,
+    )
+    # Team agent is now usable by Bob (member with an active access edge).
     used = await svc.select_agent(org, bob.id, team.id)
     assert used.id == team.id
+    # Carol still has no edge: neither discover nor use.
+    assert {a.id for a in await svc.list_visible_agents(org, carol.id)} == set()
+    with pytest.raises(NotFoundError):
+        await svc.select_agent(org, carol.id, team.id)
     # The owner uses their own personal agent.
     assert (await svc.select_agent(org, bob.id, personal.id)).id == personal.id
+    # Revoking Bob's access takes effect immediately.
+    await svc.revoke_agent_access(
+        org,
+        alice.id,
+        agent_id=team.id,
+        principal_type=AgentAccessPrincipalType.user,
+        principal_id=bob.id,
+    )
+    with pytest.raises(NotFoundError):
+        await svc.select_agent(org, bob.id, team.id)
 
 
 async def test_optimistic_concurrency_on_agent_update() -> None:

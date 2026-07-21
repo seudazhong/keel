@@ -22,6 +22,9 @@ from keel_core.identity.audit import AuditAction, AuditEvent, AuditSink, Logging
 from keel_core.identity.authz import AuthorizationService
 from keel_core.identity.models import (
     Agent,
+    AgentAccess,
+    AgentAccessLevel,
+    AgentAccessPrincipalType,
     AgentKind,
     Capability,
     ConflictError,
@@ -37,6 +40,7 @@ from keel_core.identity.models import (
     validate_agent_name,
     validate_display_name,
     validate_org_slug,
+    validate_principal_id,
 )
 from keel_core.identity.oidc import OIDCClaims
 from keel_core.identity.store import IdentityStore
@@ -324,6 +328,16 @@ class IdentityService:
         return await self._store.list_memberships(org_id)
 
     # --- agents ----------------------------------------------------------------------
+    async def _user_agent_access_edges(self, org_id: str, actor_user_id: str) -> list[AgentAccess]:
+        """Every active/inactive Agent Access edge granted to ``actor_user_id`` in ``org_id``.
+
+        A single fetch (unfiltered by Agent) is reused across ``can_view_agent``/
+        ``can_use_agent``/``can_manage_agent`` calls for the same actor+org — those methods
+        filter by ``agent_id``/``org_id`` themselves."""
+        return await self._store.list_agent_access(
+            org_id, principal_type=AgentAccessPrincipalType.user, principal_id=actor_user_id
+        )
+
     async def create_agent(
         self,
         org_id: str,
@@ -361,8 +375,11 @@ class IdentityService:
     async def list_visible_agents(self, org_id: str, actor_user_id: str) -> list[Agent]:
         actor = await self._require_actor_membership(org_id, actor_user_id)
         agents = await self._store.list_agents(org_id)
+        access_edges = await self._user_agent_access_edges(org_id, actor_user_id)
         return [
-            agent for agent in agents if self._authz.can_view_agent(actor_user_id, actor, agent)
+            agent
+            for agent in agents
+            if self._authz.can_view_agent(actor_user_id, actor, agent, access_edges)
         ]
 
     async def get_agent(self, org_id: str, actor_user_id: str, agent_id: str) -> Agent:
@@ -370,8 +387,9 @@ class IdentityService:
         agent = await self._store.get_agent(org_id, agent_id)
         if agent is None:
             raise NotFoundError("agent not found")
-        if not self._authz.can_view_agent(actor_user_id, actor, agent):
-            # Hide existence of a private personal agent.
+        access_edges = await self._user_agent_access_edges(org_id, actor_user_id)
+        if not self._authz.can_view_agent(actor_user_id, actor, agent, access_edges):
+            # Hide existence of a private/inaccessible agent (no discovery disclosure).
             raise NotFoundError("agent not found")
         return agent
 
@@ -389,10 +407,11 @@ class IdentityService:
         agent = await self._store.get_agent(org_id, agent_id)
         if agent is None:
             raise NotFoundError("agent not found")
-        decision = self._authz.can_manage_agent(actor_user_id, actor, agent)
+        access_edges = await self._user_agent_access_edges(org_id, actor_user_id)
+        decision = self._authz.can_manage_agent(actor_user_id, actor, agent, access_edges)
         if not decision:
             # Preserve privacy of a personal agent the actor can't even see.
-            if not self._authz.can_view_agent(actor_user_id, actor, agent):
+            if not self._authz.can_view_agent(actor_user_id, actor, agent, access_edges):
                 raise NotFoundError("agent not found")
             raise PermissionDenied(decision.reason)
         clean_name = validate_agent_name(name) if name is not None else None
@@ -419,9 +438,10 @@ class IdentityService:
         agent = await self._store.get_agent(org_id, agent_id)
         if agent is None:
             raise NotFoundError("agent not found")
-        decision = self._authz.can_manage_agent(actor_user_id, actor, agent)
+        access_edges = await self._user_agent_access_edges(org_id, actor_user_id)
+        decision = self._authz.can_manage_agent(actor_user_id, actor, agent, access_edges)
         if not decision:
-            if not self._authz.can_view_agent(actor_user_id, actor, agent):
+            if not self._authz.can_view_agent(actor_user_id, actor, agent, access_edges):
                 raise NotFoundError("agent not found")
             raise PermissionDenied(decision.reason)
         archived = await self._store.archive_agent(
@@ -438,15 +458,18 @@ class IdentityService:
         """Compatibility bridge: resolve a persisted Agent the actor selects for a run.
 
         Enforces *use* authorization now so a future durable-run integration can bind the
-        selected Agent without re-deriving the access decision.
+        selected Agent without re-deriving the access decision. This is also the exact check
+        the worker re-runs at claim time (:mod:`keel_worker.runs`), so a revoked Agent Access
+        edge between admission and claim fails a queued run closed.
         """
         actor = await self._require_actor_membership(org_id, actor_user_id)
         agent = await self._store.get_agent(org_id, agent_id)
         if agent is None:
             raise NotFoundError("agent not found")
-        decision = self._authz.can_use_agent(actor_user_id, actor, agent)
+        access_edges = await self._user_agent_access_edges(org_id, actor_user_id)
+        decision = self._authz.can_use_agent(actor_user_id, actor, agent, access_edges)
         if not decision:
-            if not self._authz.can_view_agent(actor_user_id, actor, agent):
+            if not self._authz.can_view_agent(actor_user_id, actor, agent, access_edges):
                 raise NotFoundError("agent not found")
             raise PermissionDenied(decision.reason)
         return agent
@@ -480,18 +503,155 @@ class IdentityService:
         The IM run executes under ``run_as_user_id`` (never the platform admin that provisions the
         mapping), so that user must be an **active member** of ``org`` and independently authorized
         to *use* the selected Agent: a **personal** Agent requires its owner, a **team** Agent
-        requires the member's ``use`` capability. Fails closed with :class:`PermissionDenied` (a
-        non-member, revoked member, or an unauthorized member) or :class:`NotFoundError` — so a
-        mapping can only ever run as a member entitled to the Agent, and a later revocation /
-        member removal makes the worker's re-check fail the run closed.
+        requires an active Agent Access edge at ``use`` (or the org admin/owner administrative
+        path) — bare membership is never sufficient (R1B). Fails closed with
+        :class:`PermissionDenied` (a non-member, revoked member, or an unauthorized member) or
+        :class:`NotFoundError` — so a mapping can only ever run as a member entitled to the
+        Agent, and a later revocation / member removal makes the worker's re-check fail the run
+        closed.
         """
         membership = await self._store.get_membership(org.id, run_as_user_id)
         if membership is None or not membership.is_active:
             raise PermissionDenied("run-as user is not an active member of the organization")
-        decision = self._authz.can_use_agent(run_as_user_id, membership, agent)
+        access_edges = await self._user_agent_access_edges(org.id, run_as_user_id)
+        decision = self._authz.can_use_agent(run_as_user_id, membership, agent, access_edges)
         if not decision:
             raise PermissionDenied(decision.reason)
         return membership
+
+    async def authorize_channel_agent_access(
+        self,
+        org: Organization,
+        agent: Agent,
+        channel_principal_id: str,
+        *,
+        minimum: AgentAccessLevel,
+    ) -> AgentAccess:
+        """Validate a **channel**-principal Agent Access edge (group IM chat/room binding).
+
+        Used by IM admission for a group channel binding: the channel identity itself (not a
+        single human run-as user) must hold an active edge at least ``minimum`` on ``agent``.
+        Fails closed with :class:`PermissionDenied` when absent/revoked/insufficient, or when
+        ``agent`` is personal (personal Agents never carry channel edges)."""
+        if agent.kind is not AgentKind.team:
+            raise PermissionDenied("only team Agents may bind a channel Agent Access edge")
+        access = await self._store.get_agent_access(
+            org.id, agent.id, AgentAccessPrincipalType.channel, channel_principal_id
+        )
+        if access is None or not access.is_active:
+            raise PermissionDenied("channel has no active Agent Access edge for this agent")
+        if not access.level_at_least(minimum):
+            raise PermissionDenied(f"channel Agent Access level is below '{minimum.value}'")
+        return access
+
+    # --- agent access (team Agents; R1B) ----------------------------------------------
+    async def grant_agent_access(
+        self,
+        org_id: str,
+        actor_user_id: str,
+        *,
+        agent_id: str,
+        principal_type: AgentAccessPrincipalType,
+        principal_id: str,
+        level: AgentAccessLevel,
+    ) -> AgentAccess:
+        """Grant/update a team Agent's ``(principal_type, principal_id) -> level`` edge.
+
+        Only an org admin/owner or an existing ``manage``-level edge holder may grant
+        (:meth:`AuthorizationService.can_manage_agent_access`); personal Agents never accept
+        edges. A ``user`` principal must be an active org member (an access edge for a
+        non-member/former member would be dead weight and could mislead a later reviewer)."""
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        agent = await self._store.get_agent(org_id, agent_id)
+        if agent is None:
+            raise NotFoundError("agent not found")
+        access_edges = await self._user_agent_access_edges(org_id, actor_user_id)
+        decision = self._authz.can_manage_agent_access(actor_user_id, actor, agent, access_edges)
+        if not decision:
+            if not self._authz.can_view_agent(actor_user_id, actor, agent, access_edges):
+                raise NotFoundError("agent not found")
+            raise PermissionDenied(decision.reason)
+        clean_principal_id = validate_principal_id(principal_id)
+        if principal_type is AgentAccessPrincipalType.user:
+            target_membership = await self._store.get_membership(org_id, clean_principal_id)
+            if target_membership is None or not target_membership.is_active:
+                raise NotFoundError("target user is not an active member of this organization")
+        access = await self._store.upsert_agent_access(
+            org_id=org_id,
+            agent_id=agent_id,
+            principal_type=principal_type,
+            principal_id=clean_principal_id,
+            level=level,
+            grantor_user_id=actor_user_id,
+        )
+        self._audit.record(
+            AuditEvent(
+                AuditAction.agent_access_granted,
+                actor_user_id,
+                org_id,
+                access.id,
+                {
+                    "agent_id": agent_id,
+                    "principal_type": principal_type.value,
+                    "level": level.value,
+                },
+            )
+        )
+        return access
+
+    async def list_agent_access(
+        self, org_id: str, actor_user_id: str, *, agent_id: str
+    ) -> list[AgentAccess]:
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        agent = await self._store.get_agent(org_id, agent_id)
+        if agent is None:
+            raise NotFoundError("agent not found")
+        access_edges = await self._user_agent_access_edges(org_id, actor_user_id)
+        decision = self._authz.can_manage_agent_access(actor_user_id, actor, agent, access_edges)
+        if not decision:
+            if not self._authz.can_view_agent(actor_user_id, actor, agent, access_edges):
+                raise NotFoundError("agent not found")
+            raise PermissionDenied(decision.reason)
+        return await self._store.list_agent_access(org_id, agent_id=agent_id)
+
+    async def revoke_agent_access(
+        self,
+        org_id: str,
+        actor_user_id: str,
+        *,
+        agent_id: str,
+        principal_type: AgentAccessPrincipalType,
+        principal_id: str,
+    ) -> AgentAccess:
+        actor = await self._require_actor_membership(org_id, actor_user_id)
+        agent = await self._store.get_agent(org_id, agent_id)
+        if agent is None:
+            raise NotFoundError("agent not found")
+        access_edges = await self._user_agent_access_edges(org_id, actor_user_id)
+        decision = self._authz.can_manage_agent_access(actor_user_id, actor, agent, access_edges)
+        if not decision:
+            if not self._authz.can_view_agent(actor_user_id, actor, agent, access_edges):
+                raise NotFoundError("agent not found")
+            raise PermissionDenied(decision.reason)
+        revoked = await self._store.revoke_agent_access(
+            org_id,
+            agent_id,
+            principal_type,
+            principal_id,
+            actor_user_id=actor_user_id,
+        )
+        if revoked is None:
+            raise NotFoundError("agent access edge not found")
+        self._audit.record(
+            AuditEvent(
+                AuditAction.agent_access_revoked,
+                actor_user_id,
+                org_id,
+                revoked.id,
+                {"agent_id": agent_id, "principal_type": principal_type.value},
+            )
+        )
+        return revoked
 
     # --- grants ----------------------------------------------------------------------
     async def grant_resource(

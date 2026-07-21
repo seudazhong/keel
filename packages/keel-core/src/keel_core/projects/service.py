@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from keel_core.errors import PermissionDenied
 from keel_core.identity.authz import AuthorizationService
 from keel_core.identity.models import (
+    AgentAccessPrincipalType,
     Capability,
     Membership,
     ResourceGrant,
@@ -163,6 +164,9 @@ class ProjectService:
         if agent is None:
             raise ProjectNotFoundError("agent not found")
         grants = await self._identity.list_grants(org_id, agent_id=agent_id)
+        access_edges = await self._identity.list_agent_access(
+            org_id, principal_type=AgentAccessPrincipalType.user, principal_id=actor_user_id
+        )
         decision = self._authz.can_agent_access_resource(
             actor_user_id,
             membership,
@@ -171,6 +175,7 @@ class ProjectService:
             PROJECT_RESOURCE_TYPE,
             project.id,
             capability,
+            access_edges,
         )
         if not decision:
             raise PermissionDenied(decision.reason)

@@ -251,6 +251,12 @@ class SessionSummary:
     messages: int
     created_at: datetime
     updated_at: datetime
+    # R1B identity/visibility (see keel_core.session_visibility) — included here so the
+    # session-list endpoint can filter by visibility without an N+1 query per session.
+    org_id: str | None = None
+    owner_user_id: str | None = None
+    channel_provider: str | None = None
+    visibility: str = "private"
 
 
 async def list_sessions(
@@ -259,7 +265,10 @@ async def list_sessions(
     """List a scope's sessions (newest first) with a preview title + message count.
 
     ``title`` falls back to the first user ``message.token`` when the session has no
-    explicit title. Purely read-only + scope-bound (RLS GUC).
+    explicit title. Purely read-only + scope-bound (RLS GUC). Callers that additionally
+    enforce R1B session visibility (``keel_core.session_visibility.can_view_session``) use
+    the returned ``org_id``/``owner_user_id``/``channel_provider``/``visibility`` fields to filter
+    without a second query per session.
     """
     async with engine.begin() as conn:
         await conn.execute(_SET_SCOPE, {"scope": scope_id})
@@ -267,6 +276,7 @@ async def list_sessions(
             await conn.execute(
                 text(
                     "SELECT s.id, s.created_at, s.updated_at, "
+                    "s.org_id, s.owner_user_id, s.channel_provider, s.visibility, "
                     "COALESCE(s.title, ("
                     "  SELECT e.payload->>'text' FROM events e "
                     "  WHERE e.session_id = s.id AND e.scope_id = s.scope_id "
@@ -289,6 +299,10 @@ async def list_sessions(
             messages=int(r.messages),
             created_at=r.created_at,
             updated_at=r.updated_at,
+            org_id=r.org_id,
+            owner_user_id=r.owner_user_id,
+            channel_provider=r.channel_provider,
+            visibility=r.visibility or "private",
         )
         for r in rows
     ]
