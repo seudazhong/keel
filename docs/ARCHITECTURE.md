@@ -4,7 +4,8 @@
 > **Product boundary:** [PRD](./PRD.md)
 > **Current capability:** [Status](./STATUS.md)
 > **Accepted domain model:** [ADR-0011](./adr/0011-product-boundary-and-domain-model.md),
-> [ADR-0012](./adr/0012-user-mailboxes-todos-notifications.md)
+> [ADR-0012](./adr/0012-user-mailboxes-todos-notifications.md),
+> [ADR-0013](./adr/0013-mailbox-portfolio-and-todo-experience.md)
 
 This document describes both the system that exists and the contracts it is moving toward. Every
 section labels a statement as **current** or **target** when the distinction matters.
@@ -43,7 +44,7 @@ Five commitments drive the architecture:
 | Memory | Core blocks/version history, archival memory, search, consolidation proposals, evals. Interactive model tools can currently mutate memory directly. | Agent-owned memory policy and proposal-first learned memory as the product default. |
 | Knowledge | Versioned documents, chunking, embeddings, hybrid retrieval, citations, taint, delete lifecycle. | Product qualification and source lifecycle across supported Connections. |
 | Connections | One provider binding per connector per scope plus selected resources/targets. | Multi-account Connection objects reusable through explicit Agent/Routine grants. |
-| Keel Mailbox | Not implemented. | One platform-managed AgentMail inbox per User, private routing, signed inbound delivery, and approval-gated outbound mail. |
+| Keel Mailbox | Not implemented. | One Primary plus optional private Purpose Mailboxes per User, private routing, signed inbound delivery, and approval-gated outbound mail. |
 | ToDos and notifications | Not implemented. | User-owned ToDos with durable reminders and reusable Web/email/IM notification delivery. |
 | Projects | Organization-owned project records, shared Git storage, worktrees, GitHub App sync, grants. | Simpler GitHub setup and complete user journeys. |
 | Review | Durable API/worker and immutable evidence-checked report artifacts. | React review request/status/report surface. |
@@ -55,7 +56,7 @@ Five commitments drive the architecture:
 ## 3. Canonical domain model
 
 ADR-0011 defines the core platform vocabulary. ADR-0012 adds user-scoped Keel Mailboxes, ToDos, and
-Notifications.
+Notifications; ADR-0013 defines mailbox cardinality, product surfaces, and Agent ToDo tools.
 
 ```text
 Organization
@@ -69,7 +70,8 @@ Organization
   └─ Routines
 
 User
-  ├─ Keel Mailbox -> Mail Threads / Messages / Drafts
+  ├─ Keel Mailboxes (one primary, optional purpose)
+  │    └─ Mail Threads / Messages / Drafts
   ├─ Verified Delivery Endpoint
   └─ Notifications -> Channel Deliveries
 
@@ -159,8 +161,10 @@ precursor, not the final autonomy model.
 ### 3.7 Keel Mailbox, ToDo, and Notification
 
 A Keel Mailbox is a platform-managed email identity bound to a User, not to a persisted Agent and
-not to a user-configured Connection. It survives personal-Agent changes. A mail thread may be pinned
-to one private email Session and personal Agent when first admitted.
+not to a user-configured Connection. When Mail is enabled and any active mailbox exists, the User has
+exactly one active Primary Mailbox and may have additional private Purpose Mailboxes within
+deployment quota. They survive personal-Agent changes. A mail thread may be pinned to one private
+email Session and personal Agent when first admitted.
 
 A ToDo is user-owned within an organization. Agent, Session, Run, Routine, and mail-message
 references record who created or changed it but do not become owners. Team Agents receive no
@@ -411,9 +415,12 @@ journey.
 ## 10. Keel Mailboxes, ToDos, and notifications
 
 AgentMail is the first Keel Mailbox provider. Its deployment credential remains in the trusted
-control/effect planes. Mailbox provisioning uses a deterministic provider `client_id`; runtime mail
-operations use the narrowest practical inbox-scoped credential and never expose it to the model,
-browser, or sandbox.
+control/effect planes. Keel persists an opaque local mailbox ID first and derives the deterministic
+provider `client_id` from that mailbox ID, so retries reuse one inbox while Purpose Mailboxes cannot
+collide. Runtime mail operations use the narrowest practical inbox-scoped credential and never
+expose it to the model, browser, or sandbox. The data model and UI support one Primary plus optional
+Purpose Mailboxes; a partial uniqueness constraint permits only one active primary per Mail-enabled
+User.
 
 Inbound processing is:
 
@@ -454,6 +461,24 @@ recipients, replies/forwards, and attachments require exact-draft approval.
 ToDos are normal user data, not Jobs or Routines. Their state uses optimistic versions and audit
 history. Due reminders create accepted Notification occurrences and are atomically cancelled or
 replaced when the ToDo is changed, completed, cancelled, or archived.
+
+The user-facing ToDo tool contract is deliberately small:
+
+```text
+todo_create
+todo_list
+todo_get
+todo_update
+todo_transition
+todo_set_reminders
+```
+
+Untrusted email/autonomous contexts receive `todo_propose` instead of active mutation authority.
+Tools derive User/Organization ownership from admitted context and never accept it from model input.
+
+Mail and ToDos are full-width Workspace surfaces. Wide screens use list/detail workspaces; medium
+screens collapse secondary rails; mobile uses separate list/detail routes. Exact-draft Send in the
+authenticated Mail UI is itself the bound human approval rather than a redundant second dialog.
 
 ## 11. Managed projects, review, and patches
 
@@ -595,7 +620,8 @@ The active ordering is in [Roadmap](./ROADMAP.md). The load-bearing gaps are:
 3. versioned Agent and first-class Routine/Connection models;
 4. direct-memory mutation removal plus proposal-first learning;
 5. durable accepted-occurrence and ambiguous-effect reconciliation;
-6. per-user Keel Mailbox, verified delivery endpoint, ToDo, and Notification models;
+6. per-user Primary/Purpose Keel Mailboxes, verified delivery endpoint, ToDo, and Notification
+   models and product surfaces;
 7. browser OIDC session and team/admin product surfaces;
 8. review/patch productization;
 9. separate trusted effect brokers and per-run command isolation;

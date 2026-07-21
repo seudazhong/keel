@@ -155,6 +155,8 @@ that reconciles before retry.
 
 ### Keel Mailboxes, notifications, and ToDos
 
+- If a User has enabled Mail and has any active mailbox, exactly one is Primary; Purpose Mailboxes
+  remain private to the same User and cannot become team resources through routing configuration.
 - One User cannot discover, read, send from, or route through another User's Keel Mailbox.
 - Mailbox provider and webhook credentials never enter model context, browser state, or sandbox
   execution.
@@ -162,6 +164,8 @@ that reconciles before retry.
   mailbox owner's verified delivery address.
 - ToDos are owned by the authenticated User, not by a model-supplied owner, scope, Agent, or email
   sender.
+- Active ToDo mutation tools are unavailable to untrusted email/IM contexts; those contexts can only
+  create bounded proposals.
 - Editing, completing, cancelling, or archiving a ToDo atomically cancels or replaces obsolete
   reminder occurrences.
 - A templated notification to the verified user endpoint may send automatically; every other email

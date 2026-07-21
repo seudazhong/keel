@@ -14,7 +14,8 @@ Keel is a cloud-native platform for durable, governed Agents:
 3. Web, email, IM, schedules, and operator tools are surfaces of the same runtime;
 4. memory, Knowledge, connectors, projects, permissions, approvals, budgets, and audit attach to
    an Agent or Routine and are enforced consistently;
-5. each user can have a private Keel Mailbox plus user-owned ToDos and durable notifications;
+5. each user can have one primary Keel Mailbox, optional private purpose mailboxes, user-owned ToDos,
+   and durable notifications;
 6. native integrations provide dependable depth for core services, while MCP and automation
    systems cover the long tail.
 
@@ -50,7 +51,7 @@ platform. Keel is not redefined as a coding-only product.
 
 ### 4.1 Personal connected Agent
 
-1. A user signs in, receives or selects a private personal Agent, and enables a user-specific Keel
+1. A user signs in, receives or selects a private personal Agent, and enables a Primary Keel
    Mailbox.
 2. They verify a human delivery address, connect Gmail and Calendar, select resources, and review
    stored-data and approval policy.
@@ -62,7 +63,8 @@ platform. Keel is not redefined as a coding-only product.
 
 ### 4.2 Keel Mailbox and ToDos
 
-1. Each user has one Keel-managed mailbox address that is independent of personal-Agent changes.
+1. Each user has one Primary Keel Mailbox and may add private Purpose Mailboxes within deployment
+   quota; all remain independent of personal-Agent changes.
 2. Incoming mail is durably received as untrusted content and can be triaged into a private email
    Session, draft, or proposed ToDo.
 3. Keel may send a versioned template notification to the user's verified email without per-message
@@ -99,7 +101,8 @@ database edits.
 The product language is Actor, Organization, Agent, Agent Access, Connection, Resource, Grant,
 Routine, Session, Run, Job, Approval, Effect, Artifact, Keel Mailbox, ToDo, and Notification. See
 [ADR-0011](./adr/0011-product-boundary-and-domain-model.md) and
-[ADR-0012](./adr/0012-user-mailboxes-todos-notifications.md).
+[ADR-0012](./adr/0012-user-mailboxes-todos-notifications.md), refined by
+[ADR-0013](./adr/0013-mailbox-portfolio-and-todo-experience.md).
 
 `scope_id` is an internal isolation key. It must not be exposed as the user's mental model for
 selecting an Agent, sharing a resource, or authorizing an action.
@@ -161,13 +164,13 @@ A Routine may narrow an Agent's granted resources/actions but may never expand t
 
 | ID | Requirement | Priority |
 |---|---|---|
-| MAIL-1 | Each user has at most one active Keel-managed mailbox per deployment; it is not owned by a persisted Agent or modeled as a user Connection. | P0 |
+| MAIL-1 | When Keel Mail is enabled, each user has exactly one active Primary Keel Mailbox and may have additional private Purpose Mailboxes within deployment quota; none is owned by a persisted Agent or modeled as a user Connection. | P0 |
 | MAIL-2 | The user's human delivery address has explicit verification, opt-in, timezone, quiet-hours, and channel preferences. | P0 |
 | MAIL-3 | Signed inbound events are durably deduplicated, stored with provenance/taint, and cannot confer user authority from a sender address alone. | P0 |
 | MAIL-4 | Only versioned template notifications to the user's verified address bypass per-message approval; all other mail binds approval to the exact draft. | P0 |
 | MAIL-5 | Mail sends use durable Effect states, provider idempotency, delivery/bounce evidence, and reconciliation before retry after an ambiguous outcome. | P0 |
 | TODO-1 | ToDos are user-owned within an organization and survive Agent replacement or deletion. | P0 |
-| TODO-2 | Users can create, read, update, complete, reopen, cancel, archive, filter, and inspect provenance through Web and chat. | P0 |
+| TODO-2 | Users can create, read, update, complete, reopen, cancel, archive, filter, inspect provenance, and accept/dismiss proposals through Web and chat. | P0 |
 | TODO-3 | ToDo mutations use optimistic versioning, explicit policy, audit history, and user-derived ownership rather than caller-supplied scope identifiers. | P0 |
 | TODO-4 | Due reminders create durable Notifications whose pending occurrences are atomically replaced or cancelled when the ToDo changes. | P0 |
 
@@ -228,6 +231,7 @@ A Routine may narrow an Agent's granted resources/actions but may never expand t
 - A visual no-code workflow builder; integrate with automation platforms instead.
 - Bulk marketing, unsolicited outreach, or a general email-campaign product.
 - A full project-management/issue-tracking suite in the initial ToDo release.
+- Shared/team mailboxes in the initial personal-Mail release.
 - Model training/fine-tuning.
 - Native mobile applications.
 - A browser IDE or unrestricted remote-code-execution service.

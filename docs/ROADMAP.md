@@ -100,9 +100,11 @@ change, but R2 cannot close until both gates pass.
 
 - a complete personal Agent definition: model, persona, tools, Connections/resources, memory
   policy, budgets, and Routine defaults;
-- one private Keel Mailbox per user, a verified human delivery endpoint, and safe inbound mail
-  triage that fails closed when organization/personal-Agent routing is ambiguous;
-- user-owned ToDos managed through Web/chat with durable reminders;
+- one private Primary Keel Mailbox per user plus optional Purpose Mailboxes within quota, a verified
+  human delivery endpoint, and safe inbound mail triage that fails closed when
+  organization/personal-Agent routing is ambiguous;
+- user-owned ToDos managed through full Web/chat surfaces with proposals, provenance, and durable
+  reminders;
 - durable Notifications, including template-only email delivery to the verified user address;
 - Gmail + Google Calendar as product-supported Connections with common lifecycle/security tests;
 - user-managed memory plus proposal-first learned memory;
@@ -110,10 +112,11 @@ change, but R2 cannot close until both gates pass.
 - consistent Web approvals and effect history;
 - onboarding that explains stored data, grants, and approval policy.
 
-**Exit scenario:** from an empty preview, one operator configures a personal Agent and Keel Mailbox,
-verifies a delivery address, connects Gmail and Calendar, completes a cited read task, creates a
-ToDo, receives exactly one email reminder, runs a Routine, approves one exact outbound effect, and
-sees the result survive a service restart.
+**Exit scenario:** from an empty preview, one operator configures a personal Agent and Primary Keel
+Mailbox, adds one Purpose Mailbox without cross-routing threads, verifies a delivery address,
+connects Gmail and Calendar, completes a cited read task, creates a ToDo, receives exactly one email
+reminder from the Primary Mailbox, runs a Routine, approves one exact outbound effect, and sees the
+result survive a service restart.
 
 **Non-goals:** browser OIDC, team Agents, broad connector catalog.
 
@@ -153,8 +156,8 @@ and force-push remain impossible.
 - browser OIDC authorization code + PKCE with secure HTTP-only session;
 - enforcement of one active organization for the initial production profile;
 - automatic private personal Agent provisioning;
-- automatic private Keel Mailbox provisioning for every user and adversarial cross-user mail/ToDo
-  isolation;
+- automatic private Primary Keel Mailbox provisioning for every user, Purpose Mailbox quota
+  enforcement, and adversarial cross-user mail/ToDo isolation;
 - membership, Agent Access, Connection, grant, Routine, and audit administration;
 - team Agents with explicit user/channel access and resources;
 - explicit session owner/channel and visibility policy;
