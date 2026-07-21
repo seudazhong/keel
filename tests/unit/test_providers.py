@@ -13,10 +13,13 @@ import pytest
 
 from keel_core.agents import AgentSpec, Scope
 from keel_core.loop import admit, run
+from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.protocols import ProviderRequest
 from keel_core.providers import LiteLLMGateway, _map_finish
 from keel_core.state import InMemoryEventStore
-from keel_core.types import FinishReason, ScopeKind, StopReason
+from keel_core.types import FinishReason, PermissionDecision, ScopeKind, StopReason
+
+_TEST_ALLOW_ALL = RuleBasedPermissionEngine([Rule("*", PermissionDecision.allow)])
 
 
 def _chunk(
@@ -165,7 +168,13 @@ async def test_gateway_drives_the_loop() -> None:
         id="a", name="n", model="openai/gpt-x", scope=Scope(id="u", kind=ScopeKind.personal)
     )
     await admit(store, "s", "u", "hello")
-    result = await run(agent=agent, session_id="s", store=store, provider=gateway)
+    result = await run(
+        agent=agent,
+        session_id="s",
+        store=store,
+        provider=gateway,
+        permissions=_TEST_ALLOW_ALL,
+    )
     assert result.reason is StopReason.completed
 
 

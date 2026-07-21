@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import AsyncIterator
 
 from keel_core.agents import AgentSpec, Scope
@@ -27,6 +28,8 @@ from keel_core.types import (
     StopReason,
     TrustLevel,
 )
+
+_TEST_ALLOW_ALL = RuleBasedPermissionEngine([Rule("*", PermissionDecision.allow)])
 
 
 def _agent() -> AgentSpec:
@@ -61,13 +64,23 @@ def _event_types(store: InMemoryEventStore, session: str) -> list[EventType]:
     return [event.type for event in store.snapshot(session)]
 
 
+def test_run_requires_an_explicit_permission_engine() -> None:
+    assert inspect.signature(run).parameters["permissions"].default is inspect.Parameter.empty
+
+
 async def test_run_completes_with_named_termination() -> None:
     store = InMemoryEventStore()
     provider = ScriptedProviderGateway(
         [[ProviderChunk(delta="hi", finish_reason=FinishReason.end_turn)]]
     )
     await admit(store, "s1", "u:1", "hello")
-    result = await run(agent=_agent(), session_id="s1", store=store, provider=provider)
+    result = await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=provider,
+        permissions=_TEST_ALLOW_ALL,
+    )
 
     assert result.reason is StopReason.completed
     types = _event_types(store, "s1")
@@ -96,6 +109,7 @@ async def test_tool_use_executes_then_completes() -> None:
         session_id="s1",
         store=store,
         provider=provider,
+        permissions=_TEST_ALLOW_ALL,
         registry=ToolRegistry([tool]),
     )
 
@@ -149,6 +163,7 @@ async def test_tool_result_persists_citations_without_projecting_them_to_provide
         session_id="s1",
         store=store,
         provider=provider,
+        permissions=_TEST_ALLOW_ALL,
         registry=ToolRegistry([CitedTool()]),
     )
 
@@ -192,6 +207,7 @@ async def test_stop_reason_gate_blocks_tools_without_tool_use() -> None:
         session_id="s1",
         store=store,
         provider=provider,
+        permissions=_TEST_ALLOW_ALL,
         registry=ToolRegistry([tool]),
     )
 
@@ -219,6 +235,7 @@ async def test_bounded_loop_hits_max_iterations() -> None:
         session_id="s1",
         store=store,
         provider=provider,
+        permissions=_TEST_ALLOW_ALL,
         registry=ToolRegistry([tool]),
         budget=RunBudget(max_iterations=3),
     )
@@ -239,6 +256,7 @@ async def test_interrupt_terminates() -> None:
         session_id="s1",
         store=store,
         provider=provider,
+        permissions=_TEST_ALLOW_ALL,
         interrupt=lambda: True,
     )
     assert result.reason is StopReason.interrupted
@@ -264,6 +282,7 @@ async def test_budget_exhausted() -> None:
         session_id="s1",
         store=store,
         provider=provider,
+        permissions=_TEST_ALLOW_ALL,
         registry=ToolRegistry([tool]),
         budget=RunBudget(max_iterations=100, token_budget=5),
     )
@@ -274,7 +293,13 @@ async def test_halted_on_empty_turn() -> None:
     store = InMemoryEventStore()
     provider = ScriptedProviderGateway([[ProviderChunk()]])  # no text, tool, or finish
     await admit(store, "s1", "u:1", "hi")
-    result = await run(agent=_agent(), session_id="s1", store=store, provider=provider)
+    result = await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=provider,
+        permissions=_TEST_ALLOW_ALL,
+    )
     assert result.reason is StopReason.halted
 
 
@@ -291,6 +316,7 @@ async def test_provider_failure_yields_error() -> None:
         session_id="s1",
         store=store,
         provider=_BoomGateway(),
+        permissions=_TEST_ALLOW_ALL,
         budget=RunBudget(max_retries=1),
     )
     assert result.reason is StopReason.error
@@ -306,7 +332,13 @@ async def test_persist_before_first_model_call() -> None:
             return _one_end_turn()
 
     await admit(store, "s1", "u:1", "hello world")
-    await run(agent=_agent(), session_id="s1", store=store, provider=_ProbeGateway())
+    await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=_ProbeGateway(),
+        permissions=_TEST_ALLOW_ALL,
+    )
 
     first_messages = seen["first_messages"]
     assert any(m["role"] == "user" and m["content"] == "hello world" for m in first_messages)
@@ -342,6 +374,7 @@ async def test_tool_error_still_reaches_named_termination() -> None:
         session_id="s1",
         store=store,
         provider=provider,
+        permissions=_TEST_ALLOW_ALL,
         registry=ToolRegistry([_BoomTool()]),
     )
     assert result.reason is StopReason.completed  # the run still terminated, named
@@ -370,7 +403,13 @@ async def test_agent_budget_is_respected() -> None:
         max_iterations=2,
     )
     await admit(store, "s1", "u:1", "loop")
-    result = await run(agent=agent, session_id="s1", store=store, provider=provider)
+    result = await run(
+        agent=agent,
+        session_id="s1",
+        store=store,
+        provider=provider,
+        permissions=_TEST_ALLOW_ALL,
+    )
     assert result.reason is StopReason.max_iterations
     assert result.iterations == 2  # honored the agent's cap, not RunBudget's default
 
@@ -420,6 +459,7 @@ async def test_on_delta_streams_text_deltas() -> None:
         session_id="s1",
         store=store,
         provider=provider,
+        permissions=_TEST_ALLOW_ALL,
         on_delta=deltas.append,
     )
     assert deltas == ["Hel", "lo"]  # tokens surfaced live, in order
@@ -437,6 +477,7 @@ async def test_on_event_observes_persisted_events_in_order() -> None:
         session_id="s1",
         store=store,
         provider=provider,
+        permissions=_TEST_ALLOW_ALL,
         on_event=lambda event: seen.append(event.type),
     )
     # The observer sees exactly the run's events (not the pre-run admit), in seq order.
@@ -466,6 +507,7 @@ async def test_observer_errors_never_abort_the_run() -> None:
         session_id="s1",
         store=store,
         provider=provider,
+        permissions=_TEST_ALLOW_ALL,
         on_event=boom_event,
         on_delta=boom_delta,
     )
@@ -492,6 +534,7 @@ async def test_provider_client_error_fails_fast_with_message() -> None:
         session_id="s1",
         store=store,
         provider=_Gateway(),
+        permissions=_TEST_ALLOW_ALL,
         budget=RunBudget(max_retries=2),
     )
     assert result.reason is StopReason.error
@@ -515,6 +558,7 @@ async def test_provider_transient_error_retries_then_surfaces_message() -> None:
         session_id="s1",
         store=store,
         provider=_Gateway(),
+        permissions=_TEST_ALLOW_ALL,
         budget=RunBudget(max_retries=2),
     )
     assert result.reason is StopReason.error
@@ -535,7 +579,14 @@ async def test_stream_deltas_emits_partials_but_projection_uses_whole() -> None:
         ]
     )
     await admit(store, "s1", "u:1", "hi")
-    await run(agent=_agent(), session_id="s1", store=store, provider=provider, stream_deltas=True)
+    await run(
+        agent=_agent(),
+        session_id="s1",
+        store=store,
+        provider=provider,
+        permissions=_TEST_ALLOW_ALL,
+        stream_deltas=True,
+    )
 
     tokens = [e for e in store.snapshot("s1") if e.type is EventType.message_token]
     partials = [e.payload["text"] for e in tokens if e.payload.get("partial")]
@@ -566,6 +617,7 @@ async def test_tools_are_advertised_to_the_provider() -> None:
         session_id="s1",
         store=store,
         provider=_ProbeGateway(),
+        permissions=_TEST_ALLOW_ALL,
         registry=ToolRegistry([_SpyTool()]),
     )
     # The model must be told the toolset exists (OpenAI/LiteLLM function-call format),

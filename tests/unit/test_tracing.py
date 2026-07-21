@@ -8,10 +8,13 @@ from keel_core.agents import AgentSpec, Scope
 from keel_core.config import Settings
 from keel_core.events import Event, EventType
 from keel_core.loop import admit, run
+from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.protocols import ProviderChunk, ProviderRequest, Usage
 from keel_core.state import InMemoryEventStore
 from keel_core.tracing import NoopTracer, make_tracer
-from keel_core.types import FinishReason, ScopeKind, TrustLevel
+from keel_core.types import FinishReason, PermissionDecision, ScopeKind, TrustLevel
+
+_TEST_ALLOW_ALL = RuleBasedPermissionEngine([Rule("*", PermissionDecision.allow)])
 
 
 def _agent() -> AgentSpec:
@@ -60,6 +63,7 @@ async def test_run_accounts_usage_and_feeds_tracer() -> None:
         session_id="s1",
         store=store,
         provider=_UsageGateway(),
+        permissions=_TEST_ALLOW_ALL,
         on_event=tracer.record,
     )
 

@@ -6,9 +6,12 @@ from collections.abc import AsyncIterator
 
 from keel_core.agents import AgentSpec, Scope
 from keel_core.loop import admit, run
+from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.protocols import ProviderChunk, ProviderRequest
 from keel_core.state import InMemoryEventStore
-from keel_core.types import FinishReason, ScopeKind
+from keel_core.types import FinishReason, PermissionDecision, ScopeKind
+
+_TEST_ALLOW_ALL = RuleBasedPermissionEngine([Rule("*", PermissionDecision.allow)])
 
 
 class _CapturingProvider:
@@ -39,7 +42,14 @@ async def test_system_context_injected_as_first_message() -> None:
     async def ctx() -> str:
         return "<core_memory><human>X</human></core_memory>"
 
-    await run(agent=_agent(), session_id="s", store=store, provider=provider, system_context=ctx)
+    await run(
+        agent=_agent(),
+        session_id="s",
+        store=store,
+        provider=provider,
+        permissions=_TEST_ALLOW_ALL,
+        system_context=ctx,
+    )
     assert provider.requests[0].messages[0] == {
         "role": "system",
         "content": "<core_memory><human>X</human></core_memory>",
@@ -55,13 +65,27 @@ async def test_system_context_reread_between_runs() -> None:
 
     await admit(store, "s", "u", "hi")
     p1 = _CapturingProvider(["r1"])
-    await run(agent=_agent(), session_id="s", store=store, provider=p1, system_context=ctx)
+    await run(
+        agent=_agent(),
+        session_id="s",
+        store=store,
+        provider=p1,
+        permissions=_TEST_ALLOW_ALL,
+        system_context=ctx,
+    )
     assert p1.requests[0].messages[0]["content"] == "before"
 
     holder["v"] = "after"  # a self-edit lands between runs
     await admit(store, "s", "u", "again")
     p2 = _CapturingProvider(["r2"])
-    await run(agent=_agent(), session_id="s", store=store, provider=p2, system_context=ctx)
+    await run(
+        agent=_agent(),
+        session_id="s",
+        store=store,
+        provider=p2,
+        permissions=_TEST_ALLOW_ALL,
+        system_context=ctx,
+    )
     assert p2.requests[0].messages[0]["content"] == "after"  # re-read, not cached
 
 
@@ -69,5 +93,11 @@ async def test_no_system_context_leaves_messages_unchanged() -> None:
     store = InMemoryEventStore()
     await admit(store, "s", "u", "hi")
     provider = _CapturingProvider(["ok"])
-    await run(agent=_agent(), session_id="s", store=store, provider=provider)
+    await run(
+        agent=_agent(),
+        session_id="s",
+        store=store,
+        provider=provider,
+        permissions=_TEST_ALLOW_ALL,
+    )
     assert all(m["role"] != "system" for m in provider.requests[0].messages)
