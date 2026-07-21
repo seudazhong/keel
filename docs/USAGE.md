@@ -1,33 +1,140 @@
 # Using Keel
 
-Keel currently provides a minimal server-rendered chat, a separate React development UI,
-a local CLI runtime, and REST/SSE APIs. The implementation is still single-scope
-(`web:local`) and is not a multi-user product.
+This guide covers the current trusted preview. The running OpenAPI document at `/docs` is
+authoritative for request/response schemas.
 
-## Start the current Compose stack
+## Start
 
 ```powershell
 Copy-Item .env.example .env
-# Edit .env and configure KEEL_DEFAULT_MODEL plus the matching provider credentials.
-docker compose --profile dev up -d --build
+# Configure KEEL_DEFAULT_MODEL and provider credentials.
+docker compose -f docker-compose.yml --profile dev up -d --build
 Invoke-RestMethod http://localhost:8000/readiness
 ```
 
 Open:
 
-- `http://localhost:8000/` — minimal chat
-- `http://localhost:8000/docs` — OpenAPI
-- `http://localhost:8000/approvals` — server-rendered durable approvals page
-- `http://localhost:3000/` — built React application
+- React: `http://localhost:3000/`
+- API: `http://localhost:8000/docs`
+- minimal server chat: `http://localhost:8000/`
 
-Sessions, connector status, schedules, Jobs, Memory proposals, Knowledge, and admin overview are
-available through `/v1` APIs and the React UI; they are not standalone server-rendered pages.
+## Authentication and workspace
 
-See [Demo](./DEMO.md) for a safe walkthrough.
+The React preview supports:
+
+- local preview;
+- API key;
+- directly supplied OIDC bearer token;
+- optional organization and Agent selection.
+
+It does not perform an OIDC provider redirect/callback login. Do not treat the credential-entry
+screen as a production browser-auth design.
+
+In authenticated use, run data is routed through the selected organization and Agent. `web:local`
+is the local-preview compatibility scope.
+
+## React surfaces
+
+| Surface | Current use |
+|---|---|
+| Chat | Durable message admission, streaming events, tool timeline, approvals, and session resume. |
+| Sessions | List, search, inspect, and resume durable conversations. |
+| Memory | Current blocks, versioned/proposed changes, and consolidation controls. |
+| Knowledge | Knowledge Base/document lifecycle and cited search. |
+| Agents | Create/select persisted personal/team Agent records; full policy configuration is not yet present. |
+| Connectors | Generic setup, authorization, resources, targets, health, sync, and disconnect. |
+| Projects | Create/import/list/detail/delete preview. |
+| Approvals | Pending/resolved durable approvals. |
+| Schedules | List/toggle/run current schedule rows. |
+| Jobs | Durable job status and cancellation. |
+| Observability | Current local overview, not a complete production telemetry product. |
+
+Projects and Agents are labeled Preview. Read-only review and controlled patches do not yet have
+React pages.
+
+## Chat and sessions
+
+Start a new chat from `/chat`. The browser keeps the durable session id in the route and can reopen
+an existing session from Sessions.
+
+Submitting through the API:
+
+```powershell
+$session = [guid]::NewGuid().ToString()
+$body = @{ content = "Reply briefly and do not call tools." } | ConvertTo-Json
+Invoke-RestMethod "http://localhost:8000/v1/sessions/$session/messages" `
+  -Method Post -ContentType "application/json" -Body $body
+```
+
+Follow:
+
+```text
+GET /v1/sessions/{session_id}/events
+```
+
+as replayable SSE.
+
+## Memory and Knowledge
+
+Memory is small Agent/session context. Knowledge is cited external/user document content. They are
+not interchangeable.
+
+Useful reads:
+
+```powershell
+Invoke-RestMethod http://localhost:8000/v1/memory/blocks
+Invoke-RestMethod http://localhost:8000/v1/memory/proposals
+Invoke-RestMethod http://localhost:8000/v1/knowledge-bases
+```
+
+Knowledge ingestion runs as durable jobs and requires Postgres, Redis, worker, and embeddings.
+
+## Connections
+
+The generic Connectors page discovers installed provider manifests. Provider-specific setup is in
+[`docs/connectors`](./connectors/README.md).
+
+Current implementations include Gmail, Google Calendar, Google Drive/Docs, Microsoft 365, Notion,
+Feishu, GitHub collaboration, RSS/Atom, and webhook.
+
+Provider presence does not imply equal product maturity. Gmail and Calendar are the initial
+connected-Agent product candidates; other providers remain subject to common qualification.
+
+External content is tainted. Outbound effects require approval when influenced by tainted content
+and use durable idempotency/reconciliation where implemented.
+
+## Projects and review
+
+Projects can be blank or imported through a linked GitHub App installation.
+
+```powershell
+Invoke-RestMethod http://localhost:8000/v1/projects
+```
+
+Read-only review endpoints live under:
+
+```text
+/v1/projects/{project_id}/reviews
+```
+
+The API/worker/report flow exists, but the React UI does not expose it.
+
+Controlled patch workers are not reachable through a public API yet.
+
+## Schedules, jobs, and approvals
+
+```powershell
+Invoke-RestMethod http://localhost:8000/v1/schedules
+Invoke-RestMethod http://localhost:8000/v1/jobs
+Invoke-RestMethod http://localhost:8000/v1/approvals
+```
+
+Run/toggle/cancel/approve/reject operations mutate durable state. Use disposable preview data.
+
+Current schedule rows are a precursor to first-class Routines and may execute only the built-in
+supported agent kinds.
 
 ## CLI
-
-Install the locked workspace and inspect commands:
 
 ```powershell
 uv sync --frozen
@@ -37,68 +144,12 @@ uv run keel chat --workspace .
 uv run keel run "Summarize README.md without modifying files" --workspace .
 ```
 
-CLI sessions are in memory unless `--durable` is supplied. On Windows, durable Postgres
-mode uses a selector event loop and cannot be combined reliably with shell subprocesses.
-Mutating tools ask by default. Avoid `--allow-all` and `--yes` outside disposable workspaces.
+The CLI is an operator/developer surface. Mutating tools should ask. Avoid broad allow flags outside
+disposable workspaces.
 
-## REST and streaming
+## Demo data
 
-The API is under `/v1`; the running `/docs` is authoritative. Common reads:
-
-```powershell
-Invoke-RestMethod http://localhost:8000/v1/sessions
-Invoke-RestMethod http://localhost:8000/v1/jobs
-Invoke-RestMethod http://localhost:8000/v1/knowledge-bases
-Invoke-RestMethod http://localhost:8000/v1/connectors
-```
-
-Submitting a message is a mutation:
-
-```powershell
-$session = [guid]::NewGuid().ToString()
-$body = @{ content = "Reply briefly; do not call tools." } | ConvertTo-Json
-Invoke-RestMethod "http://localhost:8000/v1/sessions/$session/messages" `
-  -Method Post -ContentType "application/json" -Body $body
-```
-
-Then follow `GET /v1/sessions/{id}/events` as SSE. If `KEEL_API_KEYS` is configured, pass
-`X-API-Key` or a Bearer token with the required role.
-
-## React UI
-
-Compose serves the production-built React bundle on `:3000`. For frontend-only iteration:
-
-```powershell
-Set-Location web
-npm ci
-npm run dev
-```
-
-Vite normally serves `http://localhost:5173` and proxies API calls to `:8000`. Current
-routes include chat, sessions, connectors, Knowledge, schedules, approvals, overview, and
-settings. Responsive layout, i18n, accessibility completion, onboarding, identity, and a
-real agent switcher remain roadmap work.
-
-## Gmail
-
-Gmail is the only native connector today. Configure a Desktop OAuth client and a shared
-`KEEL_SECRET_KEY`, then:
-
-```powershell
-uv run python scripts/gmail_authorize.py --scope web:local
-```
-
-Enable Gmail in the worker environment. Read access and connection status can be used
-without enabling real sends. `KEEL_GMAIL_SEND_ENABLED=1` enables production mutations;
-leave it off for development and demos.
-
-## Knowledge and jobs
-
-Current-main exposes Knowledge Base CRUD/search and durable job list/detail/cancel APIs.
-Ingestion needs Postgres, Redis/arq, and a worker. New stacks contain no Knowledge data.
-
-To populate an unmistakably local dev/demo stack without editing database rows, preview and run
-the guarded, idempotent bootstrap:
+For an unmistakably local development stack:
 
 ```powershell
 $env:KEEL_APP_ENV = "dev"
@@ -106,7 +157,4 @@ uv run python scripts/seed_demo_data.py --dry-run
 uv run python scripts/seed_demo_data.py --yes
 ```
 
-The guard refuses non-loopback or production-labelled targets. `--mode auto` falls back to a
-deterministic offline embedder when the configured provider is unavailable; use `--mode fake`
-to force an offline run. Replays reuse the same Knowledge Base, documents, jobs, and welcome
-session. Use the OpenAPI schemas rather than copying old dated plans.
+The command is guarded and idempotent. See [Demo](./DEMO.md).

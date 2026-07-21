@@ -1,126 +1,85 @@
-<!-- Keel — cloud-native personal and team agent platform -->
-<h1 align="center">⛵ Keel</h1>
-<p align="center"><em>A durable agent runtime for private personal agents and explicitly shared team agents, reached through web, IM, and operator tools.</em></p>
+<!-- Keel — governed cloud agents -->
+<h1 align="center">Keel</h1>
+<p align="center"><em>A durable, governed runtime for private personal agents and explicitly shared team agents.</em></p>
 
----
+Keel is a server-hosted agent platform built around durable conversations, memory, Knowledge,
+connectors, routines, approvals, and auditable effects. Its first product boundary is a
+single-organization deployment in which every user can have a private personal Agent and teams can
+share Agents through explicit access and resources through explicit grants.
 
-Keel's target is a **multi-user, cloud-native agent platform**:
+Managed code projects, read-only review, and controlled patch proposals are supported capability
+areas. They are not the identity of the product and do not bypass the same Agent, grant, approval,
+and execution boundaries used elsewhere.
 
-- every user has a private, persisted personal agent;
-- team agents share only resources explicitly granted to them;
-- web and IM are surfaces of the same durable runtime, memory, permissions, approvals, and
-  audit trail;
-- native connectors provide depth for core services, while MCP and automation platforms
-  cover the integration long tail.
+## Current state
 
-That is the product direction, not the current feature claim. Today Keel has a strong,
-tested, deployable **single-operator** engine and a broad React surface on a **completed
-safety foundation**: the data plane runs as a non-owner least-privilege runtime DB login with
-enforced RLS (M3A), and shell/file execution runs in a deployed authenticated isolated sandbox
-(M3B). It is not yet a multi-user product: there is no browser login flow, and the sandbox is a
-single-operator rootless-OCI boundary rather than a hardened multi-tenant microVM.
+`main` is a substantial **trusted local preview**, not a production or hostile multi-tenant
+release.
 
-## Maturity scale
+Implemented foundations include:
 
-Capabilities are rated on four independent levels. A higher level never implies a lower one,
-and code or passing tests (C/T) are **never** reported as a usable product scenario (P).
+- worker-owned durable runs, jobs, schedules, approvals, outboxes, recovery, and replayable events;
+- a React application for Chat, Sessions, Memory, Knowledge, Connectors, Agents, Projects,
+  Approvals, Schedules, Jobs, and Observability;
+- identity, organization, Agent, grant, IM-routing, retention/erasure, and event-evolution backends;
+- a manifest-driven connector runtime with Gmail, Google Calendar, Google Drive/Docs,
+  Microsoft 365, Notion, Feishu, GitHub, RSS/Atom, and webhook providers at differing maturity;
+- managed projects, GitHub App synchronization, and a read-only code-review API/worker;
+- controlled patch generation/writeback workers, durable proposal/outbox state, and reconciliation;
+- a non-owner runtime database login with enforced RLS;
+- an authenticated out-of-process sandbox used by server and worker.
 
-- **C — Code** exists on `main`.
-- **T — Tested** by automated tests that pass in CI.
-- **D — Deployable** in the standard Compose local-preview stack.
-- **P — Product** end-to-end scenario works through a shipped surface (not just an API/preview).
+Important limits:
 
-| Track | Maturity |
-|---|---|
-| Agent/data engine | C/T/D solid: durable sessions/runs/jobs/approvals/schedules, memory/search/consolidation/evals, Knowledge RAG. P is single-operator preview. |
-| Product surface | C/T/D present: React app with Chat, Sessions, Jobs, Memory, Knowledge, Connectors, onboarding, i18n, Agents, Projects. P is preview; many journeys need identity/login and backend work. |
-| Production readiness | Pre-production: safety foundation complete (M3A non-owner least-privilege runtime DB login + RLS; M3B deployed isolated sandbox), but sandbox is a single-operator rootless-OCI boundary (not a multi-tenant microVM), no browser OIDC, no production scheduler/OTel/DR. |
+- the browser has no built-in OIDC authorization-code flow; local preview or directly supplied
+  credentials are used instead;
+- the Compose sandbox is one hardened rootless-OCI service with per-scope file namespaces, not a
+  per-run microVM; shell/build/test execution remains disabled;
+- read-only review has no React surface;
+- controlled patch proposals have no public API, SDK, or UI yet;
+- the separate production scheduler, full OTel/metrics/SLO coverage, tested DR, and production
+  deployment profile are not complete.
 
-Read [`docs/STATUS.md`](./docs/STATUS.md) for the C/T/D/P capability table, verified evidence,
-and blockers, and [`docs/ROADMAP.md`](./docs/ROADMAP.md) for the active M0–M9 sequence.
+See [`docs/STATUS.md`](./docs/STATUS.md) for the current capability matrix and
+[`docs/ROADMAP.md`](./docs/ROADMAP.md) for the active plan.
 
-## What works now
+## Run the trusted preview
 
-Verified on `main` at `b885f0d` (non-integration 1924 passed / 2 skipped; integration 397
-passed; frontend 116; Playwright 18/18; migration head `0020` applied by the standard Compose
-`migrate → runtime-secret-init → provision → sandbox → server/worker/web` startup):
-
-- FastAPI chat with SSE, tool timeline, and approvals
-- durable sessions/runs/jobs/schedules with cancellation/retry/recovery, and session search
-- core/archival memory, consolidation proposals, and deterministic memory evals
-- Knowledge Base RAG: lifecycle, durable ingest/delete, hybrid retrieval, citations, and taint
-- identity/org/agents/grants APIs and read-only code-review API + worker (both headless)
-- projects/GitHub App/storage backend
-- Gmail OAuth/status/read/approval-gated send, plus OneBot/Telegram IM routing
-- Compose serves the built **React application** (Chat, Sessions, Jobs, Memory, Knowledge,
-  Connectors, Observability), with onboarding, i18n, and Agents/Projects surfaces
-- non-owner least-privilege runtime DB login (`keel_runtime_login`) with enforced RLS, and a
-  deployed HMAC-authenticated isolated sandbox for file execution (readiness reports
-  `runtime_db_principal = 'least-privilege (keel_runtime_login)'` and `sandbox = ok`)
-- CLI local runtime with file, shell, and provider tools
-
-The controlled Patch/Draft-PR foundation is **merged on `main`** (migration `0019`, plus
-models/store/bundle/generation/approval with recovery+lease guard/trusted writeback/coordinator),
-but it is a **C/T foundation only** — it has no API/SDK, worker jobs, dispatch outbox,
-reconciler, or UI (those are milestones M4/M5), so it is **not yet product usable**. See
-[`docs/STATUS.md`](./docs/STATUS.md).
-
-Important limits (trusted single-operator local deployment — **not production-safe**): the
-Compose `dev`/`full` stack runs a real authenticated `keel-sandbox` execution boundary (server/
-worker use the fail-closed `sandbox` backend over an internal-only RPC network to a hardened,
-credential-less executor) and the data plane runs as the non-owner least-privilege
-`keel_runtime_login` (RLS/DDL/`SET ROLE` denied, passwordless URL + `0600` `PGPASSFILE`). Honest
-residuals remain: the sandbox is the single-operator rootless-OCI floor — **not** a hardened
-multi-tenant microVM — its internal network is bidirectional, and shell execution stays disabled
-(file tools work, isolated per scope); the Kubernetes path is example manifests where an operator
-runs `migrate`/`provision` themselves; there is no browser OIDC login flow; and the review
-API+worker and IM routing ship without a UI. Do not expose this stack to untrusted networks.
-
-## Run the development stack
-
-Prerequisites: Docker Desktop and a configured model/provider in `.env`.
+Prerequisites: Docker Desktop and a configured chat-capable model/provider.
 
 ```powershell
 Copy-Item .env.example .env
-# Edit .env: set KEEL_DEFAULT_MODEL and its provider credentials.
+# Configure KEEL_DEFAULT_MODEL and the matching provider credentials.
 docker compose -f docker-compose.yml --profile dev up -d --build
 Invoke-RestMethod http://localhost:8000/readiness
 ```
 
-Open `http://localhost:3000/` for the Compose-served React application,
-`http://localhost:8000/` for the minimal server chat, or `http://localhost:8000/docs` for the
-current API. For a live React dev server against the running `:8000` API:
+Open:
 
-```powershell
-Set-Location web
-npm ci
-npm run dev
-```
+- React application: `http://localhost:3000/`
+- API documentation: `http://localhost:8000/docs`
+- minimal server chat: `http://localhost:8000/`
 
-Use [`docs/DEMO.md`](./docs/DEMO.md) for a safe 10–15 minute walkthrough and
-[`docs/USAGE.md`](./docs/USAGE.md) for CLI/API details.
+Read [`docs/DEMO.md`](./docs/DEMO.md) for a safe walkthrough and
+[`docs/USAGE.md`](./docs/USAGE.md) for current usage.
 
 ## Documentation
 
-Start with the canonical [`docs/README.md`](./docs/README.md) index.
+Start at [`docs/README.md`](./docs/README.md).
 
-- [Demo](./docs/DEMO.md)
-- [Status](./docs/STATUS.md)
-- [Roadmap](./docs/ROADMAP.md)
 - [Product requirements](./docs/PRD.md)
-- [Architecture and implementation fidelity](./docs/ARCHITECTURE.md)
+- [Current status](./docs/STATUS.md)
+- [Architecture](./docs/ARCHITECTURE.md)
+- [Roadmap](./docs/ROADMAP.md)
+- [Invariant acceptance specifications](./docs/INVARIANTS.md)
 - [Operations](./docs/OPERATIONS.md)
 - [Development](./docs/DEVELOPMENT.md)
 
 ## Stack
 
-Implemented foundations use Python 3.12/asyncio, FastAPI, LiteLLM, PostgreSQL + pgvector,
-Redis/arq, React + Vite, and Docker Compose, including a separate authenticated `keel-sandbox`
-execution service. The broader target architecture adds a hardened multi-tenant (microVM)
-sandbox, a separate scheduler service, full observability, generated SDKs, and production
-delivery profiles; those remain roadmap work.
+Python 3.12/asyncio, FastAPI, PostgreSQL + pgvector, Redis/arq, LiteLLM, React/Vite,
+Docker Compose, and an authenticated `keel-sandbox` execution service.
 
 ## License
 
-No repository license file has been added yet. Do not assume a license from historical
-planning text.
+No repository license file has been added. Do not infer a license from historical planning text.

@@ -47,8 +47,8 @@ built Compose `keel-web` bundle directly (see [Demo guide](./DEMO.md)).
 
 ### Playwright demo smoke
 
-A read-only Playwright smoke covers the documented 10-15 minute demo (see
-[Demo guide](./DEMO.md#6-automated-browser-smoke-23-minutes)). It targets the Compose React
+A read-only Playwright smoke covers the documented walkthrough (see
+[Demo guide](./DEMO.md#9-automated-browser-smoke)). It targets the Compose React
 surface on `http://127.0.0.1:3000` by default and requires an already-running stack — it does
 not start/stop Compose or delete volumes:
 
@@ -60,7 +60,7 @@ npm run test:e2e
 ```
 
 Override the target with `$env:SMOKE_BASE_URL` (e.g. a Vite dev server on `:5173`). The suite
-fails fast with an actionable error if the target is unreachable or is a stale pre-M3.1 build
+fails fast with an actionable error if the target is unreachable or is a stale build
 (missing current-main routes like `/v1/jobs`) rather than silently skipping current routes.
 
 ## Local services
@@ -85,39 +85,16 @@ subprocess behavior is better exercised in Linux containers.
 
 ## Documentation changes
 
-- Current truth belongs in `STATUS.md`; future sequencing belongs only in `ROADMAP.md`.
-- PRD and Architecture may describe targets, but must link to current fidelity.
-- Dated `designs/` and `plans/` are historical snapshots.
-- Check links and whitespace before committing:
+- Current truth belongs only in `STATUS.md`; future sequencing belongs only in `ROADMAP.md`.
+- Architecture must label current implementation and target contracts explicitly.
+- PRD defines product requirements, not implementation status.
+- A changed decision gets a new ADR; dated `designs/` and `plans/` remain historical.
+- Check local paths, heading anchors, and whitespace before committing:
 
 ```powershell
-@'
-import re
-import subprocess
-from pathlib import Path
-from urllib.parse import unquote
-
-bad = []
-md_files = subprocess.run(
-    ["git", "ls-files", "*.md"], capture_output=True, text=True, check=True
-).stdout.splitlines()
-for rel in md_files:
-    path = Path(rel)
-    text = path.read_text(encoding="utf-8")
-    for target in re.findall(r"\[[^\]]*\]\(([^)]+)\)", text):
-        target = target.split("#", 1)[0].strip()
-        if not target or "://" in target or target.startswith("mailto:"):
-            continue
-        resolved = (path.parent / unquote(target)).resolve()
-        if not resolved.exists():
-            bad.append(f"{path}: {target}")
-if bad:
-    raise SystemExit("\n".join(bad))
-print("relative Markdown links: OK")
-'@ | python -
+uv run python scripts/check_markdown_links.py
 git diff --check
 ```
 
-Using `git ls-files` (rather than an unfiltered filesystem walk) keeps the check scoped to
-tracked documentation and avoids false failures from `node_modules/`, `.venv/`, `.worktrees/`,
-and similar untracked/vendored directories that also contain Markdown files.
+The script checks tracked and newly created non-ignored Markdown files, while excluding
+`node_modules/`, `.venv/`, `.worktrees/`, and other ignored/vendor trees.

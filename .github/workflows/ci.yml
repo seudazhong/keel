@@ -36,6 +36,9 @@ jobs:
       - name: OpenAPI compatibility
         run: uv run python scripts/check_openapi_compat.py
 
+      - name: Documentation links
+        run: uv run python scripts/check_markdown_links.py
+
       - name: Pytest
         run: uv run pytest -m "not integration"
 

@@ -34,8 +34,9 @@ What this checks (see docs/security-model.md for the rationale behind each rule)
          ClusterRoleBinding) at all — this scaffold intentionally ships no Kubernetes API
          access for the app's own ServiceAccounts (see docs/security-model.md);
        - `base/secret-app.example.yaml` requires a non-empty, syntactically valid
-         (`key:role`, role one of viewer/operator/admin) `KEEL_API_KEYS` entry (without ever
-         logging the key material itself), `base/configmap-app.yaml` never sets that key
+         cloud-capable (`key:admin:global` or `key:role:org=...:agent=...`) `KEEL_API_KEYS`
+         entry (without ever logging the key material itself),
+         `base/configmap-app.yaml` never sets that key
          (auth must come from an externally supplied Secret, never a default-empty/open-admin
          config), and the active config forces `KEEL_CLOUD_MODE: "true"`, which is consumed by
          application code (``Settings.cloud_mode`` / ``app.state.auth_required``) so
@@ -537,12 +538,11 @@ def check_project_storage_shared_mount(findings: list[Finding]) -> None:
 
 def check_auth_secret_required(findings: list[Finding]) -> None:
     """Auth must come from an externally supplied, non-empty, syntactically valid
-    `KEEL_API_KEYS`, and every active config must force fail-closed cloud mode.
+    cloud-capable `KEEL_API_KEYS`, and every active config must force fail-closed cloud mode.
 
-    Empty/missing `KEEL_API_KEYS` makes every request an implicit, unauthenticated admin
-    (`packages/keel-core/src/keel_core/config.py` `api_keys`; docs/OPERATIONS.md). The
+    Empty/missing `KEEL_API_KEYS` would enable implicit admin outside cloud mode. The
     scaffold cannot force an operator to fill in a real value, but it can and must (a) require
-    the key to exist with a non-empty, correctly-shaped (`key:role`) placeholder in the
+    the key to exist with a non-empty, explicitly global or org/Agent-bound placeholder in the
     shipped template, (b) never let it leak into the plaintext ConfigMap, and (c) ship
     `KEEL_CLOUD_MODE: "true"` in the active config, which is consumed by application code
     (`Settings.cloud_mode` / `app.state.auth_required` / `authenticate()` in
@@ -573,6 +573,14 @@ def check_auth_secret_required(findings: list[Finding]) -> None:
                 "omitted from this message on purpose"
             )
         )
+    elif not _has_cloud_capable_key_entry(match.group(1)):
+        findings.append(
+            Finding(
+                f"{secret_label}: `KEEL_API_KEYS` must contain at least one cloud-capable "
+                "credential: `key:admin:global` or "
+                "`key:role:org=<org>:agent=<agent>` — value omitted on purpose"
+            )
+        )
 
     configmap_path = K8S_ROOT / "base/configmap-app.yaml"
     configmap_text = read(configmap_path)
@@ -596,7 +604,7 @@ def check_auth_secret_required(findings: list[Finding]) -> None:
         )
 
 
-_KEY_ROLE_ENTRY = re.compile(r"^[^\s,:]+:(viewer|operator|admin)$", re.IGNORECASE)
+_KEY_ROLE_ENTRY = re.compile(r"^[^\s,:]+:(viewer|operator|admin)(?::[^\s,]+)*$", re.IGNORECASE)
 
 
 def _has_valid_key_role_entry(raw: str) -> bool:
@@ -605,6 +613,32 @@ def _has_valid_key_role_entry(raw: str) -> bool:
     reimplementation of that parser.
     """
     return any(_KEY_ROLE_ENTRY.match(entry.strip()) for entry in raw.split(",") if entry.strip())
+
+
+def _has_cloud_capable_key_entry(raw: str) -> bool:
+    """Whether one parsed credential is explicit global admin or org+Agent scoped."""
+    for entry in raw.split(","):
+        parts = [part.strip() for part in entry.strip().split(":")]
+        if (
+            len(parts) < 3
+            or not parts[0]
+            or parts[1].lower()
+            not in {
+                "viewer",
+                "operator",
+                "admin",
+            }
+        ):
+            continue
+        attrs = parts[2:]
+        normalized = [attr.lower() for attr in attrs]
+        if parts[1].lower() == "admin" and "global" in normalized:
+            return True
+        org = any(attr.startswith("org=") and attr[4:] for attr in normalized)
+        agent = any(attr.startswith("agent=") and attr[6:] for attr in normalized)
+        if org and agent:
+            return True
+    return False
 
 
 # Mirrors `MIN_RPC_SECRET_BYTES` in packages/keel-core/src/keel_core/tools/rpc_auth.py.

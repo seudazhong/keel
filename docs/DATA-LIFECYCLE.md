@@ -1,8 +1,12 @@
-# Data Lifecycle: Retention & Erasure (M3.5)
+# Data lifecycle: retention and erasure
 
-Keel is event-sourced and multi-scope. This document is the authoritative **data map**,
+> **Status:** Implemented core with a known classification gap for newer dispatch/index and patch
+> tables. Some newer rows cascade correctly, but the code data map does not yet enumerate every
+> table added after the original lifecycle slice.
+
+Keel is event-sourced and multi-scope. This document describes the implemented **data map**,
 the **retention defaults**, and the operator **erasure runbook** + **recovery/verification**
-procedure for the M3.5 retention & erasure subsystem (WS-K).
+procedure.
 
 The code lives in `keel_core.lifecycle` (policies, data map, durable erasure ledger,
 coordinator, purge repository, tombstones, Redis/coding cleanup, worker job) with the
@@ -11,11 +15,11 @@ governance API under `keel_server.api.lifecycle` and the worker job wired in
 
 ## 1. Data map
 
-Every persisted store, its retention class, and how erasure treats it. This mirrors
+The original lifecycle data map, its retention class, and how erasure treats it. This mirrors
 `keel_core.lifecycle.datamap.DATA_MAP`, which
-`tests/unit/test_lifecycle_datamap.py` keeps honest: every *erasable* entry must be
-reached by a coordinator erasure step, and every `global_preserved`/`external` entry must
-not be — so a new store cannot be added without a conscious retention + erasure decision.
+`tests/unit/test_lifecycle_datamap.py` checks against the coordinator. The map currently omits
+several later global dispatch/index tables and patch tables. Before production, every persisted
+store must be explicitly classified even when foreign-key cascade already removes it.
 
 | Store (table / medium) | Kind | Retention class | Scope column | Erasure treatment |
 | --- | --- | --- | --- | --- |
@@ -36,18 +40,18 @@ not be — so a new store cannot be added without a conscious retention + erasur
 | `schedules` | table | permanent | `scope_id` | scope-bound |
 | `approvals` | table | standard (30d) | `scope_id` | scope-bound |
 | `jobs` | table | standard (30d) | `scope_id` | scope-bound (running erasure job kept) |
-| `runs` | table | standard (30d) | `scope_id` | scope-bound (durable interactive runs, M3.6) |
-| `run_control` | table | standard (30d) | `scope_id` | scope-bound (durable interrupt/cancel/steer, M3.6) |
-| `im_reply_intents` | table | standard (30d) | `scope_id` | scope-bound (durable encrypted IM reply outbox, M3.7) |
+| `runs` | table | standard (30d) | `scope_id` | scope-bound durable interactive runs |
+| `run_control` | table | standard (30d) | `scope_id` | scope-bound durable interrupt/cancel/steer |
+| `im_reply_intents` | table | standard (30d) | `scope_id` | scope-bound durable encrypted IM reply outbox |
 | coding artifacts | filesystem | standard | *(by project id)* | project-scoped (repo/snapshots/worktrees/artifacts) |
 | tool spill files | filesystem | short | *(by recorded path)* | session-scoped, confined to the spill root |
 | Redis event streams (`events:{session_id}`) | redis | permanent | *(by session id)* | session-scoped (bounded key delete) |
 | `event_tombstones` | table | long | `scope_id` | **retained** (anti-resurrection marker) |
 | `erasure_requests` / `erasure_steps` | table | long | `scope_id` | **retained** (audit trail) |
 | `retention_policies` | table | long | `scope_id` | **retained** (operator overrides) |
-| `organizations` / `memberships` / `agents` / `resource_grants` | table | permanent | `org_id` | **org-scoped** — erased by organization erasure (M3.6) |
-| `im_channel_mappings` | table | permanent | `org_id` | **org-scoped** — erased by organization erasure (FK cascade removes its route index rows, M3.7); a `run_as_user_id` composite FK to `memberships` ties each mapping to an active org member (the run actor, distinct from the platform-admin `created_by` provisioner) |
-| `users` / `oidc_identities` | table | permanent | *(global)* | **identity-global** — erased by user (data-subject) erasure (M3.6) |
+| `organizations` / `memberships` / `agents` / `resource_grants` | table | permanent | `org_id` | **org-scoped** — erased by organization erasure |
+| `im_channel_mappings` | table | permanent | `org_id` | **org-scoped** — erased by organization erasure (FK cascade removes its route index rows); a `run_as_user_id` composite FK to `memberships` ties each mapping to an active org member |
+| `users` / `oidc_identities` | table | permanent | *(global)* | **identity-global** — erased by user (data-subject) erasure |
 | provider logs / Langfuse telemetry | external | — | — | **external** — no delete API; recorded incomplete → `partial` |
 
 Notes:
@@ -60,7 +64,7 @@ Notes:
   `purge_all` / TTL sweep exists for full teardown).
 * **Tombstones and the erasure ledger are retained on purpose** — deleting them would
   defeat anti-resurrection and lose the audit trail.
-* **Identity is org-partitioned, not scope-bound (M3.6).** Durable users/orgs/memberships/
+* **Identity is org-partitioned, not scope-bound.** Durable users/orgs/memberships/
   Agents/grants are *not* reached by scope/session/project erasure (they carry `org_id`,
   not the runtime `scope_id`), and the `/v1/erasure` scope lifecycle API described below does
   **not** erase users or organizations. They are erased by the dedicated identity purge in

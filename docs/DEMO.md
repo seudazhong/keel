@@ -1,117 +1,59 @@
-# Keel demo guide
+# Keel trusted-preview demo
 
-This guide favors a predictable, read-only demonstration over feature breadth. The stack
-already running on `http://localhost:8000` may be healthy but built from an older worktree.
-Do not infer current-main API availability from health alone.
-
-## Demo matrix
-
-| Surface | Existing stale `:8000` stack | Rebuilt current `main` | Requirements / caveats |
-|---|---|---|---|
-| Minimal chat `/` | Available | Available | A working configured LLM model/key. Tool calls may request approval. |
-| Approvals `/approvals` | Available | Available | Read the queue only unless the approval is disposable. |
-| Sessions/history | Available | Available | Existing session data improves the demo. |
-| Gmail status | Available | Available | Status is safe to read. Connecting needs OAuth credentials; revoking is destructive. |
-| Schedules | Available | Available | List only. "Run now" and pause/resume mutate state. |
-| Admin overview | Available | Available | Open mode grants implicit admin; this is not production auth. |
-| API docs `/docs` | Available | Available | Best source for the exact API exposed by the running image. |
-| `/v1/jobs` | Usually absent | Available | Requires current-main rebuild and Postgres/Redis. |
-| `/v1/knowledge-bases` | Usually absent | Available | Requires rebuild; useful results require seeded KB data and embeddings. |
-| React app `:3000` | Static stub (no Chat/Jobs/Knowledge) | Available | Requires a current-main rebuild; `keel-web` now serves the built React bundle, not the old stub. |
+This walkthrough demonstrates current product value without implying browser multi-user,
+production, shell, review-UI, or patch-UI readiness.
 
 ## Prerequisites
 
-- Docker Desktop with Compose, PowerShell 7+, and ports `8000`, `3000`, `5432`, and `6379`
-  available when rebuilding.
-- For chat: set a valid provider configuration in `.env` or the service environment.
-- For Gmail: a Desktop OAuth client, `KEEL_SECRET_KEY`, and an authorized token.
-- For Knowledge search: current-main containers plus seeded/ingested data. A clean stack has
-  no demo KB content.
-- For the automated smoke (step 6 below): Node/npm for `web/`, and a Playwright-managed
-  Chromium install via `npm run test:e2e:install` (first run only). No provider credentials
-  or seeded data are required — the smoke only exercises safe, read-only states.
+- Docker Desktop;
+- a configured chat-capable model/provider;
+- optional connector credentials;
+- ports `3000`, `8000`, `5432`, and `6379`.
 
-## Safe 10–15 minute Windows PowerShell script
-
-Run from the repository root.
-
-### 1. Establish what is running (1 minute)
+## 1. Start and verify
 
 ```powershell
 Set-Location C:\src\keel
-$base = "http://localhost:8000"
-Invoke-RestMethod "$base/health" | ConvertTo-Json
-Invoke-RestMethod "$base/readiness" | ConvertTo-Json -Depth 4
+docker compose -f docker-compose.yml --profile dev up -d --build
+docker compose -f docker-compose.yml --profile dev ps
+Invoke-RestMethod http://localhost:8000/readiness | ConvertTo-Json -Depth 6
 ```
 
-Expected: health names `keel-server`; readiness is HTTP 200 with Postgres and Redis `ok`.
-If either fails, use the rebuild path below.
+Expected: `ready=true`, least-privilege runtime DB principal, shared run substrate/queue, Knowledge
+dispatch, and sandbox all healthy.
 
-### 2. Detect stale versus current-main API (1 minute)
+## 2. Enter the React preview
 
 ```powershell
-$jobs = Invoke-WebRequest "$base/v1/jobs" -SkipHttpErrorCheck
-$kb = Invoke-WebRequest "$base/v1/knowledge-bases" -SkipHttpErrorCheck
-"jobs=$($jobs.StatusCode) knowledge=$($kb.StatusCode)"
+Start-Process http://localhost:3000/
 ```
 
-Expected on the older running image: one or both are `404`. Expected after a current-main
-rebuild: both are `200` (often returning `[]`).
+Choose local preview only on a trusted machine. The sidebar should expose Chat, Sessions, Memory,
+Knowledge, Projects, Agents, Connectors, Approvals, Schedules, Observability, and Jobs.
 
-### 3. Demonstrate safe read surfaces (4–6 minutes)
+Projects and Agents are explicitly labeled Preview.
 
-Open the two server-rendered surfaces and API docs:
+## 3. Demonstrate durable chat and resume
 
-```powershell
-Start-Process "$base/"
-Start-Process "$base/approvals"
-Start-Process "$base/docs"
-```
+1. Start a chat with:
+   **"Describe Keel in two sentences. Do not call tools."**
+2. Navigate to Sessions.
+3. Open the session and resume it.
+4. Return to Chat and confirm the route/session identity remains stable.
 
-Show sessions/history, Gmail connection status, schedules, and admin overview through their
-read-only APIs (or through the React/Vite UI in step 5):
+The purpose is to show durable admission, replayable history, and worker-owned execution.
 
-```powershell
-Invoke-RestMethod "$base/v1/sessions" | ConvertTo-Json -Depth 6
-Invoke-RestMethod "$base/v1/approvals?status=pending" | ConvertTo-Json -Depth 6
-Invoke-RestMethod "$base/v1/connectors" | ConvertTo-Json -Depth 6
-Invoke-RestMethod "$base/v1/schedules" | ConvertTo-Json -Depth 6
-Invoke-RestMethod "$base/v1/admin/overview" | ConvertTo-Json -Depth 8
-```
+## 4. Demonstrate Memory and Knowledge
 
-If sessions exist, inspect one without mutation:
+### Memory
 
-```powershell
-$sessions = @(Invoke-RestMethod "$base/v1/sessions")
-if ($sessions.Count -gt 0) {
-  Invoke-RestMethod "$base/v1/sessions/$($sessions[0].id)/history" |
-    ConvertTo-Json -Depth 10
-}
-```
+- Open Memory.
+- Inspect current blocks and any consolidation proposals.
+- Explain that model-learned changes should become proposal-first as the product model is tightened.
 
-For chat, use a harmless prompt such as: **"Reply with a two-sentence description of
-Keel. Do not call tools."** Expected: streamed text and a named run completion. If provider
-credentials are unavailable, skip chat and continue with read-only management surfaces.
+### Knowledge
 
-### 4. Optional current-main rebuild (3–8 minutes)
-
-This replaces the currently running images and may take longer on a cold machine:
-
-```powershell
-docker compose --profile dev up -d --build
-docker compose --profile dev ps
-Invoke-RestMethod "$base/readiness" | ConvertTo-Json -Depth 4
-Invoke-RestMethod "$base/v1/jobs" | ConvertTo-Json -Depth 6
-Invoke-RestMethod "$base/v1/knowledge-bases" | ConvertTo-Json -Depth 6
-```
-
-Expected: services become healthy; jobs and Knowledge endpoints return JSON. Empty arrays
-are correct on an unseeded stack.
-
-### 4a. Optional guarded demo data (1–3 minutes)
-
-For a local demo stack, seed searchable Knowledge content plus a welcome session without editing
-database rows. Preview first; the command refuses non-loopback or production-labelled targets:
+On an empty local stack, seed deterministic demo content:
 
 ```powershell
 $env:KEEL_APP_ENV = "dev"
@@ -119,70 +61,94 @@ uv run python scripts/seed_demo_data.py --dry-run
 uv run python scripts/seed_demo_data.py --yes
 ```
 
-The default `auto` embedding mode falls back to a deterministic offline embedder if the configured
-provider is unavailable. Use `--mode fake` to force the offline path. Re-running is idempotent:
-the same Knowledge Base, documents, jobs, and session are reused, and unrelated data is not
-modified or deleted.
+Then:
 
-### 5. React application on `:3000` (2 minutes)
+- open Knowledge;
+- inspect the demo Knowledge Base/document;
+- run a search and show citation/source metadata.
 
-After a current-main rebuild (step 4), `http://localhost:3000` serves the built React app
-directly — the same demo surfaces above (Chat, Sessions, Memory, Knowledge, Jobs, Schedules,
-Approvals, Observability, Settings) with `/v1`, `/health`, and `/readiness` proxied to
-`keel-server` by nginx (`deploy/docker/web.nginx.conf`):
+## 5. Demonstrate Connections
 
-```powershell
-Start-Process "http://localhost:3000/"
+Open Connectors and show:
+
+- manifest-driven provider catalog;
+- connected/setup states;
+- selected resources and targets;
+- health/sync/disconnect controls;
+- the warning that external content is tainted and outbound actions require approval.
+
+If Gmail or Calendar is already connected, ask a read-only question such as:
+
+```text
+List the next few calendar events and cite the connected source. Do not create or update anything.
 ```
 
-For frontend-only iteration against an existing `:8000` API without rebuilding the `keel-web`
-image, run Vite instead:
+Do not configure new provider secrets during a short demo.
+
+## 6. Demonstrate Agents and Projects
+
+### Agents
+
+- Show persisted Agent records and selection.
+- State honestly that full model/tool/resource/memory/budget configuration is not yet represented
+  in the Agent record.
+
+### Projects
+
+- Show the Project list/import flow.
+- If a GitHub App installation is already configured, import a disposable repository.
+- Explain that read-only review exists through the API but has no React page.
+- Explain that controlled patch workers exist but no public Patch API/UI ships.
+
+## 7. Demonstrate operational truth
+
+Open:
+
+- Jobs;
+- Approvals;
+- Schedules;
+- Observability.
+
+Show status and feedback only. Do not approve unknown actions, run unfamiliar schedules, cancel
+valuable jobs, revoke Connections, or delete data.
+
+## 8. Optional API evidence
+
+```powershell
+Invoke-RestMethod http://localhost:8000/v1/sessions
+Invoke-RestMethod http://localhost:8000/v1/jobs
+Invoke-RestMethod http://localhost:8000/v1/knowledge-bases
+Invoke-RestMethod http://localhost:8000/v1/connectors
+Invoke-RestMethod http://localhost:8000/v1/projects
+```
+
+The live `/docs` exposes the complete current API, including identity, IM routing, lifecycle, and
+read-only review.
+
+## 9. Automated browser smoke
+
+Against an already-running stack:
 
 ```powershell
 Set-Location C:\src\keel\web
 npm ci
-npm run dev
-```
-
-Open the URL Vite prints (normally `http://localhost:5173`). Vite proxies `/v1` and
-`/health` to `:8000`. Stop it with `Ctrl+C` after the demo.
-
-### 6. Automated browser smoke (2–3 minutes)
-
-A Playwright smoke exercises this same safe walkthrough end to end against the React app on
-`:3000`: it loads the app, follows the SPA history fallback, navigates every section above,
-checks the `/health` and `/readiness` proxies, and confirms Jobs/Knowledge/Memory render a
-valid empty or populated state — without sending Gmail, revoking connectors, cancelling jobs,
-resolving approvals, running schedules, or changing settings. Run it against an
-already-running stack (it never starts/stops Compose or deletes volumes):
-
-```powershell
-Set-Location C:\src\keel\web
-npm ci
-npm run test:e2e:install   # first run only: installs the Chromium browser
+npm run test:e2e:install
 npm run test:e2e
 ```
 
-Target a different host/port (e.g. the Vite dev server from step 5) with `SMOKE_BASE_URL`:
+The smoke must not send mail, create calendar effects, resolve unknown approvals, run destructive
+schedules, or delete data.
 
-```powershell
-$env:SMOKE_BASE_URL = "http://127.0.0.1:5173"
-npm run test:e2e
-```
+## Demo boundaries
 
-If the target is still the stale pre-rebuild stack, the suite fails immediately with an
-actionable error (e.g. `/v1/jobs` returning 404) instead of silently skipping current-main
-routes — rebuild per step 4 and re-run.
+Do not claim:
 
-## Safety and fallbacks
+- browser OIDC login;
+- completed multi-user/team administration;
+- production or hostile multi-tenant readiness;
+- shell/build/test isolation;
+- review or patch React workflows;
+- full OTel/SLO/DR.
 
-- Do **not** send Gmail, revoke connectors, approve unknown actions, run schedules, cancel
-  jobs, delete Knowledge data, or change production-like settings during a demo.
-- Open mode has no user authentication and treats callers as admin. Bind only to trusted
-  local networks.
-- Session semantic search may be slow or degrade to lexical mode while embeddings catch up.
-- If chat fails, show `/docs`, health/readiness, sessions/history, approvals, schedules, and
-  admin overview.
-- If rebuild fails, restore the prior stack with the exact image/worktree procedure used by
-  its operator; do not delete volumes. Capture `docker compose logs --tail 100 keel-server
-  keel-worker` for diagnosis.
+The demo is successful when it shows one coherent trusted-preview Agent experience and makes every
+remaining boundary explicit.

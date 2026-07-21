@@ -10,7 +10,7 @@
 #   - scheduler/deployment.example.yaml        — `keel-scheduler`'s entrypoint is currently a
 #     stub that logs once and exits; deploying it as a long-lived Deployment would
 #     crash-loop. Scheduling today happens inside keel-worker's own cron tick. Promote this
-#     once the entrypoint is a real long-lived, leader-elected loop (M3.8).
+#     once the entrypoint is a real long-lived, leader-elected loop.
 #   - datastores/git-pvc.example.yaml          — no current service mounts or consumes this;
 #     shipping it active would create a volume nothing reads/writes (see the file's header).
 #   - sandbox/job-template.yaml                — rendered per-run by the control plane once a

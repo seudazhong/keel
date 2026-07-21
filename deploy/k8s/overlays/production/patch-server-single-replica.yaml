@@ -1,12 +1,7 @@
-# keel-server MUST stay at exactly 1 replica in production today, even though it is
-# architecturally stateless and horizontally scalable (ARCHITECTURE §15). Interactive runs
-# and pending tool-approval state are currently process-local (see docs/OPERATIONS.md
-# "Current production-readiness limits" and docs/ROADMAP.md M3.6 exit gate: "restart/
-# scale-out preserves run and approval ownership") — a second replica would let a client's
-# SSE stream or an in-flight approval land on a Pod that never admitted that run, silently
-# losing it. Raise this only once durable interactive run/approval coordination
-# (M3.3 "Cloud Safety Foundation" exit gate: "Server restart does not lose an admitted run or
-# pending approval") is implemented and this base's Deployment default reflects it.
+# keel-server stays at exactly 1 replica in this unqualified production scaffold. Runs and
+# approvals are durable and worker-owned, but multi-server SSE fan-out, OAuth callbacks,
+# mixed-version routing, and rolling upgrades have not been tested together. Raise this only
+# with that evidence and update the base Deployment default at the same time.
 #
 # This patch only re-asserts `replicas: 1`; it does not need to (and must not) touch
 # `spec.strategy` — the production overlay inherits base/server/deployment.yaml's

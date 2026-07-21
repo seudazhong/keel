@@ -22,12 +22,12 @@ data:
   # (../secret-app.example.yaml) is ever missing/emptied/misconfigured after this scaffold's
   # own validation has passed (e.g. an operator's own pipeline strips it later).
   #
-  # CONSUMED BY APPLICATION CODE (M3.3): `Settings.cloud_mode`
+  # CONSUMED BY APPLICATION CODE: `Settings.cloud_mode`
   # (`packages/keel-core/src/keel_core/config.py`) drives `app.state.auth_required`
   # (`packages/keel-server/src/keel_server/app.py`), which `authenticate()`
   # (`packages/keel-server/src/keel_server/auth.py`) checks whenever no API key matched. With
   # `KEEL_CLOUD_MODE=true`, an empty, missing, or malformed `KEEL_API_KEYS` (every entry
-  # skipped by `parse_api_keys`, e.g. no valid `key:role` shape) yields an empty key map, so
+  # skipped by `parse_api_keys`) yields an empty key map, so
   # every request is rejected 503 "authentication is required in cloud mode but no API keys
   # are configured" instead of silently granting local implicit-admin access. See
   # ../docs/security-model.md "Required externally-supplied auth".
@@ -40,7 +40,7 @@ data:
   # runtime login is `KEEL_DATABASE_URL` in secret-app.example.yaml (used by keel-server/
   # keel-worker), and the privileged owner/migrator `KEEL_MIGRATION_DATABASE_URL` is in
   # secret-migration.example.yaml (used by the migrate/provision Jobs only). See
-  # ../../docs/OPERATIONS.md "Runtime database login".
+  # ../../docs/OPERATIONS.md "Startup and database principals".
   KEEL_DATABASE_HOST: "keel-postgres.keel.svc.cluster.local"
   KEEL_REDIS_HOST: "keel-redis.keel.svc.cluster.local"
   # Shared, durable project/coding storage root (WS-R). keel-server and keel-worker both mount
@@ -55,24 +55,18 @@ data:
   # confirming node support — see ../docs/security-model.md "Pending gates". Wiring this
   # value through to sandbox Job creation is itself pending real sandbox integration.
   #
-  # KEEL_EXECUTION_BACKEND / KEEL_SANDBOX_URL (not set here) DEFAULT TO A NOT-YET-DEPLOYED
-  # SANDBOX SERVICE. `packages/keel-core/src/keel_core/config.py` defaults
+  # KEEL_EXECUTION_BACKEND / KEEL_SANDBOX_URL (not set here) default to a sandbox RPC service.
+  # `packages/keel-core/src/keel_core/config.py` defaults
   # `execution_backend` to `"sandbox"` and `sandbox_url` to `http://keel-sandbox:8090`:
   # `keel-server` and `keel-worker` (`keel_core.tools.wiring.build_service_execution_environment`)
   # both now route every shell/file tool call through the authenticated
   # `keel_core.tools.rpc.SandboxExecutionEnvironment` RPC client rather than running it
-  # unconditionally in-process. Neither this scaffold nor `docker-compose.yml` ships a
-  # `keel-sandbox` Deployment/Service (see ../../docs/OPERATIONS.md "Current
-  # production-readiness limits"), so as deployed here `keel-server`/`keel-worker` start and
-  # serve `/health`/`/readiness` normally, but every tool-execution call fails **closed**
-  # ("unavailable") until a real, reachable `keel-sandbox` exists — this is the intended
-  # fail-closed posture, not a bug. The only opt-out is explicitly setting
-  # `KEEL_EXECUTION_BACKEND=unsafe-local-dev` *and*
-  # `KEEL_TRUSTED_PREVIEW_ALLOW_UNSAFE_EXECUTION=true` (neither set here) to restore
-  # unconditional in-process execution for a trusted single-org preview only. The per-run
+  # unconditionally in-process. Standard Compose ships that file-only service; this Kubernetes
+  # scaffold does not. As deployed here, the sandbox readiness check fails closed until an
+  # operator adds the compatible service/controller and NetworkPolicy. Do not use the
+  # unsafe-local-dev opt-out in a cloud deployment. The per-run
   # sandbox `Job` template (`../sandbox/job-template.yaml`) is a separate, still-dormant
   # concept — a possible future execution-backend implementation reached through a
-  # sandbox-controller, not the same thing as the `keel-sandbox` RPC service above, and
-  # neither is wired up or dynamically created today. See ../docs/security-model.md
-  # "Isolation levels" and "Pending gates".
+  # sandbox-controller, not the same thing as the `keel-sandbox` RPC service above.
+  # See ../docs/security-model.md.
   KEEL_SANDBOX_RUNTIME_CLASS: ""

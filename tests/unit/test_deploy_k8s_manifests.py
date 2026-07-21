@@ -296,6 +296,8 @@ def test_validator_key_shape_check_matches_real_parse_api_keys(
     """
     accepted_and_rejected_shapes = [
         "adm:admin",
+        "adm:admin:global",
+        "svc:operator:org=org-1:agent=agt-1",
         "op:operator,vw:viewer",
         "adm:admin, op:operator ,vw:VIEWER,bad:notarole,, norole",
         "",
@@ -317,3 +319,15 @@ def test_validator_key_shape_check_matches_real_parse_api_keys(
             "disagree on whether a KEEL_API_KEYS shape is accepted "
             f"(validator={validator_accepts}, parser={parser_accepts})"
         )
+
+
+def test_cloud_capable_api_key_shape_requires_global_or_org_agent_binding(
+    validator: types.ModuleType,
+) -> None:
+    assert validator._has_cloud_capable_key_entry("adm:admin:global")
+    assert validator._has_cloud_capable_key_entry("svc:operator:org=org-1:agent=agt-1")
+    assert validator._has_cloud_capable_key_entry("svc:operator:ORG=org-1:AGENT=agt-1")
+    assert not validator._has_cloud_capable_key_entry("adm:admin")
+    assert not validator._has_cloud_capable_key_entry("svc:operator:org=org-1")
+    assert not validator._has_cloud_capable_key_entry("svc:operator:agent=agt-1")
+    assert not validator._has_cloud_capable_key_entry("svc:viewer:global")

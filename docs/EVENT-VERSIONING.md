@@ -1,5 +1,9 @@
 # Event and API versioning
 
+> **Status:** Event upcasting and tombstone-aware projection rebuild are implemented. The current
+> history contains one real event-version transition; an operator-facing rebuild workflow remains
+> future work.
+
 Events are append-only facts. Each envelope carries a positive, per-event-type
 `version`; writers emit the version in `keel_core.evolution.CURRENT_EVENT_VERSIONS`.
 Readers upcast copies through one explicit, deterministic `vN → vN+1` step for

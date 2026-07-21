@@ -1,114 +1,107 @@
-# Managed Projects & GitHub Synchronization (M3.7)
+# Managed projects and GitHub synchronization
 
-Keel's durable managed-project foundation: org-owned **projects** with control-plane-owned
-Git storage, run-scoped **worktrees**, a **repo sync ledger**, per-org **quotas**, and a
-**GitHub App** binding (installations, repositories, webhook deliveries, sync state). It reuses
-the identity actor/authorization model and the generic **resource grants** for project Agent
-authority rather than duplicating a bespoke authority table.
+> **Status:** Living subsystem reference
+> **Product maturity:** Project/import UI preview; review backend headless; patch backend not exposed
 
-Code: `keel_core.projects` (`models`, `store`, `service`, `storage`, `audit`, `jobs`, and
-`github/` — `auth`, `client`, `webhooks`, `urls`); REST API `keel_server.api.projects`;
-durable job adapter `keel_worker.projects`. Schema: migration `0015_projects_github`.
+Projects are organization-owned code resources. Users and Agents receive explicit capabilities;
+they are not storage owners.
 
 ## Model
 
-* **Project** — an org-owned managed project (`prj_…`). Blank/local or GitHub-sourced,
-  archivable / soft-deletable, with a `default_branch`, `visibility` (`private`/`internal`),
-  optimistic `version`, and a durable **active Git storage handle** owned by the control plane.
-* **Project worktree** — an ephemeral, run-scoped materialized worktree (`pwt_…`) bound to a
-  durable run id. Materialized as an isolated clone with no remote/alternates, so the sandbox
-  never receives writable access to the authoritative repository.
-* **Project run** — the project↔durable-run association (`prn_…`); a run belongs to exactly
-  one project.
-* **Repo sync ledger** — an append-only record (`syn_…`) of every import / fetch /
-  webhook-driven sync, for durable idempotent reconciliation and audit.
-* **Project quota** — per-org limits (max projects / active worktrees / repository bytes).
-* **GitHub installation** — the App installation↔org binding (`ghi_…`). Global (like
-  `oidc_identities`) so the HMAC-authenticated webhook path can resolve a delivery's
-  installation to its org before any tenant context exists. A live installation binds to
-  exactly one org.
-* **GitHub repository** — a repository visible through an installation (`ghr_…`), optionally
-  linked to a project. Pinned to its installation's org by a composite FK.
-* **GitHub sync state** — a per-repository durable sync cursor (`ghs_…`).
-* **Webhook delivery** — one row per `X-GitHub-Delivery` id (global); the primary key makes a
-  replayed delivery a durable no-op.
+| Entity | Purpose |
+|---|---|
+| Project | Organization-owned managed codebase. |
+| Project worktree | Disposable run-bound checkout/materialization. |
+| Project run | Association between a durable run and Project. |
+| Repo sync entry | Idempotent import/fetch/webhook synchronization ledger. |
+| Project quota | Organization storage/worktree limits. |
+| GitHub installation/repository | GitHub App binding and repository inventory. |
 
-## Authorization
+## Storage
 
-Project operations compose the identity principal / resource / capability model
-(`keel_core.identity.authz.AuthorizationService`). Over a project (via the acting user's org
-capabilities):
+Current deployments use `KEEL_PROJECT_STORAGE_ROOT` as shared POSIX storage mounted by both server
+and worker.
 
-| Capability | Operations |
-| ---------- | ---------- |
-| `read`   | list / get / status / list runs / list grants |
-| `use`    | materialize/reclaim a worktree, associate a run |
-| `write`  | create / import / update / request sync |
-| `manage` | archive / delete / purge / grant / manage installations |
+It contains active repository state, disposable worktrees, review reports, and patch artifacts.
+Metadata and authority live in PostgreSQL.
 
-An Agent driven by an actor never exceeds the **intersection** of the actor's org
-capabilities and the Agent's explicit `resource_grants` on the project (`resource_type =
-"project"`), a confused-deputy defense. Grants reuse the generic identity grant model.
+Important boundaries:
 
-## Isolation & confinement
+- the sandbox never receives writable authoritative repository storage;
+- worktrees are disposable;
+- server and worker must see the same storage root;
+- multi-host deployment requires a shared RWX-compatible backend;
+- object storage is a future artifact/backup layer, not the current active Git store.
 
-* Tenant-owned tables (`projects`, `project_worktrees`, `project_runs`, `repo_sync_ledger`,
-  `project_quotas`, `github_repositories`, `github_sync_state`) carry an `app.org_id` RLS
-  policy + `FORCE ROW LEVEL SECURITY`, keyed by the operating org (ADR-0009).
-* Composite foreign keys `(project_id, org_id) -> projects(id, org_id)` make a cross-org
-  project/worktree/run/repository link structurally impossible.
-* Repositories reference `github_installations(installation_id, org_id)` so a repo can never
-  bind to an installation in a different org, and a webhook payload naming a repo id owned by a
-  different installation/org is ignored (never processed).
-* GitHub tokens are **control-plane only**: minted just-in-time, cached briefly in-process,
-  never persisted and never logged, and never handed to the sandbox. Clone/fetch use safe
-  argument arrays over an allow-listed, normalized HTTPS URL (no credentials in the URL).
+## Authorization and isolation
+
+Project operations use actor membership plus explicit Agent resource grants:
+
+| Capability | Examples |
+|---|---|
+| read | list, inspect, status, reports |
+| use | associate runs, review, materialize work |
+| write | create/import/update/sync |
+| manage | delete/purge/grants/installations |
+
+Tenant tables carry `org_id`, composite foreign keys prevent cross-organization associations, and
+RLS provides defense in depth.
 
 ## GitHub App
 
-* Config: `KEEL_GITHUB_APP_ID`, `KEEL_GITHUB_PRIVATE_KEY_REF` (a reference — `env:NAME`,
-  `file:PATH`, or a path — never the PEM inline), `KEEL_GITHUB_WEBHOOK_SECRET`,
-  `KEEL_GITHUB_API_BASE_URL`, `KEEL_GITHUB_WEB_BASE_URL`, `KEEL_GITHUB_ALLOWED_HOSTS`,
-  `KEEL_GITHUB_TOKEN_CACHE_SECONDS`. The integration is disabled unless `KEEL_GITHUB_APP_ID` is
-  set.
-* Authentication: a short-lived RS256 **App JWT** signs installation-token requests;
-  least-scope **installation access tokens** are minted just in time and briefly cached.
-* Webhooks: `POST /v1/projects/github/webhook` verifies `X-Hub-Signature-256` (HMAC over the
-  raw body) in constant time, enforces delivery-id **replay protection** (durable ledger PK),
-  an **event allowlist**, and the installation→org binding, before durable idempotent
-  processing. It never uses the actor/org header path.
-* SSRF defense: every clone/API URL is normalized and checked against
-  `KEEL_GITHUB_ALLOWED_HOSTS`; loopback / private / link-local / reserved addresses,
-  credential-bearing URLs, non-HTTPS schemes, and non-default ports are rejected, and redirects
-  are never followed.
-* This phase performs **no** remote write / push / PR creation.
+The integration:
 
-## Durable sync
+- stores App configuration and secret references, not installation tokens;
+- mints short-lived installation tokens just in time;
+- validates API/clone hosts and rejects private/loopback/link-local addresses;
+- verifies webhook HMAC and delivery replay;
+- binds installations and repositories to one organization;
+- keeps GitHub credentials out of the sandbox.
 
-A GitHub push (or a manual sync request) enqueues one durable `projects.sync` job keyed by
-`(project, delivery)` on the existing jobs/outbox substrate. The job is restart-safe and
-idempotent: the sync ledger's unique `delivery_id` collapses a replayed or concurrent sync to a
-no-op, and a crash mid-fetch retries.
+The current self-hosted setup is operator-heavy because users may need to configure an App and
+secret reference. The product target is:
 
-## API
+1. deployment-level App registration once;
+2. user clicks **Connect GitHub**;
+3. GitHub installation returns and binds automatically;
+4. Projects selects from authorized repositories.
 
-Authenticated `/v1/projects` (actor + `X-Keel-Org`): list / create / import / detail / update /
-archive / delete; `sync` (request + status); `worktrees` (list / materialize / reclaim);
-`runs` (list / associate); `grants` (list / create / revoke); `github/installations` (list /
-link). The GitHub webhook endpoint is authenticated independently by HMAC. Typed SDK models and
-methods are in `keel_sdk`.
+Normal users should not handle App IDs, PEM paths, webhook secrets, or installation identifiers.
 
-## Lifecycle
+## API and UI
 
-Organization erasure (`keel_erase_organization`) purges all project + GitHub tables with the
-org. A project's `purge` reclaims its worktrees and removes the authoritative repository handle.
+`/v1/projects` provides:
 
-## Limitations
+- create/import/list/detail/update/archive/delete;
+- sync request/status;
+- worktree list/materialize/reclaim;
+- run associations;
+- grants;
+- GitHub installations and webhook.
 
-* Private-repository clone/fetch that requires embedding an installation token in the transport
-  is out of scope for this foundation slice (clone/fetch use a credential-free allow-listed
-  URL); credentialed private fetch is a follow-up.
-* No remote write / push / PR creation yet (metadata + read + sync only).
-* Worker registration of the `projects.sync` job (`keel_worker.projects.register_project_jobs`)
-  is wired where the worker constructs its `ProjectService`; the server always enqueues durably
-  so the dispatcher recovers pending syncs.
+The React Projects page supports create/import/list/detail/delete preview flows. It does not expose
+the complete review or patch lifecycle.
+
+## Read-only review
+
+Review is a durable API/worker flow over an exact change set. Reports are immutable and
+evidence-checked. See [Read-only code review](./CODE-REVIEW.md).
+
+No React review surface ships today.
+
+## Controlled patches
+
+The worker-side patch pipeline exists and can generate an immutable file-only candidate, request
+approval, and write back a Draft PR through trusted GitHub credentials. See
+[Controlled patch proposals](./PATCHES.md).
+
+There is no public Patch API, SDK, or UI.
+
+## Current limitations
+
+- GitHub setup is not a polished self-service flow.
+- Active Git/artifact storage is single shared filesystem infrastructure.
+- Project quota/product administration is incomplete.
+- Read-only review is headless.
+- Patch generation cannot run shell/build/test.
+- General coding-agent adapters and per-run command sandboxes are future work.

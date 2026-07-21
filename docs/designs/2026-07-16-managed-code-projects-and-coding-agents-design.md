@@ -1,4 +1,11 @@
-# Managed Code Projects & Pluggable Coding Agents — Reference Architecture
+# Managed Code Projects & Pluggable Coding Agents — Historical Reference Architecture
+
+> **Historical notice:** many prerequisites described here are now implemented, while other
+> assumptions have been refined by
+> [`../adr/0011-product-boundary-and-domain-model.md`](../adr/0011-product-boundary-and-domain-model.md).
+> Use [`../PROJECTS.md`](../PROJECTS.md), [`../PATCHES.md`](../PATCHES.md),
+> [`../ARCHITECTURE.md`](../ARCHITECTURE.md), and [`../ROADMAP.md`](../ROADMAP.md) for current
+> truth and sequencing.
 
 > **Status:** Draft for architecture review (no product code changed)
 > **Date:** 2026-07-16

@@ -1,4 +1,4 @@
-# keel-worker: arq worker running agent turns and durable jobs (ARCHITECTURE §15). Scale with
+# keel-worker: arq worker running agent turns and durable jobs (see docs/ARCHITECTURE.md). Scale with
 # `replicas`; arq gives each job to exactly one worker and the scheduler_tick cron coordinates
 # across replicas via a Redis lock, so scale-out is CAS-safe (see docker-compose.yml comments).
 # keel-worker builds its own execution environment the same way keel-server does

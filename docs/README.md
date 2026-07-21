@@ -1,47 +1,72 @@
 # Keel documentation
 
-This index defines which documents describe Keel **now**, which describe the target, and
-which are retained as historical design evidence.
+The documentation is split by **authority**, not by age or file size. Read the smallest document
+that answers the question and do not copy current-state facts into several places.
 
 ## Living canon
 
-| Document | Authority |
-|---|---|
-| [Product requirements](./PRD.md) | Target users, product thesis, requirements, and success measures. Target features are explicitly separated from current implementation. |
-| [Architecture](./ARCHITECTURE.md) | Target architecture and current implementation fidelity. |
-| [Status](./STATUS.md) | Verified current capability, maturity, and blockers. Prefer this over dated plans for "what works now." |
-| [Roadmap](./ROADMAP.md) | Active milestone order, dependencies, and exit gates. This is the only active roadmap. |
-| [Invariants](./INVARIANTS.md) | Non-negotiable correctness and safety acceptance specifications. |
-| [ADRs](./adr/) | Accepted architectural decisions. An ADR can describe a target that is not fully implemented; check Status and Architecture fidelity. |
+| Order | Document | Owns |
+|---:|---|---|
+| 1 | [Status](./STATUS.md) | What is implemented, deployable, product-usable, partial, or missing now. |
+| 2 | [Roadmap](./ROADMAP.md) | What comes next, in what order, and the exit evidence. |
+| 3 | [Architecture](./ARCHITECTURE.md) | Current system shape, target contracts, trust boundaries, and known deltas. |
+| 4 | [Product requirements](./PRD.md) | Product boundary, users, journeys, requirements, success measures, and non-goals. |
+| 5 | [Invariants](./INVARIANTS.md) | Merge-blocking correctness and safety properties. |
+| 6 | [ADRs](./adr/README.md) | Accepted architectural decisions and explicit supersession history. |
+
+When documents conflict about the present, **Status wins**. When they conflict about future
+sequencing, **Roadmap wins**. ADRs explain why a decision was made; they do not prove that it is
+implemented.
 
 ## Practical guides
 
 | Guide | Purpose |
 |---|---|
-| [Demo](./DEMO.md) | Safe 10–15 minute Windows demo, including stale-stack and rebuild paths. |
-| [Usage](./USAGE.md) | Current CLI, server API, minimal web UI, React UI, and connector usage. |
-| [Operations](./OPERATIONS.md) | Compose lifecycle, health checks, configuration, safety, backup caveats, and troubleshooting. |
-| [Data lifecycle](./DATA-LIFECYCLE.md) | Retention defaults, the data map, and the operator erasure runbook + recovery/verification procedure. |
-| [Development](./DEVELOPMENT.md) | Workspace setup, tests, lint/type checks, React development, and documentation validation. |
+| [Demo](./DEMO.md) | Safe walkthrough of the trusted local preview. |
+| [Usage](./USAGE.md) | Current UI, CLI, API, and workflow usage. |
+| [Operations](./OPERATIONS.md) | Compose lifecycle, trust profile, readiness, secrets, storage, and production gaps. |
+| [Development](./DEVELOPMENT.md) | Setup, checks, tests, frontend development, and documentation validation. |
 
-Repository-specific notes also live in
-[`web/README.md`](../web/README.md), [`tests/README.md`](../tests/README.md),
-[`adapters/README.md`](../adapters/README.md), and
-[`deploy/config/README.md`](../deploy/config/README.md).
+Repository-specific guides:
+
+- [`web/README.md`](../web/README.md)
+- [`tests/README.md`](../tests/README.md)
+- [`adapters/README.md`](../adapters/README.md)
+- [`deploy/k8s/README.md`](../deploy/k8s/README.md)
+- [`deploy/config/README.md`](../deploy/config/README.md)
+
+## Subsystem references
+
+| Reference | Scope |
+|---|---|
+| [Identity, organizations, and Agents](./IDENTITY.md) | Actors, OIDC verification, memberships, Agents, grants, and RLS. |
+| [Managed projects](./PROJECTS.md) | Project ownership, Git storage, GitHub App integration, worktrees, and grants. |
+| [Read-only code review](./CODE-REVIEW.md) | Durable review request, evidence verification, artifacts, and API. |
+| [Controlled patch proposals](./PATCHES.md) | Implemented patch backend, approval/writeback lifecycle, and missing product surfaces. |
+| [Connector providers](./connectors/README.md) | Shared connector contract and provider-specific setup/reference docs. |
+| [Data lifecycle](./DATA-LIFECYCLE.md) | Retention, erasure, data map, and anti-resurrection behavior. |
+| [Event and API versioning](./EVENT-VERSIONING.md) | Event upcasting and additive `/v1` compatibility. |
 
 ## Historical and supporting material
 
-- [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md) is the original M0–M4 plan. It is
-  useful for intent and acceptance-test history, but it is not the active execution plan.
-- [`DESIGN-REVIEW.md`](./DESIGN-REVIEW.md) is the pre-implementation design review plus
-  later addenda. Its claims are not current implementation evidence.
-- [`designs/`](./designs/) and [`plans/`](./plans/) contain dated feature snapshots and
-  implementation checklists. They may describe superseded names, sequencing, or intended
-  behavior.
-- [`diagrams/`](./diagrams/) support the target architecture. Read them with the
-  implementation-fidelity section in Architecture.
-- [`mockups/`](./mockups/) are historical UX exploration rather than a statement of the
-  shipped UI.
+- [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md) and
+  [`DESIGN-REVIEW.md`](./DESIGN-REVIEW.md) preserve the original plan and review.
+- [`designs/`](./designs/) and [`plans/`](./plans/) are dated snapshots, not an active backlog.
+- [`diagrams/`](./diagrams/) visualize target and current concepts; Architecture owns fidelity.
+- [`mockups/`](./mockups/) are historical UX exploration, not the shipped React UI.
 
-When documents conflict, use this order: **Status → Roadmap → Architecture fidelity →
-PRD target → ADR/design history**.
+## Maintenance rules
+
+1. Current capability and snapshot evidence belong only in Status. Status may record the reviewed
+   implementation SHA and migration head; avoid commit hashes and test counts in README,
+   Architecture, PRD, and Roadmap.
+2. Roadmap contains future outcomes and exit gates, not a second status ledger.
+3. Architecture separates **current implementation** from **target contract** explicitly.
+4. A changed decision gets a new ADR that names what it supersedes.
+5. Dated designs and plans remain historical; do not continuously rewrite them to look current.
+6. Every local Markdown path and anchor must pass:
+
+```powershell
+uv run python scripts/check_markdown_links.py
+git diff --check
+```

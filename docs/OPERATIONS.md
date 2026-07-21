@@ -1,311 +1,220 @@
 # Operating Keel
 
-Keel's Compose setup is a development deployment, not a production reference architecture.
-It runs one hard-coded scope, exposes local ports, and defaults to unauthenticated implicit
-admin when `KEEL_API_KEYS` is empty.
+Keel currently ships a **trusted preview** deployment, not a production reference deployment.
 
-For a Kubernetes-based deployment scaffold (hardened manifests, storage/backup/DR, upgrade/
-rollback, and clean-install runbooks), see [`deploy/k8s`](../deploy/k8s/README.md). It is a
-scaffold toward the M3.8 production-delivery gates below, not evidence those gates are closed.
+## 1. Supported current profile
 
-## Lifecycle and probes
+The standard Compose `dev`/`full` profiles currently select effectively the same implemented
+services:
+
+- PostgreSQL/pgvector;
+- Redis;
+- one-shot migration, runtime-secret, runtime-role provision, and sandbox-secret services;
+- `keel-server`;
+- `keel-worker`;
+- `keel-sandbox`;
+- `keel-web`;
+- optional/local Ollama service.
+
+The profile assumes one trusted operator. Do not expose open local-preview mode to an untrusted
+network.
+
+## 2. Start, inspect, and stop
 
 ```powershell
+Set-Location C:\src\keel
+Copy-Item .env.example .env
+# Configure a chat-capable model/provider.
 docker compose -f docker-compose.yml --profile dev up -d --build
-docker compose --profile dev ps
+docker compose -f docker-compose.yml --profile dev ps
 Invoke-RestMethod http://localhost:8000/health
 Invoke-RestMethod http://localhost:8000/readiness
-docker compose logs --tail 100 keel-server keel-worker
-docker compose --profile dev down
+docker compose -f docker-compose.yml logs --tail 100 keel-server keel-worker
 ```
 
-Pass `-f docker-compose.yml` so a local `docker-compose.override.yml` cannot silently
-change the startup contract. Do not add `-v` to `down` unless permanent deletion of
-Postgres and Ollama volumes is intended.
+Expected readiness includes:
 
-The `dev`/`full` profiles run a **real, authenticated sandbox execution boundary** — not the
-old in-process preview. A one-shot `keel-secret-init` generates a random ≥32-byte RPC shared
-secret into a dedicated `sandboxsecret` volume (idempotent; never committed to source or the
-YAML, never printed to logs/argv), and every service loads it from a read-only file via
-`KEEL_SANDBOX_RPC_SECRET_FILE`. `keel-server`/`keel-worker` use the fail-closed
-`KEEL_EXECUTION_BACKEND=sandbox`: every model-chosen file/shell tool call is sent over an
-**internal-only** RPC network to the dedicated, hardened `keel-sandbox` executor, so the
-control plane runs no tool operation in process and mounts no sandbox workspace. Wiring fails
-**closed** — server readiness and worker startup actively probe the sandbox's authenticated
-`/v1/ping` and refuse to serve/claim rather than silently falling back to local execution. To
-rotate the secret, `docker compose down` then delete the `sandboxsecret` volume.
-
-The `keel-sandbox` container is the accepted rootless-OCI floor: non-root (uid 10100),
-read-only rootfs, all Linux capabilities dropped, `no-new-privileges`, tmpfs scratch, on an
-`internal: true` network with **no** public egress, holding **only** the read-only RPC secret
-(no Docker socket, no project storage, no DB/Redis/provider/GitHub credentials). File tools are
-isolated per scope by an opaque `ws_<hash>` namespace. **Shell/command execution stays
-disabled**: namespaced shell is denied (a namespace dir is not an OS mount boundary —
-`KEEL_SANDBOX_NAMESPACE_SHELL_ISOLATED` is never set) and unscoped shell is denied too because
-the default workspace and the namespaces coexist in one container, so no shell can be proven
-confined to a single workspace (`KEEL_SANDBOX_WORKSPACE_SANITIZED` is left unset). No fake
-isolation flag is set anywhere. **Honest downgrades vs. `deploy/k8s`:** this is not a
-gVisor/Kata/microVM boundary (a kernel container escape is out of scope here — that gate is
-`runtimeClassName`), and Compose networks are bidirectional so it cannot express the
-per-direction NetworkPolicy K8s does (the sandbox still cannot reach Postgres/Redis/Ollama or
-the internet and holds no credentials). K8s/cloud keep the same fail-closed `sandbox` backend;
-never relax these settings toward a hostile multi-tenant workload.
-
-`keel-migrate` runs `alembic upgrade head` before server/worker startup. `keel-secret-init`,
-`keel-sandbox`, `keel-server`, `keel-worker`, Postgres, Redis, Ollama, and the nginx-served
-React web app are in both current `dev` and `full` profiles; documented full
-observability/object-store services are not implemented in Compose.
-
-## Configuration and secrets
-
-- Start from `.env.example`; environment variables override defaults.
-- Compose injects Postgres/Redis service URLs.
-- Keep provider keys, Gmail OAuth files, connector encryption keys, and API keys out of
-  source control and images.
-- Configure `KEEL_API_KEYS` before exposing the API. Keys are stored as SHA-256 digests
-  and verified in constant time (`hmac.compare_digest`); plaintext keys are never held or
-  compared. Set `KEEL_CLOUD_MODE=1` for any exposed deployment so the server fails **closed**
-  — an empty `KEEL_API_KEYS` then rejects every request instead of falling back to the local
-  implicit-admin open mode.
-- `deploy/config/` is reserved for mounted non-secret configuration; current services are
-  primarily environment-configured.
-
-### Identity & OIDC (M3.6)
-
-- **Human users** authenticate with an OIDC bearer JWT. Enable with `KEEL_OIDC_ENABLED=1`
-  and set `KEEL_OIDC_ISSUER`, `KEEL_OIDC_AUDIENCE` (comma-separated), and
-  `KEEL_OIDC_JWKS_URI` (`https://`). Tokens are verified for issuer/audience, JWKS
-  signature (rotation-aware cache), and `exp`/`nbf`/`iat` with `KEEL_OIDC_LEEWAY_SECONDS`
-  skew; only asymmetric algorithms are accepted. A verified user must select an org it
-  belongs to via the `X-Keel-Org` header. See [`docs/IDENTITY.md`](IDENTITY.md).
-- `KEEL_IDENTITY_ALLOW_JIT_PROVISIONING=1` provisions a first-seen verified subject a
-  durable user; default off (an unlinked subject is rejected). With OIDC disabled only the
-  API-key and local-operator actor paths are available.
-- Migration `0013` adds `FORCE ROW LEVEL SECURITY` + `keel_runtime` grants on the
-  tenant-owned identity tables (`memberships`, `agents`, `resource_grants`), keyed by the
-  `app.org_id` GUC — connect as a `keel_runtime` member to make RLS a hard boundary.
-
-### Managed projects & GitHub App (M3.7)
-
-- Managed projects and GitHub synchronization are enabled by configuring the GitHub App:
-  `KEEL_GITHUB_APP_ID`, `KEEL_GITHUB_PRIVATE_KEY_REF` (a **reference** — `env:NAME`,
-  `file:PATH`, or a path; never the PEM inline), `KEEL_GITHUB_WEBHOOK_SECRET`,
-  `KEEL_GITHUB_API_BASE_URL`, `KEEL_GITHUB_WEB_BASE_URL`, `KEEL_GITHUB_ALLOWED_HOSTS`
-  (comma-separated clone/API host allowlist), and `KEEL_GITHUB_TOKEN_CACHE_SECONDS`. With
-  `KEEL_GITHUB_APP_ID` unset the feature is disabled (blank/local projects still work).
-- The webhook endpoint `POST /v1/projects/github/webhook` is authenticated **independently**
-  by an `X-Hub-Signature-256` HMAC over the raw body plus the installation→org binding; it
-  enforces delivery-id replay protection, an event allowlist, and SSRF/URL allowlist checks.
-  Installation tokens are minted just in time, briefly cached in-process, and never persisted
-  or logged. See [`docs/PROJECTS.md`](PROJECTS.md).
-- Migration `0015` adds `FORCE ROW LEVEL SECURITY` + `keel_runtime` grants on the tenant-owned
-  project tables (`projects`, `project_worktrees`, `project_runs`, `repo_sync_ledger`,
-  `project_quotas`, `github_repositories`, `github_sync_state`), keyed by `app.org_id`, and
-  extends `keel_erase_organization` to purge them with the org.
-
-
-### Identity erasure (user / organization) — maintenance path (M3.6)
-
-User (data-subject) and organization erasure are **privileged, cross-tenant maintenance
-operations** and are **not** part of the `/v1/erasure` scope lifecycle API (that API erases a
-scope / session / project only — it does not erase users or orgs). They run through the
-`keel_erase_user` / `keel_erase_organization` `SECURITY DEFINER` functions installed by
-migration `0013`, which enforce the sole-owner block/archive invariant under an org-first lock
-order. Migration `0013` provisions **two** roles (least privilege):
-
-- `keel_maintenance` — **definer**, `NOLOGIN` + `BYPASSRLS`, owns the functions and their table
-  DML. Never log in as it and never grant a login membership in it.
-- `keel_maintenance_exec` — **executor**, `NOLOGIN` + `NOBYPASSRLS`, granted **only** EXECUTE on
-  the two functions (no table DML, not a member of the definer).
-
-Provision a dedicated **maintenance login** that is a member of **only** `keel_maintenance_exec`
-and point `KEEL_MAINTENANCE_DATABASE_URL` at it (it must differ from `KEEL_DATABASE_URL`;
-erasure fails closed when it is unset, and in cloud mode rejects a copy of the runtime URL):
-
-```sql
-CREATE ROLE keel_erase LOGIN PASSWORD '…' NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB;
-GRANT keel_maintenance_exec TO keel_erase;   -- executor membership only
+```text
+postgres = ok
+runtime_db_principal = least-privilege (keel_runtime_login)
+redis = ok
+run_substrate = shared-postgres
+run_queue = ok
+run_admission = ready
+knowledge_dispatch = ready
+sandbox = ok
 ```
 
-On **managed Postgres** that forbids `CREATE ROLE`/`ALTER OWNER`/`GRANT`, the migration skips
-role setup with a `NOTICE` and erasure **fails closed**. Provision it manually with an
-administrative role, in this order: create `keel_maintenance` (BYPASSRLS) and grant it
-`SELECT, INSERT, UPDATE, DELETE` on `users, oidc_identities, organizations, memberships,
-agents, resource_grants`; `ALTER FUNCTION keel_erase_organization(text) OWNER TO
-keel_maintenance` and the same for `keel_erase_user(text)`; create `keel_maintenance_exec`
-(NOBYPASSRLS) and `GRANT EXECUTE ON FUNCTION keel_erase_organization(text), keel_erase_user(text)
-TO keel_maintenance_exec`; then create the login and grant it `keel_maintenance_exec`.
-
-Run the operator command (destructive; it always previews inside a rolled-back transaction
-first, requires `--yes` or typing the id at an interactive prompt, and never prints the URL):
-
-```bash
-# Preview only (no writes):
-python -m keel_core.identity.erase_cli user   <user_id> --dry-run --json
-# Erase (non-interactive):
-python -m keel_core.identity.erase_cli user   <user_id> --yes --json
-python -m keel_core.identity.erase_cli organization <org_id> --yes --json
-```
-
-A user who is the **sole active owner** of an active org that still has **other** active
-members is reported **blocked** (exit 3) with the blocking org ids — transfer ownership first.
-An org the user solely owns and is the only member of is atomically archived.
-
-### Runtime database login (M3A)
-
-`FORCE ROW LEVEL SECURITY` (migrations `0011`/`0013`/`0015`/`0019`) only binds a **non-owner,
-non-`BYPASSRLS`** connection — a superuser or the table owner bypasses RLS entirely. So the
-server/worker must connect (`KEEL_DATABASE_URL`) as a dedicated **least-privilege login** that is
-a member of **only** the `keel_runtime` group. Migration `0020` pins that group least-privilege
-(`NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS NOINHERIT`), (re)asserts its minimal
-schema/table/sequence grants + default privileges (covering the `0019` patch tables), revokes
-`CREATE` on `public`, and re-applies the `0013` identity least-privilege revokes.
-
-Migrations and role provisioning need a privileged **owner/migrator** principal, kept separate
-from the runtime login: set `KEEL_MIGRATION_DATABASE_URL` to the owner/migrator URL. Alembic (the
-sync engine) and the provisioning CLI use it; when unset it falls back to `KEEL_DATABASE_URL` for
-the local single-owner profile, but in **cloud mode** a missing value **fails closed** (because
-`KEEL_DATABASE_URL` is then the non-owner runtime login).
-
-Provision (or idempotently repair) the runtime login with the operator CLI. The password comes
-from a mounted secret file (`--password-file`, preferred for Compose/K8s), an env var (default
-`KEEL_RUNTIME_DB_PASSWORD`), or `--password-stdin` — never a CLI argument — is quoted server-side,
-and is never surfaced in error output (a DB failure is re-raised sanitized, carrying only the
-exception class name):
-
-```bash
-export KEEL_MIGRATION_DATABASE_URL=postgresql+psycopg://<owner>:<pw>@<host>/keel
-export KEEL_RUNTIME_DB_PASSWORD='<runtime-login-password>'
-python -m keel_core.provision_runtime_cli --verify
-# then point the app at the runtime login:
-export KEEL_DATABASE_URL=postgresql+psycopg://keel_runtime_login:<runtime-login-password>@<host>/keel
-```
-
-> **Do not enable SQL statement echo on the provisioning connection.** Postgres cannot bind a
-> parameter for `ALTER ROLE … PASSWORD`, so the (server-quoted) password is unavoidably part of
-> that statement's text. Keep SQLAlchemy echo off (`echo=False`, the CLI default) and the
-> `sqlalchemy.engine` logger above INFO, and avoid Postgres `log_statement='all'/'ddl'` while
-> provisioning, so the secret is never written to a log.
-
-`--verify` connects **as** the freshly provisioned login and asserts it is least-privilege (not a
-superuser, cannot `BYPASSRLS` — directly **or** via role membership it could `SET ROLE` into — and
-does not own the tables). On **managed Postgres** that forbids `CREATE ROLE`/`GRANT`, migration
-`0020` skips role setup with a `NOTICE`; create the login manually and grant it the group with an
-administrative role:
-
-```sql
-CREATE ROLE keel_runtime_login LOGIN PASSWORD '…' NOSUPERUSER NOBYPASSRLS NOCREATEROLE NOCREATEDB;
-GRANT keel_runtime TO keel_runtime_login;   -- runtime group membership only
-```
-
-In **cloud mode** the server and worker verify the connected principal at startup and **fail
-closed**: the server crash-loops (and `/readiness` reports `runtime_db_principal` degraded → 503)
-and the worker refuses to start if the connection is a superuser, can `BYPASSRLS`, or owns the
-application tables — so the data plane is never served from an RLS-exempt connection. In
-local-preview (non-cloud) the single owner login is expected; `/readiness` surfaces it as
-`owner (local-preview)` (never reported as least-privilege) and does not fail.
-
-**Enforce the non-owner login without cloud mode.** A trusted local/self-hosted stack that keeps
-the local open API (not `KEEL_CLOUD_MODE`) can still require the least-privilege login by setting
-`KEEL_REQUIRE_RUNTIME_DB_PRINCIPAL=true`: server readiness and worker startup then apply the same
-non-owner / non-`BYPASSRLS` / non-table-owner check and fail closed, without forcing API-key auth.
-Cloud mode implies this gate, so you never need both.
-
-**Standard Compose wires this automatically.** `docker-compose.yml` splits the DB env: `keel-migrate`
-and `keel-provision` use the owner/migrator `KEEL_MIGRATION_DATABASE_URL`, while `keel-server`/
-`keel-worker` use the non-owner runtime login with `KEEL_REQUIRE_RUNTIME_DB_PRINCIPAL=true`. A
-one-shot `keel-runtime-secret-init` generates a random runtime password and a `0600` libpq pgpass
-file into a dedicated `runtimesecret` volume, so the server/worker connect **password-less** via a
-`KEEL_DATABASE_URL` that carries no secret plus `PGPASSFILE` — the runtime password never appears in
-a URL, in argv, in the environment, or in logs. `keel-provision` (`--password-file` + `--verify`)
-mints the login and asserts it is least-privilege before the app starts. Delete the `runtimesecret`
-volume to rotate. See the K8s equivalents in `deploy/k8s/base/secret-migration.example.yaml` and
-`jobs-migrate-provision.example.yaml`.
-
-### Cloud-safety controls (M3.3)
-
-- **Runtime DB role.** Migration `0011` provisions a non-owner, non-bypass `keel_runtime`
-  role and `FORCE ROW LEVEL SECURITY` on the scope-bound tables; migration `0020` pins it
-  least-privilege and re-asserts its minimal grants. Point the application connection
-  (`KEEL_DATABASE_URL`) at a login that is a member of only `keel_runtime` (see **Runtime
-  database login** above) and keep migrations on a separate owner/migrator
-  `KEEL_MIGRATION_DATABASE_URL`. In cloud mode the server/worker verify the connected principal
-  at startup and fail closed if it can bypass RLS. On managed Postgres that forbids
-  `CREATE ROLE`/`GRANT`, the migration skips role setup with a `NOTICE`; provision manually.
-- **IM webhooks.** Set `KEEL_ONEBOT_SIGNING_SECRET` and `KEEL_TELEGRAM_WEBHOOK_SECRET` so
-  inbound OneBot (HMAC-SHA1 body signature) and Telegram (secret header) deliveries are
-  verified before dispatch and de-duplicated by a durable replay store. With `KEEL_CLOUD_MODE=1`
-  a missing secret fails closed.
-- **OAuth state + outbound sends.** The Gmail connect CSRF `state` and outbound-connector
-  idempotency are durable (survive restart / a second worker); tune retention with
-  `KEEL_OAUTH_STATE_TTL_SECONDS` and `KEEL_WEBHOOK_REPLAY_TTL_SECONDS`.
-- **Key rotation.** Register versioned envelope keys with `KEEL_SECRET_KEYS=id:secret,...`
-  and select the active id with `KEEL_SECRET_KEY_ACTIVE_ID`; each stored token records its
-  `key_id`, so decrypt works across a rotation and `PostgresTokenStore.reencrypt_stale()`
-  re-wraps rows onto the active key online. Keep every historical id listed until rotation
-  completes.
-
-## Current production-readiness limits
-
-- The default Compose application DB role owns the schema and can bypass RLS. Migrations
-  `0011`/`0020` provide a non-bypass, least-privilege `keel_runtime` group, a fail-closed
-  startup/readiness gate, and an operator provisioning CLI for a dedicated runtime login; point
-  `KEEL_DATABASE_URL` at that login (and migrations at `KEEL_MIGRATION_DATABASE_URL`) to make RLS
-  a hard boundary. Wiring the deployment to use the runtime login by default is pending.
-- The authenticated `keel-sandbox` service boundary is now deployed by the standard Compose
-  `dev`/`full` profiles: server/worker use the fail-closed `sandbox` backend against a
-  hardened, internal-only executor and refuse to serve/claim if it is unreachable or
-  unauthenticated. Remaining gap vs. `deploy/k8s`/production: the Compose executor is the
-  rootless-OCI floor (non-root, read-only rootfs, dropped caps, `no-new-privileges`,
-  default-deny egress), **not** a gVisor/Kata/microVM boundary, and Compose networks are
-  bidirectional (no per-direction NetworkPolicy). Shell/command execution is therefore kept
-  disabled in the standard stack (file tools remain, isolated per `ws_<hash>` scope). Treat it
-  as a trusted single-org dev deployment, not a hostile multi-tenant platform.
-  CLI shell is available only for a workspace validated as free of `.git`, `.env`, links,
-  and nested mounts.
-- Interactive runs and some approval state are process-local; server restarts can interrupt
-  them.
-- OAuth CSRF state, IM webhook authentication/replay protection, and outbound-connector
-  idempotency are now durable and verified (M3.3); the fixed `web:local` scope still limits
-  true multi-tenancy.
-- The scope is fixed to `web:local`; there are no users, organizations, or persisted Agents.
-  *(M3.6 adds durable users/orgs/memberships/persisted Agents/grants + OIDC and an
-  identity API, but the Chat/runtime and existing `/v1` session routes still run on the
-  single `web:local` scope and are not yet multi-user — the identity APIs are additive and
-  `POST /v1/identity/agents/{id}/select` is only a forward-compatible bridge. See
-  `docs/IDENTITY.md`.)*
-- The scheduler package is not a separate elected service; worker cron performs scheduling.
-- Durable interactive runs (M3.6, WS-M): the `runs`/`run_control` tables + `run_interactive`
-  worker job give worker-owned, restart-safe interactive execution under a fenced lease; the
-  `reconcile_runs_tick` worker cron recovers admitted-but-undispatched and expired
-  running/waiting runs. The server's default web admission still uses the in-process
-  `AgentRuntime` (local-preview compatibility path) until authenticated durable admission is
-  flipped on; see `docs/STATUS.md`. New migration: `0014_durable_runs` (reversible).
-- Event versions exist but upcasters, retention, and full erasure are not implemented.
-- Observability, generated SDK/version checks, CI coverage, backup/restore, and delivery
-  profiles remain below the target architecture.
-
-Treat [Roadmap M3.3](./ROADMAP.md#m33--cloud-safety-foundation) as a prerequisite for
-internet exposure or sensitive multi-user data.
-
-## Data safety
-
-- Use dedicated `keel_test` and `keel_eval` databases for destructive tests/evals.
-- Back up Postgres before migrations or demonstrations with valuable data. A tested
-  backup/restore runbook and DR drill are not yet available.
-- Connector revoke, Gmail send, schedule run/toggle, approval resolution, job cancel, and
-  Knowledge delete are real mutations.
-- Do not co-host sensitive personal data with public/untrusted gateway traffic until the
-  cloud-safety and identity gates are complete.
-
-## Troubleshooting
+Stop without deleting data:
 
 ```powershell
-docker compose --profile dev ps
-docker compose logs --tail 200 keel-migrate keel-server keel-worker
+docker compose -f docker-compose.yml --profile dev down
+```
+
+Do not add `-v` unless permanent deletion of database, model, project, sandbox, and generated-secret
+volumes is intended.
+
+Pass `-f docker-compose.yml` so a local ignored override cannot silently change the documented
+trust contract.
+
+## 3. Startup and database principals
+
+Startup orders:
+
+```text
+keel-migrate
+  -> keel-runtime-secret-init
+  -> keel-provision
+  -> keel-sandbox
+  -> keel-server / keel-worker / keel-web
+```
+
+Migrations use the privileged owner/migrator connection. Server and worker use
+`keel_runtime_login`, a non-owner, non-`BYPASSRLS` login that is a member only of the runtime role.
+Compose generates its password into a dedicated volume and exposes it through a `0600` pgpass file,
+not a URL, argv, or normal environment variable.
+
+Server readiness and worker startup fail closed when the required runtime principal is a
+superuser, table owner, or can bypass RLS.
+
+For non-Compose deployments:
+
+- `KEEL_MIGRATION_DATABASE_URL` — schema owner/migrator;
+- `KEEL_DATABASE_URL` — least-privilege runtime login;
+- `KEEL_REQUIRE_RUNTIME_DB_PRINCIPAL=true` or cloud mode — enforce the check.
+
+## 4. Authentication modes
+
+### Local preview
+
+Outside cloud mode, an unauthenticated local request may use the explicit local-preview actor. This
+is for trusted development only.
+
+### Machine API keys
+
+Configure `KEEL_API_KEYS` and use scoped/hashed API keys. In cloud mode an empty or malformed key
+configuration fails closed.
+
+### OIDC
+
+The backend verifies OIDC bearer JWTs when issuer, audience, JWKS URI, and safe asymmetric
+algorithms are configured.
+
+Keel does not yet provide a built-in browser authorization-code callback/session flow. The current
+React credential entry is preview compatibility, not the production login design.
+
+## 5. Sandbox boundary
+
+`keel-server` and `keel-worker` use `KEEL_EXECUTION_BACKEND=sandbox` and actively probe the signed
+RPC endpoint.
+
+The Compose sandbox:
+
+- runs non-root with read-only rootfs, dropped capabilities, and `no-new-privileges`;
+- has only the RPC secret;
+- has no database, Redis, provider, GitHub, or connector credential;
+- has no public egress;
+- stores files in opaque per-scope namespaces;
+- denies shell.
+
+This is a trusted-preview rootless-OCI floor, not a gVisor/Kata/microVM boundary. The internal
+Compose network is bidirectional, and directory namespaces are not sufficient to confine an
+arbitrary command. Do not enable shell by setting optimistic environment flags.
+
+## 6. Project storage, review, and patches
+
+Set `KEEL_PROJECT_STORAGE_ROOT` to storage mounted identically in server and worker.
+
+- Local Compose uses a named volume.
+- Multi-host deployments require shared RWX storage.
+- A review-enabled worker that cannot reach shared storage must fail startup.
+- Patch workers share the same root and sandbox transfer service.
+
+Relevant flags:
+
+- `KEEL_REVIEW_ENABLED`
+- `KEEL_PATCH_ENABLED`
+- review model/budget/price settings
+- GitHub App settings and secret references
+
+Patch has no API/UI today. Disable patch capability on workers that should not participate.
+
+## 7. Connections and secrets
+
+Start from `.env.example`. Keep provider keys, connector client secrets/tokens, GitHub private keys,
+API keys, and envelope keys out of source and images.
+
+Connector credentials are encrypted and versioned. Secret references may point to environment or
+mounted files where supported. Keep historical envelope-key ids available until rotation and
+re-encryption finish.
+
+Provider webhooks use provider-specific authentication plus durable replay protection. Cloud
+deployments must use routed connector webhook URLs so the delivery resolves to one Agent scope.
+
+## 8. Data lifecycle
+
+Scope/session/project erasure runs as durable background work. User/organization erasure currently
+uses the dedicated maintenance CLI and database principal described in
+[Identity](./IDENTITY.md).
+
+The lifecycle data map predates several global dispatch/index and patch tables. Some newer rows are
+removed by foreign-key cascade, but the claim that every persisted store is explicitly classified
+is not yet true. Audit and extend the map before a production erasure claim.
+
+Never run destructive tests against the normal `keel` database. Use dedicated `keel_test` and
+`keel_eval` databases.
+
+## 9. Backup and recovery
+
+Current preview safeguards:
+
+- preserve PostgreSQL volumes;
+- preserve shared project storage;
+- keep deployment secret material available;
+- back up before migrations when data matters.
+
+Production is blocked on:
+
+- documented and automated database/project/artifact backup;
+- restore verification;
+- declared RPO/RTO;
+- upgrade and rollback drills;
+- erasure-aware backup retention.
+
+## 10. Kubernetes scaffold
+
+[`deploy/k8s`](../deploy/k8s/README.md) is a hardened scaffold and validation suite. It is not a
+production-ready Keel installation:
+
+- it does not deploy the live sandbox service/controller used by Compose;
+- the separate scheduler is not available;
+- capability-worker, telemetry, backup/restore, and hostile-tenant gates remain open.
+
+## 11. Production release checklist
+
+Do not claim the single-organization production profile until:
+
+- browser OIDC and explicit administration replace preview auth;
+- all runtime paths require explicit permission policy;
+- accepted Routine occurrences and ambiguous effects recover correctly;
+- **Target:** capability-specific workers and a separate scheduler are deployed;
+- every enabled command workload uses qualified per-run isolation;
+- traces, metrics, SLOs, alerts, cost reconciliation, backup/restore, and DR are proven;
+- two-user/private-team adversarial isolation suites pass.
+
+## 12. Troubleshooting
+
+```powershell
+docker compose -f docker-compose.yml --profile dev ps
+docker compose -f docker-compose.yml logs --tail 200 keel-migrate keel-provision keel-server keel-worker keel-sandbox
 Invoke-WebRequest http://localhost:8000/openapi.json
 ```
 
-If `/health` is green but newer routes return `404`, the running image is stale; rebuild
-with `docker compose --profile dev up -d --build`. If semantic search is slow, inspect the
-`X-Keel-Search-Mode` response header and use lexical results while embeddings catch up.
+Common diagnoses:
+
+- healthy `/health` but degraded `/readiness`: inspect the named readiness check;
+- new routes missing: rebuild the images;
+- review/project storage degraded: verify the shared mount and write access;
+- sandbox degraded: verify service health and generated RPC-secret volume;
+- queued work not progressing: inspect worker health, Redis, Postgres outbox/job rows, and worker
+  capability flags.

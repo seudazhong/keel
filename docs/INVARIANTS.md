@@ -1,55 +1,143 @@
-# Keel — Invariant Acceptance Specs
+# Keel invariant acceptance specifications
 
-> **Source:** [`DESIGN-REVIEW.md`](./DESIGN-REVIEW.md) §5. These ten invariants are
-> non-negotiable. Each is a **merge-blocking gate** for the milestone that
-> introduces or hardens it. The original milestone mapping is preserved in the historical
-> [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md); active gates are in
-> [`ROADMAP.md`](./ROADMAP.md). This document is the acceptance spec; the executable registry is
-> [`tests/invariants/test_invariants.py`](../tests/invariants/test_invariants.py).
+Invariants are correctness and safety properties, not feature descriptions. A green unit test may
+prove only one layer; deployment and product acceptance are listed separately.
 
-> **Fidelity warning:** a green policy/spike test is not proof that the deployed topology
-> satisfies the invariant. In particular, current shell execution is in-process (I6), and
-> the runtime DB owner can bypass RLS (I10). See [`STATUS.md`](./STATUS.md).
+The original executable registry remains in
+[`tests/invariants/test_invariants.py`](../tests/invariants/test_invariants.py).
 
-**Status legend:** **proven** = acceptance test green in M0 (via a spike) · **M1** =
-spec frozen here; the enforcement + its acceptance test land in M1.
+## Existing invariant registry
 
-| # | Invariant | Enforced in | Status | Acceptance test |
-|---|---|---|---|---|
-| I1 | Bounded loop, **named termination** | `keel_core/loop` | **proven (loop α)** | Force `max_iterations`/budget/interrupt/halt/error/completed; assert `run.ended{reason}` for each. |
-| I2 | **Persist-before-first-model-call** | `keel_core/state` admission | **proven** | `admit` appends the user event before `run` calls the provider; with the durable `PostgresEventStore` a fresh store over the same DB replays the full log (0 lost turns). |
-| I3 | **Stop-reason-gated** tool execution | `keel_core/loop` | **proven (loop α)** | A stream with `finish_reason != tool_use` + a trailing tool call runs **no tool**. |
-| I4 | **Byte-stable prompt prefix** | `keel_core/context` | **proven (S1)** | Prefix bytes identical across turns/agents → stable `cache_key`; memory never in prefix. |
-| I5 | Parallel-safe executor, **deterministic order** | `keel_core/tools` | **proven** | Mixed read/write calls with overlapping resources: writes serialize, independent reads run concurrently, results emit in source order. |
-| I6 | **Two-level sandbox** | `keel_sandbox` + `permissions/` | **policy proven; deployment open** | Egress / `.git` / `.env` / path-escape denied; network off by default; execution must not occur in the API process. |
-| I7 | **Shared budget** across delegation tree | `keel_core/agents` | M1 | Fan-out sub-agents; tree cost ≤ cap; a child can't exceed the parent's remaining. |
-| I8 | **Import ≠ trust** | `mcp/`, `skills/`, `discovery/` | **proven** | Register a malicious tool description; assert allow-list gate + injection-scan quarantine. |
-| I9 | **At-most-once** schedule | `keel_scheduler` | **proven (S2)** | Crash mid-tick after cursor advance; the job runs **0 or 1** times, never twice. |
-| I10 | **Per-scope data isolation** | `keel_core/scope` + Postgres RLS | **query/RLS tests proven; owner-bypass open** | Co-hosted group vs personal: cross-scope read is denied and audited using a non-bypass runtime role. |
+| ID | Invariant | Current status | Acceptance evidence |
+|---|---|---|---|
+| I1 | Bounded loop with named termination | **Proven** | Force completion, budget, iteration, interrupt, halt, and error exits; each records one named reason. |
+| I2 | Persist before first model call | **Proven** | User input/event is committed before provider invocation and survives a fresh store/process. |
+| I3 | Stop-reason-gated tools | **Proven** | A trailing tool call with a non-tool finish reason executes nothing. |
+| I4 | Byte-stable prompt prefix | **Proven** | Stable inputs produce identical prefix bytes/cache key; mutable history and memory remain outside it. |
+| I5 | Parallel-safe deterministic tool order | **Proven** | Conflicting writes serialize; independent reads may overlap; transcript results retain source order. |
+| I6 | Two-level execution boundary | **Partial** | Path/egress policy and deployed authenticated out-of-process file execution are proven. Shell remains disabled because per-run command isolation is not proven. |
+| I7 | Shared budget across a delegation tree | **Open** | The executable registry intentionally skips it. Child runs must not ship before immutable inherited authority and one shared budget exist. |
+| I8 | Import is not trust | **Proven at import layer** | Unlisted or injection-bearing MCP/skill metadata is rejected or quarantined. |
+| I9 | Legacy schedule occurrence executes zero or one times | **Proven, insufficient for product Routines** | Cursor claim prevents duplicate enqueue, but a crash after claim may lose the occurrence. See correction gate C3. |
+| I10 | Per-scope data isolation | **Infrastructure proven; product authority partial** | Non-owner RLS, scope guards, and cross-scope tests pass. Full two-user/Agent/resource authorization journeys remain a release gate. |
 
-## Notes per invariant
+## Corrections and additional platform gates
 
-- **I1 — bounded loop / named termination.** *(proven — loop α)* Every run caps iterations, budgets tokens, and exits for exactly one named `StopReason` (`keel_core.types.StopReason`), emitted as `run.ended{reason}`. Test: [`tests/unit/test_loop.py`](../tests/unit/test_loop.py).
-- **I2 — durable admission.** *(proven)* `keel_core.loop.admit` persists the user input as an event **before** `run` makes the first model call. With the durable `PostgresEventStore`, a fresh store over the same DB replays the full log — **0 lost turns**. Tests: [`tests/unit/test_loop.py`](../tests/unit/test_loop.py), [`tests/integration/test_state_postgres.py`](../tests/integration/test_state_postgres.py).
-- **I3 — stop-reason gate.** *(proven — loop α)* Tools execute **only** when the provider's `finish_reason == tool_use`; a trailing tool call after any other finish reason must not trigger execution. Test: [`tests/unit/test_loop.py`](../tests/unit/test_loop.py).
-- **I4 — byte-stable prefix.** *(proven — S1)* The cache-friendly prompt prefix depends only on stable inputs; volatile content (history, memory) lives in the suffix and never perturbs `prompt_cache_key`. Test: [`tests/unit/test_spike_s1_prompt_cache.py`](../tests/unit/test_spike_s1_prompt_cache.py).
-- **I5 — deterministic parallel executor.** *(proven)* Independent read-only tools run concurrently; writes to overlapping resources serialize; results always emit in source order. Test: [`tests/unit/test_tools_executor.py`](../tests/unit/test_tools_executor.py).
-- **I6 — two-level sandbox.** *(policy layer proven; deployed topology open)* Policy tests
-  cover loopback/link-local/private/SSRF and workspace path restrictions, but current
-  `ShellTool` execution remains in the server/CLI process. M3.3 must add the isolated
-  executor and escape/egress acceptance evidence. Test:
-  [`tests/unit/test_spike_s3_sandbox_policy.py`](../tests/unit/test_spike_s3_sandbox_policy.py).
-- **I7 — shared budget.** A delegation tree shares one budget; children cannot exceed the parent's remaining allowance; depth and handoff cycles are capped (G13).
-- **I8 — import ≠ trust.** *(proven — WS-G)* MCP/skill/plugin descriptions and imported instructions are allow-listed and injection-scanned (G6) at import/discovery time; hits are quarantined, never registered. Skills use progressive disclosure (descriptions for discovery; instructions only on activation). Tests: [`tests/unit/test_extensibility.py`](../tests/unit/test_extensibility.py), gate in [`tests/invariants/test_invariants.py`](../tests/invariants/test_invariants.py).
-- **I9 — at-most-once schedule.** *(proven — S2)* The cursor advances (atomic CAS claim) **before** enqueue, so a crash between claim and enqueue yields 0/1 runs and two leaders enqueue exactly once. Promoted to a durable service by the `PostgresClaimStore` (CAS on `schedules.next_run_at`) + `due_tick`. Tests: [`tests/unit/test_spike_s2_at_most_once.py`](../tests/unit/test_spike_s2_at_most_once.py), [`tests/unit/test_scheduler_store.py`](../tests/unit/test_scheduler_store.py), [`tests/integration/test_scheduler_approvals_postgres.py`](../tests/integration/test_scheduler_approvals_postgres.py).
-- **I10 — per-scope isolation.** *(query/RLS tests proven; deployed owner-bypass open)*
-  Application filters and RLS tests deny cross-scope access, but the current runtime DB role
-  owns the schema and can bypass RLS. M3.3 requires a non-bypass runtime role and audited
-  adversarial proof. Tests: [`tests/unit/test_spike_s5_scope_guard.py`](../tests/unit/test_spike_s5_scope_guard.py),
-  [`tests/integration/test_spike_s5_rls.py`](../tests/integration/test_spike_s5_rls.py).
-  The confused-deputy extension taints connector content and escalates influenced outbound
-  actions to approval; durable outbound idempotency is still open.
+These gates capture design corrections discovered after the original ten invariants.
 
-## Beyond the ten (M2 slice)
+### C1 — Explicit policy, never implicit allow-all
 
-- **G5 — durable cross-surface approval.** *(proven — autonomy slice v1)* An approval raised by an **unattended** (scheduled) run is a durable `approvals` row; the run **suspends to the event log** (the checkpoint) and later **resumes** on grant/deny/expire, executing the gated outbound action **exactly once** and failing **closed** on timeout — surviving process death. Tests: [`tests/unit/test_loop_suspend_resume.py`](../tests/unit/test_loop_suspend_resume.py), [`tests/unit/test_worker_tasks.py`](../tests/unit/test_worker_tasks.py), [`tests/integration/test_scheduler_approvals_postgres.py`](../tests/integration/test_scheduler_approvals_postgres.py); gate `test_g5_durable_approval_survives_a_fresh_process` in [`tests/invariants/test_invariants.py`](../tests/invariants/test_invariants.py). Design: [`designs/2026-07-07-keel-autonomy-slice-design.md`](designs/2026-07-07-keel-autonomy-slice-design.md).
+Every executable tool path supplies a permission engine. Omitting policy must fail construction or
+deny, never substitute an allow-all engine.
+
+**Current gap:** the low-level loop defaults to allow-all when `permissions` is omitted, even though
+the main interactive paths build explicit policies.
+
+**Acceptance:** enumerate every runtime construction path; omit policy; assert no tool can execute.
+
+### C2 — Authority intersection
+
+An operation is allowed only by the intersection of:
+
+```text
+actor membership
+  x Agent access
+  x Agent authority
+  x Routine policy
+  x resource grant
+  x deployment capability
+```
+
+RLS/scope equality is defense in depth and never sufficient authority.
+
+**Acceptance:** two users, private Agents, a team Agent, explicit Agent-access edges, private/team
+Connections, Knowledge, and Projects; every unauthorized Agent discovery, session read, or
+resource use/manage attempt is denied without existence disclosure.
+
+### C3 — No lost accepted Routine occurrence
+
+Once a due occurrence is durably accepted, it is eventually terminal or explicitly cancelled.
+Duplicate delivery may not duplicate the occurrence.
+
+**Current gap:** I9's advance-before-enqueue contract permits a crash to lose the occurrence.
+
+**Acceptance:** crash at every transaction/enqueue boundary; after recovery there is exactly one
+occurrence row and zero or one active owner, never silent disappearance.
+
+### C4 — Ambiguous effects reconcile before retry
+
+An external mutation that may have succeeded before a timeout enters `unknown`, not `failed`.
+Retries are blocked until provider reconciliation proves whether the effect exists.
+
+**Acceptance:** inject success-before-response-loss for email/calendar/comment/PR effects; recovery
+produces one external effect and one confirmed local record.
+
+### C5 — Approval binds an exact effect
+
+An approval covers an immutable action hash or candidate revision plus actor, Agent, resource,
+budget/policy context, and expiry. Any changed input requires a new approval.
+
+**Current status:** controlled patch writeback implements the strongest form through a bundle hash.
+Connector effects use durable approvals/idempotency but do not yet share one generic effect record.
+
+### C6 — Scope is partition, not authority
+
+`scope_id` is derived from organization and Agent and used for storage isolation. Clients cannot
+gain access by naming a scope, and product APIs authorize resources explicitly.
+
+**Acceptance:** spoofed organization/Agent/scope headers, foreign run/session ids, and outbox pointer
+scope mismatches fail closed and do not reveal foreign existence.
+
+### C7 — Control-plane credentials never enter untrusted execution
+
+Database, Redis, connector refresh, provider, and GitHub writeback credentials stay outside the
+sandbox. A guest receives only an explicitly admitted short-lived capability, if any.
+
+**Current status:** Compose sandbox and GitHub patch writeback satisfy this for file-only patch
+generation. Future shell/opaque-agent execution must re-prove it.
+
+### C8 — Durable configuration snapshot
+
+Every run records the immutable Agent version, Routine policy, model, budget, grants/resources, and
+effect policy used at admission. Later configuration changes do not rewrite an in-flight run.
+
+**Current status:** durable runs capture several admission fields, but the persisted Agent/Routine
+model is not yet complete enough to satisfy the full invariant.
+
+## Domain-specific acceptance
+
+### Memory
+
+- Model-learned core/profile changes are proposal-first with provenance; direct mutation tools are
+  disabled for normal product Agents.
+- Untrusted IM/content cannot write durable memory.
+- Erased source content cannot be resurrected through consolidation or rebuild.
+
+### Knowledge
+
+- Every result includes source identity and citation.
+- External Knowledge remains tainted.
+- Embedding model/dimension mismatch is rejected.
+- Delete hides content before asynchronous physical purge and rebuild cannot resurrect it.
+
+### Connections and effects
+
+- Credentials are encrypted, scoped, refresh/revoke failures are explicit, and secret values never
+  enter metadata/logs.
+- Webhooks authenticate before replay claim and route to exactly one bound scope.
+- An Agent/Routine can use only selected and granted provider resources.
+
+### Projects, review, and patches
+
+- Worktrees never expose writable authoritative Git state.
+- Review findings cite bounded evidence in the reviewed diff.
+- Patch approval binds the immutable candidate.
+- Trusted writeback can create only the controlled branch and Draft PR.
+- Shell/build/test claims require actual qualified execution evidence.
+
+## Merge and release policy
+
+- A code-level invariant blocks the change that introduces or weakens it.
+- A deployment invariant blocks enabling the capability in that trust profile.
+- A product invariant blocks the release claim until a real end-to-end scenario passes.
+- [Status](./STATUS.md) records what is proven now; [Roadmap](./ROADMAP.md) owns the remaining gate.

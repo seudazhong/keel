@@ -1,8 +1,8 @@
 # Keel — Diagrams
 
-> These diagrams primarily visualize the **target architecture**. Read
-> [`../ARCHITECTURE.md`](../ARCHITECTURE.md), especially its implementation-fidelity table,
-> before treating a container, boundary, or flow as deployed.
+> These diagrams are supporting snapshots and may predate ADR-0011. Read
+> [`../ARCHITECTURE.md`](../ARCHITECTURE.md), especially the current-implementation summary,
+> before treating a container, boundary, or flow as deployed or still planned.
 
 Source diagrams are authored in **Mermaid** (renders natively on GitHub). They visualize
 the architecture and accepted decisions, including event versions, embedding pinning,

@@ -9,11 +9,11 @@
 # today, not this file.
 #
 # Promote this file back into ../kustomization.yaml's `resources:` only once
-# `keel-scheduler`'s entrypoint is a real long-lived, leader-elected loop (M3.8 —
-# "scheduler service/leadership" in docs/ROADMAP.md). Until then this file is a forward-looking
+# `keel-scheduler`'s entrypoint is a real long-lived, leader-elected loop. Until then this file is
+# a forward-looking
 # shape, not a working manifest.
 #
-# keel-scheduler: leader-elected cron singleton (ADR-0006, ARCHITECTURE §15). Exactly one
+# keel-scheduler: leader-elected cron singleton (ADR-0006, docs/ARCHITECTURE.md). Exactly one
 # active replica should perform scheduling; `replicas: 1` here is a placeholder until leader
 # election is implemented. Do not scale this beyond 1 replica before that lands, or schedules
 # may double-fire.

@@ -7,3 +7,5 @@ For current decisions use [`../STATUS.md`](../STATUS.md) and
 [`../ROADMAP.md`](../ROADMAP.md). A dated plan may mention an old branch, worktree,
 baseline, command, or intended behavior; verify all of those against current code before
 reuse.
+
+Old `M*` milestone references are historical and do not map directly to the active `R*` releases.

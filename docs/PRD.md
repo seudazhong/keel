@@ -1,270 +1,199 @@
 # Keel product requirements
 
-> **Status:** Living target specification · **Updated:** 2026-07-16
-> **Current implementation:** [STATUS.md](./STATUS.md) · **Execution:** [ROADMAP.md](./ROADMAP.md)
-> **Architecture:** [ARCHITECTURE.md](./ARCHITECTURE.md) · **Product form:** [ADR-0009](./adr/0009-product-form-and-primary-use-cases.md)
+> **Status:** Living target specification
+> **Current implementation:** [Status](./STATUS.md)
+> **Architecture:** [Architecture](./ARCHITECTURE.md)
+> **Active delivery plan:** [Roadmap](./ROADMAP.md)
 
 ## 1. Product thesis
 
-Keel is a cloud-native agent platform where:
+Keel is a cloud-native platform for durable, governed Agents:
 
-1. each user has a **private, persisted personal agent**;
-2. users can create or join **team agents** that share only explicitly granted resources;
-3. Web and IM are surfaces of the **same durable runtime**, not separate bots;
-4. memory, connectors, permissions, approvals, schedules, and audit are attached to an
-   Agent and enforced by identity and grants;
-5. native connectors provide reliable depth for core services, while MCP and workflow
-   systems such as n8n provide the long tail.
+1. each user can have a private, persisted personal Agent;
+2. organizations can create team Agents shared only with explicit members and resources;
+3. Web, IM, schedules, and operator tools are surfaces of the same runtime;
+4. memory, Knowledge, connectors, projects, permissions, approvals, budgets, and audit attach to
+   an Agent or Routine and are enforced consistently;
+5. native integrations provide dependable depth for core services, while MCP and automation
+   systems cover the long tail.
 
-The stable "keel" is the bounded, durable runtime. Product value comes from safely
-connecting that runtime to people, memory, knowledge, and actions.
+The initial production boundary is **multi-user, one active organization per deployment**. The
+schema may remain multi-organization-ready, but hosted multi-organization SaaS is a later product.
 
-### 1.1 Current implementation versus target
+Managed projects, code review, and controlled patch proposals are a capability pack for the same
+platform. Keel is not redefined as a coding-only product.
 
-The current code is a **single deployment with one hard-coded `web:local` scope/agent**.
-It has a comparatively mature runtime/data engine, Durable Jobs, Gmail, memory/evals, and
-RAG/Knowledge, but no real users, organizations, Agents CRUD, Calendar, or hard
-production-grade tenant boundary. See [Status](./STATUS.md) for evidence and blockers.
+## 2. Product principles
 
-This PRD describes the target unless a requirement is explicitly marked current.
+- **One Agent runtime, many surfaces.**
+- **Identity and grants before sharing.**
+- **Private by default; explicit sharing only.**
+- **Durable admission before autonomous execution.**
+- **Scope is a partition key, not authority.**
+- **Untrusted content stays untrusted even when its account or user is trusted.**
+- **Human decisions bind exact effects or immutable revisions.**
+- **Native depth before connector count.**
+- **Evidence over aspiration.**
 
-### 1.2 Tenancy boundary
+## 3. Users
 
-- **Initial product boundary:** multi-user, **single organization per deployment**. Users
-  have private agents and can explicitly share team agents/resources inside that
-  organization.
-- **Future boundary:** multi-organization SaaS with hard organizational tenancy, billing,
-  fleet administration, and regional/data-residency controls.
-- Self-hosted deployments remain supported; "single organization" must not mean
-  "unauthenticated single user."
-
-## 2. Goals and non-goals
-
-### Goals
-
-- **Identity and Agents:** durable users/sessions, Agents CRUD, private personal agents,
-  explicit team-agent membership and resource grants.
-- **One durable runtime:** Web, IM, schedules, triggers, and operator clients share session,
-  event, approval, and run ownership.
-- **Connected assistance:** Gmail and Calendar first; docs/knowledge next; connector
-  triggers can initiate safe runs.
-- **Memory and knowledge:** editable memory, session recall, consolidation, and cited,
-  tainted Knowledge retrieval.
-- **Safe action:** fail-closed permissions, cross-scope isolation, durable approvals,
-  sandboxed execution, auditable/idempotent outbound actions.
-- **Governance:** admin/RBAC, data retention/erasure, observability, cost controls, and
-  operable cloud delivery.
-- **Extensibility:** connector/tool seams, MCP, skills, and eventually a versioned SDK.
-
-### Non-goals for the initial product
-
-- Hosted multi-organization SaaS, billing, and marketplace.
-- Visual no-code workflow authoring; integrate with n8n rather than rebuilding it.
-- Model training/fine-tuning.
-- Native mobile applications.
-- Local desktop/file execution before the remote trust and approval model is proven.
-- Broad connector quantity at the expense of safe identity, grants, and lifecycle.
-
-## 3. Personas
-
-| Persona | Need |
+| User | Primary need |
 |---|---|
-| **Individual user** | A private agent with personal memory, Gmail/Calendar/knowledge, proactive triggers, and approval before external action. |
-| **Team member** | A shared agent in Web/IM that can use team-granted resources but cannot access private agents or connectors. |
-| **Organization admin** | User/role/Agent/connector governance, audit, retention, costs, health, and incident controls. |
-| **Operator/SRE** | Repeatable deployment, upgrades, metrics, backup/restore, security boundaries, and run/job diagnosis. |
-| **Builder** | Safe extension points, MCP, connector framework, compatibility policy, examples, and test harnesses. |
-
-Developer CLI automation remains useful, but it is secondary to the connected personal/team
-assistant product.
+| Individual user | A private Agent with memory, connected accounts, cited Knowledge, routines, and approval before sensitive effects. |
+| Team member | A shared Agent that can use only team-granted resources and never private resources. |
+| Organization admin | Membership, Agent, Connection, grant, routine, audit, retention, cost, and safety management. |
+| Operator/SRE | Repeatable deployment, upgrades, diagnostics, observability, backup/restore, and incident controls. |
+| Builder | Stable extension seams, capability declarations, compatibility tests, and safe examples. |
 
 ## 4. Primary journeys
 
-### 4.1 Personal onboarding
+### 4.1 Personal connected Agent
 
-1. A user signs in and receives a private personal Agent.
-2. They choose a model and grant Gmail and Calendar with least OAuth scopes.
-3. They review what data is stored, retention settings, and approval policy.
-4. A first-run guide demonstrates read-only retrieval before enabling outbound actions.
+1. A user signs in and receives or selects a private personal Agent.
+2. They connect Gmail and Calendar, select resources, and review stored-data and approval policy.
+3. The Agent answers using cited Knowledge and user-managed memory.
+4. A Routine prepares a digest, reminder, or draft.
+5. Sensitive outbound effects require an exact, cross-surface approval and remain idempotent after
+   restart or retry.
 
-### 4.2 Personal proactive assistant
+### 4.2 Team Agent
 
-1. A connector trigger or schedule starts a durable run.
-2. The Agent reads only resources granted to it, with external content taint preserved.
-3. It updates private memory or drafts an outbound action.
-4. The user approves/rejects from Web or IM; retry cannot duplicate the action.
+1. An admin creates a team Agent and grants selected team resources.
+2. Explicit Agent-access members or mapped channels use it from Web and IM.
+3. Private personal memory, Connections, and projects are never visible.
+4. Private Web sessions remain private unless their visibility is explicitly changed.
+5. Membership, Agent access, grants, actions, and failures are auditable.
 
-### 4.3 Team agent
+### 4.3 Managed project
 
-1. An admin/member creates a team Agent and grants selected team resources.
-2. Members use it from Web and an IM channel mapped to the same Agent/session policy.
-3. Private personal memory/connectors are never visible.
-4. Actions and grant changes are audited.
+1. An authorized user connects GitHub and imports a repository as an organization-owned Project.
+2. A read-only review produces an immutable evidence-checked report.
+3. A controlled patch request produces an immutable candidate revision.
+4. A human approves that exact revision before the trusted control plane may create a branch and
+   Draft PR.
+5. Build/test execution is offered only when a qualified per-run sandbox can enforce it.
 
-### 4.4 Admin governance
+### 4.4 Administration and operations
 
-An admin can manage users, roles, Agents, memberships, connector grants, API credentials,
-retention/erasure, pending approvals, jobs, schedules, costs, and health without direct DB
-access.
+Admins and operators can manage identity, Agents, Connections, grants, Routines, approvals, jobs,
+retention/erasure, health, costs, and incidents without direct database edits.
 
-### 4.5 Builder extension
+## 5. Canonical product concepts
 
-A builder adds a connector/tool through the narrow tool contract, declares permissions and
-taint/provenance behavior, tests it against compatibility/security suites, and deploys it
-without modifying the runtime loop.
+The product language is Actor, Organization, Agent, Agent Access, Connection, Resource, Grant,
+Routine, Session, Run, Job, Approval, Effect, and Artifact. See
+[ADR-0011](./adr/0011-product-boundary-and-domain-model.md).
 
-## 5. Product principles
-
-- **One core, many surfaces:** no UI- or gateway-specific agent logic.
-- **Identity before sharing:** every read/action has an actor, Agent, scope, and grant.
-- **Private by default:** personal resources are never ambient to team Agents.
-- **Durable before autonomous:** admitted work, approvals, and idempotency survive restart.
-- **Content trust differs from scope trust:** trusted users still ingest untrusted email,
-  web, docs, and messages.
-- **Fail closed on trust, degrade on operations.**
-- **Human control is cross-surface:** approval policy and pending state are consistent in
-  Web and IM.
-- **Native depth, extensible breadth:** native Gmail/Calendar; MCP/n8n for the long tail.
-- **Evidence over aspiration:** Status and milestone exit gates define completion.
+`scope_id` is an internal isolation key. It must not be exposed as the user's mental model for
+selecting an Agent, sharing a resource, or authorizing an action.
 
 ## 6. Functional requirements
 
-Priority: **P0** initial product, **P1** fast follow, **P2** later.
+Priority: **P0** initial single-organization product, **P1** fast follow, **P2** later.
 
-### 6.1 Identity, organization, Agents, and governance
-
-| ID | Requirement | Priority |
-|---|---|---|
-| ID-1 | User identity and durable login/session management. | P0 |
-| ID-2 | Single-organization-v1 membership and owner/admin/member/viewer roles. | P0 |
-| ID-3 | Agents CRUD with persona/model/tools/memory/connectors/permissions. | P0 |
-| ID-4 | Every user receives a private persisted personal Agent. | P0 |
-| ID-5 | Team Agents expose only explicitly granted resources to explicit members/channels. | P0 |
-| ID-6 | Real Agent/scope switcher in Web; active Agent visible on every surface. | P0 |
-| ID-7 | Admin UI/API for users, roles, Agents, grants, credentials, audit, and safety state. | P0 |
-| ID-8 | Future multi-organization tenancy and billing. | P2 |
-
-### 6.2 Surfaces and durable interaction
+### 6.1 Identity, Agents, and governance
 
 | ID | Requirement | Priority |
 |---|---|---|
-| SUR-1 | Web chat, sessions, approvals, Agent switcher, memory, connectors, schedules, Knowledge, and admin. | P0 |
-| SUR-2 | IM adapters map channels/DMs to the same Agent/runtime and approval state as Web. | P0 |
-| SUR-3 | Streaming typed events with replay/resume after reconnect. | P0 |
-| SUR-4 | Interactive runs are worker-owned/durable; API restart does not lose them. | P0 |
-| SUR-5 | Responsive layout, keyboard access, WCAG-oriented semantics, and EN/简体中文 foundation. | P0 |
-| SUR-6 | CLI remains an operator/builder and local-runtime surface. | P1 |
-| SUR-7 | Desktop shell/local executor only after trust gates. | P2 |
+| ID-1 | Browser OIDC authorization-code login with secure server-managed session. | P0 |
+| ID-2 | One active organization per initial production deployment with owner/admin/member/viewer roles. | P0 |
+| ID-3 | Versioned personal/team Agent definitions: persona, model, tools, resources, memory policy, budgets, and autonomy defaults. | P0 |
+| ID-4 | Private personal Agent provisioning and explicit team Agent access for users/channels. | P0 |
+| ID-5 | Actor authority, Agent access, and Agent resource grants are intersected and fail closed. | P0 |
+| ID-6 | Admin UI/API for users, Agents, Connections, grants, Routines, audit, retention, and safety state. | P0 |
+| ID-7 | Initial production enforces one active organization per deployment. | P0 |
+| ID-8 | Hosted multi-organization tenancy, billing, and regional policy. | P2 |
 
-### 6.3 Connectors and triggers
-
-| ID | Requirement | Priority |
-|---|---|---|
-| CON-1 | Native Gmail and Calendar connectors with least-scope OAuth. | P0 |
-| CON-2 | Connector framework owns auth, lifecycle, provenance, grants, triggers, and health; connectors still enter the loop as tools. | P0 |
-| CON-3 | Tokens are encrypted, revocable, rotated, and keyed to user/Agent/grant. | P0 |
-| CON-4 | Connector content carries provenance and untrusted-content taint. | P0 |
-| CON-5 | Webhook/poll/schedule triggers can start idempotent durable runs. | P0 |
-| CON-6 | Outbound send/post/invite actions are approval-gated, audited, and durably idempotent. | P0 |
-| CON-7 | Docs/storage/contacts via native depth where justified; curated MCP/n8n elsewhere. | P1 |
-
-### 6.4 Runtime, tools, and multi-agent
+### 6.2 Durable interaction and routines
 
 | ID | Requirement | Priority |
 |---|---|---|
-| RUN-1 | Bounded two-loop runtime, durable admission, stop-reason gate, named termination. | P0 |
-| RUN-2 | Deterministic parallel tool execution and bounded outputs. | P0 |
-| RUN-3 | File/shell/web tools execute through an isolated environment, never the API process. | P0 |
-| RUN-4 | Explicit fail-closed permission defaults and durable cross-surface approvals. | P0 |
-| RUN-5 | Background jobs provide leases/reclaim, retries, progress, cancellation, and exactly-once result injection. | P0/current |
-| RUN-6 | Sub-agents share budgets and inherit explicit scope/grants without expanding authority. | P1 |
+| RUN-1 | Bounded runs with named termination, persist-before-call, and replayable typed events. | P0 |
+| RUN-2 | Worker-owned interactive runs survive API restart and support cancel, interrupt, steer, and approval. | P0 |
+| RUN-3 | A Routine binds trigger, Agent, input, allowed resources/actions, budget, approval policy, owner, and delivery target. | P0 |
+| RUN-4 | Accepted Routine occurrences are never silently lost and duplicate delivery cannot duplicate work. | P0 |
+| RUN-5 | Web and IM share the same Agent, session, run, approval, and result state. | P0 |
+| RUN-6 | Sessions record owner/channel and visibility; team Agent access does not imply access to every private session. | P0 |
+| RUN-7 | Child/sub-agent runs inherit immutable authority and one shared budget without expansion. | P2 |
 
-### 6.5 Memory, Knowledge, and data lifecycle
+### 6.3 Connections and effects
 
 | ID | Requirement | Priority |
 |---|---|---|
-| DATA-1 | Durable session history and lexical/semantic recall. | P0/current |
-| DATA-2 | Versioned core memory and archival memory; proposal-first consolidation. | P0/current |
-| DATA-3 | Knowledge ingest/version/delete/search with citations, taint, and embedding pinning. | P0/current |
-| DATA-4 | Event upcasters and projection rebuild compatibility. | P0 |
-| DATA-5 | Per-Agent/session retention and complete audited erasure across events, projections, vectors, Knowledge, tokens, artifacts, and telemetry. | P0 |
-| DATA-6 | User-facing Memory UI with edit/history/proposal controls. | P0 |
+| CON-1 | First-class multi-account Connections owned by a user or organization, initially Gmail and Google Calendar. | P0 |
+| CON-2 | Users select provider resources and grant explicit capabilities to Agents/Routines. | P0 |
+| CON-3 | Connector manifests declare action semantics, OAuth scopes, risk, approval, idempotency, reconciliation, provenance, health, and worker capability. | P0 |
+| CON-4 | External content retains provenance, sensitivity, and untrusted influence. | P0 |
+| CON-5 | Effects use durable states including ambiguous/unknown provider outcomes and reconcile before retry. | P0 |
+| CON-6 | Additional providers graduate from experimental only after common lifecycle/security suites. | P1 |
+
+A Routine may narrow an Agent's granted resources/actions but may never expand them.
+
+### 6.4 Memory, Knowledge, and lifecycle
+
+| ID | Requirement | Priority |
+|---|---|---|
+| DATA-1 | Durable session history and lexical/semantic recall. | P0 |
+| DATA-2 | User-managed core/profile memory with version history; model learning is proposal-first with provenance. | P0 |
+| DATA-3 | Knowledge ingest/version/delete/search with citations, taint, and embedding pinning. | P0 |
+| DATA-4 | Event upcasters and tombstone-aware projection rebuilds. | P0 |
+| DATA-5 | Audited retention and erasure across owned stores; external gaps are reported honestly. | P0 |
+| DATA-6 | Run-local scratch state is separate from durable memory and Knowledge. | P0 |
+
+### 6.5 Managed projects and controlled code changes
+
+| ID | Requirement | Priority |
+|---|---|---|
+| CODE-1 | Organization-owned Projects with GitHub App import/sync and explicit Agent grants. | P1 |
+| CODE-2 | Read-only review produces immutable, bounded, evidence-verified reports. | P1 |
+| CODE-3 | Patch approval binds an immutable candidate revision and trusted writeback creates only a branch and Draft PR. | P1 |
+| CODE-4 | Patch generation labels validation truthfully; no build/test claim without actual execution. | P1 |
+| CODE-5 | Shell/build/test runs only in an ephemeral, resource-bounded, default-deny execution environment. | P2 |
+| CODE-6 | Automatic merge, default-branch push, force-push, and host Docker socket access are forbidden. | P0 |
 
 ### 6.6 Operations and extensibility
 
 | ID | Requirement | Priority |
 |---|---|---|
-| OPS-1 | Non-owner runtime DB role and RLS enforced as defense in depth. | P0 |
-| OPS-2 | Hashed/scoped machine credentials, OIDC for humans, authenticated webhooks. | P0 |
-| OPS-3 | Complete traces, reconciled usage/cost, health/SLO metrics, and alerts. | P0 |
-| OPS-4 | Repeatable install/upgrade/rollback plus tested backup/restore. | P0 |
-| OPS-5 | Accurate production images/profiles, including React delivery and isolated services. | P0 |
-| EXT-1 | Skills and MCP remain supported with import/trust controls. | P1/current foundation |
-| EXT-2 | Generated/versioned SDK and plugin lifecycle only after event/API gates. | P2 |
+| OPS-1 | Non-owner runtime database principal and enforced RLS. | P0 |
+| OPS-2 | Separate scheduler and capability-specific worker pools. | P0 |
+| OPS-3 | End-to-end traces, metrics, usage/cost reconciliation, alerts, and SLOs. | P0 |
+| OPS-4 | Tested install, upgrade, rollback, backup, restore, and DR. | P0 |
+| OPS-5 | Production trust profiles never substitute in-process execution or implicit admin. | P0 |
+| EXT-1 | Skills and MCP remain governed tool sources with import-not-trust controls. | P1 |
+| EXT-2 | Public plugin SDK and local desktop executor wait for stable contracts and security gates. | P2 |
 
 ## 7. Non-functional requirements
 
 | Area | Requirement |
 |---|---|
-| Isolation | Automated two-user/private-team tests prove no unauthorized cross-Agent resource access; runtime DB ownership cannot bypass the tested boundary. |
-| Reliability | No admitted turn or pending approval is lost on process restart; duplicate delivery does not duplicate outbound effects. |
-| Performance | Warm first token target <2 seconds p50 excluding provider latency; management pages remain usable with production-sized histories. |
-| Availability | Stateless API and horizontally scalable workers after durable topology gates; graceful drain and recovery. |
-| Security | Isolated execution, least privilege, SSRF/egress/path controls, encrypted secrets, authenticated webhooks, and audit. |
-| Privacy | Documented data map, configurable retention, PII/secret redaction, and verified erasure. |
-| Accessibility/i18n | Core journeys keyboard-operable and screen-reader-labeled; architecture supports English and 简体中文 without duplicated product logic. |
-| Operability | Health/readiness, structured logs, traces/metrics, queue/run diagnosis, tested backup/restore, upgrade/rollback. |
+| Isolation | Automated two-user/private-team tests prove no unauthorized Agent discovery, session read, or cross-resource access. |
+| Reliability | No admitted run, accepted Routine occurrence, pending approval, or confirmed effect is lost after restart. |
+| Security | Explicit policy, isolated execution, least privilege, SSRF/egress controls, secret isolation, authenticated webhooks, and audit. |
+| Privacy | Documented data map, configurable retention, redaction, verified erasure, and no false claim when an external deletion cannot be proven. |
+| Performance | Management surfaces remain usable with production-sized histories; provider latency is measured separately. |
+| Accessibility/i18n | Core journeys are keyboard-operable and screen-reader-labeled; English and Simplified Chinese share one product implementation. |
+| Operability | Health/readiness, structured logs, traces/metrics, queue/run/effect diagnosis, and tested recovery. |
 | Compatibility | Event upcasters and additive API policy protect stored histories and clients. |
 
-## 8. KPIs and exit evidence
+## 8. Success measures
 
-KPIs apply only after their prerequisite milestone:
+- A new user completes sign-in, personal Agent setup, and one connected read-only task without
+  operator intervention.
+- Personal and team journeys show zero unauthorized Agent discovery, private-session access, or
+  resource access in adversarial acceptance tests.
+- Accepted Routine occurrences and approvals survive induced crashes with no duplicate effect.
+- Gmail and Calendar happy paths meet declared success and revoke/refresh error budgets.
+- Memory and Knowledge quality gates remain deterministic and published.
+- Controlled patch approval creates the exact reviewed Draft PR revision.
+- Production release requires measured SLOs and a backup/restore drill meeting declared RPO/RTO.
 
-- **Activation:** ≥80% of invited users complete sign-in, select/create an Agent, and finish
-  one successful read-only connected task.
-- **Time to value:** median <10 minutes from deployment-ready credentials to first
-  successful run; median <15 minutes for user onboarding after admin setup.
-- **Cross-surface continuity:** ≥95% of sampled Web/IM journeys preserve the same session,
-  Agent, approval, and result state.
-- **Safety:** zero unauthorized cross-Agent reads in acceptance suites; 100% of outbound
-  mutations pass policy, audit, and idempotency checks.
-- **Durability:** zero lost admitted turns/approvals in restart tests; job recovery suites
-  remain green.
-- **Connector quality:** Gmail and Calendar happy-path success ≥95% excluding upstream
-  outages; refresh/revoke failures fail closed.
-- **Retrieval quality:** published deterministic Memory/Knowledge gates remain at or above
-  their accepted thresholds.
-- **Operations:** required runs traced with usage reconciliation; restore drill meets the
-  declared RPO/RTO before production release.
-- **Accessibility:** no critical automated violations in core journeys plus documented
-  keyboard/manual review.
+## 9. Non-goals
 
-## 9. Release sequence
-
-The active release plan is [Roadmap](./ROADMAP.md):
-
-1. Demo-ready Product Surface
-2. Personal Agent Experience Preview (trusted local/single-organization mode)
-3. Cloud Safety Foundation
-4. Event Evolution
-5. Retention/Erasure
-6. Multi-user Identity, Access, and durable run topology
-7. Connector and Team Experience
-8. Production Delivery and Scale
-9. Plugin SDK and Desktop only after their gates
-
-User login/OIDC/OAuth authentication is intentionally deferred until the multi-user milestone.
-Connector-specific OAuth remains part of the connector that needs it.
-
-## 10. Risks
-
-| Risk | Response |
-|---|---|
-| Cross-scope data leak/confused deputy | Identity/grants, enforced RLS, taint, approval, audit, adversarial acceptance tests. |
-| Prompt injection through email/web/docs/IM | Treat content as untrusted independent of user/scope trust; constrain outbound/cross-connector actions. |
-| Sandbox escape or server-process shell | Isolated execution service with least privilege, egress/path policy, and security tests. |
-| Duplicate email/invite/post | Durable idempotency keys and provider-ID reconciliation. |
-| Connector breadth overwhelms product | Gmail/Calendar native first; framework + MCP/n8n long tail. |
-| UI outruns runtime truth | One API/event model; Status and measurable gates govern claims. |
-| Privacy deletion is incomplete | Data map, upcasters, idempotent erasure jobs, rebuild/no-resurrection tests. |
-| Premature SDK/Desktop | Explicitly gated after event, identity, approval, and production delivery milestones. |
+- Billing, marketplace, and broad multi-organization SaaS in the initial product.
+- A visual no-code workflow builder; integrate with automation platforms instead.
+- Model training/fine-tuning.
+- Native mobile applications.
+- A browser IDE or unrestricted remote-code-execution service.
+- Automatic merge or autonomous default-branch writes.
+- Connector quantity at the expense of lifecycle, security, and usable journeys.

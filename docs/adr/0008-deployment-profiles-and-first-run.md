@@ -1,6 +1,6 @@
 # ADR-0008 — Deployment profiles & first-run
 
-**Status:** Accepted · **Date:** 2026-07-06 · **Resolves:** PRD §13 Q3, Q4, Q5 · **Related:** ADR-0002, ADR-0006, ARCHITECTURE §15
+**Status:** Accepted · **Date:** 2026-07-06 · **Refined by:** [ADR-0011](./0011-product-boundary-and-domain-model.md) · **Resolves:** PRD §13 Q3, Q4, Q5 · **Related:** ADR-0002, ADR-0006
 
 ## Context
 Keel targets one-command self-hosting (DR-1) across very different footprints: a developer's inner loop, a full production stack, and a single-user/offline CLI. The PRD leaves three deployment questions open: whether MinIO is always bundled (Q3), whether the `lite` single-container/SQLite mode is first-class (Q4), and whether a local model ships for a zero-key first run (Q5).

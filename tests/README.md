@@ -51,5 +51,5 @@ Replay mode must fail closed rather than call a live provider/embedding service.
 mode can incur cost and mutate evaluation data; inspect `--help` and use only isolated
 credentials/databases.
 
-See [Development](../docs/DEVELOPMENT.md) and [Status](../docs/STATUS.md) for the full CI
-commands and retained verified baselines.
+See [Development](../docs/DEVELOPMENT.md) for CI commands and
+[Status](../docs/STATUS.md) for current capability maturity.

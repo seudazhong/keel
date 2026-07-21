@@ -1,4 +1,7 @@
-# Read-only Code Review (MVP, WS-R)
+# Read-only code review
+
+> **Status:** Living subsystem reference
+> **Product maturity:** durable API/worker/report backend; no React review surface
 
 Keel's read-only, managed-code **review** capability: given an authorized project change set
 (a branch, a single commit, or a pull request), it materializes an **isolated, disposable**
@@ -198,4 +201,3 @@ budget or cost ceiling is exceeded.
   fails explicitly.
 * Findings are advisory model output. Even a verified finding only proves the cited
   file/line/snippet exists in the reviewed change — a human validates whether the issue is real.
-

@@ -4,6 +4,9 @@ These date-prefixed documents preserve feature and product/UX design snapshots. 
 contain superseded sequencing, names, architecture assumptions, and "will" statements.
 They are supporting evidence, not living product or implementation truth.
 
+Old `M*` milestone references belong to the historical roadmap scheme; the active roadmap uses
+`R*` release outcomes.
+
 Use:
 
 - [`../STATUS.md`](../STATUS.md) for current capability;

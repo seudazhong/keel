@@ -1,4 +1,4 @@
-# Reference-only Service pointing at Redis (queue/lock/pub-sub backbone, ARCHITECTURE §15).
+# Reference-only Service pointing at Redis (queue/lock/pub-sub backbone; see docs/ARCHITECTURE.md).
 # As with Postgres, prefer a managed Redis (ElastiCache/Memorystore/Azure Cache) or a
 # supported in-cluster operator over a hand-rolled StatefulSet; the scheduler's Redis-lock
 # leader election and arq's job dispatch both depend on Redis's own durability/availability

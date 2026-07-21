@@ -3,18 +3,17 @@
 This directory is a **production-delivery scaffold**: a concrete, validated starting point for
 running Keel's control plane (`keel-server`, `keel-worker`, `keel-web`) on Kubernetes with
 hardened defaults, plus a per-run sandbox Job template for the execution plane. It targets the
-topology described in [`docs/ARCHITECTURE.md` §15](../../docs/ARCHITECTURE.md) and §8.4
-"Deployment topology (Docker / Kubernetes)" of the
-[managed-code-projects design doc](../../docs/designs/2026-07-16-managed-code-projects-and-coding-agents-design.md).
+future single-organization trust profile described in
+[`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
 
 **It is not a claim of hostile multi-tenant readiness.** Read
 [`docs/security-model.md`](docs/security-model.md) "Pending gates" before running untrusted,
 multi-organization workloads on this scaffold. `keel-server`/`keel-worker` route shell/file
 tool calls through an authenticated `keel-sandbox` RPC boundary by default
-(`execution_backend=sandbox`; see [`docs/OPERATIONS.md`](../../docs/OPERATIONS.md)), but
-neither Compose nor this scaffold deploys that service, so tool execution fails closed until
-one exists (or an operator explicitly opts into unconditional in-process execution — see
-[`docs/security-model.md`](docs/security-model.md) "Isolation levels"). The separate per-run
+(`execution_backend=sandbox`; see [`docs/OPERATIONS.md`](../../docs/OPERATIONS.md)). Standard
+Compose deploys the live file-only sandbox service; this scaffold does not yet deploy that service
+or a sandbox controller, so tool execution fails closed until an operator adds the execution
+plane. The separate per-run
 sandbox `Job` template describes the *target* isolation shape a future, narrowly-scoped
 sandbox-controller will submit to once real Job creation lands — it is not wired up to a live
 agent runtime yet, and `keel-server` holds no Kubernetes RBAC to create it directly (see "What
@@ -53,7 +52,8 @@ kubectl kustomize deploy\k8s\overlays\production | Out-Null
 ```
 
 To actually install, copy `base/secret-app.example.yaml` (set a real, non-empty
-`KEEL_API_KEYS` with at least one valid `key:role` entry, **and** a real, random
+`KEEL_API_KEYS` with at least one explicit `key:admin:global` bootstrap credential or a scoped
+`key:role:org=...:agent=...` credential, **and** a real, random
 `KEEL_SANDBOX_RPC_SECRET` of at least 32 bytes — both required, see "What is (and is not)
 enforced here" below) and `base/datastores/objectstorage-secret.example.yaml` (fill from
 your secret manager, do not commit the result), point
@@ -66,8 +66,8 @@ Set `KEEL_DATABASE_URL` in that Secret to the **least-privilege** runtime login
 `KEEL_MIGRATION_DATABASE_URL` + `KEEL_RUNTIME_DB_PASSWORD` in `base/secret-migration.example.yaml`
 and run the one-shot `base/jobs-migrate-provision.example.yaml` (migrate, then provision the login)
 before the app starts. With `KEEL_CLOUD_MODE: "true"` keel-server/keel-worker fail **closed**
-unless that runtime login is non-owner / non-`BYPASSRLS` (M3A — see the runbook and
-[`../../docs/OPERATIONS.md`](../../docs/OPERATIONS.md) "Runtime database login").
+unless that runtime login is non-owner / non-`BYPASSRLS` (see the runbook and
+[`../../docs/OPERATIONS.md`](../../docs/OPERATIONS.md) "Startup and database principals").
 
 ## Validation
 
@@ -100,10 +100,10 @@ Kubernetes cluster, kind/minikube, or any credentials.
   resource. Per-run sandbox Job creation therefore is **not wired up**: it needs a
   narrowly-scoped, separately-namespaced sandbox-controller with an admission policy, which
   this scaffold documents as a pending gate rather than implementing.
-- `KEEL_API_KEYS` is **required**, non-empty, contains at least one syntactically valid
-  `key:role` entry (role one of `viewer`/`operator`/`admin`), and lives only in a Secret
-  (never the ConfigMap). `KEEL_CLOUD_MODE: "true"` is forced in the active config and is
-  consumed by application code (`Settings.cloud_mode` / `app.state.auth_required`, M3.3): with
+- `KEEL_API_KEYS` is **required**, non-empty, contains at least one explicit global or
+  org/Agent-bound machine credential, and lives only in a Secret (never the ConfigMap).
+  `KEEL_CLOUD_MODE: "true"` is forced in the active config and is
+  consumed by application code (`Settings.cloud_mode` / `app.state.auth_required`): with
   cloud mode on, an empty *or malformed* `KEEL_API_KEYS` fails every request closed instead of
   falling back to open admin mode (see
   [`docs/security-model.md`](docs/security-model.md) "What is enforced by these manifests").
@@ -117,11 +117,9 @@ Kubernetes cluster, kind/minikube, or any credentials.
   `/workspace` via `workingDir`, so its read-only root filesystem never has to make the app's
   own `/app` source tree the place model-chosen tool calls write to.
 - `keel-server` is pinned to **1 replica** with a **non-overlapping (`Recreate`) rollout
-  strategy** in both `base/` and the production overlay, even though it is architecturally
-  stateless and horizontally scalable — interactive runs and pending tool-approval state are
-  currently process-local (see [`docs/security-model.md`](docs/security-model.md) "Pending
-  gates"), so a second replica *or* an overlapping rollout today would silently drop an
-  in-flight run or approval. Only `keel-worker` scales up in the production overlay.
+  strategy** in both `base/` and the production overlay. Interactive runs are now durable and
+  worker-owned, but server scale-out, streaming fan-out, OAuth callbacks, and rolling upgrades
+  have not been qualified together. Only `keel-worker` scales up in the current overlay.
 - No ServiceAccount token in sandbox Jobs; the sandbox `ServiceAccount` has no Role/RoleBinding
   anywhere in this scaffold.
 - Explicit `resources.requests`/`limits` on every container; sandbox Jobs additionally carry
@@ -139,9 +137,8 @@ Kubernetes cluster, kind/minikube, or any credentials.
   [`docs/storage-topology.md`](docs/storage-topology.md)), so shipping them as applied would
   be a nonfunctional claim.
 
-See [`docs/security-model.md`](docs/security-model.md) for the full list of gates that remain
-pending real sandbox, identity, and vertical integration before this scaffold can back a
-hostile multi-tenant deployment.
+See [`docs/security-model.md`](docs/security-model.md) for the full list of gates that remain:
+execution plane, browser identity/admin, production operations, and adversarial tenant evidence.
 
 ## Boundaries of this change
 

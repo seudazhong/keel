@@ -1,19 +1,22 @@
 # Mounted configuration
 
-This directory is reserved for non-secret configuration files mounted into Keel services.
-The current Compose stack does not yet mount a complete production configuration set; most
-runtime settings come from defaults, `.env`, and `KEEL_*` environment variables.
+This directory is reserved for non-secret configuration mounted into Keel services.
 
-Configuration precedence is intended to be:
+Current services primarily use typed defaults plus `KEEL_*` environment variables. Mounted
+configuration may be added where it improves operability, but secret values do not belong here.
 
-1. package defaults;
-2. mounted configuration files;
-3. environment variables;
-4. durable/runtime overrides where implemented.
+Never store:
 
-Do not store provider keys, OAuth client secrets/tokens, `KEEL_SECRET_KEY`, or API keys
-here. Use environment variables or an external secret manager. Production-grade secret
-envelope/KMS integration and rotation remain roadmap work.
+- provider or API keys;
+- OAuth client secrets or refresh/access tokens;
+- GitHub private keys or webhook secrets;
+- sandbox RPC secret;
+- runtime database password;
+- envelope-encryption key material.
 
-See [Operations](../../docs/OPERATIONS.md), [`.env.example`](../../.env.example), and the
-current settings model in `packages/keel-core/src/keel_core/config.py`.
+Use environment/file references or an external secret manager. Keel supports versioned
+envelope-encryption keys for connector credentials, but production KMS/secret-manager integration is
+still a roadmap gate.
+
+See [Operations](../../docs/OPERATIONS.md), [`.env.example`](../../.env.example), and
+`packages/keel-core/src/keel_core/config.py`.

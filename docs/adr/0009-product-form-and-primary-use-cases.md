@@ -1,6 +1,6 @@
 # ADR-0009 — Product form & primary use cases
 
-**Status:** Accepted · **Date:** 2026-07-06 · **Supersedes framing in:** PRD §1–§4 · **Related:** ADR-0002, ADR-0005, ADR-0008, DESIGN-REVIEW G4
+**Status:** Accepted · **Date:** 2026-07-06 · **Refined by:** [ADR-0011](./0011-product-boundary-and-domain-model.md) · **Supersedes framing in:** PRD §1–§4 · **Related:** ADR-0002, ADR-0005, ADR-0008, DESIGN-REVIEW G4
 
 ## Context
 The original brief asked for a broadly **general-purpose** agent across every surface and feature. That is under-constrained on scope and leaves a load-bearing ambiguity unresolved: **is Keel a server-side agent that acts in its own sandbox, or a personal agent that acts on the user's machine?** The two pull the architecture in opposite directions (where tools execute, whose data is at risk, which surfaces are natural, ops footprint).

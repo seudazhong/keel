@@ -1,154 +1,113 @@
 # Keel implementation status
 
-> **Snapshot:** 2026-07-19 · **Branch:** `main` · **HEAD:** `b885f0d`
-> **Target:** [PRD](./PRD.md) · **Architecture fidelity:** [ARCHITECTURE](./ARCHITECTURE.md#0-implementation-status-and-fidelity) · **Active execution:** [ROADMAP](./ROADMAP.md)
+> **Snapshot:** 2026-07-21
+> **Branch:** `main`
+> **Implementation baseline reviewed:** `10f6806`
+> **Migration head:** `0023_oauth_state_metadata`
+> **Target:** [Product requirements](./PRD.md)
+> **Next work:** [Roadmap](./ROADMAP.md)
 
-This document is the authority for **what is true on `main` now**. It is rebuilt from directly
-measured evidence, not from historical task ledgers or dated snapshots. When a document
-conflicts with this one about current capability, this document wins.
+This document is the authority for what is true now. It intentionally avoids historical milestone
+claims and volatile test-count copies.
+
+Evidence is reproducible through the committed CI workflow and the commands in
+[Development](./DEVELOPMENT.md). Capability-specific evidence is linked from the subsystem
+references in [Documentation](./README.md).
 
 ## Maturity scale
-
-Every capability is rated on four independent levels. A higher level never implies a lower
-one automatically, and **code or passing tests (C/T) are never reported as a usable product
-scenario (P)**.
 
 | Level | Meaning |
 |---|---|
 | **C — Code** | Implementation exists on `main`. |
-| **T — Tested** | Automated tests cover it and pass in CI. |
-| **D — Deployable** | It starts and runs in the standard Compose local-preview stack. |
-| **P — Product** | A real end-to-end user scenario works through a shipped surface, not just an API or a preview screen. |
+| **T — Tested** | Automated tests cover the behavior. |
+| **D — Deployable** | The standard Compose preview wires and starts it. |
+| **P — Product** | A coherent user journey works through a shipped surface. |
 
-`✓` = level met, `~` = partial/preview, `—` = not met.
+`yes` = met, `partial` = useful but incomplete/preview, `no` = not met.
 
-## Summary
+## Executive summary
 
-`main` has a **strong, tested, deployable single-operator agent engine** with a broad React
-surface, now on a **completed safety foundation**: the data plane runs as a non-owner,
-least-privilege runtime DB login with enforced RLS (**M3A**), and shell/file execution runs in a
-deployed, authenticated, isolated sandbox service (**M3B**). It is still **not** a multi-user
-product: there is no browser login flow, and the surfaces remain a **trusted single-operator
-local preview**, not a production or multi-tenant deployment. Safety infrastructure being
-complete (C/T/D) does **not** make the platform a usable multi-tenant product (P).
+Keel has a strong durable runtime and data foundation. The current Compose stack is healthy with:
 
-## Verified baseline (M0 green + M2 patch merge + M3A/M3B safety foundation)
+- a non-owner `keel_runtime_login` data plane and enforced RLS;
+- shared Postgres run/event/job state and Redis delivery;
+- worker-owned interactive run admission;
+- an authenticated out-of-process sandbox;
+- the built React application.
 
-Measured on `main` at `b885f0d`. The standard Compose stack runs, in one command, the ordered
-startup `migrate → runtime-secret-init → provision → sandbox → server/worker/web`
-(migration head `0020_runtime_role_hardening`):
+The product remains a **trusted local/single-operator preview**. Backend capability has outpaced
+product cohesion: identity, lifecycle, connectors, projects, review, and patch infrastructure are
+substantial, while browser login, admin/team journeys, review/patch UI, safe shell execution, and
+production operations remain incomplete.
 
-- **Standard stack launches.** `docker compose -f docker-compose.yml --profile dev up -d --build`
-  starts cleanly; server `/readiness` returns `true` with
-  `runtime_db_principal = 'least-privilege (keel_runtime_login)'` and `sandbox = ok`; the worker
-  arq health check succeeds; the web surface returns `200` on `/health` and `/`.
-- **Backend CI green.** `ruff check`, `ruff format --check`, `mypy`, and the OpenAPI
-  compatibility check all pass.
-- **Backend tests.** Non-integration suite: **1924 passed / 2 skipped**. Full Postgres/Redis
-  integration suite: **397 passed**.
-- **M3A targeted (runtime DB least-privilege).** **121 passed / 1 skipped.** The runtime
-  connects via a **passwordless URL + `0600` `PGPASSFILE`**; the runtime login has
-  `super`, `bypassrls`, `createrole`/`createdb`, schema ownership, identity-delete,
-  erase-exec, and Alembic-DML privileges **all false**; RLS-bypass, DDL, and `SET ROLE`
-  attempts are denied.
-- **M3B targeted (real sandbox).** **69 + 10 targeted tests pass** — the sandbox service is
-  reached over **authenticated HMAC**, runs **nonroot / read-only rootfs / cap-drop** on an
-  **internal-only network**, provisions **per-scope files**, **denies shell**, and has **no
-  database, Redis, or public-network** reachability.
-- **Patch/review targeted tests.** **45** patch/review targeted tests pass on merged `main`.
-- **Frontend tests.** **116 passed.** Playwright browser smoke: **18 / 18**.
-- **Images build.** Both the `app` and `web` container images build.
-- **Git JIT auth fix.** The Git just-in-time credential bug is fixed on `main` — JIT
-  credentials are sent as an `Authorization` header.
+## Capability matrix
 
-## Capability maturity
-
-### Agent/data engine (backend)
-
-| Capability | C | T | D | P | Notes |
+| Capability | C | T | D | P | Current truth |
 |---|:--:|:--:|:--:|:--:|---|
-| Durable sessions/runs/jobs/approvals/schedules | ✓ | ✓ | ✓ | ~ | Durable job/schedule/approval loops are usable in single-operator preview; multi-user run topology gates remain (see blockers). |
-| Memory: core/archival, search, consolidation, evals | ✓ | ✓ | ✓ | ~ | Deterministic Memory evals pass; block/history editing UI is partial. |
-| Knowledge Base RAG (lifecycle, hybrid retrieval, citations, taint) | ✓ | ✓ | ✓ | ~ | Full vertical slice with React management/search UI, single-operator preview. |
-| Identity / org / agents / grants APIs | ✓ | ✓ | ✓ | — | REST + RBAC exist and are tested, but there is **no browser login flow**, so no end-to-end product scenario. |
-| Projects / GitHub App / storage | ✓ | ✓ | ✓ | ~ | Backend + storage exist; product journey is preview-level. |
-| Read-only code review API + worker | ✓ | ✓ | ✓ | — | Review generation runs server + worker side; **no review UI** ships. |
-| Patch / Draft PR foundation (models/store/bundle/generation/approval/writeback/coordinator) | ✓ | ✓ | ✓ | — | Merged on `main` (M2); C/T foundation only. No API/SDK/worker/outbox/reconciler/UI (M4/M5). |
-| Connectors: Gmail native, IM routing (OneBot/Telegram) | ✓ | ✓ | ✓ | ~ | Gmail OAuth/read/status/send preview works; IM message routing exists, IM durable routing + admin UI do not. |
-| Runtime DB least-privilege role + enforced RLS (M3A) | ✓ | ✓ | ✓ | — | Data plane runs as non-owner `keel_runtime_login`; RLS/DDL/`SET ROLE` denied. Safety infrastructure, not a multi-tenant product. |
-| Real isolated execution sandbox (M3B) | ✓ | ✓ | ✓ | — | Deployed HMAC-authenticated nonroot/read-only/cap-drop service, per-scope files, shell denied. Safety infrastructure, not a product surface. |
+| Durable chat/session/run pipeline | yes | yes | yes | partial | Worker-owned admission, replayable events, interrupt/steer/approval, and recovery exist. Product use is still preview-oriented. |
+| Jobs, schedules, approvals, outboxes | yes | yes | yes | partial | Durable jobs and approvals are strong. Schedules still use legacy hard-coded agent behavior and zero-or-one trigger delivery. |
+| Memory and session recall | yes | yes | yes | partial | Core/archival memory, search, consolidation, proposals, and UI exist. Interactive model tools can currently mutate memory directly; proposal-first is not yet enforced. |
+| Knowledge Base | yes | yes | yes | partial | Lifecycle, chunking, hybrid retrieval, citations, taint, connector ingest, and React management/search are present. |
+| Identity, organizations, Agents, grants | yes | yes | yes | partial | Backend and preview UI exist; no browser OIDC flow, Agent-access/session-visibility model, enforced one-org policy, or complete admin journey. Persisted Agent definition is still thin. |
+| Event evolution and data lifecycle | yes | yes | yes | partial | Upcasters, rebuild checkpoints/tombstones, retention classes, durable erasure, and identity purge exist. The data map does not yet classify every table added by later dispatch/patch slices. |
+| Connector framework | yes | yes | yes | partial | Manifest discovery, encrypted credentials, routed webhooks, recurring sync, provenance, taint, and durable actions exist. Provider maturity and setup UX differ. |
+| Gmail | yes | yes | yes | partial | Mail read and approval-gated send exist. The connected personal-Agent journey still needs common release qualification. |
+| Google Calendar | yes | yes | yes | partial | Read/sync/create/update exist with incremental OAuth and approval. It has less product history than Gmail and needs its own end-to-end qualification. |
+| Other connector providers | yes | yes | partial | no | Drive/Docs, Microsoft 365, Notion, Feishu, GitHub collaboration, RSS/Atom, and webhook providers exist but are not all product-qualified. |
+| Managed projects and GitHub sync | yes | yes | yes | partial | API and React project/import surfaces exist; GitHub App setup is still operator-heavy. |
+| Read-only code review | yes | yes | yes | no | Durable API/worker/report path exists. No React review surface ships. |
+| Controlled patch proposals | yes | yes | partial | no | Proposal store, generation, sandbox transfer, jobs, outbox, approval, writeback, and reconciler exist. No public API/SDK/UI. |
+| IM routing | yes | yes | partial | no | OneBot/Telegram ingress, durable mappings/replies, webhook authentication, and worker routing exist; admin and cross-surface product journeys do not. |
+| Runtime DB isolation | yes | yes | yes | n/a | Standard Compose uses the least-privilege runtime login; owner/RLS bypass is denied. |
+| Sandbox execution | yes | yes | yes | n/a | File operations run out of process. Compose uses one hardened container with per-scope namespaces; shell/build/test stays disabled. |
+| React application | yes | yes | yes | partial | Broad navigation and pages ship. Several pages are explicitly Preview or lack complete workflows. |
+| Production operations | partial | partial | no | no | K8s scaffold, readiness, and hardened defaults exist; separate scheduler, complete telemetry, scale proof, and DR remain open. |
 
-### Product surface (React)
+## Product scenarios that work today
 
-| Capability | C | T | D | P | Notes |
-|---|:--:|:--:|:--:|:--:|---|
-| React app (Chat, Sessions, Jobs, Schedules, Approvals, Memory, Knowledge, Connectors, Observability) | ✓ | ✓ | ✓ | ~ | Compose serves the built React app; several pages are preview or depend on backend/login work not yet shipped. |
-| i18n foundation | ✓ | ✓ | ✓ | ~ | Present and tested; not a complete localization. |
-| Onboarding / first-run | ✓ | ✓ | ✓ | ~ | Local onboarding flow exists as a single-operator preview. |
-| Agents / Projects UI | ✓ | ✓ | ✓ | ~ | Present; gated by missing identity/login and grant journeys. |
-| Auth/workspace context (API key / bearer, org/Agent) | ✓ | ✓ | ✓ | — | In-memory/tab-scoped credential context exists; it does **not** implement a browser OIDC authorization-code flow. |
+### Trusted local connected-agent preview
 
-> **Correction of stale claims.** Earlier docs asserted Keel had "no real identity/onboarding"
-> and served "a static stub rather than the React bundle." Those claims are **false on `main`**:
-> identity/org/agents/grants APIs, a React onboarding flow, and Compose-served React delivery
-> all exist. What is still missing is the **browser OIDC login flow** and multi-user product
-> journeys — not the code.
+- Start the Compose stack and enter local preview.
+- Chat through durable sessions and resume prior sessions.
+- Inspect and manage Memory, Knowledge, Jobs, Schedules, and Approvals.
+- Configure supported connectors and expose their actions to the interactive runtime.
 
-## Trusted local-preview safety contract
+This is useful but not a production identity/team journey.
 
-The Compose `dev` and `full` profiles are a **trusted, single-operator local preview**. The
-M3A/M3B safety foundation is now in place — the data plane runs as the non-owner
-least-privilege runtime login, and shell/file execution runs in the deployed isolated sandbox —
-but the preview is still **not a production or multi-tenant deployment** and must not be exposed
-to untrusted networks. Honest residual limits:
+### Managed project preview
 
-- The Compose sandbox is a **single-operator OCI container** (nonroot, read-only rootfs,
-  cap-drop, internal-only network), **not a microVM**; container isolation is weaker than a VM
-  boundary.
-- Sandbox networking is restricted to the internal service network but is **bidirectional**
-  within it (not a one-way/egress-only boundary).
-- **Per-scope shell execution remains disabled**; the sandbox provisions per-scope files and
-  denies shell.
-- The Kubernetes path is **example manifests**: an operator must run the `migrate` and
-  `provision` steps themselves (the single-command ordering is Compose-only).
+- Create or import an organization-owned Project through the React/API surface.
+- Synchronize through a configured GitHub App.
+- Request and retrieve a read-only review through the API.
 
-Safety infrastructure completing (C/T/D) does **not** by itself deliver a multi-tenant product
-(P): there is still no browser login and no multi-user product journey.
+Review results do not yet have a React surface.
 
-## Patch / Draft PR foundation (merged on `main`, C/T foundation only — not product usable)
+## Important gaps
 
-The controlled patch-proposal foundation is **merged on `main`** (milestone **M2**, complete):
+1. **Browser identity:** no OIDC authorization-code/PKCE login or secure browser session.
+2. **Domain completeness:** Agent definitions are not yet the versioned home for model, tools,
+   resources, memory policy, budgets, and autonomy; Agent Access, Session Visibility, Routine, and
+   reusable multi-account Connection concepts are missing.
+3. **Memory authority:** normal interactive Agents can directly call memory mutation tools; the
+   proposal-first model is not yet enforced.
+4. **Autonomous-effect correctness:** accepted schedule occurrences may be lost between claim and
+   enqueue, and generic connector effects need an explicit ambiguous/unknown reconciliation state.
+5. **Product cohesion:** review is headless; patch has no API/UI; team/IM administration is absent.
+6. **Lifecycle coverage:** newer dispatch/index and patch tables rely partly on foreign-key cascade
+   but are not all explicitly classified in the lifecycle data map.
+7. **Execution:** standard sandbox supports isolated file operations only, not safe build/test or
+   general coding-agent command execution.
+8. **Production:** no separate scheduler, trusted effect/capability worker pools, complete
+   OTel/metrics/SLOs,
+   proven horizontal topology, or tested backup/restore/DR.
 
-- Migration `0019` (`0019_patch_proposals`), plus the patch models / store / bundle /
-  generation / approval / writeback modules and the coordinator, including generation-run
-  **recovery + lease guard** and **trusted writeback**.
-- On merged `main`: `ruff` + `mypy` clean; the patch/review targeted suite (**45 tests**)
-  passes, and the foundation is covered within the green non-integration and Postgres
-  integration baselines above.
+## Safety contract
 
-This is a **C/T foundation only**. It has **no Patch API/SDK, no worker jobs, no dispatch
-outbox, no approved/expiry reconciler, and no UI** — those remain milestones **M4** (API /
-worker / outbox / reconciler) and **M5** (UI + human approval → Draft PR e2e). Until then the
-patch foundation is **not a usable product scenario (not P)** and must not be described as one.
+The Compose `dev`/`full` stack is a trusted preview:
 
-## Critical blockers (before any multi-user or production exposure)
-
-Resolved by the safety foundation: **RLS bypass** (M3A — the data plane now runs as the
-non-owner least-privilege `keel_runtime_login` with RLS/DDL/`SET ROLE` denied) and **no real
-sandbox** (M3B — shell/file execution runs in the deployed authenticated isolated sandbox).
-Remaining:
-
-1. **No browser login:** identity/org/agents/grants APIs exist but there is no browser OIDC
-   authorization-code flow, so no real multi-user product scenario (**M7**).
-2. **No review UI / IM admin UI:** the review API+worker and IM routing exist headless (**M5/M7**).
-3. **Event/data lifecycle:** event versions exist without upcasters, and erasure closure is
-   incomplete (**M8**).
-4. **Production operations:** no production scheduler service/leadership, OTel/metrics/SLOs,
-   or backup/restore/DR drills (**M9**).
-
-## Next work
-
-Follow [Roadmap](./ROADMAP.md): M0, M1, M2, **M3A, and M3B are complete** → **next: M4 Patch
-API/worker/outbox** (migration `0021`) → M5 Patch UI + approval → Draft PR e2e → M6 Personal
-Agent + Calendar → M7 Browser OIDC + admin/review/IM UI → M8 Event/lifecycle + erasure closure →
-M9 Production delivery/scale/OTel/DR.
+- do not expose open local-preview mode to untrusted networks;
+- the sandbox is a rootless-OCI floor, not a hostile-tenant microVM boundary;
+- shell is disabled because directory namespaces are not sufficient command isolation;
+- GitHub and connector credentials stay in the control plane;
+- API keys are machine credentials, not a browser login design;
+- production claims require the gates in [Roadmap](./ROADMAP.md).
