@@ -30,6 +30,8 @@ from keel_core.types import FinishReason, PermissionDecision, ScopeKind, StopRea
 from keel_sandbox.policy import EgressPolicy, PathPolicy
 from keel_scheduler.atmostonce import AtMostOnceScheduler, InMemoryClaimStore, Schedule
 
+_TEST_ALLOW_ALL = RuleBasedPermissionEngine([Rule("*", PermissionDecision.allow)])
+
 
 def _gate_byte_stable_prefix() -> None:
     agent = AgentSpec(id="a", name="n", model="m", scope=Scope(id="s", kind=ScopeKind.personal))
@@ -85,6 +87,7 @@ def _gate_bounded_loop_named_termination() -> None:
             session_id="s",
             store=store,
             provider=provider,
+            permissions=_TEST_ALLOW_ALL,
             budget=RunBudget(max_iterations=2),
         )
         return result.reason
@@ -103,7 +106,13 @@ def _gate_persist_before_first_model_call() -> None:
                 return _end_turn()
 
         await admit(store, "s", "u:1", "hello")
-        await run(agent=_loop_agent(), session_id="s", store=store, provider=_Probe())
+        await run(
+            agent=_loop_agent(),
+            session_id="s",
+            store=store,
+            provider=_Probe(),
+            permissions=_TEST_ALLOW_ALL,
+        )
         return any(m["role"] == "user" and m["content"] == "hello" for m in seen["messages"])
 
     assert asyncio.run(scenario())
@@ -141,6 +150,7 @@ def _gate_stop_reason_gated_tools() -> None:
             session_id="s",
             store=store,
             provider=provider,
+            permissions=_TEST_ALLOW_ALL,
             registry=ToolRegistry([_SpyTool()]),
         )
 

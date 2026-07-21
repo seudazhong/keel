@@ -37,7 +37,6 @@ from keel_core.connectors import taint_from_events
 from keel_core.errors import KeelError
 from keel_core.events import Event, EventType
 from keel_core.evolution import current_event_version
-from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.projections import project_messages
 from keel_core.protocols import (
     EventStore,
@@ -111,10 +110,6 @@ class _ObservingStore:
 
     def read(self, session_id: SessionId, after: int | None = None) -> AsyncIterator[Event]:
         return self._inner.read(session_id, after)
-
-
-# Library default: the caller (server/surface) supplies a real policy engine.
-_ALLOW_ALL = RuleBasedPermissionEngine([Rule("*", PermissionDecision.allow)])
 
 
 class ToolRegistry:
@@ -1038,10 +1033,10 @@ async def run(
     session_id: SessionId,
     store: EventStore,
     provider: ProviderGateway,
+    permissions: PermissionEngine,
     registry: ToolRegistry | None = None,
     budget: RunBudget | None = None,
     interrupt: Callable[[], bool] | None = None,
-    permissions: PermissionEngine | None = None,
     approve: ApproveFn | None = None,
     on_event: EventObserver | None = None,
     on_delta: DeltaObserver | None = None,
@@ -1071,7 +1066,6 @@ async def run(
     budget = budget or RunBudget(
         max_iterations=agent.max_iterations, token_budget=agent.token_budget
     )
-    permissions = permissions or _ALLOW_ALL
     if on_event is not None:
         store = _ObservingStore(store, on_event)
     scope_id = agent.scope.id

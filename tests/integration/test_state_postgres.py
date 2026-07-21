@@ -13,12 +13,14 @@ from keel_core.agents import AgentSpec, Scope
 from keel_core.errors import CrossScopeError
 from keel_core.events import Event, EventType
 from keel_core.loop import admit, run
+from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.protocols import ProviderChunk
 from keel_core.state import PostgresEventStore, append_event_in_transaction
 from keel_core.testing import ScriptedProviderGateway
-from keel_core.types import FinishReason, ScopeKind, StopReason
+from keel_core.types import FinishReason, PermissionDecision, ScopeKind, StopReason
 
 pytestmark = pytest.mark.integration
+_TEST_ALLOW_ALL = RuleBasedPermissionEngine([Rule("*", PermissionDecision.allow)])
 
 
 def _msg(session_id: str, scope_id: str, text: str) -> Event:
@@ -69,7 +71,13 @@ async def test_loop_persists_and_resumes(migrated_db: AsyncEngine) -> None:
     provider = ScriptedProviderGateway(
         [[ProviderChunk(delta="hi", finish_reason=FinishReason.end_turn)]]
     )
-    result = await run(agent=agent, session_id=session_id, store=store, provider=provider)
+    result = await run(
+        agent=agent,
+        session_id=session_id,
+        store=store,
+        provider=provider,
+        permissions=_TEST_ALLOW_ALL,
+    )
     assert result.reason is StopReason.completed
 
     types = [e.type async for e in PostgresEventStore(migrated_db, "u:1").read(session_id)]

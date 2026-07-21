@@ -30,10 +30,12 @@ These gates capture design corrections discovered after the original ten invaria
 Every executable tool path supplies a permission engine. Omitting policy must fail construction or
 deny, never substitute an allow-all engine.
 
-**Current gap:** the low-level loop defaults to allow-all when `permissions` is omitted, even though
-the main interactive paths build explicit policies.
+**Current status:** proven. The low-level `run()` entry point requires a permission engine, production
+construction paths pass an explicit policy, and allow-all remains available only through an explicit
+trusted-CLI/test choice.
 
-**Acceptance:** enumerate every runtime construction path; omit policy; assert no tool can execute.
+**Acceptance evidence:** the signature regression test rejects an omitted policy, Linux mypy checks
+every package call site, and loop tests select their policy explicitly.
 
 ### C2 — Authority intersection
 

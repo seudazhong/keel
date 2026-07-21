@@ -344,11 +344,10 @@ The core loop provides:
 
 ### 7.1 Permission construction
 
-Interactive server/worker paths build explicit read/ask policies. However the low-level `run()`
-library currently substitutes an allow-all policy when callers omit one.
-
-**Target invariant:** every executable tool path requires an explicit policy; omitted policy means
-deny or construction failure, never allow-all.
+Every low-level `run()` call requires a permission engine. Interactive server/worker paths build
+explicit read/ask policies; specialized Routines and patch generation use narrow allow-lists. An
+omitted policy fails construction rather than substituting allow-all. Trusted local CLI execution
+may still choose allow-all explicitly.
 
 ### 7.2 Content influence
 
@@ -613,16 +612,15 @@ docs/              living canon, subsystem references, ADRs, and history
 
 ## 16. Open architectural gates
 
-The active ordering is in [Roadmap](./ROADMAP.md). The load-bearing gaps are:
+The active ordering is in [Roadmap](./ROADMAP.md). The remaining load-bearing gaps are:
 
-1. explicit no-allow-all runtime policy;
-2. Agent access, session visibility, and enforced single-organization policy;
-3. versioned Agent and first-class Routine/Connection models;
-4. direct-memory mutation removal plus proposal-first learning;
-5. durable accepted-occurrence and ambiguous-effect reconciliation;
-6. per-user Primary/Purpose Keel Mailboxes, verified delivery endpoint, ToDo, and Notification
+1. Agent access, session visibility, and enforced single-organization policy;
+2. versioned Agent and first-class Routine/Connection models;
+3. direct-memory mutation removal plus proposal-first learning;
+4. durable accepted-occurrence and ambiguous-effect reconciliation;
+5. per-user Primary/Purpose Keel Mailboxes, verified delivery endpoint, ToDo, and Notification
    models and product surfaces;
-7. browser OIDC session and team/admin product surfaces;
-8. review/patch productization;
-9. separate trusted effect brokers and per-run command isolation;
-10. scheduler/capability workers, telemetry, scale proof, and DR.
+6. browser OIDC session and team/admin product surfaces;
+7. review/patch productization;
+8. separate trusted effect brokers and per-run command isolation;
+9. scheduler/capability workers, telemetry, scale proof, and DR.
