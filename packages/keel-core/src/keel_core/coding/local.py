@@ -160,7 +160,8 @@ class GitRunner:
         command, env = self._command_and_env(args, extra_env=extra_env)
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
-            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP")
+            windows_subprocess = importlib.import_module("subprocess")
+            popen_kwargs["creationflags"] = windows_subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs["start_new_session"] = True
         process = subprocess.Popen(
