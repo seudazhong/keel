@@ -76,7 +76,12 @@ change, but R2 cannot close until both gates pass.
 
 - require an explicit runtime permission policy; remove omitted-policy allow-all behavior;
 - define a versioned Agent configuration snapshot used at run admission;
-- define Agent Access and Session Visibility;
+- define Agent Access and Session Visibility — **done**: a first-class `agent_access` edge
+  (discover/use/manage) gates team-Agent discovery/use (bare org membership no longer suffices),
+  and every session additively records ownership/channel identity + a `private`/`agent_members`/
+  `explicit` visibility policy enforced independent of the selected Agent's scope
+  (`keel_core.identity.authz`, `keel_core.session_visibility`, migration `0025`). Admin UI for
+  granting/revoking access and managing visibility/shares is not built (API-only);
 - introduce first-class Routine and accepted-occurrence/outbox semantics;
 - introduce durable Effect states including `unknown` plus provider reconciliation;
 - define user/organization-owned multi-account Connections and resource grants instead of one
@@ -88,7 +93,11 @@ change, but R2 cannot close until both gates pass.
 
 - crash tests prove no lost accepted Routine occurrence and no blind retry of an unknown effect;
 - all runtime construction paths are fail-closed;
-- authorization tests cover Agent discovery, session visibility, and resource use separately.
+- authorization tests cover Agent discovery, session visibility, and resource use separately —
+  **done for Agent discovery/use/manage tiers and session ownership/visibility**
+  (`tests/integration/test_r1b_agent_access_session_visibility.py`,
+  `tests/unit/test_identity_authz.py`, `tests/unit/test_session_visibility.py`); Routine/Effect
+  coverage remains open.
 
 ## R2 — Connected personal Agent
 

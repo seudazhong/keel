@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from keel_core.identity import (
     Agent,
+    AgentAccess,
+    AgentAccessLevel,
+    AgentAccessPrincipalType,
     AgentKind,
     AuthorizationService,
     Capability,
+    GrantStatus,
     Membership,
     MembershipRole,
     MembershipStatus,
@@ -41,6 +47,24 @@ def _grant(cap: Capability, agent_id: str = "agt_1", org: str = ORG) -> Resource
     )
 
 
+def _access(
+    user: str,
+    level: AgentAccessLevel,
+    agent_id: str = "agt_1",
+    org: str = ORG,
+    principal_type: AgentAccessPrincipalType = AgentAccessPrincipalType.user,
+) -> AgentAccess:
+    return AgentAccess(
+        id=f"aac_{user}",
+        org_id=org,
+        agent_id=agent_id,
+        principal_type=principal_type,
+        principal_id=user,
+        level=level,
+        grantor_user_id=ALICE,
+    )
+
+
 def test_personal_agent_private_to_owner() -> None:
     agent = _agent(AgentKind.personal, BOB)
     bob = _member(BOB, MembershipRole.member)
@@ -55,14 +79,66 @@ def test_personal_agent_private_to_owner() -> None:
     assert AUTHZ.can_manage_agent(ALICE, alice_admin, agent)
 
 
-def test_team_agent_follows_membership() -> None:
+def test_team_agent_requires_explicit_access_edge() -> None:
+    """R1B: bare org membership no longer implies team-Agent discovery/use."""
     agent = _agent(AgentKind.team, ALICE)
     viewer = _member(BOB, MembershipRole.viewer)
     member = _member(BOB, MembershipRole.member)
-    assert AUTHZ.can_view_agent(BOB, viewer, agent)
-    assert not AUTHZ.can_use_agent(BOB, viewer, agent)  # viewer lacks 'use'
-    assert AUTHZ.can_use_agent(BOB, member, agent)
-    assert not AUTHZ.can_manage_agent(BOB, member, agent)  # member can't manage team agent
+    # No Agent Access edge at all: viewer AND member are both denied.
+    assert not AUTHZ.can_view_agent(BOB, viewer, agent)
+    assert not AUTHZ.can_view_agent(BOB, member, agent)
+    assert not AUTHZ.can_use_agent(BOB, member, agent)
+
+
+def test_team_agent_access_levels_are_ordered() -> None:
+    agent = _agent(AgentKind.team, ALICE)
+    member = _member(BOB, MembershipRole.member)
+    discover_only = [_access(BOB, AgentAccessLevel.discover)]
+    use_edge = [_access(BOB, AgentAccessLevel.use)]
+    manage_edge = [_access(BOB, AgentAccessLevel.manage)]
+    # discover: view yes, use/manage no.
+    assert AUTHZ.can_view_agent(BOB, member, agent, discover_only)
+    assert not AUTHZ.can_use_agent(BOB, member, agent, discover_only)
+    assert not AUTHZ.can_manage_agent(BOB, member, agent, discover_only)
+    # use: view+use yes, manage no.
+    assert AUTHZ.can_view_agent(BOB, member, agent, use_edge)
+    assert AUTHZ.can_use_agent(BOB, member, agent, use_edge)
+    assert not AUTHZ.can_manage_agent(BOB, member, agent, use_edge)
+    # manage: all three yes (manage implies use implies discover).
+    assert AUTHZ.can_view_agent(BOB, member, agent, manage_edge)
+    assert AUTHZ.can_use_agent(BOB, member, agent, manage_edge)
+    assert AUTHZ.can_manage_agent(BOB, member, agent, manage_edge)
+
+
+def test_team_agent_revoked_access_edge_denies() -> None:
+    agent = _agent(AgentKind.team, ALICE)
+    member = _member(BOB, MembershipRole.member)
+    revoked = replace(_access(BOB, AgentAccessLevel.use), status=GrantStatus.revoked)
+    assert not AUTHZ.can_view_agent(BOB, member, agent, [revoked])
+    assert not AUTHZ.can_use_agent(BOB, member, agent, [revoked])
+
+
+def test_team_agent_channel_principal_does_not_grant_user_access() -> None:
+    """A channel-principal edge never authorizes a human actor directly."""
+    agent = _agent(AgentKind.team, ALICE)
+    member = _member(BOB, MembershipRole.member)
+    channel_edge = [
+        _access(
+            BOB,
+            AgentAccessLevel.manage,
+            principal_type=AgentAccessPrincipalType.channel,
+        )
+    ]
+    assert not AUTHZ.can_view_agent(BOB, member, agent, channel_edge)
+
+
+def test_org_admin_keeps_administrative_manage_path() -> None:
+    """Org admin/owner retains an implicit manage-equivalent path on team Agents."""
+    agent = _agent(AgentKind.team, ALICE)
+    admin = _member(BOB, MembershipRole.admin)
+    assert AUTHZ.can_view_agent(BOB, admin, agent)
+    assert AUTHZ.can_use_agent(BOB, admin, agent)
+    assert AUTHZ.can_manage_agent(BOB, admin, agent)
 
 
 def test_no_membership_denies_everything() -> None:
@@ -81,13 +157,18 @@ def test_no_membership_denies_everything() -> None:
 def test_capability_intersection_of_role_and_grant() -> None:
     agent = _agent(AgentKind.team, ALICE)
     member = _member(BOB, MembershipRole.member)  # {read, use}
+    use_edge = [_access(BOB, AgentAccessLevel.use)]
     grants = [_grant(Capability.read), _grant(Capability.write)]
-    effective = AUTHZ.effective_resource_capabilities(BOB, member, agent, grants, "kb", "kb1")
+    effective = AUTHZ.effective_resource_capabilities(
+        BOB, member, agent, grants, "kb", "kb1", use_edge
+    )
     # Grant offers read+write, but the member only holds read/use -> write is dropped.
     assert effective == {Capability.read}
-    assert AUTHZ.can_agent_access_resource(BOB, member, agent, grants, "kb", "kb1", Capability.read)
+    assert AUTHZ.can_agent_access_resource(
+        BOB, member, agent, grants, "kb", "kb1", Capability.read, use_edge
+    )
     assert not AUTHZ.can_agent_access_resource(
-        BOB, member, agent, grants, "kb", "kb1", Capability.write
+        BOB, member, agent, grants, "kb", "kb1", Capability.write, use_edge
     )
 
 

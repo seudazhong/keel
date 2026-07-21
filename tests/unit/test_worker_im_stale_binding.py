@@ -20,7 +20,12 @@ from typing import Any
 
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.identity import IdentityService, InMemoryIdentityStore, LoggingAuditSink
-from keel_core.identity.models import AgentKind, MembershipRole
+from keel_core.identity.models import (
+    AgentAccessLevel,
+    AgentAccessPrincipalType,
+    AgentKind,
+    MembershipRole,
+)
 from keel_core.im_routing import (
     ImChannelMapping,
     ImChatKind,
@@ -71,6 +76,16 @@ async def _identity_with_team_agent_and_members() -> tuple[IdentityService, str,
     await svc.add_member(org.org_id, owner.id, runner.id, MembershipRole.member)
     other = await svc.store.create_user(display_name="Other", email=None)
     await svc.add_member(org.org_id, owner.id, other.id, MembershipRole.member)
+    # R1B: both run-as candidates need an active Agent Access edge on the team Agent.
+    for user_id in (runner.id, other.id):
+        await svc.grant_agent_access(
+            org.org_id,
+            owner.id,
+            agent_id=agent.id,
+            principal_type=AgentAccessPrincipalType.user,
+            principal_id=user_id,
+            level=AgentAccessLevel.use,
+        )
     return svc, org.org_id, runner.id, other.id, agent.id
 
 
@@ -204,6 +219,16 @@ async def _setup(
         run_as=runner_id,
         policy=policy or ImReplyPolicy(reply_enabled=True),
     )
+    agent = await svc.get_agent_for_admission(org_id, agent_id)
+    assert agent is not None
+    await svc.grant_agent_access(
+        org_id,
+        agent.owner_user_id,
+        agent_id=agent_id,
+        principal_type=AgentAccessPrincipalType.channel,
+        principal_id=mapping.route_key,
+        level=AgentAccessLevel.use,
+    )
     await mappings.create(mapping)
     run_id = await _admit_im(
         runs,
@@ -252,6 +277,21 @@ async def test_exact_unchanged_mapping_completes_and_replies() -> None:
 async def test_revoked_mapping_before_claim_fails_closed() -> None:
     ctx, scope_id, mappings, mapping, _sender, _dispatch, _replies, run_id = await _setup()
     await mappings.set_status(mapping.id, ImMappingStatus.revoked, actor="admin")
+    await _assert_denied(ctx, run_id, scope_id)
+
+
+async def test_revoked_channel_access_before_claim_fails_closed() -> None:
+    ctx, scope_id, _mappings, mapping, _sender, _dispatch, _replies, run_id = await _setup()
+    svc: IdentityService = ctx["identity"]
+    agent = await svc.get_agent_for_admission(mapping.org_id, mapping.agent_id)
+    assert agent is not None
+    await svc.revoke_agent_access(
+        mapping.org_id,
+        agent.owner_user_id,
+        agent_id=mapping.agent_id,
+        principal_type=AgentAccessPrincipalType.channel,
+        principal_id=mapping.route_key,
+    )
     await _assert_denied(ctx, run_id, scope_id)
 
 

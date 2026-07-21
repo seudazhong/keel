@@ -33,12 +33,17 @@ class AuditAction(StrEnum):
     agent_created = "agent.created"
     agent_updated = "agent.updated"
     agent_archived = "agent.archived"
+    agent_access_granted = "agent_access.granted"
+    agent_access_revoked = "agent_access.revoked"
     grant_created = "grant.created"
     grant_revoked = "grant.revoked"
     user_provisioned = "user.provisioned"
     user_erased = "user.erased"
     im_route_claimed = "im.route_claimed"
     im_route_released = "im.route_released"
+    session_visibility_changed = "session.visibility_changed"
+    session_share_granted = "session.share_granted"
+    session_share_revoked = "session.share_revoked"
 
 
 @dataclass(frozen=True)

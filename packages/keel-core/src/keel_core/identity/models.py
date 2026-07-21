@@ -25,6 +25,7 @@ _MEMBERSHIP_PREFIX = "mem_"
 _AGENT_PREFIX = "agt_"
 _GRANT_PREFIX = "grt_"
 _OIDC_PREFIX = "oid_"
+_AGENT_ACCESS_PREFIX = "aac_"
 
 type UserId = str
 type OrganizationId = str
@@ -32,6 +33,7 @@ type MembershipId = str
 type AgentId = str
 type GrantId = str
 type OIDCIdentityId = str
+type AgentAccessId = str
 
 
 def _new_id(prefix: str) -> str:
@@ -60,6 +62,10 @@ def new_grant_id() -> GrantId:
 
 def new_oidc_id() -> OIDCIdentityId:
     return _new_id(_OIDC_PREFIX)
+
+
+def new_agent_access_id() -> AgentAccessId:
+    return _new_id(_AGENT_ACCESS_PREFIX)
 
 
 # --- Errors --------------------------------------------------------------------------
@@ -136,6 +142,37 @@ class GrantStatus(StrEnum):
     revoked = "revoked"
 
 
+class AgentAccessPrincipalType(StrEnum):
+    """What kind of principal an :class:`AgentAccess` edge binds — a durable user or a
+    durable channel identity (e.g. an IM chat/room), never a bare org membership."""
+
+    user = "user"
+    channel = "channel"
+
+
+class AgentAccessLevel(StrEnum):
+    """Ordered team-Agent access tiers; a higher tier's capabilities include the lower
+    tiers' (``manage`` implies ``use`` implies ``discover``)."""
+
+    discover = "discover"
+    use = "use"
+    manage = "manage"
+
+
+# AgentAccessLevel -> its rank for "at least" comparisons. Never compare the enum members
+# directly (StrEnum ordering is lexical, not the intended tier order).
+_AGENT_ACCESS_LEVEL_RANK: dict[AgentAccessLevel, int] = {
+    AgentAccessLevel.discover: 0,
+    AgentAccessLevel.use: 1,
+    AgentAccessLevel.manage: 2,
+}
+
+
+def agent_access_level_at_least(level: AgentAccessLevel, minimum: AgentAccessLevel) -> bool:
+    """Whether ``level`` implies at least ``minimum`` (``manage`` implies ``use``/``discover``)."""
+    return _AGENT_ACCESS_LEVEL_RANK[level] >= _AGENT_ACCESS_LEVEL_RANK[minimum]
+
+
 class Capability(StrEnum):
     """A capability an actor/Agent may hold on the org or a resource.
 
@@ -204,6 +241,21 @@ def validate_agent_name(value: str) -> str:
             "agent name must be 2-64 chars of letters, digits, space, '_', '.' or '-'"
         )
     return name
+
+
+_PRINCIPAL_ID_MAX = 300
+
+
+def validate_principal_id(value: str) -> str:
+    """Validate an :class:`AgentAccess` principal id (a user id or an opaque channel key).
+
+    Bounded, non-blank, and traversal-free (no control characters) — a caller-composed
+    channel key (e.g. ``"slack:T1/C2"``) must never smuggle whitespace/newlines into an
+    audit log or SQL parameter."""
+    principal = value.strip()
+    if not principal or len(principal) > _PRINCIPAL_ID_MAX or any(ord(c) < 0x20 for c in principal):
+        raise IdentityValidationError(f"principal id must be 1-{_PRINCIPAL_ID_MAX} characters")
+    return principal
 
 
 def normalize_email(value: str | None) -> str | None:
@@ -335,10 +387,46 @@ class ResourceGrant:
         return self.status is GrantStatus.active
 
 
+@dataclass(frozen=True)
+class AgentAccess:
+    """An explicit ``(org, agent, principal) -> level`` edge for a **team** Agent.
+
+    First-class replacement for "bare org membership implies team-Agent access": a member/
+    viewer's org role alone no longer discovers or uses a team Agent — an active edge here
+    is required (R1B). ``principal_type`` is ``user`` (a durable :class:`User`) or ``channel``
+    (an opaque, caller-defined channel identity string, e.g. an IM chat/room key); exactly one
+    row exists per ``(org, agent, principal_type, principal_id)`` — granting again updates the
+    ``level``/reactivates rather than creating a duplicate edge. Personal Agents never carry
+    these edges (they stay private to their owner via :class:`Agent.kind`)."""
+
+    id: AgentAccessId
+    org_id: OrganizationId
+    agent_id: AgentId
+    principal_type: AgentAccessPrincipalType
+    principal_id: str
+    level: AgentAccessLevel
+    grantor_user_id: UserId
+    status: GrantStatus = GrantStatus.active
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    revoked_at: datetime | None = None
+
+    @property
+    def is_active(self) -> bool:
+        return self.status is GrantStatus.active
+
+    def level_at_least(self, minimum: AgentAccessLevel) -> bool:
+        return self.is_active and agent_access_level_at_least(self.level, minimum)
+
+
 __all__ = [
     "ADMIN_ROLES",
     "ROLE_CAPABILITIES",
     "Agent",
+    "AgentAccess",
+    "AgentAccessId",
+    "AgentAccessLevel",
+    "AgentAccessPrincipalType",
     "AgentId",
     "AgentKind",
     "AgentStatus",
@@ -365,7 +453,9 @@ __all__ = [
     "User",
     "UserId",
     "UserStatus",
+    "agent_access_level_at_least",
     "capabilities_for_role",
+    "new_agent_access_id",
     "new_agent_id",
     "new_grant_id",
     "new_membership_id",
@@ -376,4 +466,5 @@ __all__ = [
     "validate_agent_name",
     "validate_display_name",
     "validate_org_slug",
+    "validate_principal_id",
 ]

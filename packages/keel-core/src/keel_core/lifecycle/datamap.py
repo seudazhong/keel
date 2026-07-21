@@ -52,7 +52,19 @@ DATA_MAP: tuple[DataMapEntry, ...] = (
         policies.SESSION,
         "scope_id",
         ErasureTreatment.session_scoped,
-        "Session index; erased with its events.",
+        "Session index; erased with its events. Also carries R1B ownership/channel "
+        "identity + visibility columns (owner_user_id/channel_provider/"
+        "channel_external_id/visibility) — additive, erased with the row.",
+    ),
+    DataMapEntry(
+        "session_access",
+        "table",
+        policies.SESSION,
+        "scope_id",
+        ErasureTreatment.session_scoped,
+        "R1B explicit per-user session share edges; cascades from its session (composite "
+        "FK to sessions(scope_id, id)) — erased by the same events_and_sessions step, "
+        "never a separate one.",
     ),
     DataMapEntry(
         "events",
@@ -539,6 +551,16 @@ DATA_MAP: tuple[DataMapEntry, ...] = (
         "org_id",
         ErasureTreatment.org_scoped,
         "Explicit Agent resource grants; erased on organization erasure (and owner erasure).",
+    ),
+    DataMapEntry(
+        "agent_access",
+        "table",
+        policies.IDENTITY,
+        "org_id",
+        ErasureTreatment.org_scoped,
+        "R1B team-Agent discover/use/manage access edges; cascades on organization erasure "
+        "(org_id FK), Agent deletion, grantor erasure, and user-principal erasure through the "
+        "structurally checked principal_user_id FK; channel principals remain opaque.",
     ),
     DataMapEntry(
         "users",

@@ -18,6 +18,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from keel_core.errors import PermissionDenied
 from keel_core.identity import (
     Agent,
+    AgentAccess,
+    AgentAccessLevel,
+    AgentAccessPrincipalType,
     AgentKind,
     Capability,
     IdentityError,
@@ -130,6 +133,23 @@ class GrantResponse(_Model):
         return cls.model_validate(grant)
 
 
+class AgentAccessResponse(_Model):
+    id: str
+    org_id: str
+    agent_id: str
+    principal_type: AgentAccessPrincipalType
+    principal_id: str
+    level: AgentAccessLevel
+    grantor_user_id: str
+    status: str
+    created_at: datetime | None
+    updated_at: datetime | None
+
+    @classmethod
+    def of(cls, access: AgentAccess) -> AgentAccessResponse:
+        return cls.model_validate(access)
+
+
 # --- request models ------------------------------------------------------------------
 
 
@@ -168,6 +188,12 @@ class CreateGrantRequest(_Model):
     resource_type: str = Field(min_length=1, max_length=100)
     resource_id: str = Field(min_length=1, max_length=200)
     capability: Capability
+
+
+class GrantAgentAccessRequest(_Model):
+    principal_type: AgentAccessPrincipalType
+    principal_id: str = Field(min_length=1, max_length=300)
+    level: AgentAccessLevel
 
 
 def _service(request: Request) -> IdentityService:
@@ -362,6 +388,64 @@ async def select_agent(
     return AgentResponse.of(agent)
 
 
+# --- agent access (team Agents; R1B) --------------------------------------------------
+
+
+@router.get("/agents/{agent_id}/access", response_model=list[AgentAccessResponse])
+async def list_agent_access(
+    agent_id: str,
+    request: Request,
+    org: Annotated[ResolvedOrg, Depends(require_org)],
+) -> list[AgentAccessResponse]:
+    """List a team Agent's Agent Access edges (requires org admin/owner or manage access)."""
+    edges = await _service(request).list_agent_access(org.org_id, org.user_id, agent_id=agent_id)
+    return [AgentAccessResponse.of(e) for e in edges]
+
+
+@router.post(
+    "/agents/{agent_id}/access",
+    response_model=AgentAccessResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def grant_agent_access(
+    agent_id: str,
+    body: GrantAgentAccessRequest,
+    request: Request,
+    org: Annotated[ResolvedOrg, Depends(require_org)],
+) -> AgentAccessResponse:
+    """Grant (or update) a user/channel's discover/use/manage edge on a team Agent."""
+    access = await _service(request).grant_agent_access(
+        org.org_id,
+        org.user_id,
+        agent_id=agent_id,
+        principal_type=body.principal_type,
+        principal_id=body.principal_id,
+        level=body.level,
+    )
+    return AgentAccessResponse.of(access)
+
+
+@router.delete(
+    "/agents/{agent_id}/access",
+    response_model=AgentAccessResponse,
+)
+async def revoke_agent_access(
+    agent_id: str,
+    principal_type: Annotated[AgentAccessPrincipalType, Query()],
+    principal_id: Annotated[str, Query(min_length=1, max_length=300)],
+    request: Request,
+    org: Annotated[ResolvedOrg, Depends(require_org)],
+) -> AgentAccessResponse:
+    access = await _service(request).revoke_agent_access(
+        org.org_id,
+        org.user_id,
+        agent_id=agent_id,
+        principal_type=principal_type,
+        principal_id=principal_id,
+    )
+    return AgentAccessResponse.of(access)
+
+
 # --- grants --------------------------------------------------------------------------
 
 
@@ -417,6 +501,7 @@ def register_exception_handlers(app: FastAPI) -> None:
 
 
 __all__ = [
+    "AgentAccessResponse",
     "AgentResponse",
     "GrantResponse",
     "MeResponse",

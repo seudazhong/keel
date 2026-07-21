@@ -21,7 +21,8 @@ global routing indices and stores removed through foreign-key cascade.
 
 | Store (table / medium) | Kind | Retention class | Scope column | Erasure treatment |
 | --- | --- | --- | --- | --- |
-| `sessions` | table | permanent | `scope_id` | session-scoped |
+| `sessions` | table | permanent | `scope_id` | session-scoped; also carries R1B `owner_user_id`/`channel_provider`/`channel_external_id`/`visibility` (additive) |
+| `session_access` | table | permanent | `scope_id` | session-scoped — R1B explicit per-user session shares; cascades from its session (composite FK) |
 | `events` | table | permanent | `scope_id` | session-scoped (tombstoned before delete) |
 | `message_embeddings` | table | permanent | `scope_id` | session-scoped (cascades from events) |
 | `archival` | table | permanent | `scope_id` | scope-bound |
@@ -55,6 +56,7 @@ global routing indices and stores removed through foreign-key cascade.
 | `erasure_requests` / `erasure_steps` | table | long | `scope_id` | **retained** (audit trail) |
 | `retention_policies` | table | long | `scope_id` | **retained** (operator overrides) |
 | `organizations` / `memberships` / `agents` / `resource_grants` | table | permanent | `org_id` | **org-scoped** — erased by organization erasure |
+| `agent_access` | table | permanent | `org_id` | **org-scoped** — R1B team-Agent discover/use/manage edges; organization, Agent, grantor, and user-principal erasure are enforced by FKs |
 | `im_channel_mappings` | table | permanent | `org_id` | **org-scoped** — erased by organization erasure (FK cascade removes its route index rows); a `run_as_user_id` composite FK to `memberships` ties each mapping to an active org member |
 | `users` / `oidc_identities` | table | permanent | *(global)* | **identity-global** — erased by user (data-subject) erasure |
 | provider logs / Langfuse telemetry | external | — | — | **external** — no delete API; recorded incomplete → `partial` |

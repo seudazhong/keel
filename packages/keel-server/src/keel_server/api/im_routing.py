@@ -118,6 +118,7 @@ class MappingResponse(_Model):
     chat_kind: ImChatKind
     agent_id: str
     scope_id: str
+    channel_principal_id: str
     run_as_user_id: str
     policy: PolicyModel
     status: ImMappingStatus
@@ -139,6 +140,7 @@ class MappingResponse(_Model):
             chat_kind=mapping.chat_kind,
             agent_id=mapping.agent_id,
             scope_id=mapping.scope_id,
+            channel_principal_id=mapping.route_key,
             run_as_user_id=mapping.run_as_user_id,
             policy=PolicyModel.of(mapping.policy),
             status=mapping.status,

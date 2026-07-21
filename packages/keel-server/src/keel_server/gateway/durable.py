@@ -16,8 +16,11 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 
+from sqlalchemy.ext.asyncio import AsyncEngine
+
 from keel_core.agent_config_snapshot import AgentConfigSnapshot, ResourceGrantSnapshot
-from keel_core.identity import IdentityService
+from keel_core.errors import PermissionDenied
+from keel_core.identity import AgentAccessLevel, IdentityService, NotFoundError
 from keel_core.im_routing import (
     IM_SAFE_TOOLS,
     ImApprovalCommand,
@@ -35,6 +38,7 @@ from keel_core.im_routing import (
 )
 from keel_core.run_service import DurableRunService
 from keel_core.runs import RunSurface
+from keel_core.session_visibility import SessionVisibility, ensure_session_identity
 from keel_core.types import ScopeId
 from keel_server.gateway.onebot import OneBotEvent, wake_rule
 from keel_server.gateway.telegram import (
@@ -95,6 +99,12 @@ class DurableImIngress:
     # without identity wired) falls back to an id-only snapshot.
     identity: IdentityService | None = None
     snapshot_tool_names: SnapshotToolNamesResolver | None = None
+    # R1B: the shared Postgres engine used to durably record a session's owner/channel
+    # identity + visibility before the admitted prompt (idempotent, atomic first-writer-wins
+    # insert — see keel_core.session_visibility.ensure_session_identity). ``None`` (in-memory
+    # preview without a durable substrate) skips this — such a session keeps the pre-R1B
+    # Agent-scope-only gate (see SessionIdentity.is_legacy).
+    engine: AsyncEngine | None = None
     _reject_unknown: Callable[[str], Awaitable[None]] | None = field(default=None)
 
     async def admit(self, inbound: ImInbound) -> str | None:
@@ -120,6 +130,22 @@ class DurableImIngress:
         if mapping is None or mapping.status is not ImMappingStatus.active:
             logger.info("im ingress dropped: mapping %s revoked/missing", resolved.mapping_id)
             return None
+        if self.identity is not None:
+            try:
+                org, agent = await self.identity.resolve_machine_binding(
+                    mapping.org_id, mapping.agent_id
+                )
+                await self.identity.authorize_im_run_as(org, agent, mapping.run_as_user_id)
+                if mapping.chat_kind is ImChatKind.group:
+                    await self.identity.authorize_channel_agent_access(
+                        org,
+                        agent,
+                        mapping.route_key,
+                        minimum=AgentAccessLevel.use,
+                    )
+            except (NotFoundError, PermissionDenied):
+                logger.info("im ingress dropped: current Agent/channel authority denied")
+                return None
         # An IM-originated approval decision (opt-in per mapping) resolves an existing durable
         # approval instead of admitting a new run; the exact approval/attempt/action-hash + org
         # binding is re-validated by resolve_approval (stale/replay denied).
@@ -132,6 +158,26 @@ class DurableImIngress:
         actor = mapping.run_as_user_id or _IM_SERVICE_ACTOR
         service = self.run_service_factory(resolved.scope_id)
         snapshot = await self._build_snapshot(resolved.org_id, resolved.agent_id, mapping)
+        # R1B: durably record this session's channel identity + a sensible default visibility
+        # BEFORE the admitted prompt (idempotent, atomic first-writer-wins insert) — a private
+        # 1:1 chat belongs to the run-as user (visibility 'private'); a group chat has no
+        # single owner, so it is bound to the channel identity with visibility 'agent_members'
+        # (readable only by principals holding an active Agent Access edge — never every org
+        # member). See keel_core.session_visibility.ensure_session_identity.
+        if self.engine is not None:
+            is_group = inbound.chat_kind is ImChatKind.group
+            await ensure_session_identity(
+                self.engine,
+                resolved.scope_id,
+                inbound.session_id(),
+                org_id=resolved.org_id,
+                owner_user_id=None if is_group else (mapping.run_as_user_id or None),
+                channel_provider=inbound.provider.value,
+                channel_external_id=inbound.external_chat_id,
+                visibility=(
+                    SessionVisibility.agent_members if is_group else SessionVisibility.private
+                ),
+            )
         result = await service.admit(
             org_id=resolved.org_id,
             actor=actor,

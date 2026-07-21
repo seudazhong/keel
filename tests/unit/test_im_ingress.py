@@ -11,6 +11,8 @@ from __future__ import annotations
 from keel_core.agent_config_snapshot import ResourceGrantSnapshot
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.identity import (
+    AgentAccessLevel,
+    AgentAccessPrincipalType,
     AgentKind,
     Capability,
     IdentityService,
@@ -180,6 +182,14 @@ async def test_ingress_snapshots_the_mapped_agent_at_admission() -> None:
         created_by=user.id,
         run_as_user_id=user.id,
     )
+    await identity.grant_agent_access(
+        org.org_id,
+        user.id,
+        agent_id=agent.id,
+        principal_type=AgentAccessPrincipalType.channel,
+        principal_id=mapping.route_key,
+        level=AgentAccessLevel.use,
+    )
     await h.mappings.create(mapping)
     await h.route_index.put(mapping.route_entry())
     run_id = await h.ingress().admit(_inbound())
@@ -195,6 +205,15 @@ async def test_ingress_snapshots_the_mapped_agent_at_admission() -> None:
     assert snapshot.persona == "Be terse."
     assert snapshot.permission_profile == "im_safe"
     assert snapshot.resource_grants == (ResourceGrantSnapshot("knowledge_base", "kb-1", "read"),)
+
+    await identity.revoke_agent_access(
+        org.org_id,
+        user.id,
+        agent_id=agent.id,
+        principal_type=AgentAccessPrincipalType.channel,
+        principal_id=mapping.route_key,
+    )
+    assert await h.ingress().admit(_inbound("after revoke")) is None
 
 
 async def test_ingress_without_identity_falls_back_to_an_id_only_snapshot() -> None:
