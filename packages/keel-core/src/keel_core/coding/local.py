@@ -160,7 +160,7 @@ class GitRunner:
         command, env = self._command_and_env(args, extra_env=extra_env)
         popen_kwargs: dict[str, Any] = {}
         if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP")
         else:
             popen_kwargs["start_new_session"] = True
         process = subprocess.Popen(
@@ -429,7 +429,7 @@ class _ProjectLock:
             while True:
                 try:
                     if os.name == "nt":
-                        import msvcrt
+                        msvcrt = importlib.import_module("msvcrt")
 
                         if self.path.stat().st_size == 0:
                             handle.write(b"\0")
@@ -450,7 +450,7 @@ class _ProjectLock:
         finally:
             try:
                 if os.name == "nt":
-                    import msvcrt
+                    msvcrt = importlib.import_module("msvcrt")
 
                     handle.seek(0)
                     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
