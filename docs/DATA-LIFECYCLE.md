@@ -1,8 +1,7 @@
 # Data lifecycle: retention and erasure
 
-> **Status:** Implemented core with a known classification gap for newer dispatch/index and patch
-> tables. Some newer rows cascade correctly, but the code data map does not yet enumerate every
-> table added after the original lifecycle slice.
+> **Status:** Implemented core with complete classification of every migration-created application
+> table. CI fails when a new table is added without an explicit retention and erasure decision.
 
 Keel is event-sourced and multi-scope. This document describes the implemented **data map**,
 the **retention defaults**, and the operator **erasure runbook** + **recovery/verification**
@@ -15,11 +14,10 @@ governance API under `keel_server.api.lifecycle` and the worker job wired in
 
 ## 1. Data map
 
-The original lifecycle data map, its retention class, and how erasure treats it. This mirrors
-`keel_core.lifecycle.datamap.DATA_MAP`, which
-`tests/unit/test_lifecycle_datamap.py` checks against the coordinator. The map currently omits
-several later global dispatch/index tables and patch tables. Before production, every persisted
-store must be explicitly classified even when foreign-key cascade already removes it.
+The lifecycle data map, its retention class, and how erasure treats it. This mirrors
+`keel_core.lifecycle.datamap.DATA_MAP`. `tests/unit/test_lifecycle_datamap.py` checks both the
+coordinator coverage and exact equality with every `CREATE TABLE` in the migration history, including
+global routing indices and stores removed through foreign-key cascade.
 
 | Store (table / medium) | Kind | Retention class | Scope column | Erasure treatment |
 | --- | --- | --- | --- | --- |
@@ -35,6 +33,7 @@ store must be explicitly classified even when foreign-key cascade already remove
 | `connector_bindings` / `connector_binding_targets` / `connector_resources` / `connector_items` / `connector_cursors` | table | permanent | `scope_id` | typed targets, selected roots, imported-item mappings, and per-resource sync state |
 | `connector_deliveries` | table | short (1d) | `scope_id` | scope-bound replay/processing ledger |
 | `connector_outbox` | table | short (1d) | `scope_id` | scope-bound |
+| `connector_active_scopes` / `connector_webhook_routes` | table | permanent | `scope_id` | global non-content routing indices explicitly removed by connector scope purge |
 | `oauth_states` | table | transient (1h) | `scope_id` | scope-bound |
 | `webhook_deliveries` | table | short (1d) | *(global)* | **global — preserved** (no personal content) |
 | `schedules` | table | permanent | `scope_id` | scope-bound |
@@ -42,7 +41,13 @@ store must be explicitly classified even when foreign-key cascade already remove
 | `jobs` | table | standard (30d) | `scope_id` | scope-bound (running erasure job kept) |
 | `runs` | table | standard (30d) | `scope_id` | scope-bound durable interactive runs |
 | `run_control` | table | standard (30d) | `scope_id` | scope-bound durable interrupt/cancel/steer |
+| `run_dispatch_outbox` / `job_dispatch_outbox` | table | standard (30d) | `scope_id` | global non-content pointers; cascade when their scoped run/job is erased |
 | `im_reply_intents` | table | standard (30d) | `scope_id` | scope-bound durable encrypted IM reply outbox |
+| `im_route_index` / `im_reply_dispatch_index` | table | standard (30d) | `scope_id` | global routing pointers removed explicitly or by reply-intent cascade |
+| `projects` / `project_worktrees` / `project_runs` / `repo_sync_ledger` / `project_quotas` | table | permanent | `org_id` | org-scoped; Project lifecycle and organization erasure cascade to children |
+| `github_installations` / `github_repositories` / `github_sync_state` | table | permanent | `org_id` | org-scoped GitHub App/catalog/sync state |
+| `github_webhook_deliveries` | table | short (1d) | *(global)* | **global — preserved** replay ledger without user content |
+| `patch_proposals` / `patch_writeback_ledger` / `patch_proposal_outbox` / `patch_generation_requests` | table | standard (30d) | `org_id` | org/Project-scoped; proposal/Project/org deletion cascades through the patch graph |
 | coding artifacts | filesystem | standard | *(by project id)* | project-scoped (repo/snapshots/worktrees/artifacts) |
 | tool spill files | filesystem | short | *(by recorded path)* | session-scoped, confined to the spill root |
 | Redis event streams (`events:{session_id}`) | redis | permanent | *(by session id)* | session-scoped (bounded key delete) |
@@ -56,9 +61,10 @@ store must be explicitly classified even when foreign-key cascade already remove
 
 Notes:
 
-* **User content and connector state are `permanent`** — they are removed only by an explicit erasure request,
-  never on a timer. Only derived/operational data (`oauth_states`, `webhook_deliveries`,
-  `connector_outbox`, `approvals`, `jobs`, tool spill) carries a finite TTL.
+* **User content, Project metadata, and connector state are `permanent`** — they are removed only by
+  an explicit lifecycle action, never on a timer. Only derived/operational data (`oauth_states`,
+  webhook deduplication, dispatch pointers, patch proposals/artifacts, approvals, jobs, tool spill)
+  carries a finite TTL.
 * **`webhook_deliveries` is global** and holds only `(provider, delivery_id)` dedup
   tokens with no personal content, so scope erasure deliberately preserves it (a global
   `purge_all` / TTL sweep exists for full teardown).

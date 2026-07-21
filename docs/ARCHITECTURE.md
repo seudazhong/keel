@@ -534,9 +534,9 @@ Retention and erasure cover scope, session, and project data through durable job
 organization erasure uses a separate least-privilege maintenance path today. Target mailbox, mail,
 ToDo, reminder, Notification, and delivery stores are user content or user-linked operational data
 and must join the data map before implementation closes. Remote mailbox deletion reports partial
-rather than false success when the provider cannot be verified. The lifecycle data map predates
-several global dispatch/index and patch tables, so complete classification remains an open
-production gate even where foreign-key cascade already removes rows.
+rather than false success when the provider cannot be verified. Every migration-created table,
+including global dispatch indices and patch stores, is currently classified; a unit guard compares
+the migration history to the data map so a new unclassified table fails CI.
 
 The HTTP contract is additive under `/v1`; the committed OpenAPI baseline detects breaking changes.
 
