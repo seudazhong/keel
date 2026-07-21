@@ -3,7 +3,8 @@
 > **Status:** Living architecture
 > **Product boundary:** [PRD](./PRD.md)
 > **Current capability:** [Status](./STATUS.md)
-> **Accepted domain model:** [ADR-0011](./adr/0011-product-boundary-and-domain-model.md)
+> **Accepted domain model:** [ADR-0011](./adr/0011-product-boundary-and-domain-model.md),
+> [ADR-0012](./adr/0012-user-mailboxes-todos-notifications.md)
 
 This document describes both the system that exists and the contracts it is moving toward. Every
 section labels a statement as **current** or **target** when the distinction matters.
@@ -16,8 +17,8 @@ generation reuse the same Agent, authorization, approval, and execution boundari
 
 Five commitments drive the architecture:
 
-1. **One runtime, many surfaces.** Web, IM, schedules, and operator tools do not own separate Agent
-   logic.
+1. **One runtime, many surfaces.** Web, email, IM, schedules, and operator tools do not own separate
+   Agent logic.
 2. **Durable orchestration.** Accepted work, approvals, and effects survive process and delivery
    failure.
 3. **Explicit authority.** Actor membership and Agent/resource grants are intersected; a storage
@@ -42,6 +43,8 @@ Five commitments drive the architecture:
 | Memory | Core blocks/version history, archival memory, search, consolidation proposals, evals. Interactive model tools can currently mutate memory directly. | Agent-owned memory policy and proposal-first learned memory as the product default. |
 | Knowledge | Versioned documents, chunking, embeddings, hybrid retrieval, citations, taint, delete lifecycle. | Product qualification and source lifecycle across supported Connections. |
 | Connections | One provider binding per connector per scope plus selected resources/targets. | Multi-account Connection objects reusable through explicit Agent/Routine grants. |
+| Keel Mailbox | Not implemented. | One platform-managed AgentMail inbox per User, private routing, signed inbound delivery, and approval-gated outbound mail. |
+| ToDos and notifications | Not implemented. | User-owned ToDos with durable reminders and reusable Web/email/IM notification delivery. |
 | Projects | Organization-owned project records, shared Git storage, worktrees, GitHub App sync, grants. | Simpler GitHub setup and complete user journeys. |
 | Review | Durable API/worker and immutable evidence-checked report artifacts. | React review request/status/report surface. |
 | Patch | Durable proposal/generation/outbox/approval/writeback backend. | API, SDK, UI, evidence, capability pool, and Draft PR e2e. |
@@ -51,7 +54,8 @@ Five commitments drive the architecture:
 
 ## 3. Canonical domain model
 
-ADR-0011 defines the product vocabulary.
+ADR-0011 defines the core platform vocabulary. ADR-0012 adds user-scoped Keel Mailboxes, ToDos, and
+Notifications.
 
 ```text
 Organization
@@ -61,7 +65,13 @@ Organization
   ├─ Connections -> selected external resources
   ├─ Knowledge Bases
   ├─ Projects
+  ├─ User-owned ToDos
   └─ Routines
+
+User
+  ├─ Keel Mailbox -> Mail Threads / Messages / Drafts
+  ├─ Verified Delivery Endpoint
+  └─ Notifications -> Channel Deliveries
 
 Actor + Agent Access + Agent + Routine + Resource Grants
   -> Session
@@ -146,7 +156,21 @@ decision, not a replacement for it.
 The current `schedules` rows and hard-coded digest/consolidation dispatch are an implementation
 precursor, not the final autonomy model.
 
-### 3.7 Scope
+### 3.7 Keel Mailbox, ToDo, and Notification
+
+A Keel Mailbox is a platform-managed email identity bound to a User, not to a persisted Agent and
+not to a user-configured Connection. It survives personal-Agent changes. A mail thread may be pinned
+to one private email Session and personal Agent when first admitted.
+
+A ToDo is user-owned within an organization. Agent, Session, Run, Routine, and mail-message
+references record who created or changed it but do not become owners. Team Agents receive no
+implicit access to a member's personal ToDos or mailbox.
+
+A Notification is a durable user-facing notice. Each channel delivery is tracked separately and an
+email delivery is an external Effect. Only a structurally constrained, versioned template addressed
+to the user's verified delivery endpoint may bypass per-message approval.
+
+### 3.8 Scope
 
 `scope_id` partitions runtime data. Authenticated Agent work derives a canonical scope from
 organization and Agent. `web:local` is a preview compatibility scope.
@@ -155,14 +179,18 @@ Scope equality can prevent accidental cross-partition reads, but it cannot answe
 or Agent is allowed to use a Project, Connection, or other resource. Product authorization always
 uses explicit identity and grants.
 
+User-owned Mailbox/mail/Notification data uses a separate `owner_user_id` RLS axis. ToDos and
+reminders require both `org_id` and `owner_user_id`. These rows are not forced into an arbitrary
+Agent scope; only a mail-triggered Session/Run receives the derived Agent `scope_id`.
+
 ## 4. Trust zones
 
 ```text
-Web / IM / CLI / operator
+Web / Email / IM / CLI / operator
           |
           v
 Control plane
-  identity, Agents, Routines, Connections, grants, approvals, audit, API
+  identity, Agents, Routines, Connections, mailboxes, ToDos, grants, approvals, audit, API
           |
           v
 Orchestration plane
@@ -171,7 +199,7 @@ Orchestration plane
           +------------------------------+------------------------------+
           v                              v
 Trusted effect plane              Untrusted execution plane
-connector / Git brokers           sandbox
+connector / mail / Git brokers    sandbox
 narrow/JIT credentials            no control-plane credentials
 ```
 
@@ -287,7 +315,7 @@ duplicated, but the occurrence is never silently lost after acceptance.
 **Current:** provider-specific idempotency is strong in several connectors and patch writeback, but
 the generic connector wrapper releases an idempotency claim after any exception.
 
-**Target:** every effect has:
+**Target:** every effect, including an email send or notification delivery, has:
 
 ```text
 reserved -> executing -> confirmed
@@ -380,9 +408,56 @@ Provider presence is not product support. A provider graduates only after common
 revoke, scope, webhook, idempotency, reconciliation, provenance, and health suites plus a usable UI
 journey.
 
-## 10. Managed projects, review, and patches
+## 10. Keel Mailboxes, ToDos, and notifications
 
-### 10.1 Projects
+AgentMail is the first Keel Mailbox provider. Its deployment credential remains in the trusted
+control/effect planes. Mailbox provisioning uses a deterministic provider `client_id`; runtime mail
+operations use the narrowest practical inbox-scoped credential and never expose it to the model,
+browser, or sandbox.
+
+Inbound processing is:
+
+```text
+verified webhook or reconciler
+  -> durable delivery deduplication
+  -> normalized untrusted message
+  -> private thread/session routing
+  -> triage, proposed ToDo, or local draft
+```
+
+Webhook authenticity establishes provider delivery, not human authorization. HTML, links, and
+attachments remain tainted. Missing large bodies are fetched through the trusted provider client;
+attachments are quarantined before use.
+
+Mail storage is user-owned and independent of Agent scope. A content-free global route index resolves
+the provider inbox to a User, after which normal access requires `app.user_id`; ToDos additionally
+require `app.org_id`. If no unique active organization/personal-Agent route exists, mail is retained
+with `routing_required` and no model Run starts.
+
+Inbound persistence is cheap and does not imply model execution. User opt-in, per-mailbox/sender rate
+limits, queue bounds, budgets, and a circuit breaker govern automatic triage.
+
+Outbound processing is:
+
+```text
+Notification or approved Mail Draft
+  -> immutable mail Effect
+  -> trusted mail broker
+  -> AgentMail idempotent send
+  -> delivery/bounce/rejection reconciliation
+```
+
+The only automatic-send exception is a versioned template sent to the user's active verified
+delivery endpoint under preferences, quiet hours, quotas, and deduplication. Freeform content, other
+recipients, replies/forwards, and attachments require exact-draft approval.
+
+ToDos are normal user data, not Jobs or Routines. Their state uses optimistic versions and audit
+history. Due reminders create accepted Notification occurrences and are atomically cancelled or
+replaced when the ToDo is changed, completed, cancelled, or archived.
+
+## 11. Managed projects, review, and patches
+
+### 11.1 Projects
 
 Projects are organization-owned resources. Users and Agents receive capabilities; they are not
 storage owners.
@@ -396,14 +471,14 @@ Current storage separates:
 
 The sandbox never receives writable authoritative Git storage.
 
-### 10.2 Read-only review
+### 11.2 Read-only review
 
 Review resolves exact refs, computes a bounded diff, calls the shared provider path with no tools,
 verifies every finding against the reviewed hunk, and stores immutable JSON/Markdown reports.
 
 It is backend-complete but headless in the React product.
 
-### 10.3 Controlled patch proposals
+### 11.3 Controlled patch proposals
 
 The patch backend performs:
 
@@ -422,7 +497,7 @@ unvalidated unless another trusted validator actually ran.
 General or opaque coding agents are later work and require per-run execution isolation, capability
 workers, egress policy, quotas, and explicit credential/legal review.
 
-## 11. Persistence, versioning, and lifecycle
+## 12. Persistence, versioning, and lifecycle
 
 PostgreSQL stores relational state, event logs, vector/search data, lifecycle ledgers, and outboxes.
 Redis provides queueing, fan-out, locks, and ephemeral coordination.
@@ -432,21 +507,24 @@ one-step transitions. Projection rebuild supports dry-run, checkpoints, resume, 
 filtering.
 
 Retention and erasure cover scope, session, and project data through durable jobs. User and
-organization erasure uses a separate least-privilege maintenance path today. The lifecycle data
-map predates several global dispatch/index and patch tables, so complete classification is an open
+organization erasure uses a separate least-privilege maintenance path today. Target mailbox, mail,
+ToDo, reminder, Notification, and delivery stores are user content or user-linked operational data
+and must join the data map before implementation closes. Remote mailbox deletion reports partial
+rather than false success when the provider cannot be verified. The lifecycle data map predates
+several global dispatch/index and patch tables, so complete classification remains an open
 production gate even where foreign-key cascade already removes rows.
 
 The HTTP contract is additive under `/v1`; the committed OpenAPI baseline detects breaking changes.
 
-## 12. Security model
+## 13. Security model
 
-### 12.1 Database
+### 13.1 Database
 
 Migrations/provisioning use an owner principal. Server/worker use a separate non-owner,
 non-`BYPASSRLS` runtime login. Standard Compose generates its password into a `0600` pgpass file and
 verifies the connected principal before serving.
 
-### 12.2 Browser and machine authentication
+### 13.2 Browser and machine authentication
 
 Current server auth supports:
 
@@ -457,7 +535,7 @@ Current server auth supports:
 The React app currently accepts a supplied credential or local preview. Production browser login
 must use authorization code + PKCE and an HTTP-only server session.
 
-### 12.3 Sandbox and secrets
+### 13.3 Sandbox and secrets
 
 The current sandbox:
 
@@ -470,13 +548,14 @@ The current sandbox:
 Enabling shell requires a per-run process/mount boundary, resource limits, default-deny egress, and
 cleanup/recovery evidence. Directory naming alone is not sufficient.
 
-### 12.4 Remote writes
+### 13.4 Remote writes
 
-Connector effects and Git writeback remain in trusted brokers. Approval must bind the exact effect
-or immutable candidate. Default-branch push, force-push, merge, and host Docker socket access are
-forbidden.
+Connector effects, mail sends, and Git writeback remain in trusted brokers. Approval must bind the
+exact effect or immutable candidate. The template notification exemption is enforced structurally
+after model output and cannot accept arbitrary recipients or bodies. Default-branch push,
+force-push, merge, and host Docker socket access are forbidden.
 
-## 13. Deployment trust profiles
+## 14. Deployment trust profiles
 
 | Profile | Contract |
 |---|---|
@@ -488,7 +567,7 @@ forbidden.
 The current `dev` and `full` Compose profiles select effectively the same implemented service set.
 They are not separate trust contracts.
 
-## 14. Repository layout
+## 15. Repository layout
 
 ```text
 packages/
@@ -507,7 +586,7 @@ tests/             unit, integration, invariant, e2e, and eval coverage
 docs/              living canon, subsystem references, ADRs, and history
 ```
 
-## 15. Open architectural gates
+## 16. Open architectural gates
 
 The active ordering is in [Roadmap](./ROADMAP.md). The load-bearing gaps are:
 
@@ -516,7 +595,8 @@ The active ordering is in [Roadmap](./ROADMAP.md). The load-bearing gaps are:
 3. versioned Agent and first-class Routine/Connection models;
 4. direct-memory mutation removal plus proposal-first learning;
 5. durable accepted-occurrence and ambiguous-effect reconciliation;
-6. browser OIDC session and team/admin product surfaces;
-7. review/patch productization;
-8. separate trusted effect brokers and per-run command isolation;
-9. scheduler/capability workers, telemetry, scale proof, and DR.
+6. per-user Keel Mailbox, verified delivery endpoint, ToDo, and Notification models;
+7. browser OIDC session and team/admin product surfaces;
+8. review/patch productization;
+9. separate trusted effect brokers and per-run command isolation;
+10. scheduler/capability workers, telemetry, scale proof, and DR.

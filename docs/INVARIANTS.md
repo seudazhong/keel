@@ -85,8 +85,14 @@ Connector effects use durable approvals/idempotency but do not yet share one gen
 `scope_id` is derived from organization and Agent and used for storage isolation. Clients cannot
 gain access by naming a scope, and product APIs authorize resources explicitly.
 
+User-owned objects that are not Agent-owned use their explicit User/Organization partition instead:
+Mailbox/mail/Notification rows require the authenticated User context, and ToDos/reminders require
+both User and Organization context. Supplying an Agent scope can never substitute for either.
+
 **Acceptance:** spoofed organization/Agent/scope headers, foreign run/session ids, and outbox pointer
-scope mismatches fail closed and do not reveal foreign existence.
+scope mismatches fail closed and do not reveal foreign existence. Foreign `app.user_id` access and
+User/Organization mismatches on mail, Notifications, and ToDos are denied under the runtime database
+principal.
 
 ### C7 — Control-plane credentials never enter untrusted execution
 
@@ -103,6 +109,26 @@ effect policy used at admission. Later configuration changes do not rewrite an i
 
 **Current status:** durable runs capture several admission fields, but the persisted Agent/Routine
 model is not yet complete enough to satisfy the full invariant.
+
+### C9 — Mail receipt is content, not authority
+
+A valid provider webhook proves that AgentMail delivered an event. It does not prove that the
+address in `From` is an authenticated Keel User or that the sender may exercise the mailbox owner's
+authority.
+
+**Acceptance:** verify raw-body signatures before parsing, reject stale/replayed deliveries, keep
+mail tainted, and prove that sender spoofing, forwarded instructions, links, and attachments cannot
+directly authorize a connector, mail, ToDo, memory, or code effect.
+
+### C10 — Automatic email is a structural exception
+
+Per-message approval may be skipped only for a versioned template addressed to the active verified
+delivery endpoint of the same User. The enforcement boundary accepts a template ID and typed
+parameters, not caller/model-supplied recipients, HTML, attachments, or arbitrary body text.
+
+**Acceptance:** mutate every recipient/content/attachment/reply field and assert the operation
+requires a new exact approval; retry/crash tests produce one logical send or an `unknown` Effect
+that reconciles before retry.
 
 ## Domain-specific acceptance
 
@@ -126,6 +152,20 @@ model is not yet complete enough to satisfy the full invariant.
   enter metadata/logs.
 - Webhooks authenticate before replay claim and route to exactly one bound scope.
 - An Agent/Routine can use only selected and granted provider resources.
+
+### Keel Mailboxes, notifications, and ToDos
+
+- One User cannot discover, read, send from, or route through another User's Keel Mailbox.
+- Mailbox provider and webhook credentials never enter model context, browser state, or sandbox
+  execution.
+- Inbound mail is durably deduplicated and remains untrusted even when its sender address matches the
+  mailbox owner's verified delivery address.
+- ToDos are owned by the authenticated User, not by a model-supplied owner, scope, Agent, or email
+  sender.
+- Editing, completing, cancelling, or archiving a ToDo atomically cancels or replaces obsolete
+  reminder occurrences.
+- A templated notification to the verified user endpoint may send automatically; every other email
+  requires approval bound to the exact draft.
 
 ### Projects, review, and patches
 

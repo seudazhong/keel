@@ -16,6 +16,7 @@ implementation status.
 | [0009](./0009-product-form-and-primary-use-cases.md) | Server-primary connected personal/team assistant. |
 | [0010](./0010-durable-background-jobs.md) | Postgres-owned durable jobs with at-least-once delivery. |
 | [0011](./0011-product-boundary-and-domain-model.md) | Product boundary, authority model, trust zones, and release strategy. |
+| [0012](./0012-user-mailboxes-todos-notifications.md) | Per-user Keel mailboxes, user-owned ToDos, and durable notifications. |
 
 To change an accepted decision, add a new ADR with `Supersedes` or `Refines`; do not rewrite the
 old ADR into a different historical decision.

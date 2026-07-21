@@ -19,6 +19,8 @@ usable product scenario.
   with the connector that needs it.
 - Do not add net-new provider breadth before Gmail and Google Calendar pass the common Connection
   lifecycle, security, effect, and product-journey gates.
+- AgentMail is a Keel-owned communication provider, not another user Connection; it still must pass
+  the same webhook, secret, effect, reconciliation, lifecycle, and product-journey gates.
 - No release closes on code or tests alone; its end-to-end exit scenarios must pass.
 
 ## R0 — Truth and design baseline
@@ -33,6 +35,7 @@ roadmap.
 - README, PRD, Architecture, Status, Roadmap, and Invariants have non-overlapping authority.
 - ADR-0011 defines Agent Access, Connection/Resource/Grant, Routine/Effect, session visibility, and
   the four trust zones.
+- ADR-0012 defines per-user Keel Mailboxes, user-owned ToDos, and durable Notification policy.
 - historical plans are clearly non-authoritative;
 - `uv run python scripts/check_markdown_links.py`, `git diff --check`, and the CI documentation
   gate pass;
@@ -97,14 +100,19 @@ change, but R2 cannot close until both gates pass.
 
 - a complete personal Agent definition: model, persona, tools, Connections/resources, memory
   policy, budgets, and Routine defaults;
+- one private Keel Mailbox per user, a verified human delivery endpoint, and safe inbound mail
+  triage that fails closed when organization/personal-Agent routing is ambiguous;
+- user-owned ToDos managed through Web/chat with durable reminders;
+- durable Notifications, including template-only email delivery to the verified user address;
 - Gmail + Google Calendar as product-supported Connections with common lifecycle/security tests;
 - user-managed memory plus proposal-first learned memory;
 - at least one useful daily/meeting/inbox Routine;
 - consistent Web approvals and effect history;
 - onboarding that explains stored data, grants, and approval policy.
 
-**Exit scenario:** from an empty preview, one operator configures a personal Agent, connects Gmail
-and Calendar, completes a cited read task, runs a Routine, approves one exact outbound effect, and
+**Exit scenario:** from an empty preview, one operator configures a personal Agent and Keel Mailbox,
+verifies a delivery address, connects Gmail and Calendar, completes a cited read task, creates a
+ToDo, receives exactly one email reminder, runs a Routine, approves one exact outbound effect, and
 sees the result survive a service restart.
 
 **Non-goals:** browser OIDC, team Agents, broad connector catalog.
@@ -145,10 +153,12 @@ and force-push remain impossible.
 - browser OIDC authorization code + PKCE with secure HTTP-only session;
 - enforcement of one active organization for the initial production profile;
 - automatic private personal Agent provisioning;
+- automatic private Keel Mailbox provisioning for every user and adversarial cross-user mail/ToDo
+  isolation;
 - membership, Agent Access, Connection, grant, Routine, and audit administration;
 - team Agents with explicit user/channel access and resources;
 - explicit session owner/channel and visibility policy;
-- Web/IM continuity for sessions, approvals, and results;
+- Web/email/IM continuity for sessions, approvals, and results;
 - no user-facing dependence on `scope_id`;
 - local open mode isolated to an explicit preview profile.
 

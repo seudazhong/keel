@@ -49,6 +49,8 @@ production operations remain incomplete.
 | Memory and session recall | yes | yes | yes | partial | Core/archival memory, search, consolidation, proposals, and UI exist. Interactive tools mutate directly; consolidation reads scope-wide sessions and auto-commits high-confidence archival facts. |
 | Knowledge Base | yes | yes | yes | partial | Lifecycle, chunking, hybrid retrieval, citations, taint, connector ingest, and React management/search are present. |
 | Identity, organizations, Agents, grants | yes | yes | yes | partial | Backend and preview UI exist; no browser OIDC flow, Agent-access/session-visibility model, enforced one-org policy, or complete admin journey. Persisted Agent definition is still thin. |
+| Per-user Keel Mailbox | no | no | no | no | AgentMail is selected in ADR-0012, but provisioning, inbound mail, drafts, notifications, and UI are not implemented. |
+| User ToDos and reminders | no | no | no | no | ADR-0012 defines the target ownership and lifecycle; no API, tools, persistence, reminders, or React surface exist. |
 | Event evolution and data lifecycle | yes | yes | yes | partial | Upcasters, rebuild checkpoints/tombstones, retention classes, durable erasure, and identity purge exist. The data map does not yet classify every table added by later dispatch/patch slices. |
 | Connector framework | yes | yes | yes | partial | Manifest discovery, encrypted credentials, routed webhooks, recurring sync, provenance, taint, and durable actions exist. Provider maturity and setup UX differ. |
 | Gmail | yes | yes | yes | partial | Mail read and approval-gated send exist. The connected personal-Agent journey still needs common release qualification. |
@@ -94,11 +96,13 @@ Review results do not yet have a React surface.
 4. **Autonomous-effect correctness:** accepted schedule occurrences may be lost between claim and
    enqueue, and generic connector effects need an explicit ambiguous/unknown reconciliation state.
 5. **Product cohesion:** review is headless; patch has no API/UI; team/IM administration is absent.
-6. **Lifecycle coverage:** newer dispatch/index and patch tables rely partly on foreign-key cascade
+6. **Personal task and communication:** there is no per-user Keel Mailbox, verified notification
+   endpoint, durable Notification model, or user ToDo surface.
+7. **Lifecycle coverage:** newer dispatch/index and patch tables rely partly on foreign-key cascade
    but are not all explicitly classified in the lifecycle data map.
-7. **Execution:** standard sandbox supports isolated file operations only, not safe build/test or
+8. **Execution:** standard sandbox supports isolated file operations only, not safe build/test or
    general coding-agent command execution.
-8. **Production:** no separate scheduler, trusted effect/capability worker pools, complete
+9. **Production:** no separate scheduler, trusted effect/capability worker pools, complete
    OTel/metrics/SLOs,
    proven horizontal topology, or tested backup/restore/DR.
 
