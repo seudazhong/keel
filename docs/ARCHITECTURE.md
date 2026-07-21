@@ -35,9 +35,9 @@ Five commitments drive the architecture:
 |---|---|---|
 | Product profile | Trusted local/single-operator Compose preview. | Single-organization multi-user product, then production profile. |
 | Identity | Users, organizations, memberships, Agents, grants, OIDC JWT verification, API keys, local actor. Organization membership currently acts as team-Agent access. | Browser authorization-code/PKCE login, Agent-access/session-visibility model, secure session, complete admin UI. |
-| Agent model | Persisted kind, owner, name, persona, status, version. | Versioned model/tools/resources/memory/budget/autonomy configuration captured at admission. |
+| Agent model | Persisted kind, owner, name, persona, status, version. Runs capture an immutable, schema-versioned `AgentConfigSnapshot` (version/name/persona/model/budget/permission-profile identifier/tool names/memory-policy/grant descriptors) at admission. | Agent-owned versioned tool/resource/memory/autonomy config the snapshot draws from directly (today it is assembled per-surface at admission), and Routine policy in the snapshot. |
 | Scope | `agent:<org>/<agent>` is derived for authenticated runs; `web:local` remains preview compatibility. | Scope remains internal and disappears from normal product UX. |
-| Runs | Postgres-owned worker execution with leases, controls, approvals, dispatch outbox, and reconciliation. | Capability routing and immutable full Agent/Routine snapshots. |
+| Runs | Postgres-owned worker execution with leases, controls, approvals, dispatch outbox, reconciliation, and an immutable per-run Agent config snapshot bound into the admission fingerprint. | Capability routing and immutable full Agent/Routine snapshots (richer grant/tool/routine fields; today's snapshot is extensible but not the full future model). |
 | Schedules | Persistent rows and compare-and-set cursor advance in worker cron. | First-class Routines and durable accepted-occurrence outbox; no silent loss after acceptance. |
 | Jobs | Postgres lifecycle, at-least-once Redis/arq delivery, leases, retries, cancellation, result injection, dispatch recovery. | Capability-specific worker pools and production SLOs. |
 | Effects | Connector-specific durable idempotency and approval. | Generic effect ledger with `unknown` state and provider reconciliation. |
@@ -83,10 +83,12 @@ Actor + Agent Access + Agent + Routine + Resource Grants
 
 ### 3.1 Actor
 
-**Current:** requests resolve to a user, machine API-key actor, or local preview actor.
+**Current:** requests resolve to a user, machine API-key actor, or local preview actor. Every
+admitted run records the stable actor plus an immutable `AgentConfigSnapshot` (INVARIANTS.md
+C8) captured at admission.
 
-**Target:** every admitted run and effect records the stable actor plus the immutable authority
-snapshot used for the decision.
+**Target:** the snapshot's authority basis grows to include a full effect policy alongside the
+Agent config, and non-run effects (not just runs) record an equivalent immutable snapshot.
 
 ### 3.2 Organization
 
@@ -102,11 +104,16 @@ must enforce a deployment tenant policy rather than rely on operator convention.
 An Agent is a persisted execution identity. Personal Agents are private to their owner. Team Agents
 currently follow organization membership and grants.
 
-**Current:** persisted Agent records are intentionally small.
+**Current:** persisted Agent records are intentionally small (kind, owner, name, persona, status,
+version). A run's admission separately assembles the rest of the executed configuration
+(model, tool set, permission profile, memory policy, budget, active grants) per surface and
+freezes it into the run's `AgentConfigSnapshot` — the worker executes from that frozen snapshot,
+never from the Agent's later-mutated `name`/`persona` (INVARIANTS.md C8). Revoking Agent
+visibility (archive, membership loss) still denies execution at claim time.
 
-**Target:** an Agent version includes persona, model selection, tool policy, memory policy, default
-resources, budgets, and allowed Routine classes. Runs capture that immutable version instead of
-reading mutable configuration mid-execution.
+**Target:** an Agent version itself *owns* persona, model selection, tool policy, memory policy,
+default resources, budgets, and allowed Routine classes, so the run snapshot is stamped from one
+first-class versioned Agent record rather than assembled per-surface at admission time.
 
 ### 3.4 Agent access and session visibility
 

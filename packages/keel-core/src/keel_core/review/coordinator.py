@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot, MemoryPolicySnapshot
 from keel_core.coding.models import CodingRunId, ProjectId
 from keel_core.coding.protocols import ArtifactStore
 from keel_core.errors import DuplicateEventError, PermissionDenied
@@ -223,17 +224,29 @@ class ReviewCoordinator:
         )
         now = self._clock()
         run_id = new_review_id()
+        effective_agent_id = request.agent_id or DEFAULT_REVIEW_AGENT_ID
+        # Review runs are not (yet) an Agent-execution surface (no persona/model/tool-set
+        # selection) — a minimal, honestly-labeled snapshot records the identity + a
+        # single-iteration/no-mutation-tool profile rather than claiming a real Agent
+        # configuration was captured.
+        snapshot = AgentConfigSnapshot(
+            agent_id=effective_agent_id,
+            permission_profile="review_readonly",
+            max_iterations=1,
+            memory_policy=MemoryPolicySnapshot(core_memory_enabled=False),
+        )
         record, created = await self._runs.create(
             run_id=run_id,
             scope_id=self._scope_id,
             org_id=request.org_id,
             actor=actor,
-            agent_id=request.agent_id or DEFAULT_REVIEW_AGENT_ID,
+            agent_id=effective_agent_id,
             session_id=run_id,
             surface=REVIEW_SURFACE,
             idempotency_key=request.idempotency_key,
             budget=RunBudgetSpec(max_iterations=1, token_budget=None),
             expires_at=now + timedelta(seconds=self._ttl_seconds),
+            snapshot=snapshot,
             fingerprint=review_fingerprint(request),
             now=now,
         )

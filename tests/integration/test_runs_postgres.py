@@ -23,6 +23,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot
 from keel_core.approvals import PostgresApprovalStore
 from keel_core.runs import (
     PostgresRunStore,
@@ -62,6 +63,7 @@ async def _admit(
         idempotency_key=key,
         budget=RunBudgetSpec(max_iterations=5, token_budget=1000),
         expires_at=_now() + timedelta(seconds=ttl_seconds),
+        snapshot=AgentConfigSnapshot(agent_id="agent-1"),
     )
 
 
@@ -79,6 +81,7 @@ async def test_admission_is_idempotent(migrated_db: AsyncEngine) -> None:
         idempotency_key="dup",
         budget=RunBudgetSpec(),
         expires_at=_now() + timedelta(hours=1),
+        snapshot=AgentConfigSnapshot(agent_id="agent-1"),
     )
     assert await store.get("run-1") is not None
     assert await store.get("run-2") is None  # no duplicate row created
@@ -446,6 +449,7 @@ async def _suspend_pg(
         idempotency_key=key,
         budget=RunBudgetSpec(),
         expires_at=_now() + timedelta(hours=1),
+        snapshot=AgentConfigSnapshot(agent_id="agent-1"),
     )
     await runs.mark_queued(run_id)
     lease = await runs.claim(run_id, worker_id="w1", now=_now(), lease_seconds=30)

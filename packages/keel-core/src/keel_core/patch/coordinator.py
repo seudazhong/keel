@@ -45,6 +45,7 @@ from typing import Protocol
 
 from sqlalchemy.exc import SQLAlchemyError
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot, MemoryPolicySnapshot
 from keel_core.approvals import ApprovalStore
 from keel_core.coding.protocols import ArtifactStore
 from keel_core.protocols import Usage
@@ -311,12 +312,24 @@ class PatchCoordinator:
         )
         if binding.scope_id != canonical_scope:
             raise PatchValidationError("authorized scope does not match the canonical Agent scope")
+        effective_agent_id = request.agent_id or DEFAULT_PATCH_AGENT_ID
+        # Patch generation is not (yet) a general Agent-execution surface (no persisted persona
+        # selection) — the snapshot honestly captures only what the request actually configures
+        # (model/budget/permission profile), not a claim that a full Agent config was resolved.
+        snapshot = AgentConfigSnapshot(
+            agent_id=effective_agent_id,
+            model=request.model,
+            max_iterations=request.max_iterations,
+            token_budget=request.token_budget,
+            permission_profile="patch_generation",
+            memory_policy=MemoryPolicySnapshot(core_memory_enabled=False),
+        )
         await self.run_store_factory(binding.scope_id).create(
             run_id=run_id,
             scope_id=binding.scope_id,
             org_id=request.org_id,
             actor=request.actor,
-            agent_id=request.agent_id or DEFAULT_PATCH_AGENT_ID,
+            agent_id=effective_agent_id,
             session_id=run_id,
             surface=PATCH_SURFACE,
             idempotency_key=request.idempotency_key,
@@ -324,6 +337,7 @@ class PatchCoordinator:
                 max_iterations=request.max_iterations, token_budget=request.token_budget
             ),
             expires_at=moment + timedelta(seconds=self.ttl_seconds),
+            snapshot=snapshot,
             fingerprint=request.idempotency_key,
             now=moment,
         )

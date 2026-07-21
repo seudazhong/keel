@@ -551,6 +551,30 @@ class IdentityService:
             raise PermissionDenied("listing all grants requires org admin/owner")
         return await self._store.list_grants(org_id, agent_id=agent_id)
 
+    # --- durable-run admission resolver seam (R1B) ------------------------------------
+    # These two reads back the durable-run *admission* path (web/IM), never the grants
+    # management surface: they exist only to embed a snapshot of the Agent's current
+    # name/persona/version + its non-secret active grant descriptors into an admitted run's
+    # immutable AgentConfigSnapshot. They deliberately skip the owner/admin *listing*
+    # authorization :meth:`list_grants` enforces (and the member/private-agent *viewing*
+    # authorization :meth:`get_agent` enforces): the caller has already established the run's
+    # narrower authority to *use* this Agent (a user's `select_agent`, a machine credential's
+    # scoped binding, or an IM channel mapping's admin-provisioned agent_id) before reaching
+    # here, so reading its profile/grants for the snapshot never grants new access.
+
+    async def get_agent_for_admission(self, org_id: str, agent_id: str) -> Agent | None:
+        """Resolve an Agent's current persisted profile for a run's admission snapshot.
+
+        Returns ``None`` (never raises) when the Agent no longer exists so a caller can fail
+        the admission closed with its own error rather than an ambiguous identity exception.
+        """
+        return await self._store.get_agent(org_id, agent_id)
+
+    async def active_resource_grants(self, org_id: str, agent_id: str) -> list[ResourceGrant]:
+        """The currently-active resource grants for ``agent_id`` (admission snapshot use)."""
+        grants = await self._store.list_grants(org_id, agent_id=agent_id)
+        return [grant for grant in grants if grant.is_active]
+
     async def revoke_grant(self, org_id: str, actor_user_id: str, grant_id: str) -> ResourceGrant:
         actor = await self._require_actor_membership(org_id, actor_user_id)
         grant = await self._store.get_grant(org_id, grant_id)

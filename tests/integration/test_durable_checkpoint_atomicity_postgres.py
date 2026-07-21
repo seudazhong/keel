@@ -23,6 +23,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 import keel_core.loop as loop_mod
+from keel_core.agent_config_snapshot import AgentConfigSnapshot
 from keel_core.agents import AgentSpec, Scope
 from keel_core.approvals import PostgresApprovalStore
 from keel_core.connectors import ConnectorTool
@@ -111,6 +112,7 @@ async def _admit_and_claim(runs: PostgresRunStore, *, now: datetime, key: str = 
         idempotency_key=key,
         budget=RunBudgetSpec(),
         expires_at=_EXPIRES,
+        snapshot=AgentConfigSnapshot(agent_id="agent-1"),
         now=now,
     )
     await runs.mark_queued(_RUN, now=now)

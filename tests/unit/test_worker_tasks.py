@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from arq.worker import Function
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.config import get_settings
 from keel_core.digest import digest_session_id
@@ -223,6 +224,7 @@ async def test_reconcile_runs_tick_owns_approval_expiry_routing() -> None:
         idempotency_key="k1",
         budget=RunBudgetSpec(),
         expires_at=now + timedelta(hours=1),
+        snapshot=AgentConfigSnapshot(agent_id="agent-1"),
     )
     await runs.mark_queued("run-1")
     lease = await runs.claim("run-1", worker_id="w1", lease_seconds=30)

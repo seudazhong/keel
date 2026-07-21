@@ -25,6 +25,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot
 from keel_core.runs import (
     RunBudgetSpec,
     _fingerprint_matches,
@@ -374,6 +375,12 @@ async def test_downgrade_retry_with_remapped_id_admits_idempotently_via_runstore
     await asyncio.to_thread(_run_to, url, _PREV)
     remapped = _expected_remap(_SCOPE_B, _DUP)
 
+    # Re-upgrade before exercising the RunStore: it always targets the current head schema (a
+    # single running binary is never simultaneously compatible with two schema versions), so the
+    # downgrade above is used only to trigger 0017's own session-id remap (data), not to keep the
+    # connection pinned to the older schema for this application-level idempotency assertion.
+    await asyncio.to_thread(_run_to, url, "head")
+
     store = PostgresRunStore(migrated_db, _SCOPE_B)
     # A retry that presents the remapped session id + the reconstructed legacy fallback is
     # recognized as the same admission (idempotent), returning the existing run id.
@@ -383,6 +390,7 @@ async def test_downgrade_retry_with_remapped_id_admits_idempotently_via_runstore
         idempotency_key="k1",
         budget=RunBudgetSpec(),
         expires_at=datetime.now(UTC) + timedelta(hours=1),
+        snapshot=AgentConfigSnapshot(),
         fingerprint=admission_fingerprint(
             **binding_b, session_id=remapped, content=_CONTENT, model=_MODEL
         ),

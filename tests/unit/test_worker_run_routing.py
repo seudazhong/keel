@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.identity import IdentityService, InMemoryIdentityStore, LoggingAuditSink
 from keel_core.identity.models import AgentKind
@@ -48,6 +49,7 @@ async def _admit(
     org_id: str,
     actor: str,
     agent_id: str,
+    snapshot: AgentConfigSnapshot | None = None,
 ) -> str:
     enqueued: list[str] = []
 
@@ -70,6 +72,7 @@ async def _admit(
         surface=RunSurface.web.value,
         content="hi",
         idempotency_key="k1",
+        snapshot=snapshot,
     )
     return result.run_id
 
@@ -153,18 +156,88 @@ async def test_run_interactive_fails_closed_when_agent_revoked() -> None:
     assert record.error_kind == "agent_forbidden"
 
 
+class _CapturingProvider:
+    """Wraps a provider, recording every request it streams (assert on model/messages)."""
+
+    def __init__(self, inner: ScriptedProviderGateway) -> None:
+        self._inner = inner
+        self.requests: list[Any] = []
+
+    def stream(self, request: Any) -> Any:
+        self.requests.append(request)
+        return self._inner.stream(request)
+
+
+async def test_run_interactive_pins_snapshot_persona_model_despite_later_mutation() -> None:
+    """A run admitted with an explicit snapshot executes with ITS captured name/persona/model —
+    never the Agent's later-mutated fields (R1B; INVARIANTS.md C8). Claim-time visibility is
+    still (successfully) re-authorized; only the *content* of the profile is pinned."""
+    svc, org_id, user_id, agent_id = await _identity_with_agent(name="Scout", persona="Scout it.")
+    runs, events, approvals = InMemoryRunStore(), InMemoryEventStore(), InMemoryApprovalStore()
+    agent = await svc.get_agent(org_id, user_id, agent_id)
+    snapshot = AgentConfigSnapshot(
+        agent_id=agent_id,
+        agent_version=agent.version,
+        agent_name=agent.name,
+        persona=agent.persona,
+        model="pinned-model",
+    )
+    run_id = await _admit(
+        runs, events, org_id=org_id, actor=user_id, agent_id=agent_id, snapshot=snapshot
+    )
+    # Mutate the Agent's persona/name AFTER admission but BEFORE claim/execution.
+    await svc.update_agent(
+        org_id,
+        user_id,
+        agent_id,
+        expected_version=agent.version,
+        name="Renamed",
+        persona="a completely different persona",
+    )
+    inner = ScriptedProviderGateway(
+        [[ProviderChunk(delta="done", finish_reason=FinishReason.end_turn)]]
+    )
+    provider = _CapturingProvider(inner)
+    ctx = _ctx(runs, events, approvals, svc, provider)
+    status = await run_interactive(ctx, run_id, _SCOPE)
+    assert status == RunStatus.completed.value
+    assert provider.requests, "the provider must have been called"
+    request = provider.requests[0]
+    # The pinned (admitted) model — never settings' process default.
+    assert request.model == "pinned-model"
+    system_texts = [
+        str(m.get("content", "")) for m in request.messages if m.get("role") == "system"
+    ]
+    assert any("Scout it." in text for text in system_texts)
+    assert not any("different persona" in text for text in system_texts)
+
+
 async def test_resolve_agent_profile_local_preview_uses_defaults() -> None:
     # A local-preview run (or a worker with no identity service) uses the local-preview profile.
     record = _record(LOCAL_PREVIEW_ORG_ID, "local:local", "web")
-    assert await _resolve_agent_profile(None, record) == ("web", "Keel Web", "")
+    assert await _resolve_agent_profile(None, record, None) == ("web", "Keel Web", "")
     svc, *_ = await _identity_with_agent()
-    assert await _resolve_agent_profile(svc, record) == ("web", "Keel Web", "")
+    assert await _resolve_agent_profile(svc, record, None) == ("web", "Keel Web", "")
 
 
 async def test_resolve_agent_profile_loads_persisted_profile() -> None:
     svc, org_id, user_id, agent_id = await _identity_with_agent(name="Scout", persona="Scout it.")
     record = _record(org_id, user_id, agent_id)
-    assert await _resolve_agent_profile(svc, record) == (agent_id, "Scout", "Scout it.")
+    assert await _resolve_agent_profile(svc, record, None) == (agent_id, "Scout", "Scout it.")
+
+
+async def test_resolve_agent_profile_prefers_the_persisted_snapshot() -> None:
+    """A run admitted with a snapshot always uses ITS name/persona (R1B, INVARIANTS.md C8) —
+    never the Agent's current (possibly since-mutated) live profile, even when an identity
+    service *could* resolve a different current name/persona."""
+    svc, org_id, user_id, agent_id = await _identity_with_agent(name="Scout", persona="Scout it.")
+    record = _record(org_id, user_id, agent_id)
+    snapshot = AgentConfigSnapshot(agent_id=agent_id, agent_name="Old Name", persona="old persona")
+    assert await _resolve_agent_profile(svc, record, snapshot) == (
+        agent_id,
+        "Old Name",
+        "old persona",
+    )
 
 
 async def test_visibility_check_denies_non_member() -> None:

@@ -42,6 +42,7 @@ from keel_core.tools import (
     LsTool,
     ReadTool,
     ShellTool,
+    UnavailableExecutionEnvironment,
     WriteTool,
 )
 from keel_core.types import PermissionDecision, ScopeId, ScopeKind, TrustLevel
@@ -199,6 +200,26 @@ def build_interactive_registry(
     return tools, tuple(tool.name for tool in extra)
 
 
+def build_interactive_tool_names(
+    *,
+    engine: AsyncEngine | None,
+    scope_id: ScopeId,
+    embedder: Embedder | None,
+    caps: InteractiveCapabilities | None = None,
+    connector_actions: tuple[ConnectorAction, ...] = (),
+) -> tuple[str, ...]:
+    """Resolve the exact interactive tool-name set available at admission."""
+    tools, _extra = build_interactive_registry(
+        UnavailableExecutionEnvironment(),
+        engine=engine,
+        scope_id=scope_id,
+        embedder=embedder,
+        caps=caps,
+        connector_actions=connector_actions,
+    )
+    return tuple(tool.name for tool in tools)
+
+
 def interactive_permissions(
     read_only_allow: tuple[str, ...] = (),
     connector_actions: tuple[ConnectorAction, ...] = (),
@@ -261,6 +282,7 @@ __all__ = [
     "build_interactive_knowledge_tools",
     "build_interactive_memory_tools",
     "build_interactive_registry",
+    "build_interactive_tool_names",
     "build_interactive_tools",
     "build_im_readonly_extras",
     "interactive_permissions",

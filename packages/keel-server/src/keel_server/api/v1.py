@@ -27,6 +27,12 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from keel_core.agent_config_snapshot import (
+    AgentConfigSnapshot,
+    AgentConfigSnapshotError,
+    MemoryPolicySnapshot,
+    ResourceGrantSnapshot,
+)
 from keel_core.api import (
     ApprovalResolution,
     CreateMessageRequest,
@@ -34,6 +40,8 @@ from keel_core.api import (
     JobResponse,
 )
 from keel_core.approvals import ApprovalStore, InMemoryApprovalStore, PostgresApprovalStore
+from keel_core.config import Settings
+from keel_core.connector_actions import build_connector_actions
 from keel_core.consolidation import (
     MemoryProposal,
     MemoryProposalStore,
@@ -44,6 +52,12 @@ from keel_core.consolidation import (
 from keel_core.errors import CrossScopeError
 from keel_core.events import EventType
 from keel_core.identity import NotFoundError
+from keel_core.interactive import (
+    LOCAL_PREVIEW_AGENT_ID,
+    LOCAL_PREVIEW_AGENT_NAME,
+    InteractiveCapabilities,
+    build_interactive_tool_names,
+)
 from keel_core.jobs import JobStatus, JobStore, JobValidationError
 from keel_core.loop import admit
 from keel_core.memory import PostgresMemoryStore
@@ -52,6 +66,7 @@ from keel_core.run_service import DurableRunService
 from keel_core.runs import (
     PostgresRunStore,
     RunAdmissionConflict,
+    RunBudgetSpec,
     RunControlKind,
     RunRecord,
     RunStore,
@@ -217,6 +232,80 @@ def _admission_model(request: Request) -> str:
     return default if isinstance(default, str) and default else "github_copilot/claude-sonnet-4.5"
 
 
+async def _admission_snapshot(
+    request: Request, auth: EndpointAuth, model: str, budget: RunBudgetSpec
+) -> AgentConfigSnapshot:
+    """The immutable :class:`AgentConfigSnapshot` bound into this web admission (R1B).
+
+    An authenticated caller's snapshot reflects the *persisted* Agent
+    :func:`~keel_server.endpoint_auth.resolve_endpoint_auth` already resolved (name/persona/
+    optimistic version) plus its currently active resource grants (non-secret descriptors —
+    type/id/capability only). The non-cloud local-preview compatibility profile has no
+    persisted Agent record, so it gets an explicit local snapshot bound to the same stable
+    compatibility identity the run row itself carries instead.
+    """
+    settings = getattr(request.app.state, "settings", None)
+    if not isinstance(settings, Settings):
+        settings = Settings()
+    engine = getattr(request.app.state, "engine", None)
+    runtime = getattr(request.app.state, "runtime", None)
+    embedder = getattr(runtime, "embedder", None)
+    connector_actions = await build_connector_actions(
+        engine=engine,
+        settings=settings,
+        scope_id=auth.scope_id,
+        registry=getattr(request.app.state, "connector_registry", None),
+    )
+    tools = build_interactive_tool_names(
+        engine=engine,
+        scope_id=auth.scope_id,
+        embedder=embedder,
+        caps=InteractiveCapabilities(
+            memory_block_max_chars=settings.memory_block_max_chars,
+            session_embedding_batch_size=settings.session_embedding_batch_size,
+            session_embedding_catchup_limit=settings.session_embedding_catchup_limit,
+            knowledge_search_query_max_chars=settings.knowledge_search_query_max_chars,
+            knowledge_search_k_max=settings.knowledge_search_k_max,
+            knowledge_tool_output_max_chars=settings.knowledge_tool_output_max_chars,
+        ),
+        connector_actions=connector_actions,
+    )
+    if auth.agent is not None and auth.org_id is not None:
+        identity = getattr(request.app.state, "identity", None)
+        grants: list[Any] = []
+        if identity is not None:
+            grants = await identity.active_resource_grants(auth.org_id, auth.agent.id)
+        return AgentConfigSnapshot(
+            agent_id=auth.agent.id,
+            agent_version=auth.agent.version,
+            agent_name=auth.agent.name,
+            persona=auth.agent.persona,
+            model=model,
+            max_iterations=budget.max_iterations,
+            token_budget=budget.token_budget,
+            permission_profile="default",
+            tools=tools,
+            memory_policy=MemoryPolicySnapshot(archival_enabled=embedder is not None),
+            resource_grants=tuple(
+                ResourceGrantSnapshot(g.resource_type, g.resource_id, g.capability.value)
+                for g in grants
+            ),
+        )
+    return AgentConfigSnapshot(
+        agent_id=LOCAL_PREVIEW_AGENT_ID,
+        agent_version=1,
+        agent_name=LOCAL_PREVIEW_AGENT_NAME,
+        persona="",
+        model=model,
+        max_iterations=budget.max_iterations,
+        token_budget=budget.token_budget,
+        permission_profile="local_preview",
+        tools=tools,
+        memory_policy=MemoryPolicySnapshot(),
+        resource_grants=(),
+    )
+
+
 def _durable_run_service(request: Request, scope_id: ScopeId) -> DurableRunService:
     """Build a :class:`DurableRunService` bound to ``scope_id`` (per-Agent data plane).
 
@@ -304,6 +393,9 @@ async def create_message(
     actor_id = durable_actor_id(auth.actor)
     assert auth.org_id is not None and auth.agent_id is not None
     service = _durable_run_service(request, auth.scope_id)
+    model = _admission_model(request)
+    budget = RunBudgetSpec()
+    snapshot = await _admission_snapshot(request, auth, model, budget)
     try:
         result = await service.admit(
             org_id=auth.org_id,
@@ -313,7 +405,9 @@ async def create_message(
             surface=RunSurface.web.value,
             content=body.content,
             idempotency_key=idempotency_key,
-            model=_admission_model(request),
+            model=model,
+            budget=budget,
+            snapshot=snapshot,
         )
     except RunAdmissionConflict:
         # Same idempotency identity, different immutable binding/content: reject (never repair
@@ -401,6 +495,30 @@ async def get_run(
     if record is None or record.scope_id != auth.scope_id:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
     await _authorize_run(request, record, auth.scope_id)
+    try:
+        snapshot = record.snapshot
+    except AgentConfigSnapshotError:
+        # Corrupt/tampered persisted snapshot: never surface unverifiable content, only that
+        # verification failed (the run itself is unaffected — this is diagnostic metadata).
+        snapshot = None
+    snapshot_meta: dict[str, object] | None = None
+    if snapshot is not None:
+        # Non-sensitive Agent configuration metadata only (R1B): no credential/secret material
+        # ever flows through a snapshot (resource grants are type/id/capability descriptors).
+        snapshot_meta = {
+            "schema_version": snapshot.schema_version,
+            "hash": record.snapshot_hash,
+            "agent_version": snapshot.agent_version,
+            "agent_name": snapshot.agent_name,
+            "persona": snapshot.persona,
+            "model": snapshot.model,
+            "max_iterations": snapshot.max_iterations,
+            "token_budget": snapshot.token_budget,
+            "permission_profile": snapshot.permission_profile,
+            "tools": list(snapshot.tools),
+            "memory_policy": snapshot.memory_policy.to_dict(),
+            "resource_grants": [grant.to_dict() for grant in snapshot.resource_grants],
+        }
     return {
         "id": record.id,
         "status": record.status.value,
@@ -417,6 +535,7 @@ async def get_run(
         "updated_at": record.updated_at.isoformat(),
         "finished_at": record.finished_at.isoformat() if record.finished_at else None,
         "error_kind": record.error_kind,
+        "agent_config_snapshot": snapshot_meta,
     }
 
 

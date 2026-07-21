@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.errors import PermissionDenied
-from keel_core.identity import MembershipRole, NotFoundError
+from keel_core.identity import Capability, MembershipRole, NotFoundError
 from keel_core.runs import InMemoryRunStore, RunStatus
 from keel_server.app import create_app
 from keel_server.auth import Principal, Role, hash_api_key
@@ -80,6 +80,9 @@ class _Membership:
 @dataclass
 class _Agent:
     id: str
+    version: int = 1
+    name: str = "Agent"
+    persona: str = ""
 
 
 class _FakeIdentity:
@@ -91,10 +94,14 @@ class _FakeIdentity:
         agents: dict[str, str],
         *,
         denied: set[str] | None = None,
+        agent_profiles: dict[str, _Agent] | None = None,
+        grants: list[object] | None = None,
     ) -> None:
         self._member_of = member_of
         self._agents = agents  # agent_ref -> agent_id
         self._denied = denied or set()  # agent_refs the actor may see but not use
+        self._agent_profiles = agent_profiles or {}  # agent_id -> full _Agent (name/persona/ver)
+        self._grants = grants or []
 
     async def select_org(self, user_id: str, org_ref: str) -> _Org:
         if org_ref in self._member_of:
@@ -105,8 +112,19 @@ class _FakeIdentity:
         if agent_ref in self._denied:
             raise PermissionDenied("agent not permitted")
         if agent_ref in self._agents:
-            return _Agent(id=self._agents[agent_ref])
+            agent_id = self._agents[agent_ref]
+            return self._agent_profiles.get(agent_id, _Agent(id=agent_id))
         raise NotFoundError("agent not found")
+
+    async def active_resource_grants(self, org_id: str, agent_id: str) -> list[object]:
+        return self._grants
+
+
+@dataclass
+class _Grant:
+    resource_type: str
+    resource_id: str
+    capability: Capability
 
 
 def _as_user(client: TestClient) -> None:
@@ -132,6 +150,12 @@ def test_local_preview_admission_binds_local_profile() -> None:
     record = _run(runs.get(run_id))
     assert record is not None
     assert (record.org_id, record.actor, record.agent_id) == ("local", "local:local", "web")
+    # Local preview creates an explicit local snapshot (no persisted Agent record exists).
+    snapshot = record.snapshot
+    assert snapshot is not None
+    assert snapshot.agent_id == "web"
+    assert snapshot.permission_profile == "local_preview"
+    assert snapshot.resource_grants == ()
 
 
 def test_cloud_user_admission_binds_org_and_agent() -> None:
@@ -139,7 +163,14 @@ def test_cloud_user_admission_binds_org_and_agent() -> None:
     enqueued: list[tuple[str, tuple[object, ...]]] = []
     client = _app(runs, enqueued)
     _as_user(client)
-    cast(FastAPI, client.app).state.identity = _FakeIdentity({"org-A"}, {"agent-ref": "agent-1"})
+    cast(FastAPI, client.app).state.identity = _FakeIdentity(
+        {"org-A"},
+        {"agent-ref": "agent-1"},
+        agent_profiles={
+            "agent-1": _Agent(id="agent-1", version=3, name="Scout", persona="Be terse.")
+        },
+        grants=[_Grant("knowledge_base", "kb-1", Capability.read)],
+    )
     resp = client.post(
         "/v1/sessions/s1/messages",
         json={"content": "hi"},
@@ -150,6 +181,21 @@ def test_cloud_user_admission_binds_org_and_agent() -> None:
     assert record is not None
     assert (record.org_id, record.actor, record.agent_id) == ("org-A", "user-alice", "agent-1")
     assert record.status is RunStatus.queued
+    # The snapshot reflects the *resolved* Agent (name/persona/version) + its active grants.
+    snapshot = record.snapshot
+    assert snapshot is not None
+    assert snapshot.agent_id == "agent-1"
+    assert snapshot.agent_version == 3
+    assert snapshot.agent_name == "Scout"
+    assert snapshot.persona == "Be terse."
+    assert snapshot.permission_profile == "default"
+    assert len(snapshot.resource_grants) == 1
+    grant = snapshot.resource_grants[0]
+    assert (grant.resource_type, grant.resource_id, grant.capability) == (
+        "knowledge_base",
+        "kb-1",
+        "read",
+    )
 
 
 def test_cloud_user_requires_org_header() -> None:

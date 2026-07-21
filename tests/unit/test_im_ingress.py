@@ -8,7 +8,15 @@ dropped fail-closed; and the OneBot/Telegram parsers wake-gate + normalize provi
 
 from __future__ import annotations
 
+from keel_core.agent_config_snapshot import ResourceGrantSnapshot
 from keel_core.approvals import InMemoryApprovalStore
+from keel_core.identity import (
+    AgentKind,
+    Capability,
+    IdentityService,
+    InMemoryIdentityStore,
+    LoggingAuditSink,
+)
 from keel_core.im_routing import (
     ImChannelMapping,
     ImChatKind,
@@ -35,12 +43,13 @@ from keel_server.gateway.durable import (
 class _Harness:
     """A durable-run substrate that records the admitted run per scope for assertions."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, identity: IdentityService | None = None) -> None:
         self.route_index = InMemoryImRouteIndex()
         self.mappings = InMemoryImMappingStore()
         self.runs: dict[str, InMemoryRunStore] = {}
         self.events: dict[str, InMemoryEventStore] = {}
         self.enqueued: list[tuple[str, str]] = []
+        self.identity = identity
 
     def run_service(self, scope_id: str) -> DurableRunService:
         runs = self.runs.setdefault(scope_id, InMemoryRunStore())
@@ -65,6 +74,7 @@ class _Harness:
             run_service_factory=self.run_service,
             cloud_mode=cloud_mode,
             default_model="gpt-4o-mini",
+            identity=self.identity,
         )
 
 
@@ -136,6 +146,94 @@ async def test_ingress_admits_durable_im_run_with_context() -> None:
         agent_id="agent-1",
         scope_id="agent:org-a/agent-1",
     )
+
+
+async def test_ingress_snapshots_the_mapped_agent_at_admission() -> None:
+    """IM admission snapshots the mapped Agent's *current* name/persona/version (R1B): the
+    worker never has to defer that (mutable) lookup to execution time."""
+    identity = IdentityService(InMemoryIdentityStore(), audit=LoggingAuditSink())
+    user = await identity.ensure_local_user()
+    org = await identity.create_org(user.id, slug="org-a", display_name="Org A")
+    agent = await identity.create_agent(
+        org.org_id, user.id, kind=AgentKind.team, name="Field Agent", persona="Be terse."
+    )
+    await identity.grant_resource(
+        org.org_id,
+        user.id,
+        agent_id=agent.id,
+        resource_type="knowledge_base",
+        resource_id="kb-1",
+        capability=Capability.read,
+    )
+    h = _Harness(identity=identity)
+    mapping = ImChannelMapping(
+        id="map-1",
+        org_id=org.org_id,
+        provider=ImProvider.telegram,
+        external_bot_id="bot-9",
+        external_chat_id="4242",
+        chat_kind=ImChatKind.group,
+        agent_id=agent.id,
+        scope_id=f"agent:{org.org_id}/{agent.id}",
+        policy=ImReplyPolicy(reply_enabled=True),
+        status=ImMappingStatus.active,
+        created_by=user.id,
+        run_as_user_id=user.id,
+    )
+    await h.mappings.create(mapping)
+    await h.route_index.put(mapping.route_entry())
+    run_id = await h.ingress().admit(_inbound())
+    assert run_id is not None
+    runs = h.runs[f"agent:{org.org_id}/{agent.id}"]
+    record = await runs.get(run_id)
+    assert record is not None
+    snapshot = record.snapshot
+    assert snapshot is not None
+    assert snapshot.agent_id == agent.id
+    assert snapshot.agent_version == agent.version
+    assert snapshot.agent_name == "Field Agent"
+    assert snapshot.persona == "Be terse."
+    assert snapshot.permission_profile == "im_safe"
+    assert snapshot.resource_grants == (ResourceGrantSnapshot("knowledge_base", "kb-1", "read"),)
+
+
+async def test_ingress_without_identity_falls_back_to_an_id_only_snapshot() -> None:
+    """No identity service wired (in-memory preview): the snapshot still captures at least the
+    admitted agent id/model — never crashes admission."""
+    h = _Harness(identity=None)
+    await _publish_mapping(h)
+    run_id = await h.ingress().admit(_inbound())
+    assert run_id is not None
+    runs = h.runs["agent:org-a/agent-1"]
+    record = await runs.get(run_id)
+    assert record is not None
+    snapshot = record.snapshot
+    assert snapshot is not None
+    assert snapshot.agent_id == "agent-1"
+    assert snapshot.model == "gpt-4o-mini"
+    assert snapshot.resource_grants == ()
+
+
+async def test_ingress_snapshot_uses_resolved_readonly_extra_tools() -> None:
+    h = _Harness(identity=None)
+    await _publish_mapping(h)
+
+    async def tool_names(_scope_id: str) -> tuple[str, ...]:
+        return ("read", "session_search", "kb_search")
+
+    ingress = DurableImIngress(
+        route_index=h.route_index,
+        mapping_store_factory=lambda _org: h.mappings,
+        run_service_factory=h.run_service,
+        cloud_mode=True,
+        default_model="gpt-4o-mini",
+        snapshot_tool_names=tool_names,
+    )
+    run_id = await ingress.admit(_inbound())
+    assert run_id is not None
+    record = await h.runs["agent:org-a/agent-1"].get(run_id)
+    assert record is not None and record.snapshot is not None
+    assert record.snapshot.tools == ("kb_search", "read", "session_search")
 
 
 async def test_ingress_is_idempotent_per_message() -> None:

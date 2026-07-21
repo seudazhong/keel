@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot
 from keel_core.approvals import PostgresApprovalStore
 from keel_core.loop import admit
 from keel_core.projections import project_messages
@@ -338,6 +339,7 @@ async def _make_run(
         idempotency_key=key,
         budget=RunBudgetSpec(),
         expires_at=datetime.now(UTC) + timedelta(hours=1),
+        snapshot=AgentConfigSnapshot(agent_id=agent),
     )
     return record.id
 

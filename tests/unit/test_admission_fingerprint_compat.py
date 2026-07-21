@@ -18,12 +18,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot
 from keel_core.runs import (
     InMemoryRunStore,
     RunAdmissionConflict,
     RunBudgetSpec,
     admission_fingerprint,
     legacy_admission_fingerprint,
+    pre_snapshot_admission_fingerprint,
 )
 
 _SCOPE = "web:local"
@@ -37,8 +39,16 @@ _BINDING = dict(
 )
 
 
-def _current(*, model: str | None, **overrides: str) -> str:
-    return admission_fingerprint(**{**_BINDING, **overrides}, model=model)  # type: ignore[arg-type]
+def _current(*, model: str | None, snapshot_hash: str | None = None, **overrides: str) -> str:
+    return admission_fingerprint(
+        **{**_BINDING, **overrides},  # type: ignore[arg-type]
+        model=model,
+        snapshot_hash=snapshot_hash,
+    )
+
+
+def _pre_snapshot(*, model: str | None, **overrides: str) -> str:
+    return pre_snapshot_admission_fingerprint(**{**_BINDING, **overrides}, model=model)  # type: ignore[arg-type]
 
 
 def _legacy(**overrides: str) -> str:
@@ -51,7 +61,9 @@ async def _create(
     run_id: str,
     fingerprint: str,
     legacy_fingerprint: str = "",
+    pre_snapshot_fingerprint: str = "",
     idempotency_key: str = "k1",
+    snapshot: AgentConfigSnapshot | None = None,
     **binding: str,
 ) -> tuple[str, bool]:
     # ``content`` is a fingerprint input only, not a stored run column.
@@ -63,8 +75,10 @@ async def _create(
         idempotency_key=idempotency_key,
         budget=RunBudgetSpec(),
         expires_at=datetime.now(UTC) + timedelta(hours=1),
+        snapshot=snapshot or AgentConfigSnapshot(agent_id=binding.get("agent_id", "agent-1")),
         fingerprint=fingerprint,
         legacy_fingerprint=legacy_fingerprint,
+        pre_snapshot_fingerprint=pre_snapshot_fingerprint,
         **merged,  # type: ignore[arg-type]
     )
     return record.id, created
@@ -141,3 +155,67 @@ def test_legacy_and_model_aware_fingerprints_are_structurally_distinct() -> None
     — the property that makes the legacy fallback safe against model-change hijack."""
     assert _legacy() != _current(model=None)
     assert _legacy() != _current(model="gpt-5")
+
+
+# --------------------------------------------------------------------------------------------
+# R1B: the Agent config snapshot hash joins the fingerprint (INVARIANTS.md C8).
+# --------------------------------------------------------------------------------------------
+
+
+def test_snapshot_aware_and_pre_snapshot_fingerprints_are_structurally_distinct() -> None:
+    """A snapshot-aware hash always encodes ``snapshot_hash``, so it never equals the older
+    (model-aware, pre-snapshot) or legacy (pre-model) forms — the property that makes both
+    older compatibility forms safe against a changed-snapshot hijack."""
+    assert _pre_snapshot(model="gpt-5") != _current(model="gpt-5", snapshot_hash="")
+    assert _pre_snapshot(model="gpt-5") != _current(model="gpt-5", snapshot_hash="deadbeef")
+    assert _legacy() != _current(model=None, snapshot_hash="deadbeef")
+
+
+async def test_pre_snapshot_row_retry_succeeds_after_snapshot_upgrade() -> None:
+    """A row admitted by a pre-snapshot (but model-aware) binary retries cleanly once the
+    fleet is snapshot-aware — mirroring the legacy pre-model rollout compatibility."""
+    store = InMemoryRunStore()
+    original, created = await _create(
+        store, run_id="run-1", fingerprint=_pre_snapshot(model="gpt-5")
+    )
+    assert created
+    retried, created_again = await _create(
+        store,
+        run_id="run-2",
+        fingerprint=_current(model="gpt-5", snapshot_hash="abc123"),
+        pre_snapshot_fingerprint=_pre_snapshot(model="gpt-5"),
+    )
+    assert retried == original
+    assert created_again is False
+
+
+async def test_changed_snapshot_hash_conflicts_on_a_snapshot_aware_row() -> None:
+    """A retry that reuses the idempotency key but presents a *different* snapshot hash (the
+    Agent's version/persona/model/budget changed) is rejected — never silently repaired."""
+    store = InMemoryRunStore()
+    await _create(
+        store, run_id="run-1", fingerprint=_current(model="gpt-5", snapshot_hash="abc123")
+    )
+    with pytest.raises(RunAdmissionConflict):
+        await _create(
+            store,
+            run_id="run-2",
+            fingerprint=_current(model="gpt-5", snapshot_hash="changed-hash"),
+            pre_snapshot_fingerprint=_pre_snapshot(model="gpt-5"),
+        )
+
+
+async def test_same_snapshot_hash_is_idempotent() -> None:
+    """The same snapshot hash on a retry of a snapshot-aware row is an idempotent no-op."""
+    store = InMemoryRunStore()
+    original, _ = await _create(
+        store, run_id="run-1", fingerprint=_current(model="gpt-5", snapshot_hash="abc123")
+    )
+    retried, created_again = await _create(
+        store,
+        run_id="run-2",
+        fingerprint=_current(model="gpt-5", snapshot_hash="abc123"),
+        pre_snapshot_fingerprint=_pre_snapshot(model="gpt-5"),
+    )
+    assert retried == original
+    assert created_again is False

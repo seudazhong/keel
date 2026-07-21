@@ -16,6 +16,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import keel_server.api.v1 as v1
+from keel_core.agent_config_snapshot import AgentConfigSnapshot
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.identity import MembershipRole, NotFoundError
 from keel_core.runs import InMemoryRunStore, RunBudgetSpec, RunStatus, RunSurface, action_hash
@@ -69,6 +70,7 @@ async def _admit_run(
         idempotency_key=run_id,
         budget=RunBudgetSpec(),
         expires_at=datetime.now(UTC) + timedelta(hours=1),
+        snapshot=AgentConfigSnapshot(agent_id="agent-1"),
     )
 
 
@@ -200,6 +202,7 @@ async def _suspend_run_for_user(
         idempotency_key=run_id,
         budget=RunBudgetSpec(),
         expires_at=datetime.now(UTC) + timedelta(hours=1),
+        snapshot=AgentConfigSnapshot(agent_id="agent-1"),
     )
     await runs.mark_queued(run_id)
     lease = await runs.claim(run_id, worker_id="w1", lease_seconds=30)
