@@ -31,6 +31,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot
 from keel_core.agents import AgentSpec
 from keel_core.approvals import ApprovalRecord, ApprovalStore
 from keel_core.errors import DuplicateEventError
@@ -63,6 +64,7 @@ from keel_core.runs import (
     admission_fingerprint,
     legacy_admission_fingerprint,
     mark_checkpoint_in_transaction,
+    pre_snapshot_admission_fingerprint,
 )
 from keel_core.types import RunId, ScopeId, SessionId, StopReason
 
@@ -238,6 +240,9 @@ class AdmitResult:
     # queued-but-undispatched runs, so the caller must NOT surface an error / retry — doing
     # so would risk a duplicate run. See :meth:`DurableRunService.admit`.
     dispatch_pending: bool = False
+    # The admitted (or already-persisted) Agent configuration snapshot's content hash —
+    # non-sensitive diagnostic/test metadata (R1B); never a secret.
+    snapshot_hash: str = ""
 
 
 async def prompt_persisted_in_log(
@@ -295,6 +300,7 @@ class DurableRunService:
         surface: str,
         content: str,
         idempotency_key: str,
+        snapshot: AgentConfigSnapshot | None = None,
         budget: RunBudgetSpec | None = None,
         ttl_seconds: int | None = None,
         run_id: RunId | None = None,
@@ -318,12 +324,26 @@ class DurableRunService:
         and persisted in the admission event so the worker executes the run with the admitted
         model (reproducibility) rather than its own process default. It is part of the
         immutable identity: a retry that reuses the idempotency key but changes the model is a
-        conflict."""
+        conflict.
+
+        ``snapshot`` — the caller-resolved :class:`~keel_core.agent_config_snapshot.
+        AgentConfigSnapshot` (persisted Agent version/name/persona/model/budget/permission
+        profile/tools/memory-policy/grants) — is persisted verbatim on the run row and its
+        content hash is likewise folded into the fingerprint (INVARIANTS.md C8): a retry that
+        reuses the idempotency key but presents a *different* snapshot (e.g. the Agent's
+        version/persona/model changed between the original request and the retry) is a
+        conflict, never silently repaired with the retry's snapshot. Every durable run
+        persists *some* snapshot (never optional at the storage layer); a caller that omits
+        one here (surfaces that pre-date a real Agent-config resolution, or a test harness
+        that does not care) gets a minimal, honestly-labeled default built from ``agent_id``/
+        ``model`` alone — never a claim that a real Agent configuration was captured."""
         now = now or datetime.now(UTC)
         run_id = run_id or uuid.uuid4().hex
         expires_at = now + timedelta(seconds=ttl_seconds or self._default_ttl_seconds)
+        snapshot = snapshot or AgentConfigSnapshot(agent_id=agent_id, model=model or "")
+        snapshot_hash = snapshot.content_hash()
         # Immutable admission fingerprint: a retry that reuses the identity but mismatches the
-        # tenant/actor/agent/session/surface/content/model is rejected as a conflict.
+        # tenant/actor/agent/session/surface/content/model/snapshot is rejected as a conflict.
         fingerprint = admission_fingerprint(
             org_id=org_id,
             actor=actor,
@@ -332,12 +352,23 @@ class DurableRunService:
             surface=surface,
             content=content,
             model=model,
+            snapshot_hash=snapshot_hash,
         )
-        # Deployment-rollout compatibility: a run admitted by a *pre-model* binary stored a
-        # fingerprint that omitted the model. Recompute that precise legacy form so a retry of
-        # such an in-flight run completes idempotently across the deploy. A model-aware stored
-        # fingerprint always encodes the model field and can never equal this, so a changed
-        # model cannot hijack a new-model row through the legacy path.
+        # Deployment-rollout compatibility: a run admitted by a *pre-snapshot* (but
+        # model-aware) binary stored a fingerprint that omitted the snapshot hash; a run
+        # admitted by a *pre-model* binary omitted both. Recompute both precise intermediate
+        # forms so a retry of such an in-flight run completes idempotently across either
+        # deploy boundary. Each newer form encodes strictly more fields, so a changed
+        # model/snapshot can never hijack a newer row through an older compatibility path.
+        pre_snapshot_fingerprint = pre_snapshot_admission_fingerprint(
+            org_id=org_id,
+            actor=actor,
+            agent_id=agent_id,
+            session_id=session_id,
+            surface=surface,
+            content=content,
+            model=model,
+        )
         legacy_fingerprint = legacy_admission_fingerprint(
             org_id=org_id,
             actor=actor,
@@ -356,8 +387,10 @@ class DurableRunService:
             surface=surface,
             idempotency_key=idempotency_key,
             budget=budget or RunBudgetSpec(),
+            snapshot=snapshot,
             fingerprint=fingerprint,
             legacy_fingerprint=legacy_fingerprint,
+            pre_snapshot_fingerprint=pre_snapshot_fingerprint,
             expires_at=expires_at,
             now=now,
         )
@@ -365,7 +398,9 @@ class DurableRunService:
         # the prompt is persisted and dispatch progressed, so a retry is an idempotent no-op
         # (a lost enqueue after the queue transition is repaired by the reconciler, not here).
         if record.status is not RunStatus.admitted:
-            return AdmitResult(run_id=record.id, created=created)
+            return AdmitResult(
+                run_id=record.id, created=created, snapshot_hash=record.snapshot_hash
+            )
 
         # Fresh admission, or crash-repair of a half-admitted row: complete the missing steps
         # idempotently, always persisting the prompt *before* the queued/dispatch transition.
@@ -417,7 +452,12 @@ class DurableRunService:
                 session_id,
                 surface,
             )
-        return AdmitResult(run_id=record.id, created=created, dispatch_pending=dispatch_pending)
+        return AdmitResult(
+            run_id=record.id,
+            created=created,
+            dispatch_pending=dispatch_pending,
+            snapshot_hash=record.snapshot_hash,
+        )
 
     async def _ensure_prompt(
         self,

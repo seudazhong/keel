@@ -749,8 +749,21 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     # run (worker-owned, safe Agent, durable encrypted reply) instead of the in-process gateway.
     if engine is not None:
         from keel_core.approvals import PostgresApprovalStore as _PgApprovals
-        from keel_core.im_routing import PostgresImMappingStore as _PgMappingStore
-        from keel_core.im_routing import PostgresImRouteIndex as _PgRouteIndex
+        from keel_core.im_routing import (
+            IM_SAFE_TOOLS as _IM_SAFE_TOOLS,
+        )
+        from keel_core.im_routing import (
+            PostgresImMappingStore as _PgMappingStore,
+        )
+        from keel_core.im_routing import (
+            PostgresImRouteIndex as _PgRouteIndex,
+        )
+        from keel_core.interactive import (
+            InteractiveCapabilities as _InteractiveCapabilities,
+        )
+        from keel_core.interactive import (
+            build_im_readonly_extras as _build_im_readonly_extras,
+        )
         from keel_core.loop import admit as _loop_admit
         from keel_core.run_service import DurableRunService as _DurableRunService
         from keel_core.runs import PostgresRunStore as _PgRunStore
@@ -778,6 +791,22 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 dispatch_outbox=getattr(app.state, "dispatch_outbox", None),
             )
 
+        async def _im_snapshot_tool_names(scope_id: str) -> tuple[str, ...]:
+            extras = _build_im_readonly_extras(
+                _im_engine,
+                scope_id,
+                app.state.runtime.embedder,
+                _InteractiveCapabilities(
+                    memory_block_max_chars=settings.memory_block_max_chars,
+                    session_embedding_batch_size=settings.session_embedding_batch_size,
+                    session_embedding_catchup_limit=settings.session_embedding_catchup_limit,
+                    knowledge_search_query_max_chars=settings.knowledge_search_query_max_chars,
+                    knowledge_search_k_max=settings.knowledge_search_k_max,
+                    knowledge_tool_output_max_chars=settings.knowledge_tool_output_max_chars,
+                ),
+            )
+            return tuple(sorted(set(_IM_SAFE_TOOLS) | {tool.name for tool in extras}))
+
         app.state.im_route_index = _PgRouteIndex(engine)
         app.state.im_ingress = DurableImIngress(
             route_index=app.state.im_route_index,
@@ -785,6 +814,8 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
             run_service_factory=_im_run_service,
             cloud_mode=settings.cloud_mode,
             default_model=settings.default_model,
+            identity=app.state.identity,
+            snapshot_tool_names=_im_snapshot_tool_names,
         )
     # M3A runtime-role gate (WS-DB). When enforced (``KEEL_REQUIRE_RUNTIME_DB_PRINCIPAL``, implied
     # by ``cloud_mode``) the data plane MUST be served from a least-privilege, non-owner runtime

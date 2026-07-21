@@ -109,8 +109,22 @@ generation. Future shell/opaque-agent execution must re-prove it.
 Every run records the immutable Agent version, Routine policy, model, budget, grants/resources, and
 effect policy used at admission. Later configuration changes do not rewrite an in-flight run.
 
-**Current status:** durable runs capture several admission fields, but the persisted Agent/Routine
-model is not yet complete enough to satisfy the full invariant.
+**Current status:** durable runs persist a typed, schema-versioned `AgentConfigSnapshot`
+(`keel_core.agent_config_snapshot`) at admission — the persisted Agent's optimistic version,
+name, persona, selected model, `max_iterations`/`token_budget`, a permission-profile identifier,
+the admitted tool-name set, a (currently minimal) memory-policy object, and non-secret active
+resource-grant descriptors (type/id/capability only). The snapshot's canonical JSON + content
+hash are folded into the admission fingerprint, so a retried admission whose Agent
+version/persona/model/budget/snapshot changed is rejected as a conflict rather than silently
+repaired (`keel_core.runs.admission_fingerprint`). The worker (`keel_worker.runs`) reconstructs a
+claimed run's name/persona/model/bounded config from this frozen record — never from the Agent's
+later-mutated fields — while still re-authorizing current Agent visibility/revocation at claim
+time (a revocation denies execution; a persona/model edit does not rewrite an admitted run). A
+snapshotted tool no longer available is dropped, never substituted (`AgentConfigSnapshot.
+restrict_tools`); a legacy pre-R1B row (empty `snapshot_hash`) falls back to the prior
+live-Agent-lookup behavior. Routine policy and a richer effect-policy object are not yet part of
+the snapshot — the persisted Agent/Routine model this invariant ultimately depends on remains
+extensible for later PRs.
 
 ### C9 — Mail receipt is content, not authority
 

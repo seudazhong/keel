@@ -11,6 +11,7 @@ import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot
 from keel_core.agents import AgentSpec, Scope
 from keel_core.approvals import InMemoryApprovalStore
 from keel_core.connectors import ConnectorTool
@@ -311,6 +312,7 @@ async def test_reconcile_redispatches_reclaims_and_expires() -> None:
         idempotency_key="k1",
         budget=run_store_budget(),
         expires_at=now + timedelta(hours=1),
+        snapshot=AgentConfigSnapshot(agent_id="a"),
         now=now,
     )
     # (b) running with an expired lease
@@ -325,6 +327,7 @@ async def test_reconcile_redispatches_reclaims_and_expires() -> None:
         idempotency_key="k2",
         budget=run_store_budget(),
         expires_at=now + timedelta(hours=1),
+        snapshot=AgentConfigSnapshot(agent_id="a"),
         now=now,
     )
     await run_store.mark_queued("r-expired-lease", now=now)
@@ -341,6 +344,7 @@ async def test_reconcile_redispatches_reclaims_and_expires() -> None:
         idempotency_key="k3",
         budget=run_store_budget(),
         expires_at=now - timedelta(seconds=1),
+        snapshot=AgentConfigSnapshot(agent_id="a"),
         now=now,
     )
 
@@ -622,6 +626,7 @@ async def test_admit_repairs_incomplete_admission() -> None:
         idempotency_key="k1",
         budget=RunBudgetSpec(),
         expires_at=datetime.now(UTC) + timedelta(hours=1),
+        snapshot=AgentConfigSnapshot(agent_id="agent-1"),
     )
     # The idempotent retry must *repair* the row: persist the prompt, queue, and enqueue.
     result = await service.admit(
@@ -670,6 +675,7 @@ async def test_reconcile_never_dispatches_a_prompt_less_run() -> None:
         idempotency_key="k1",
         budget=RunBudgetSpec(),
         expires_at=now + timedelta(hours=1),
+        snapshot=AgentConfigSnapshot(agent_id="a"),
         now=now,
     )
     enqueued: list[str] = []
@@ -993,6 +999,7 @@ async def test_admit_repairs_after_prompt_persisted_before_queue() -> None:
         idempotency_key="k1",
         budget=RunBudgetSpec(),
         expires_at=datetime.now(UTC) + timedelta(hours=1),
+        snapshot=AgentConfigSnapshot(agent_id="agent-1"),
     )
     await admit_run(events, "sess-1", _SCOPE, "the real prompt", "run-1")
     await run_store.mark_prompt_persisted("run-1")

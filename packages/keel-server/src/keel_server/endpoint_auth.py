@@ -30,7 +30,7 @@ from typing import Annotated
 from fastapi import Depends, Header, HTTPException, Request, status
 
 from keel_core.errors import PermissionDenied
-from keel_core.identity import IdentityService, MembershipRole, NotFoundError
+from keel_core.identity import Agent, IdentityService, MembershipRole, NotFoundError
 from keel_core.interactive import LOCAL_PREVIEW_AGENT_ID, LOCAL_PREVIEW_ORG_ID
 from keel_core.scoping import LOCAL_PREVIEW_SCOPE, ScopeValidationError, derive_agent_scope
 from keel_core.types import ScopeId
@@ -75,6 +75,10 @@ class EndpointAuth:
     scope_id: ScopeId
     org_id: str | None = None
     agent_id: str | None = None
+    # The resolved persisted Agent (name/persona/version) this request's authority is bound
+    # to, when one exists (R1B admission snapshot). ``None`` only for the explicit non-cloud
+    # local-preview compatibility profile, which has no persisted Agent record.
+    agent: Agent | None = None
 
     @property
     def is_user(self) -> bool:
@@ -135,6 +139,7 @@ async def _resolve_user_scope(
         scope_id=scope_id,
         org_id=org_context.org_id,
         agent_id=agent.id,
+        agent=agent,
     )
 
 
@@ -195,6 +200,7 @@ async def _resolve_machine_scope(
         scope_id=scope_id,
         org_id=org.id,
         agent_id=agent.id,
+        agent=agent,
     )
 
 
@@ -244,6 +250,7 @@ async def _resolve_legacy_machine_scope(
         scope_id=scope_id,
         org_id=org.id,
         agent_id=agent.id,
+        agent=agent,
     )
 
 

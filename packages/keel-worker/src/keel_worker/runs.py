@@ -22,6 +22,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot, AgentConfigSnapshotError
 from keel_core.approvals import ApprovalRecord, ApprovalStore, PostgresApprovalStore
 from keel_core.config import Settings, get_settings
 from keel_core.connector_actions import build_connector_actions
@@ -144,15 +145,23 @@ def _is_local_preview(record: RunRecord) -> bool:
 
 
 async def _resolve_agent_profile(
-    identity: IdentityService | None, record: RunRecord
+    identity: IdentityService | None,
+    record: RunRecord,
+    snapshot: AgentConfigSnapshot | None,
 ) -> tuple[str, str, str]:
-    """Resolve ``(agent_id, name, persona)`` from the persisted selected Agent.
+    """Resolve ``(agent_id, name, persona)`` — preferring the persisted admission snapshot.
 
-    A local-preview run (or a worker with no identity service) uses the explicit local-
-    preview profile. A cloud run loads the persisted Agent bound at admission; if it is not
-    visible / permitted / archived at build time we fall back to a safe empty profile and let
-    the claim-time visibility check terminalize the run closed before it executes.
+    R1B (INVARIANTS.md C8): a run admitted with a snapshot always executes with **its**
+    name/persona, never the Agent's later-mutated fields — even if a live lookup would return
+    something different by claim/execution time. Only a legacy pre-snapshot row falls back to
+    the pre-R1B behavior of resolving the Agent profile live (best-effort; a local-preview run
+    or a worker with no identity service uses the explicit local-preview profile). A cloud run
+    whose live Agent is no longer visible/permitted/archived falls back to a safe empty
+    profile — the claim-time visibility check independently terminalizes the run closed before
+    it executes.
     """
+    if snapshot is not None:
+        return snapshot.agent_id or record.agent_id, snapshot.agent_name, snapshot.persona
     if identity is None or _is_local_preview(record):
         return record.agent_id, LOCAL_PREVIEW_AGENT_NAME, ""
     try:
@@ -290,6 +299,7 @@ async def _execute_im_run(
     identity: IdentityService | None,
     engine: Any,
     embedder: Any,
+    snapshot: AgentConfigSnapshot | None,
 ) -> tuple[RunRecord, str, str]:
     """Execute a claimed **untrusted IM** run on the safe (read-only) Agent + persist its reply.
 
@@ -305,11 +315,18 @@ async def _execute_im_run(
     extras = build_im_readonly_extras(engine, lease.scope_id, embedder, _capabilities(settings))
     extra_names = tuple(tool.name for tool in extras)
     tools = im_safe_tools(environment) + extras
-    agent_id, agent_name, persona = await _resolve_agent_profile(identity, record)
-    model = (
-        await admission_model_in_log(event_store, record.session_id, record.id)
-        or settings.default_model
-    )
+    if snapshot is not None:
+        admitted = set(snapshot.restrict_tools(tool.name for tool in tools))
+        tools = [tool for tool in tools if tool.name in admitted]
+        extra_names = tuple(name for name in extra_names if name in admitted)
+    agent_id, agent_name, persona = await _resolve_agent_profile(identity, record, snapshot)
+    if snapshot is not None and snapshot.model:
+        model = snapshot.model
+    else:
+        model = (
+            await admission_model_in_log(event_store, record.session_id, record.id)
+            or settings.default_model
+        )
     agent = build_im_safe_agent(
         scope_id=lease.scope_id,
         model=model,
@@ -319,6 +336,8 @@ async def _execute_im_run(
         persona=persona,
         policy=policy,
         read_only_extra=extra_names,
+        max_iterations=snapshot.max_iterations if snapshot is not None else record.max_iterations,
+        token_budget=snapshot.token_budget if snapshot is not None else record.token_budget,
     )
     final = await execute_run(
         lease=lease,
@@ -429,6 +448,25 @@ async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> st
         current = await run_store.get(run_id)
         return current.status.value if current is not None else "missing"
 
+    try:
+        snapshot = record.snapshot
+    except AgentConfigSnapshotError:
+        # Corrupt/tampered persisted snapshot: never fall back to a live (mutable) Agent
+        # lookup for a run that was supposed to be pinned — fail the run closed instead
+        # (R1B; INVARIANTS.md C8). Terminalize (rather than leaving it claimable forever)
+        # so reconciliation does not livelock retrying an unrecoverable row.
+        logger.error(
+            "run_interactive invalid snapshot run=%s scope=%s (failing closed)", run_id, scope_id
+        )
+        await run_store.terminalize(
+            lease,
+            status=RunStatus.failed,
+            stop_reason="error",
+            error_kind="invalid_snapshot",
+            error_message="persisted Agent configuration snapshot failed integrity validation",
+        )
+        return RunStatus.failed.value
+
     identity: IdentityService | None = ctx.get("identity")
     engine = ctx.get("engine")
     embedder = ctx.get("embedder")
@@ -450,6 +488,7 @@ async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> st
                 identity,
                 engine,
                 embedder,
+                snapshot,
             )
         else:
             # Capability parity with the server web runtime: the same file/shell + memory +
@@ -469,12 +508,19 @@ async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> st
                 caps=_capabilities(settings),
                 connector_actions=connector_actions,
             )
-            agent_id, agent_name, persona = await _resolve_agent_profile(identity, record)
+            if snapshot is not None:
+                admitted = set(snapshot.restrict_tools(tool.name for tool in tools))
+                tools = [tool for tool in tools if tool.name in admitted]
+                extra_names = tuple(name for name in extra_names if name in admitted)
+            agent_id, agent_name, persona = await _resolve_agent_profile(identity, record, snapshot)
             # The model captured at admission (reproducibility) — not the worker's default.
-            model = (
-                await admission_model_in_log(event_store, record.session_id, run_id)
-                or settings.default_model
-            )
+            if snapshot is not None and snapshot.model:
+                model = snapshot.model
+            else:
+                model = (
+                    await admission_model_in_log(event_store, record.session_id, run_id)
+                    or settings.default_model
+                )
             agent = build_interactive_agent(
                 scope_id=lease.scope_id,
                 model=model,
@@ -482,6 +528,10 @@ async def run_interactive(ctx: dict[str, Any], run_id: str, scope_id: str) -> st
                 name=agent_name,
                 persona=persona,
                 extra_tool_names=extra_names,
+                max_iterations=(
+                    snapshot.max_iterations if snapshot is not None else record.max_iterations
+                ),
+                token_budget=snapshot.token_budget if snapshot is not None else record.token_budget,
             )
             final = await execute_run(
                 lease=lease,

@@ -16,7 +16,10 @@ import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot, ResourceGrantSnapshot
+from keel_core.identity import IdentityService
 from keel_core.im_routing import (
+    IM_SAFE_TOOLS,
     ImApprovalCommand,
     ImChannelMapping,
     ImChatKind,
@@ -74,6 +77,7 @@ class ImInbound:
 # (org_id) -> a mapping store bound to that org; (scope_id) -> a DurableRunService for that scope.
 MappingStoreFactory = Callable[[str], ImMappingStore]
 RunServiceFactory = Callable[[ScopeId], DurableRunService]
+SnapshotToolNamesResolver = Callable[[ScopeId], Awaitable[tuple[str, ...]]]
 
 
 @dataclass
@@ -85,6 +89,12 @@ class DurableImIngress:
     run_service_factory: RunServiceFactory
     cloud_mode: bool
     default_model: str = ""
+    # Resolver seam (R1B): resolves the mapped Agent's current name/persona/version + its
+    # active resource grants so the run is snapshotted at admission rather than the worker
+    # deferring that (mutable) profile lookup until execution. ``None`` (in-memory preview
+    # without identity wired) falls back to an id-only snapshot.
+    identity: IdentityService | None = None
+    snapshot_tool_names: SnapshotToolNamesResolver | None = None
     _reject_unknown: Callable[[str], Awaitable[None]] | None = field(default=None)
 
     async def admit(self, inbound: ImInbound) -> str | None:
@@ -121,6 +131,7 @@ class DurableImIngress:
         context = self._context(inbound, mapping)
         actor = mapping.run_as_user_id or _IM_SERVICE_ACTOR
         service = self.run_service_factory(resolved.scope_id)
+        snapshot = await self._build_snapshot(resolved.org_id, resolved.agent_id, mapping)
         result = await service.admit(
             org_id=resolved.org_id,
             actor=actor,
@@ -131,6 +142,7 @@ class DurableImIngress:
             idempotency_key=self._idempotency_key(inbound),
             model=self.default_model or None,
             admission_extra=context.to_admission_extra(),
+            snapshot=snapshot,
         )
         logger.info(
             "im ingress admitted provider=%s org=%s agent=%s run=%s",
@@ -140,6 +152,47 @@ class DurableImIngress:
             result.run_id,
         )
         return result.run_id
+
+    async def _build_snapshot(
+        self, org_id: str, agent_id: str, mapping: ImChannelMapping
+    ) -> AgentConfigSnapshot:
+        """Snapshot the mapped Agent's *current* profile + active grants at admission (R1B).
+
+        Unlike the pre-R1B worker, which resolved the Agent's name/persona lazily at claim/
+        execution time (deferring to whatever the Agent looked like *then*), this snapshots it
+        now — at admission — so a later persona/model edit cannot rewrite an already-admitted
+        IM run. The tool-name set is approximated from what admission already knows (the
+        untrusted safe toolset + the mapping's explicitly policy-approved tools); the worker
+        still re-derives its live registry and intersects it with this snapshot
+        (:meth:`AgentConfigSnapshot.restrict_tools`), so authority can only shrink, never grow.
+        """
+        agent_name, agent_version, persona = agent_id, 0, ""
+        resource_grants: tuple[ResourceGrantSnapshot, ...] = ()
+        if self.identity is not None:
+            agent = await self.identity.get_agent_for_admission(org_id, agent_id)
+            if agent is not None:
+                agent_name, agent_version, persona = agent.name, agent.version, agent.persona
+            grants = await self.identity.active_resource_grants(org_id, agent_id)
+            resource_grants = tuple(
+                ResourceGrantSnapshot(g.resource_type, g.resource_id, g.capability.value)
+                for g in grants
+            )
+        if self.snapshot_tool_names is not None:
+            tools = await self.snapshot_tool_names(mapping.scope_id)
+        else:
+            tools = tuple(sorted(set(IM_SAFE_TOOLS) | set(mapping.policy.allow_tools)))
+        return AgentConfigSnapshot(
+            agent_id=agent_id,
+            agent_version=agent_version,
+            agent_name=agent_name,
+            persona=persona,
+            model=self.default_model,
+            max_iterations=20,
+            token_budget=None,
+            permission_profile="im_safe",
+            tools=tools,
+            resource_grants=resource_grants,
+        )
 
     @staticmethod
     def _context(inbound: ImInbound, mapping: ImChannelMapping) -> ImInboundContext:

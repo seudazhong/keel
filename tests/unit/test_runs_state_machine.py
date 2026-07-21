@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot
 from keel_core.runs import (
     TERMINAL_STATUSES,
     InMemoryRunStore,
@@ -42,6 +43,7 @@ async def _admit(store: InMemoryRunStore, *, key: str = "k1", run_id: str = "r1"
         idempotency_key=key,
         budget=RunBudgetSpec(max_iterations=5, token_budget=1000),
         expires_at=_t(3600),
+        snapshot=AgentConfigSnapshot(agent_id="agent1"),
         now=_t(),
     )
 
@@ -89,6 +91,7 @@ async def test_admit_is_idempotent_by_scope_and_key() -> None:
         idempotency_key="dup",
         budget=RunBudgetSpec(),
         expires_at=_t(3600),
+        snapshot=AgentConfigSnapshot(agent_id="agent1"),
         now=_t(1),
     )
     assert again.id == "r1"

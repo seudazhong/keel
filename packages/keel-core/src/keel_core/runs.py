@@ -18,12 +18,18 @@ Load-bearing invariants proven here:
   retrying a user request returns the same run instead of creating a duplicate message/run;
   and admission identity is namespaced by tenant + actor so one caller cannot collide with
   (or hijack) another's run via a shared idempotency key. An immutable ``fingerprint`` binds
-  the admission to its exact org/actor/agent/session/surface/content — a retry that reuses
-  the identity but mismatches the binding is a **conflict**, never a silent repair.
+  the admission to its exact org/actor/agent/session/surface/content/model/Agent-config-snapshot
+  — a retry that reuses the identity but mismatches the binding is a **conflict**, never a
+  silent repair (R1B; see :mod:`keel_core.agent_config_snapshot`).
 * **Idempotent terminalization** — terminalizing an already-terminal run is a no-op that
   returns the authoritative row (fail-safe under retries/races).
 * **Fail-closed transitions** — an illegal or stale-version transition raises rather than
   silently corrupting state.
+* **Durable configuration snapshot (R1B)** — every run persists an immutable, schema-versioned
+  ``AgentConfigSnapshot`` captured at admission (Agent version/name/persona/model/budget/
+  permission profile/tool names/memory policy/resource grants). A worker reconstructs its
+  execution profile from this frozen record, never from the Agent's later-mutated fields
+  (INVARIANTS.md C8).
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ from typing import Any, Protocol, runtime_checkable
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+from keel_core.agent_config_snapshot import AgentConfigSnapshot
 from keel_core.run_dispatch import (
     PostgresRunDispatchOutbox,
     RunDispatchOutbox,
@@ -183,14 +190,17 @@ def admission_fingerprint(
     surface: str,
     content: str,
     model: str | None = None,
+    snapshot_hash: str | None = None,
 ) -> str:
-    """Immutable fingerprint of an admission request (M3.6 blocker 3).
+    """Immutable fingerprint of an admission request (M3.6 blocker 3; R1B snapshot binding).
 
     Covers the full tenant/actor binding, the selected agent, the target session, the
-    surface, the selected model, and a hash of the normalized admission content. Two
-    admissions that share an idempotency identity must present an identical fingerprint; a
-    mismatch is a conflict. Canonical JSON with sorted keys makes the hash stable across
-    equivalent inputs."""
+    surface, the selected model, a hash of the normalized admission content, and — when the
+    caller captured one — the admitted :class:`~keel_core.agent_config_snapshot.
+    AgentConfigSnapshot`'s content hash. Two admissions that share an idempotency identity must
+    present an identical fingerprint; a mismatch (a changed Agent version/persona/model/budget,
+    which all flow into the snapshot hash) is a conflict. Canonical JSON with sorted keys makes
+    the hash stable across equivalent inputs."""
     return _fingerprint(
         org_id=org_id,
         actor=actor,
@@ -200,6 +210,39 @@ def admission_fingerprint(
         content=content,
         model=model,
         include_model=True,
+        snapshot_hash=snapshot_hash,
+        include_snapshot=True,
+    )
+
+
+def pre_snapshot_admission_fingerprint(
+    *,
+    org_id: str,
+    actor: str,
+    agent_id: str,
+    session_id: str,
+    surface: str,
+    content: str,
+    model: str | None = None,
+) -> str:
+    """The *pre-snapshot* (model-aware, no snapshot) admission fingerprint form.
+
+    Runs admitted before the Agent configuration snapshot was folded into the fingerprint
+    (R1B) stored a hash that was model-aware but omitted the snapshot hash entirely. On retry
+    we accept a match against this precise intermediate form so an in-flight run admitted by
+    the immediately-prior binary can still complete idempotently across a rolling deploy,
+    exactly mirroring how :func:`legacy_admission_fingerprint` covers the pre-model form."""
+    return _fingerprint(
+        org_id=org_id,
+        actor=actor,
+        agent_id=agent_id,
+        session_id=session_id,
+        surface=surface,
+        content=content,
+        model=model,
+        include_model=True,
+        snapshot_hash=None,
+        include_snapshot=False,
     )
 
 
@@ -230,6 +273,8 @@ def legacy_admission_fingerprint(
         content=content,
         model=None,
         include_model=False,
+        snapshot_hash=None,
+        include_snapshot=False,
     )
 
 
@@ -243,6 +288,8 @@ def _fingerprint(
     content: str,
     model: str | None,
     include_model: bool,
+    snapshot_hash: str | None = None,
+    include_snapshot: bool = False,
 ) -> str:
     payload: dict[str, str] = {
         "org_id": org_id,
@@ -256,22 +303,33 @@ def _fingerprint(
     # the two hashes are structurally distinct and never collide across the model boundary.
     if include_model:
         payload["model"] = model or ""
+    # Likewise the snapshot_hash key is present only for the current (R1B) fingerprint form, so
+    # it is structurally distinct from both older forms — a changed Agent version/persona/
+    # model/budget (all folded into the snapshot hash) can never be laundered through an older
+    # compatibility form onto a snapshot-aware row.
+    if include_snapshot:
+        payload["snapshot_hash"] = snapshot_hash or ""
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _fingerprint_matches(stored: str, current: str, legacy: str = "") -> bool:
+def _fingerprint_matches(
+    stored: str, current: str, legacy: str = "", pre_snapshot: str = ""
+) -> bool:
     """Whether a retry's fingerprint is compatible with an existing run's stored one.
 
     An empty ``stored`` or empty ``current`` fingerprint is treated as "unverifiable" and
     accepted (back-compat with rows/callers that never carried a fingerprint). Otherwise the
-    stored hash must equal the current model-aware fingerprint **or** the precise legacy
-    pre-model fingerprint (deployment rollout). Because a model-aware stored hash always
-    encodes the ``model`` field it can never equal ``legacy``, so a changed model can never be
-    laundered through the legacy path onto a new-model row."""
+    stored hash must equal the current snapshot-aware fingerprint, the intermediate model-aware
+    pre-snapshot form (rolling deploy across the R1B boundary), **or** the precise legacy
+    pre-model fingerprint (rolling deploy across the M3.6 boundary). Because each newer form
+    encodes strictly more fields than the last, a changed model or snapshot can never be
+    laundered through an older compatibility form onto a newer row."""
     if not current or not stored:
         return True
     if stored == current:
+        return True
+    if pre_snapshot and stored == pre_snapshot:
         return True
     return bool(legacy) and stored == legacy
 
@@ -352,10 +410,32 @@ class RunRecord:
     # checkpoint exactly; a foreign/older/newer batch fails closed. Empty for pre-checkpoint or
     # never-suspended rows (older-build repair then falls back to attempt + action-hash match).
     checkpoint_batch_id: str = ""
+    # Immutable Agent configuration snapshot captured at admission (R1B, INVARIANTS.md C8):
+    # canonical JSON + its content hash, so a worker reconstructs name/persona/model/bounded
+    # config from this frozen record rather than the Agent's later-mutated fields. Empty
+    # ``snapshot_hash`` marks a row admitted before this feature (or by a caller that never
+    # captured one) — never confused with a real (always non-empty-hashing) captured snapshot.
+    snapshot_schema_version: int = 0
+    snapshot_json: str = ""
+    snapshot_hash: str = ""
 
     @property
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
+
+    @property
+    def snapshot(self) -> AgentConfigSnapshot | None:
+        """The run's admitted :class:`AgentConfigSnapshot`, or ``None`` for a pre-snapshot row.
+
+        Raises :class:`~keel_core.agent_config_snapshot.AgentConfigSnapshotError` if the
+        persisted payload's hash no longer matches its content (tamper/corruption) — a worker
+        must fail closed rather than execute an unverifiable configuration.
+        """
+        if not self.snapshot_hash:
+            return None
+        return AgentConfigSnapshot.from_canonical_json(
+            self.snapshot_json, expected_hash=self.snapshot_hash
+        )
 
     @property
     def budget(self) -> RunBudgetSpec:
@@ -436,8 +516,10 @@ class RunStore(Protocol):
         idempotency_key: str,
         budget: RunBudgetSpec,
         expires_at: datetime,
+        snapshot: AgentConfigSnapshot,
         fingerprint: str = "",
         legacy_fingerprint: str = "",
+        pre_snapshot_fingerprint: str = "",
         now: datetime | None = None,
     ) -> tuple[RunRecord, bool]: ...
 
@@ -454,8 +536,10 @@ class RunStore(Protocol):
         idempotency_key: str,
         budget: RunBudgetSpec,
         expires_at: datetime,
+        snapshot: AgentConfigSnapshot,
         fingerprint: str = "",
         legacy_fingerprint: str = "",
+        pre_snapshot_fingerprint: str = "",
         now: datetime | None = None,
     ) -> RunRecord: ...
 
@@ -601,8 +685,10 @@ class InMemoryRunStore:
         idempotency_key: str,
         budget: RunBudgetSpec,
         expires_at: datetime,
+        snapshot: AgentConfigSnapshot,
         fingerprint: str = "",
         legacy_fingerprint: str = "",
+        pre_snapshot_fingerprint: str = "",
         now: datetime | None = None,
     ) -> tuple[RunRecord, bool]:
         now = now or _now()
@@ -614,9 +700,12 @@ class InMemoryRunStore:
             existing = self._rows[existing_id]
             # A retry that reuses the identity but presents a different immutable fingerprint
             # is a conflict (never repaired with the caller-supplied binding/content). A row
-            # admitted by a pre-model binary matches the precise legacy fingerprint, so an
-            # in-flight legacy run still completes idempotently across a deploy.
-            if not _fingerprint_matches(existing.fingerprint, fingerprint, legacy_fingerprint):
+            # admitted by a pre-model (or pre-snapshot) binary matches the precise compatible
+            # fingerprint form, so an in-flight run still completes idempotently across a
+            # deploy — but a changed Agent version/persona/model/budget/snapshot never does.
+            if not _fingerprint_matches(
+                existing.fingerprint, fingerprint, legacy_fingerprint, pre_snapshot_fingerprint
+            ):
                 raise RunAdmissionConflict(existing_id)
             return existing, False
         record = RunRecord(
@@ -640,6 +729,9 @@ class InMemoryRunStore:
             updated_at=now,
             expires_at=expires_at,
             fingerprint=fingerprint,
+            snapshot_schema_version=snapshot.schema_version,
+            snapshot_json=snapshot.canonical_json(),
+            snapshot_hash=snapshot.content_hash(),
         )
         self._rows[run_id] = record
         self._by_key[key] = run_id
@@ -658,8 +750,10 @@ class InMemoryRunStore:
         idempotency_key: str,
         budget: RunBudgetSpec,
         expires_at: datetime,
+        snapshot: AgentConfigSnapshot,
         fingerprint: str = "",
         legacy_fingerprint: str = "",
+        pre_snapshot_fingerprint: str = "",
         now: datetime | None = None,
     ) -> RunRecord:
         record, _ = await self.create(
@@ -673,8 +767,10 @@ class InMemoryRunStore:
             idempotency_key=idempotency_key,
             budget=budget,
             expires_at=expires_at,
+            snapshot=snapshot,
             fingerprint=fingerprint,
             legacy_fingerprint=legacy_fingerprint,
+            pre_snapshot_fingerprint=pre_snapshot_fingerprint,
             now=now,
         )
         return record
@@ -1083,6 +1179,7 @@ _RUN_COLUMNS = (
     "max_iterations, token_budget, prompt_tokens, completion_tokens, cost_usd, result_ref, "
     "error_kind, error_message, resume_requested, prompt_persisted, iterations, fingerprint, "
     "suspend_checkpoint, checkpoint_attempt, checkpoint_batch_id, "
+    "snapshot_schema_version, snapshot_json, snapshot_hash, "
     "created_at, updated_at, started_at, finished_at, expires_at"
 )
 
@@ -1120,6 +1217,9 @@ def _to_record(row: Mapping[Any, Any]) -> RunRecord:
         suspend_checkpoint=bool(row["suspend_checkpoint"]),
         checkpoint_attempt=row["checkpoint_attempt"],
         checkpoint_batch_id=row["checkpoint_batch_id"],
+        snapshot_schema_version=row["snapshot_schema_version"],
+        snapshot_json=row["snapshot_json"],
+        snapshot_hash=row["snapshot_hash"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         started_at=row["started_at"],
@@ -1362,8 +1462,10 @@ class PostgresRunStore:
         idempotency_key: str,
         budget: RunBudgetSpec,
         expires_at: datetime,
+        snapshot: AgentConfigSnapshot,
         fingerprint: str = "",
         legacy_fingerprint: str = "",
+        pre_snapshot_fingerprint: str = "",
         now: datetime | None = None,
     ) -> tuple[RunRecord, bool]:
         if scope_id != self._scope_id:
@@ -1379,9 +1481,11 @@ class PostgresRunStore:
                         "INSERT INTO runs (id, scope_id, org_id, actor, agent_id, session_id, "
                         "surface, idempotency_key, status, attempt, version, max_iterations, "
                         "token_budget, prompt_tokens, completion_tokens, cost_usd, fingerprint, "
+                        "snapshot_schema_version, snapshot_json, snapshot_hash, "
                         "created_at, updated_at, expires_at) VALUES (:id, :scope, :org, :actor, "
                         ":agent, :session, :surface, :key, 'admitted', 0, 1, :max_it, "
-                        ":tok_budget, :ptok, :ctok, :cost, :fingerprint, :now, :now, :expires) "
+                        ":tok_budget, :ptok, :ctok, :cost, :fingerprint, "
+                        ":snap_version, :snap_json, :snap_hash, :now, :now, :expires) "
                         "ON CONFLICT (scope_id, org_id, actor, idempotency_key) DO NOTHING "
                         "RETURNING id"
                     ),
@@ -1400,6 +1504,9 @@ class PostgresRunStore:
                         "ctok": budget.completion_tokens,
                         "cost": budget.cost_usd,
                         "fingerprint": fingerprint,
+                        "snap_version": snapshot.schema_version,
+                        "snap_json": snapshot.canonical_json(),
+                        "snap_hash": snapshot.content_hash(),
                         "now": now,
                         "expires": expires_at,
                     },
@@ -1428,10 +1535,11 @@ class PostgresRunStore:
         record = _to_record(row)
         # A retry that reuses the identity but mismatches the immutable fingerprint is a
         # conflict — never repaired using the caller-supplied binding/content. A run admitted
-        # by a pre-model binary matches the precise legacy fingerprint, so an in-flight legacy
-        # run still completes idempotently across a deploy without a model change hijacking it.
+        # by a pre-model (or pre-snapshot) binary matches the precise compatible fingerprint
+        # form, so an in-flight run still completes idempotently across a deploy without a
+        # changed model/Agent-config-snapshot hijacking it.
         if not created and not _fingerprint_matches(
-            record.fingerprint, fingerprint, legacy_fingerprint
+            record.fingerprint, fingerprint, legacy_fingerprint, pre_snapshot_fingerprint
         ):
             raise RunAdmissionConflict(record.id)
         return record, created
@@ -1449,8 +1557,10 @@ class PostgresRunStore:
         idempotency_key: str,
         budget: RunBudgetSpec,
         expires_at: datetime,
+        snapshot: AgentConfigSnapshot,
         fingerprint: str = "",
         legacy_fingerprint: str = "",
+        pre_snapshot_fingerprint: str = "",
         now: datetime | None = None,
     ) -> RunRecord:
         record, _ = await self.create(
@@ -1464,8 +1574,10 @@ class PostgresRunStore:
             idempotency_key=idempotency_key,
             budget=budget,
             expires_at=expires_at,
+            snapshot=snapshot,
             fingerprint=fingerprint,
             legacy_fingerprint=legacy_fingerprint,
+            pre_snapshot_fingerprint=pre_snapshot_fingerprint,
             now=now,
         )
         return record
