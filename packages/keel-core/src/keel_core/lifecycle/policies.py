@@ -82,6 +82,7 @@ SCHEDULE = "schedule"
 APPROVAL = "approval"
 JOB = "job"
 RUN = "run"
+PROJECT_STATE = "project_state"
 CODING_ARTIFACT = "coding_artifact"
 TOOL_SPILL = "tool_spill"
 ERASURE_LEDGER = "erasure_ledger"
@@ -109,6 +110,7 @@ DEFAULT_RETENTION: Mapping[str, RetentionPolicy] = {
     APPROVAL: _policy(APPROVAL, RetentionClass.standard),
     JOB: _policy(JOB, RetentionClass.standard),
     RUN: _policy(RUN, RetentionClass.standard),
+    PROJECT_STATE: _policy(PROJECT_STATE, RetentionClass.permanent),
     CODING_ARTIFACT: _policy(CODING_ARTIFACT, RetentionClass.standard),
     TOOL_SPILL: _policy(TOOL_SPILL, RetentionClass.short),
     ERASURE_LEDGER: _policy(ERASURE_LEDGER, RetentionClass.long),

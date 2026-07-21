@@ -8,6 +8,9 @@ explicit ``global_preserved`` / ``external`` decision.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from lifecycle_helpers import SCOPE, FakePurge, RecordingRedis
 
 from keel_core.lifecycle.coordinator import ErasureCoordinator, UnsupportedExternalStep
@@ -40,13 +43,19 @@ _ENTRY_TO_STEP = {
     "connector_cursors": "connector_state",
     "connector_deliveries": "connector_state",
     "connector_outbox": "connector_outbox",
+    "connector_active_scopes": "connector_state",
+    "connector_webhook_routes": "connector_state",
     "oauth_states": "oauth_states",
     "schedules": "schedules",
     "approvals": "approvals",
     "jobs": "jobs",
     "runs": "runs",
     "run_control": "runs",
+    "run_dispatch_outbox": "runs",
+    "job_dispatch_outbox": "jobs",
     "im_reply_intents": "im_routing",
+    "im_route_index": "im_routing",
+    "im_reply_dispatch_index": "im_routing",
     "coding_artifacts": "coding_artifacts",
     "tool_spill": "tool_spill",
     "redis_event_streams": "redis_streams",
@@ -64,6 +73,22 @@ def test_every_data_map_entry_has_a_resolvable_retention_policy() -> None:
         assert entry.resource_class in DEFAULT_RETENTION, entry.name
         # The convenience property must resolve (would KeyError on an unknown class).
         assert entry.retention.resource_class == entry.resource_class
+
+
+def test_every_migration_table_is_classified_exactly_once() -> None:
+    migration_root = Path(__file__).parents[2] / "migrations" / "versions"
+    create_table = re.compile(
+        r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"`]?"
+        r"([a-zA-Z_][a-zA-Z0-9_]*)",
+        re.IGNORECASE,
+    )
+    migration_tables: set[str] = set()
+    for migration in migration_root.glob("*.py"):
+        migration_tables.update(create_table.findall(migration.read_text(encoding="utf-8-sig")))
+
+    mapped_tables = [entry.name for entry in DATA_MAP if entry.kind == "table"]
+    assert len(mapped_tables) == len(set(mapped_tables)), "duplicate data-map table"
+    assert set(mapped_tables) == migration_tables
 
 
 def test_data_map_treatments_partition_erasable_from_preserved() -> None:

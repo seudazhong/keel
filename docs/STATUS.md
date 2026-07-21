@@ -51,7 +51,7 @@ production operations remain incomplete.
 | Identity, organizations, Agents, grants | yes | yes | yes | partial | Backend and preview UI exist; no browser OIDC flow, Agent-access/session-visibility model, enforced one-org policy, or complete admin journey. Persisted Agent definition is still thin. |
 | Per-user Keel Mailboxes | no | no | no | no | AgentMail and the Primary/Purpose mailbox UX are designed in ADR-0012/0013, but provisioning, inbound mail, drafts, notifications, and UI are not implemented. |
 | User ToDos and reminders | no | no | no | no | ADR-0012/0013 define ownership, UI, proposals, and Agent tools; no API, tools, persistence, reminders, or React surface exist. |
-| Event evolution and data lifecycle | yes | yes | yes | partial | Upcasters, rebuild checkpoints/tombstones, retention classes, durable erasure, and identity purge exist. The data map does not yet classify every table added by later dispatch/patch slices. |
+| Event evolution and data lifecycle | yes | yes | yes | partial | Upcasters, rebuild checkpoints/tombstones, retention classes, durable erasure, identity purge, and complete migration-table classification exist. Product administration and external-provider erasure remain partial. |
 | Connector framework | yes | yes | yes | partial | Manifest discovery, encrypted credentials, routed webhooks, recurring sync, provenance, taint, and durable actions exist. Provider maturity and setup UX differ. |
 | Gmail | yes | yes | yes | partial | Mail read and approval-gated send exist. The connected personal-Agent journey still needs common release qualification. |
 | Google Calendar | yes | yes | yes | partial | Read/sync/create/update exist with incremental OAuth and approval. It has less product history than Gmail and needs its own end-to-end qualification. |
@@ -98,11 +98,9 @@ Review results do not yet have a React surface.
 5. **Product cohesion:** review is headless; patch has no API/UI; team/IM administration is absent.
 6. **Personal task and communication:** there is no per-user Keel Mailbox, verified notification
    endpoint, durable Notification model, or user ToDo surface.
-7. **Lifecycle coverage:** newer dispatch/index and patch tables rely partly on foreign-key cascade
-   but are not all explicitly classified in the lifecycle data map.
-8. **Execution:** standard sandbox supports isolated file operations only, not safe build/test or
+7. **Execution:** standard sandbox supports isolated file operations only, not safe build/test or
    general coding-agent command execution.
-9. **Production:** no separate scheduler, trusted effect/capability worker pools, complete
+8. **Production:** no separate scheduler, trusted effect/capability worker pools, complete
    OTel/metrics/SLOs,
    proven horizontal topology, or tested backup/restore/DR.
 

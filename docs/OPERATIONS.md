@@ -157,9 +157,9 @@ Scope/session/project erasure runs as durable background work. User/organization
 uses the dedicated maintenance CLI and database principal described in
 [Identity](./IDENTITY.md).
 
-The lifecycle data map predates several global dispatch/index and patch tables. Some newer rows are
-removed by foreign-key cascade, but the claim that every persisted store is explicitly classified
-is not yet true. Audit and extend the map before a production erasure claim.
+The lifecycle data map classifies every migration-created application table, including global
+dispatch indices and patch stores that are removed by foreign-key cascade. CI compares migration
+DDL with the map, so a new table cannot merge without an explicit retention and erasure decision.
 
 Never run destructive tests against the normal `keel` database. Use dedicated `keel_test` and
 `keel_eval` databases.
