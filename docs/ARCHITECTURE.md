@@ -327,7 +327,17 @@ The target generalizes binary taint into an influence envelope containing origin
 sensitivity, trust, and provenance. Conservative rule: if untrusted content influences an external
 effect, the effect requires the configured human decision.
 
+### 7.3 Rate limiting
+
+**Current:** IM gateways have per-key sliding-window limits and provider clients handle upstream
+rate-limit responses, but there is no unified provider-credential/session/chat limiter.
+
+**Target:** Redis-backed token buckets bound provider credentials, sessions, and chat/channel keys,
+with upstream `Retry-After` reconciliation and observable denial/backoff.
+
 ## 8. Memory and Knowledge
+
+Detailed current contracts are in [Memory](./MEMORY.md) and [Knowledge](./KNOWLEDGE.md).
 
 These are separate data classes:
 
@@ -340,7 +350,9 @@ These are separate data classes:
 
 Current interactive registration places memory mutation tools in the explicitly allowed extra-tool
 set. The target disables direct model mutation for normal product Agents and uses proposal-first
-learning by default.
+learning by default. Current consolidation also reads all non-internal sessions in a scope and
+auto-commits high-confidence archival facts; [Memory](./MEMORY.md) records the required trust and
+proposal correction.
 
 Knowledge collections pin embedding model and dimension. A model change is an explicit re-embed
 operation, never silent cross-model vector search.

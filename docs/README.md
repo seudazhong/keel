@@ -18,6 +18,14 @@ When documents conflict about the present, **Status wins**. When they conflict a
 sequencing, **Roadmap wins**. ADRs explain why a decision was made; they do not prove that it is
 implemented.
 
+## Suggested reading paths
+
+- **Five-minute state:** Status -> Roadmap.
+- **Product/design:** PRD -> Architecture -> relevant ADR.
+- **Run the preview:** Operations -> Usage or Demo.
+- **Implement a subsystem:** its subsystem reference -> code/tests; use History only when original
+  rationale is needed.
+
 ## Practical guides
 
 | Guide | Purpose |
@@ -44,16 +52,18 @@ Repository-specific guides:
 | [Read-only code review](./CODE-REVIEW.md) | Durable review request, evidence verification, artifacts, and API. |
 | [Controlled patch proposals](./PATCHES.md) | Implemented patch backend, approval/writeback lifecycle, and missing product surfaces. |
 | [Connector providers](./connectors/README.md) | Shared connector contract and provider-specific setup/reference docs. |
+| [Memory and recall](./MEMORY.md) | Session recall, core/archival memory, consolidation, proposals, and evals. |
+| [Knowledge Base](./KNOWLEDGE.md) | Document lifecycle, chunking, retrieval, citations, taint, and evals. |
 | [Data lifecycle](./DATA-LIFECYCLE.md) | Retention, erasure, data map, and anti-resurrection behavior. |
 | [Event and API versioning](./EVENT-VERSIONING.md) | Event upcasting and additive `/v1` compatibility. |
 
 ## Historical and supporting material
 
+- [Historical documentation](./HISTORY.md) indexes removed plans, designs, and mockups and explains
+  how to retrieve them from Git.
 - [`IMPLEMENTATION-PLAN.md`](./IMPLEMENTATION-PLAN.md) and
-  [`DESIGN-REVIEW.md`](./DESIGN-REVIEW.md) preserve the original plan and review.
-- [`designs/`](./designs/) and [`plans/`](./plans/) are dated snapshots, not an active backlog.
-- [`diagrams/`](./diagrams/) visualize target and current concepts; Architecture owns fidelity.
-- [`mockups/`](./mockups/) are historical UX exploration, not the shipped React UI.
+  [`DESIGN-REVIEW.md`](./DESIGN-REVIEW.md) are short compatibility summaries.
+- [`diagrams/`](./diagrams/) contains the maintained architecture diagrams.
 
 ## Maintenance rules
 
@@ -63,7 +73,7 @@ Repository-specific guides:
 2. Roadmap contains future outcomes and exit gates, not a second status ledger.
 3. Architecture separates **current implementation** from **target contract** explicitly.
 4. A changed decision gets a new ADR that names what it supersedes.
-5. Dated designs and plans remain historical; do not continuously rewrite them to look current.
+5. Superseded implementation plans/designs live in Git history, not the current documentation tree.
 6. Every local Markdown path and anchor must pass:
 
 ```powershell

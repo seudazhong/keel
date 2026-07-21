@@ -3,7 +3,7 @@
 # No shipped Deployment in this scaffold mounts this PVC, and no current application code
 # (`packages/keel-core/src/keel_core/config.py`) has any Git-storage or object-storage
 # setting — the "managed code projects" Git-storage design
-# (`docs/designs/2026-07-16-managed-code-projects-and-coding-agents-design.md` §2.3) is not
+# (see `docs/PROJECTS.md`) is not
 # implemented yet. Shipping this as an active, applied resource would create a volume nothing
 # ever reads or writes: a nonfunctional claim of capability that does not exist. Promote it
 # back into ../kustomization.yaml (and wire an actual `volumeMounts` entry on the service that

@@ -46,7 +46,7 @@ production operations remain incomplete.
 |---|:--:|:--:|:--:|:--:|---|
 | Durable chat/session/run pipeline | yes | yes | yes | partial | Worker-owned admission, replayable events, interrupt/steer/approval, and recovery exist. Product use is still preview-oriented. |
 | Jobs, schedules, approvals, outboxes | yes | yes | yes | partial | Durable jobs and approvals are strong. Schedules still use legacy hard-coded agent behavior and zero-or-one trigger delivery. |
-| Memory and session recall | yes | yes | yes | partial | Core/archival memory, search, consolidation, proposals, and UI exist. Interactive model tools can currently mutate memory directly; proposal-first is not yet enforced. |
+| Memory and session recall | yes | yes | yes | partial | Core/archival memory, search, consolidation, proposals, and UI exist. Interactive tools mutate directly; consolidation reads scope-wide sessions and auto-commits high-confidence archival facts. |
 | Knowledge Base | yes | yes | yes | partial | Lifecycle, chunking, hybrid retrieval, citations, taint, connector ingest, and React management/search are present. |
 | Identity, organizations, Agents, grants | yes | yes | yes | partial | Backend and preview UI exist; no browser OIDC flow, Agent-access/session-visibility model, enforced one-org policy, or complete admin journey. Persisted Agent definition is still thin. |
 | Event evolution and data lifecycle | yes | yes | yes | partial | Upcasters, rebuild checkpoints/tombstones, retention classes, durable erasure, and identity purge exist. The data map does not yet classify every table added by later dispatch/patch slices. |
@@ -88,7 +88,8 @@ Review results do not yet have a React surface.
 2. **Domain completeness:** Agent definitions are not yet the versioned home for model, tools,
    resources, memory policy, budgets, and autonomy; Agent Access, Session Visibility, Routine, and
    reusable multi-account Connection concepts are missing.
-3. **Memory authority:** normal interactive Agents can directly call memory mutation tools; the
+3. **Memory authority:** normal interactive Agents can directly call memory mutation tools;
+   consolidation is not surface/trust-aware and auto-commits high-confidence archival facts. The
    proposal-first model is not yet enforced.
 4. **Autonomous-effect correctness:** accepted schedule occurrences may be lost between claim and
    enqueue, and generic connector effects need an explicit ambiguous/unknown reconciliation state.

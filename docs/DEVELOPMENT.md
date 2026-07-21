@@ -48,7 +48,7 @@ built Compose `keel-web` bundle directly (see [Demo guide](./DEMO.md)).
 ### Playwright demo smoke
 
 A read-only Playwright smoke covers the documented walkthrough (see
-[Demo guide](./DEMO.md#9-automated-browser-smoke)). It targets the Compose React
+[Demo guide](./DEMO.md)). It targets the Compose React
 surface on `http://127.0.0.1:3000` by default and requires an already-running stack — it does
 not start/stop Compose or delete volumes:
 
@@ -65,18 +65,12 @@ fails fast with an actionable error if the target is unreachable or is a stale b
 
 ## Local services
 
-The Compose `dev` profile runs a **real, authenticated sandbox execution boundary**: a
-one-shot `keel-secret-init` generates a random ≥32-byte RPC secret into a dedicated volume
-(never in source/YAML/logs), and server/worker use the fail-closed `sandbox` backend to send
-every file/shell tool call over an internal-only RPC network to the hardened `keel-sandbox`
-executor (non-root, read-only rootfs, dropped caps, no egress, no credentials). Shell stays
-disabled (file tools work, isolated per scope); it is a trusted single-org dev deployment, not
-a microVM/multi-tenant boundary. Pass `-f docker-compose.yml` so a local override cannot change
-that contract.
+Start and interpret the trusted Compose profile through
+[Operations](./OPERATIONS.md#1-supported-current-profile). Development commonly needs:
 
 ```powershell
 docker compose -f docker-compose.yml --profile dev up -d --build
-Invoke-RestMethod http://localhost:8000/readiness   # checks.sandbox == "ok" (probed RPC)
+Invoke-RestMethod http://localhost:8000/readiness
 docker compose logs --tail 100 keel-server keel-worker
 ```
 
@@ -88,7 +82,8 @@ subprocess behavior is better exercised in Linux containers.
 - Current truth belongs only in `STATUS.md`; future sequencing belongs only in `ROADMAP.md`.
 - Architecture must label current implementation and target contracts explicitly.
 - PRD defines product requirements, not implementation status.
-- A changed decision gets a new ADR; dated `designs/` and `plans/` remain historical.
+- A changed decision gets a new ADR; superseded implementation detail is retrieved through
+  [`HISTORY.md`](./HISTORY.md), not kept as a parallel documentation tree.
 - Check local paths, heading anchors, and whitespace before committing:
 
 ```powershell

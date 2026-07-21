@@ -197,7 +197,7 @@ Do not claim the single-organization production profile until:
 - browser OIDC and explicit administration replace preview auth;
 - all runtime paths require explicit permission policy;
 - accepted Routine occurrences and ambiguous effects recover correctly;
-- **Target:** capability-specific workers and a separate scheduler are deployed;
+- capability-specific workers and a separate scheduler are deployed;
 - every enabled command workload uses qualified per-run isolation;
 - traces, metrics, SLOs, alerts, cost reconciliation, backup/restore, and DR are proven;
 - two-user/private-team adversarial isolation suites pass.

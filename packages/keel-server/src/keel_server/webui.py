@@ -151,7 +151,7 @@ input.addEventListener("keydown", (e) => { if (e.key === "Enter") send(); });
 """
 
 
-# --- Approvals page (server-rendered; realizes docs/mockups/slice-preview.html) -------
+# --- Legacy server-rendered approvals page --------------------------------------------
 
 pages_router = APIRouter()
 

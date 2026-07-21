@@ -63,7 +63,9 @@ change, but R2 cannot close until both gates pass.
 
 - real Compose Playwright coverage for the journeys;
 - preview labels and unsupported states are explicit;
-- direct model memory writes are disabled for the normal product profile and become proposals.
+- direct model memory writes are disabled for the normal product profile and become proposals;
+- consolidation admits only eligible trusted sources, and learned core/archival changes are
+  proposal-first by default.
 
 ### R1B — Correctness and domain foundation
 

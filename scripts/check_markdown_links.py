@@ -37,7 +37,7 @@ def markdown_files() -> list[Path]:
         text=True,
         check=True,
     )
-    return [ROOT / line for line in result.stdout.splitlines() if line]
+    return [path for line in result.stdout.splitlines() if line and (path := ROOT / line).exists()]
 
 
 def strip_code(text: str) -> str:

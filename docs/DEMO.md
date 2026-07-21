@@ -1,59 +1,30 @@
 # Keel trusted-preview demo
 
-This walkthrough demonstrates current product value without implying browser multi-user,
-production, shell, review-UI, or patch-UI readiness.
+This walkthrough assumes the Compose preview is already healthy. Use
+[Operations](./OPERATIONS.md) to start and diagnose the stack.
 
-## Prerequisites
+Open `http://localhost:3000/` and choose local preview only on a trusted machine.
 
-- Docker Desktop;
-- a configured chat-capable model/provider;
-- optional connector credentials;
-- ports `3000`, `8000`, `5432`, and `6379`.
+## 1. Durable chat and resume
 
-## 1. Start and verify
-
-```powershell
-Set-Location C:\src\keel
-docker compose -f docker-compose.yml --profile dev up -d --build
-docker compose -f docker-compose.yml --profile dev ps
-Invoke-RestMethod http://localhost:8000/readiness | ConvertTo-Json -Depth 6
-```
-
-Expected: `ready=true`, least-privilege runtime DB principal, shared run substrate/queue, Knowledge
-dispatch, and sandbox all healthy.
-
-## 2. Enter the React preview
-
-```powershell
-Start-Process http://localhost:3000/
-```
-
-Choose local preview only on a trusted machine. The sidebar should expose Chat, Sessions, Memory,
-Knowledge, Projects, Agents, Connectors, Approvals, Schedules, Observability, and Jobs.
-
-Projects and Agents are explicitly labeled Preview.
-
-## 3. Demonstrate durable chat and resume
-
-1. Start a chat with:
-   **"Describe Keel in two sentences. Do not call tools."**
+1. Start a chat with: **"Describe Keel in two sentences. Do not call tools."**
 2. Navigate to Sessions.
-3. Open the session and resume it.
-4. Return to Chat and confirm the route/session identity remains stable.
+3. Reopen the session and continue it.
+4. Confirm the route/session identity remains stable.
 
-The purpose is to show durable admission, replayable history, and worker-owned execution.
+This demonstrates durable admission, replayable history, and worker-owned execution.
 
-## 4. Demonstrate Memory and Knowledge
+## 2. Memory and Knowledge
 
 ### Memory
 
-- Open Memory.
-- Inspect current blocks and any consolidation proposals.
-- Explain that model-learned changes should become proposal-first as the product model is tightened.
+- inspect current blocks and consolidation proposals;
+- distinguish user-managed memory from model-proposed learning;
+- state that direct model mutation remains a known preview limitation.
 
 ### Knowledge
 
-On an empty local stack, seed deterministic demo content:
+If the stack has no demo content:
 
 ```powershell
 $env:KEEL_APP_ENV = "dev"
@@ -61,94 +32,60 @@ uv run python scripts/seed_demo_data.py --dry-run
 uv run python scripts/seed_demo_data.py --yes
 ```
 
-Then:
+Open Knowledge, inspect a document, run search, and show its citation/source metadata.
 
-- open Knowledge;
-- inspect the demo Knowledge Base/document;
-- run a search and show citation/source metadata.
+## 3. Connections
 
-## 5. Demonstrate Connections
+Show:
 
-Open Connectors and show:
-
-- manifest-driven provider catalog;
-- connected/setup states;
+- provider catalog and connected/setup state;
 - selected resources and targets;
 - health/sync/disconnect controls;
-- the warning that external content is tainted and outbound actions require approval.
+- taint and approval messaging.
 
-If Gmail or Calendar is already connected, ask a read-only question such as:
+If Gmail or Calendar is already connected, use a read-only prompt such as:
 
 ```text
 List the next few calendar events and cite the connected source. Do not create or update anything.
 ```
 
-Do not configure new provider secrets during a short demo.
+Do not configure secrets or perform outbound effects during a short demo.
 
-## 6. Demonstrate Agents and Projects
+## 4. Agents and Projects
 
 ### Agents
 
-- Show persisted Agent records and selection.
-- State honestly that full model/tool/resource/memory/budget configuration is not yet represented
-  in the Agent record.
+- show persisted Agent records and selection;
+- explain that complete model/tool/resource/memory/budget configuration is still roadmap work.
 
 ### Projects
 
-- Show the Project list/import flow.
-- If a GitHub App installation is already configured, import a disposable repository.
-- Explain that read-only review exists through the API but has no React page.
-- Explain that controlled patch workers exist but no public Patch API/UI ships.
+- show Project list/import;
+- use only a disposable repository when GitHub is already configured;
+- explain that review is API-only and Patch has no public API/UI.
 
-## 7. Demonstrate operational truth
+## 5. Operational truth
 
-Open:
+Open Jobs, Approvals, Schedules, and Observability. Show status and feedback without resolving
+unknown approvals, running unfamiliar schedules, cancelling valuable jobs, revoking Connections, or
+deleting data.
 
-- Jobs;
-- Approvals;
-- Schedules;
-- Observability.
+The live API contract is at `http://localhost:8000/docs`.
 
-Show status and feedback only. Do not approve unknown actions, run unfamiliar schedules, cancel
-valuable jobs, revoke Connections, or delete data.
+## Automated smoke
 
-## 8. Optional API evidence
+The read-only browser smoke is documented in [Development](./DEVELOPMENT.md). It must not send mail,
+create calendar effects, run destructive schedules, or delete data.
 
-```powershell
-Invoke-RestMethod http://localhost:8000/v1/sessions
-Invoke-RestMethod http://localhost:8000/v1/jobs
-Invoke-RestMethod http://localhost:8000/v1/knowledge-bases
-Invoke-RestMethod http://localhost:8000/v1/connectors
-Invoke-RestMethod http://localhost:8000/v1/projects
-```
-
-The live `/docs` exposes the complete current API, including identity, IM routing, lifecycle, and
-read-only review.
-
-## 9. Automated browser smoke
-
-Against an already-running stack:
-
-```powershell
-Set-Location C:\src\keel\web
-npm ci
-npm run test:e2e:install
-npm run test:e2e
-```
-
-The smoke must not send mail, create calendar effects, resolve unknown approvals, run destructive
-schedules, or delete data.
-
-## Demo boundaries
+## Boundaries
 
 Do not claim:
 
-- browser OIDC login;
-- completed multi-user/team administration;
+- browser OIDC login or finished multi-user/team administration;
 - production or hostile multi-tenant readiness;
 - shell/build/test isolation;
 - review or patch React workflows;
 - full OTel/SLO/DR.
 
-The demo is successful when it shows one coherent trusted-preview Agent experience and makes every
-remaining boundary explicit.
+A successful demo shows one coherent trusted-preview Agent journey and names every remaining
+boundary.
