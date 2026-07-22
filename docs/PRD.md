@@ -154,7 +154,7 @@ A Routine may narrow an Agent's granted resources/actions but may never expand t
 | ID | Requirement | Priority |
 |---|---|---|
 | DATA-1 | Durable session history and lexical/semantic recall. | P0 |
-| DATA-2 | User-managed core/profile memory with version history; model learning is proposal-first with provenance. | P0 |
+| DATA-2 | User-managed core/profile memory with version history; model learning uses an explicit, provenance-preserving policy selected from measured product evidence. | P0 |
 | DATA-3 | Knowledge ingest/version/delete/search with citations, taint, and embedding pinning. | P0 |
 | DATA-4 | Event upcasters and tombstone-aware projection rebuilds. | P0 |
 | DATA-5 | Audited retention and erasure across owned stores; external gaps are reported honestly. | P0 |

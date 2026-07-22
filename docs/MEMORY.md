@@ -1,8 +1,8 @@
 # Memory and recall
 
 > **Status:** Living subsystem reference
-> **Product gap:** normal interactive Agents can still mutate memory directly; proposal-first
-> learning is the target default
+> **Product policy:** current direct mutation and consolidation behavior remains in place.
+> Proposal-first learning is a deferred option pending comparative product evidence.
 
 Keel separates durable conversation history, small Agent memory, archival passages, learned-memory
 proposals, and temporary run state.
@@ -24,8 +24,8 @@ Knowledge documents are separate; see [Knowledge](./KNOWLEDGE.md).
 Core memory is a set of labeled, bounded blocks with optimistic versions and history. Current tools
 can append, replace, or rethink a block.
 
-The React Memory page exposes blocks and consolidation proposals. The target product keeps
-user-authored edits direct but makes model-learned changes proposal-first.
+The React Memory page exposes blocks and consolidation proposals. Keel currently supports direct
+governed mutation as well as proposals; R1 does not change the default.
 
 ## Session recall
 
@@ -45,8 +45,8 @@ Archival passages are scope-bound text plus embedding metadata. Search refuses i
 embedding model/dimension combinations. Changing the embedding model requires an explicit re-embed
 operation.
 
-Current interactive Agents can insert archival passages directly. The target applies the same
-proposal/provenance policy used for learned core memory.
+Current interactive Agents can insert archival passages directly. A proposal-only policy may be
+evaluated later, but is not assumed to be superior without product evidence.
 
 ## Consolidation
 

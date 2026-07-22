@@ -420,11 +420,12 @@ async def create_message(
     engine = getattr(request.app.state, "engine", None)
     if engine is not None:
         owner_user_id = auth.actor.user_id if auth.is_user else None
+        session_org_id = None if auth.scope_id == LOCAL_PREVIEW_SCOPE else auth.org_id
         await ensure_session_identity(
             engine,
             auth.scope_id,
             session_id,
-            org_id=auth.org_id,
+            org_id=session_org_id,
             owner_user_id=owner_user_id,
             visibility=(
                 SessionVisibility.private

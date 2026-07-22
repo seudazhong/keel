@@ -165,8 +165,9 @@ Under `/v1`:
 - session visibility read/update (`/v1/sessions/{id}/visibility`);
 - session explicit-share list/create/revoke (`/v1/sessions/{id}/shares`).
 
-The React Agents page consumes the Agent APIs, but membership/grant/Agent-Access/session-visibility
-administration UI remains incomplete (API-only).
+Agent, membership, grant, Agent-Access, and session-visibility administration remain API-only. The
+incomplete Agents preview page was removed from the shipped R1 product navigation; legacy
+`/agents` links redirect to Chat.
 
 ## Identity erasure
 

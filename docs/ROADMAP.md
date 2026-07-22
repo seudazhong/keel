@@ -1,6 +1,6 @@
 # Keel roadmap
 
-> **Updated:** 2026-07-21
+> **Updated:** 2026-07-22
 > **Authority:** Active outcome sequence
 > **Baseline:** [Status](./STATUS.md)
 
@@ -13,8 +13,8 @@ usable product scenario.
 - The connected personal/team Agent product is the mainline.
 - Controlled code review/patching is an optional capability track, not a prerequisite for the
   personal assistant.
-- Visible vertical slices are delivered early, but correctness gates for authority, accepted
-  occurrences, and external effects are not postponed.
+- Visible vertical slices are delivered early. Authority and external-effect correctness are
+  load-bearing; Schedule occurrence hardening is explicitly deferred and documented.
 - Platform browser OIDC is deferred until the multi-user release; connector-specific OAuth ships
   with the connector that needs it.
 - Do not add net-new provider breadth before Gmail and Google Calendar pass the common Connection
@@ -44,73 +44,38 @@ roadmap.
 
 ## R1 — Preview convergence
 
-**Status:** next mainline release.
+**Status:** complete for the narrowed trusted-preview scope.
 
-R1 has two independently shippable gates. Visible-value work does not wait for every internal model
-change, but R2 cannot close until both gates pass.
+R1 deliberately closed on the existing product rather than adding new autonomy or account models.
+It removed an incomplete product surface and retained the proven backend safety work already merged.
 
 ### R1A — Visible assistant coherence
 
-**Goal:** make the existing local/single-operator assistant one dependable product.
+**Outcome:** one honest local/single-operator preview with no shipped Agent-management tab.
 
-**Journeys:**
+**Exit evidence:**
 
-- create/select an Agent, chat, leave and resume the same session;
-- use Memory and Knowledge with clear provenance and feedback;
-- connect Gmail/Calendar and prove the Agent can use the granted resources;
-- run the current automation flow and observe admitted, running, approval, effect, and terminal
-  feedback;
-- no dead controls or generic errors on the main paths.
-
-**Exit gates:**
-
-- real Compose Playwright coverage for the journeys;
-- preview labels and unsupported states are explicit;
-- direct model memory writes are disabled for the normal product profile and become proposals;
-- consolidation admits only eligible trusted sources, and learned core/archival changes are
-  proposal-first by default.
+- durable Chat/Session resume already works and was manually verified by the owner;
+- the incomplete Agents navigation item and product page are removed; legacy `/agents` links redirect
+  to Chat;
+- the current Chat, Sessions, Memory, Knowledge, Connectors, Projects, Approvals, Schedules, Jobs,
+  Observability, and Settings routes pass a real Compose browser smoke;
+- current Memory, connector, and Schedule behavior is retained rather than changed without product
+  evidence.
 
 ### R1B — Correctness and domain foundation
 
-**Goal:** close the design gaps that would make autonomy or sharing unsafe.
+**Outcome:** the merged safety foundation includes explicit fail-closed permissions, immutable Agent
+configuration snapshots, Agent Access and Session Visibility, durable Effects with `unknown`
+reconciliation, and complete lifecycle classification.
 
-- require an explicit runtime permission policy; remove omitted-policy allow-all behavior;
-- define a versioned Agent configuration snapshot used at run admission;
-- define Agent Access and Session Visibility — **done**: a first-class `agent_access` edge
-  (discover/use/manage) gates team-Agent discovery/use (bare org membership no longer suffices),
-  and every session additively records ownership/channel identity + a `private`/`agent_members`/
-  `explicit` visibility policy enforced independent of the selected Agent's scope
-  (`keel_core.identity.authz`, `keel_core.session_visibility`, migration `0025`). Admin UI for
-  granting/revoking access and managing visibility/shares is not built (API-only);
-- introduce first-class Routine and accepted-occurrence/outbox semantics;
-- introduce durable Effect states including `unknown` plus provider reconciliation — **done**: a
-  generic Effect ledger (`reserved -> executing -> {confirmed, unknown, failed}`, `unknown` leaving
-  only through provider reconciliation) now backs every outbound connector action with an
-  idempotency key (`keel_core.effects`/`keel_core.effect_store`, migration `0026_effect_ledger`),
-  with a fenced single-winner execution lease, a worker-cron cross-scope reconciler
-  (`keel_worker.effects_reconciliation`), and a read/manual-reconcile/retry-eligibility API+SDK
-  surface (`/v1/effects`). Reconciliation capability exists for Gmail send and Google Calendar
-  create/update only; every other connector's `unknown` Effects surface via the API rather than
-  reconciling automatically — that provider-capability gap remains open, as does a React
-  effect-history surface;
-- define user/organization-owned multi-account Connections and resource grants instead of one
-  connector binding per Agent scope; Routine policy may only attenuate Agent grants;
-- enumerate and classify every persisted table/index/artifact in lifecycle and erasure policy,
-  including dispatch and patch stores added after the original data-map slice.
+### Explicitly deferred from R1
 
-**Exit gates:**
-
-- crash tests prove no lost accepted Routine occurrence and no blind retry of an unknown effect —
-  **done for the generic Effect ledger** (`tests/unit/test_effect_store.py`,
-  `tests/integration/test_effect_store_postgres.py`: crash-after-provider-success-before-confirm
-  recovers to `unknown`, and `begin_execution` refuses while `unknown`). Routine's own
-  accepted-occurrence-outbox equivalent (C3) remains open;
-- all runtime construction paths are fail-closed;
-- authorization tests cover Agent discovery, session visibility, and resource use separately —
-  **done for Agent discovery/use/manage tiers and session ownership/visibility**
-  (`tests/integration/test_r1b_agent_access_session_visibility.py`,
-  `tests/unit/test_identity_authz.py`, `tests/unit/test_session_visibility.py`); Routine coverage
-  remains open.
+- first-class Routine, accepted-occurrence/outbox, and Scheduler/reconciler hardening;
+- user/organization-owned multi-account Connections (moves to R2);
+- proposal-first Memory, citation UI, and detailed run/effect status UI pending product evidence;
+- Gmail/Calendar product qualification beyond their existing preview behavior;
+- browser Agent administration; backend Agent identity and authorization remain internal/API-only.
 
 ## R2 — Connected personal Agent
 
@@ -120,8 +85,8 @@ change, but R2 cannot close until both gates pass.
 
 **Deliverables:**
 
-- a complete personal Agent definition: model, persona, tools, Connections/resources, memory
-  policy, budgets, and Routine defaults;
+- a complete personal assistant definition: model, persona, tools, Connections/resources, memory
+  policy, and budgets;
 - one private Primary Keel Mailbox per user plus optional Purpose Mailboxes within quota, a verified
   human delivery endpoint, and safe inbound mail triage that fails closed when
   organization/personal-Agent routing is ambiguous;
@@ -129,16 +94,15 @@ change, but R2 cannot close until both gates pass.
   reminders;
 - durable Notifications, including template-only email delivery to the verified user address;
 - Gmail + Google Calendar as product-supported Connections with common lifecycle/security tests;
-- user-managed memory plus proposal-first learned memory;
-- at least one useful daily/meeting/inbox Routine;
+- user-managed memory with a learning policy selected from measured product evidence;
 - consistent Web approvals and effect history;
 - onboarding that explains stored data, grants, and approval policy.
 
 **Exit scenario:** from an empty preview, one operator configures a personal Agent and Primary Keel
 Mailbox, adds one Purpose Mailbox without cross-routing threads, verifies a delivery address,
 connects Gmail and Calendar, completes a cited read task, creates a ToDo, receives exactly one email
-reminder from the Primary Mailbox, runs a Routine, approves one exact outbound effect, and sees the
-result survive a service restart.
+reminder from the Primary Mailbox, approves one exact outbound effect, and sees the result survive a
+service restart.
 
 **Non-goals:** browser OIDC, team Agents, broad connector catalog.
 
