@@ -85,16 +85,51 @@ occurrence row and zero or one active owner, never silent disappearance.
 An external mutation that may have succeeded before a timeout enters `unknown`, not `failed`.
 Retries are blocked until provider reconciliation proves whether the effect exists.
 
-**Acceptance:** inject success-before-response-loss for email/calendar/comment/PR effects; recovery
-produces one external effect and one confirmed local record.
+**Current status (R1B):** proven at the generic-ledger layer. Every outbound connector action
+with an idempotency key now goes through one typed durable Effect state machine
+(`keel_core.effects`/`keel_core.effect_store`, migration `0026_effect_ledger`): `reserved ->
+executing -> {confirmed, unknown, failed}`; `unknown` leaves only through provider reconciliation
+(`reconciled_confirmed` / `reconciled_absent`, the latter permitting exactly one controlled retry)
+— never directly to `failed`, and its row is never deleted. `begin_execution` is an atomic
+compare-and-set fenced lease, so two concurrent callers (or a retried run) never both execute the
+provider mutation. A crashed owner's execution lease is reaped to `unknown` (never a silent
+pending-retry state) both by a worker-restart best-effort pass and the recurring
+`keel_worker.effects_reconciliation` cron. A provider signals ambiguity explicitly by raising
+`keel_core.connectors.ProviderAmbiguousError` — never inferred from a generic exception — so an
+ordinary validation/auth/pre-send failure still becomes an ordinary, retryable `failed`.
+Reconciliation reconciler capabilities exist today for **Gmail send** (a deterministic
+`Message-ID` + a `rfc822msgid:` search) and **Google Calendar create/update** (the existing
+deterministic event id / request-id marker + a direct lookup); every other current connector has
+no reconciler yet, so an `unknown` Effect from one of those stays `unknown` and is surfaced via
+`/v1/effects` for an operator/user decision rather than guessed at.
+
+**Acceptance:** proven — `tests/unit/test_effects.py`/`test_effect_store.py` (legal/illegal
+transitions, concurrent single winner, crash-after-success-before-confirm, no retry while
+unknown, reconciliation confirms/proves-absent-then-one-retry, cross-scope isolation),
+`tests/integration/test_effect_store_postgres.py` (the same under real Postgres concurrency/RLS +
+migration round-trip), `tests/unit/test_gmail.py`/`test_google_calendar.py` (fake-client
+ambiguous-outcome classification + reconciliation), and
+`tests/unit/test_worker_effects_reconciliation.py` (bounded backoff, incapable-provider posture,
+lease-expiry reaping). Injecting success-before-response-loss for email/calendar effects recovers
+to exactly one external effect and one confirmed local record; the same acceptance for
+comment/PR effects (GitHub) is not yet re-proven against this generic ledger (GitHub's connector
+still uses its own pre-existing search-based idempotent-retry safety net, not yet migrated onto
+`ConnectorTool`'s Effect path — see the connector docs' Effects/reconciliation table).
 
 ### C5 — Approval binds an exact effect
 
 An approval covers an immutable action hash or candidate revision plus actor, Agent, resource,
 budget/policy context, and expiry. Any changed input requires a new approval.
 
-**Current status:** controlled patch writeback implements the strongest form through a bundle hash.
-Connector effects use durable approvals/idempotency but do not yet share one generic effect record.
+**Current status (R1B):** controlled patch writeback implements the strongest form through a
+bundle hash. Connector effects now share one generic Effect record
+(`keel_core.effects.EffectRecord`) keyed by `(scope_id, provider, action_name,
+idempotency_key)`, binding the immutable `action_hash` (`keel_core.runs.action_hash`, the same
+function the approval/suspension path already uses) at reservation — a duplicate logical send
+always resolves to the *same* Effect and a caller that reuses an idempotency key for a different
+action_hash is rejected (`EffectConflictError`), never silently repointed to a new action. The
+confused-deputy/approval gate itself (which action requires `ask`) is unchanged and still
+evaluated before `ConnectorTool` ever reserves an Effect.
 
 ### C6 — Scope is partition, not authority
 

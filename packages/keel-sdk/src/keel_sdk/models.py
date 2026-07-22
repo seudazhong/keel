@@ -378,6 +378,46 @@ class CreateImMappingRequest(BaseModel):
     policy: ImMappingPolicy = ImMappingPolicy()
 
 
+# --- Durable Effect ledger (R1B, C4/C5) — additive DTOs ------------------------------
+
+
+class EffectSummary(BaseModel):
+    """A durable Effect ledger row (an outbound connector mutation attempt).
+
+    ``canonical_args`` is either the call's canonical JSON or a ``sha256:<hex>`` safe
+    digest — never a raw secret."""
+
+    id: str
+    org_id: str
+    agent_id: str
+    actor_id: str
+    run_id: str
+    tool_name: str
+    provider: str
+    resource_id: str
+    action_name: str
+    action_hash: str
+    idempotency_key: str
+    canonical_args: str
+    status: str
+    attempt: int
+    provider_ref: str
+    result: str
+    error: str
+    reconciliation_attempts: int
+    reconciled_at: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class EffectRetryEligibility(BaseModel):
+    """Whether an Effect may be retried now (the API never re-executes it directly)."""
+
+    effect: EffectSummary
+    retryable: bool
+    detail: str
+
+
 class ImMappingSummary(BaseModel):
     """An org-owned durable IM channel mapping (no raw external secrets)."""
 

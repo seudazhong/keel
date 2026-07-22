@@ -46,7 +46,7 @@ from keel_core.connector_repository import InMemoryConnectorRepository
 from keel_core.connector_service import ConnectorChangeSink, ConnectorService
 from keel_core.connectors import ConnectorTool
 from keel_core.digest import digest_permissions, digest_registry
-from keel_core.outbox import InMemoryOutboundStore
+from keel_core.effect_store import InMemoryEffectStore
 from keel_core.protocols import ToolContext
 from keel_core.secrets import EnvelopeCipher
 from keel_core.tokens import InMemoryTokenStore
@@ -640,7 +640,7 @@ async def test_outbound_approval_idempotency_and_provider_reconciliation(
             "scope:github",
             repository,
             credential_store=raw,
-            idempotency_store=InMemoryOutboundStore(),
+            effect_store=InMemoryEffectStore(),
         )
     )
     outbound = {
@@ -667,7 +667,7 @@ async def test_outbound_approval_idempotency_and_provider_reconciliation(
 
     tools = digest_registry(
         connector_actions=actions,
-        idempotency_store=InMemoryOutboundStore(),
+        effect_store=InMemoryEffectStore(),
     )
     comment_tool = tools.get("github_comment_create")
     issue_tool = tools.get("github_issue_create")
@@ -769,7 +769,7 @@ async def test_comment_reconciliation_reads_recent_tail_after_more_than_300_comm
     )
     tools = digest_registry(
         connector_actions=actions,
-        idempotency_store=InMemoryOutboundStore(),
+        effect_store=InMemoryEffectStore(),
     )
     comment_tool = tools.get("github_comment_create")
     assert comment_tool is not None

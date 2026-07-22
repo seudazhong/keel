@@ -20,7 +20,8 @@ from keel_core.connector_credentials import ConnectorCredentialStore
 from keel_core.connector_registry import ConnectorRegistry, get_connector_registry
 from keel_core.connector_repository import PostgresConnectorRepository
 from keel_core.connectors import ActionFn, ConnectorActionUserError
-from keel_core.outbox import PostgresOutboundStore
+from keel_core.effect_outbox import PostgresEffectReconciliationOutbox
+from keel_core.effect_store import PostgresEffectStore
 from keel_core.protocols import ToolContext
 from keel_core.secrets import SecretsError, keyring_from_settings
 from keel_core.tokens import PostgresTokenStore
@@ -117,7 +118,11 @@ async def build_connector_actions(
         repository,
         credential_store=credential_store,
         envelope_credential_store=envelope_credential_store,
-        idempotency_store=PostgresOutboundStore(engine) if engine is not None else None,
+        effect_store=(
+            PostgresEffectStore(engine, PostgresEffectReconciliationOutbox(engine))
+            if engine is not None
+            else None
+        ),
     )
     owners = {
         action.name: manifest.id for manifest in registry.manifests() for action in manifest.actions
@@ -142,6 +147,7 @@ async def build_connector_actions(
         ConnectorAction(
             action.manifest,
             _tracked_action(action, owners[action.manifest.name], repository),
+            connector_id=owners[action.manifest.name],
         )
         for action in registry.build_actions(context)
         if owners[action.manifest.name] in active_connector_ids

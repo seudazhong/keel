@@ -130,7 +130,7 @@ async def test_outbound_connector_can_require_idempotency() -> None:
 
 async def test_outbound_idempotency_survives_a_fresh_tool_via_shared_store() -> None:
     """A durable store makes at-most-once hold across tool instances (restart/worker)."""
-    from keel_core.outbox import InMemoryOutboundStore
+    from keel_core.effect_store import InMemoryEffectStore
 
     calls: list[dict[str, object]] = []
 
@@ -138,23 +138,24 @@ async def test_outbound_idempotency_survives_a_fresh_tool_via_shared_store() -> 
         calls.append(args)
         return "sent"
 
-    store = InMemoryOutboundStore()  # stands in for the durable Postgres store
+    store = InMemoryEffectStore()  # stands in for the durable Postgres store
     first = ConnectorTool(
-        name="mail_send", description="", action=send, outbound=True, idempotency_store=store
+        name="mail_send", description="", action=send, outbound=True, effect_store=store
     )
     await first.run({"idempotency_key": "k1", "to": "x"}, _ctx(ContentTaint.clean))
     # A brand-new tool instance sharing the store still replays instead of re-sending.
     second = ConnectorTool(
-        name="mail_send", description="", action=send, outbound=True, idempotency_store=store
+        name="mail_send", description="", action=send, outbound=True, effect_store=store
     )
     result = await second.run({"idempotency_key": "k1", "to": "x"}, _ctx(ContentTaint.clean))
     assert result.output == "sent"
     assert len(calls) == 1
 
 
-async def test_outbound_claim_released_when_action_fails() -> None:
-    """A failed send releases its claim so a later retry can re-send (not stuck)."""
-    from keel_core.outbox import InMemoryOutboundStore
+async def test_outbound_ordinary_failure_marks_effect_failed_and_permits_retry() -> None:
+    """An ordinary (non-ambiguous) failure marks the Effect `failed`; a retry re-executes."""
+    from keel_core.effect_store import InMemoryEffectStore
+    from keel_core.effects import EffectStatus
 
     attempts = {"n": 0}
 
@@ -164,16 +165,144 @@ async def test_outbound_claim_released_when_action_fails() -> None:
             raise RuntimeError("transient")
         return "sent"
 
-    store = InMemoryOutboundStore()
+    store = InMemoryEffectStore()
     tool = ConnectorTool(
-        name="mail_send", description="", action=flaky, outbound=True, idempotency_store=store
+        name="mail_send", description="", action=flaky, outbound=True, effect_store=store
     )
-    try:
+    with pytest.raises(RuntimeError):
         await tool.run({"idempotency_key": "k1"}, _ctx(ContentTaint.clean))
-    except RuntimeError:
-        pass
+    failed = store.snapshot()[0]
+    assert failed.status is EffectStatus.failed
     result = await tool.run({"idempotency_key": "k1"}, _ctx(ContentTaint.clean))
     assert result.output == "sent" and attempts["n"] == 2
+    assert result.effect_status == EffectStatus.confirmed.value
+
+
+async def test_outbound_ambiguous_outcome_becomes_unknown_and_blocks_retry() -> None:
+    """A possible-success-before-response-loss becomes `unknown`; retry is refused (C4)."""
+    from keel_core.connectors import ProviderAmbiguousError
+    from keel_core.effect_store import InMemoryEffectStore
+    from keel_core.effects import EffectStatus
+
+    attempts = {"n": 0}
+
+    async def maybe_sent(args: dict[str, object], ctx: ToolContext) -> str:
+        attempts["n"] += 1
+        raise ProviderAmbiguousError("timeout after send")
+
+    store = InMemoryEffectStore()
+    tool = ConnectorTool(
+        name="mail_send", description="", action=maybe_sent, outbound=True, effect_store=store
+    )
+    first = await tool.run({"idempotency_key": "k1"}, _ctx(ContentTaint.clean))
+    assert first.ok is False
+    assert first.effect_status == EffectStatus.unknown.value
+    # A second attempt with the same idempotency key must NOT re-invoke the action.
+    second = await tool.run({"idempotency_key": "k1"}, _ctx(ContentTaint.clean))
+    assert second.ok is False
+    assert second.effect_status == EffectStatus.unknown.value
+    assert attempts["n"] == 1  # never retried while unknown
+
+
+async def test_late_provider_success_after_lease_reap_is_recorded_as_reconciled() -> None:
+    from keel_core.effect_store import InMemoryEffectStore
+    from keel_core.effects import EffectRecord, EffectStatus
+
+    class _ReapedBeforeConfirmStore(InMemoryEffectStore):
+        async def confirm(
+            self,
+            scope_id: str,
+            effect_id: str,
+            *,
+            lease_token: str,
+            provider_ref: str,
+            result: str,
+        ) -> EffectRecord:
+            await self.mark_unknown(
+                scope_id,
+                effect_id,
+                lease_token=lease_token,
+                error="lease reaped while provider response was in flight",
+            )
+            await self.reconcile_absent(scope_id, effect_id)
+            raise LookupError("stale execution lease")
+
+    store = _ReapedBeforeConfirmStore()
+
+    async def send(args: dict[str, object], ctx: ToolContext) -> str:
+        return "sent (id=provider-1)"
+
+    tool = ConnectorTool(
+        name="mail_send", description="", action=send, outbound=True, effect_store=store
+    )
+    result = await tool.run({"idempotency_key": "k1"}, _ctx(ContentTaint.clean))
+    assert result.ok
+    assert result.effect_status == EffectStatus.reconciled_confirmed.value
+    assert result.provider_ref == "provider-1"
+    current = store.snapshot()[0]
+    assert current.status is EffectStatus.reconciled_confirmed
+    assert current.result == "sent (id=provider-1)"
+
+
+async def test_late_provider_success_corrects_failed_state_and_blocks_another_retry() -> None:
+    from keel_core.effect_store import InMemoryEffectStore
+    from keel_core.effects import EffectRecord, EffectStatus
+
+    class _FailedBeforeConfirmStore(InMemoryEffectStore):
+        async def confirm(
+            self,
+            scope_id: str,
+            effect_id: str,
+            *,
+            lease_token: str,
+            provider_ref: str,
+            result: str,
+        ) -> EffectRecord:
+            await self.mark_failed(
+                scope_id,
+                effect_id,
+                lease_token=lease_token,
+                error="lease ownership changed before confirmation",
+            )
+            raise LookupError("stale execution lease")
+
+    store = _FailedBeforeConfirmStore()
+
+    async def send(args: dict[str, object], ctx: ToolContext) -> str:
+        return "sent (id=provider-2)"
+
+    tool = ConnectorTool(
+        name="mail_send", description="", action=send, outbound=True, effect_store=store
+    )
+    result = await tool.run({"idempotency_key": "k2"}, _ctx(ContentTaint.clean))
+    assert result.ok
+    assert result.effect_status == EffectStatus.reconciled_confirmed.value
+    retried = await store.begin_execution(
+        _ctx(ContentTaint.clean).scope_id,
+        store.snapshot()[0].id,
+        lease_owner="w2",
+    )
+    assert retried is None
+
+
+async def test_outbound_duplicate_send_observes_same_effect_never_double_mutates() -> None:
+    """A duplicate logical send (same idempotency key) always resolves to one Effect."""
+    from keel_core.effect_store import InMemoryEffectStore
+
+    calls: list[dict[str, object]] = []
+
+    async def send(args: dict[str, object], ctx: ToolContext) -> str:
+        calls.append(args)
+        return "sent"
+
+    store = InMemoryEffectStore()
+    tool = ConnectorTool(
+        name="mail_send", description="", action=send, outbound=True, effect_store=store
+    )
+    a = await tool.run({"idempotency_key": "k1", "to": "x"}, _ctx(ContentTaint.clean))
+    b = await tool.run({"idempotency_key": "k1", "to": "x"}, _ctx(ContentTaint.clean))
+    assert a.effect_id == b.effect_id
+    assert len(calls) == 1
 
 
 def test_confused_deputy_engine_escalates_only_tainted_outbound() -> None:

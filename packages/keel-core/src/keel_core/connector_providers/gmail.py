@@ -24,6 +24,7 @@ from keel_core.connector_contracts import (
     ConnectorHealthStatus,
     ConnectorManifest,
     ConnectorOperationContext,
+    ConnectorReconciler,
     ConnectorSetupResult,
     ConnectorUnavailableError,
 )
@@ -32,6 +33,7 @@ from keel_core.gmail import (
     GMAIL_CONNECTOR_ID,
     GMAIL_SCOPES,
     make_gmail_inbox_action,
+    make_gmail_reconciler,
     make_gmail_send_action,
 )
 
@@ -192,6 +194,12 @@ class GmailProvider(BaseConnectorProvider):
                 )
             )
         return tuple(actions)
+
+    def build_reconciler(self, context: ConnectorActionContext) -> ConnectorReconciler | None:
+        """R1B: prove whether an ``unknown`` ``email_send`` Effect reached Gmail."""
+        if context.credential_store is None:
+            return None
+        return make_gmail_reconciler(context.credential_store)
 
 
 def factory() -> GmailProvider:

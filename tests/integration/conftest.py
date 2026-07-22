@@ -112,6 +112,7 @@ async def migrated_db(pg_engine: AsyncEngine) -> AsyncIterator[AsyncEngine]:
                 "connector_items, connector_resources, connector_binding_targets, "
                 "connector_bindings, connector_tokens, "
                 "connector_outbox, connector_active_scopes, connector_webhook_routes, "
+                "effect_reconciliation_outbox, effects, "
                 "oauth_states, "
                 "webhook_deliveries, archival, schedules, approvals, run_control, "
                 "im_reply_dispatch_index, im_reply_intents, im_route_index, "

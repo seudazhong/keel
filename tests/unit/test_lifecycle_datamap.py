@@ -44,6 +44,8 @@ _ENTRY_TO_STEP = {
     "connector_cursors": "connector_state",
     "connector_deliveries": "connector_state",
     "connector_outbox": "connector_outbox",
+    "effects": "effects",
+    "effect_reconciliation_outbox": "effects",
     "connector_active_scopes": "connector_state",
     "connector_webhook_routes": "connector_state",
     "oauth_states": "oauth_states",

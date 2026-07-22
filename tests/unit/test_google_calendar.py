@@ -59,7 +59,7 @@ from keel_core.connector_registry import discover_connector_registry
 from keel_core.connector_repository import InMemoryConnectorRepository
 from keel_core.connectors import ConnectorTool
 from keel_core.digest import digest_permissions
-from keel_core.outbox import InMemoryOutboundStore
+from keel_core.effect_store import InMemoryEffectStore
 from keel_core.protocols import ToolContext
 from keel_core.types import ContentTaint, PermissionDecision
 
@@ -166,6 +166,8 @@ class FakeCalendarClient(CalendarClient):
         assert calendar_id == "team-calendar@example.test"
         if time_zone is not None:
             assert time_zone == "Asia/Shanghai"
+        if event_id in self.updated:
+            return self.updated[event_id]
         if event_id in self.created:
             return self.created[event_id]
         return {
@@ -832,7 +834,7 @@ async def test_outbound_actions_require_selection_approval_and_reconcile_retries
         action=create.action,
         outbound=True,
         idempotency_required=True,
-        idempotency_store=InMemoryOutboundStore(),
+        effect_store=InMemoryEffectStore(),
     )
     with pytest.raises(ValueError, match="idempotency_key"):
         await tool.run(
@@ -854,6 +856,160 @@ async def test_outbound_actions_require_selection_approval_and_reconcile_retries
             {**arguments, "calendar_id": "read-only@example.test"},
             _tool_context(),
         )
+
+
+async def _writable_context(store: FakeCredentialStore) -> ConnectorActionContext:
+    """A context with ``team-calendar@example.test`` selected + write-granted (matches
+    ``test_outbound_actions_require_selection_approval_and_reconcile_retries``'s setup)."""
+    repository = InMemoryConnectorRepository("scope:a")
+    binding = await repository.upsert_binding(
+        GOOGLE_CALENDAR_CONNECTOR_ID,
+        ConnectorBindingDraft(),
+        ConnectorBindingStatus.connected,
+    )
+    await repository.upsert_resources(
+        GOOGLE_CALENDAR_CONNECTOR_ID,
+        binding.id,
+        (
+            ConnectorResourceDraft(
+                "team-calendar@example.test",
+                "calendar",
+                "Team Calendar",
+                selected=True,
+                config={"access_role": "owner"},
+            ),
+        ),
+    )
+    return ConnectorActionContext.with_repository("scope:a", repository, credential_store=store)
+
+
+async def test_calendar_reconciler_confirms_existing_created_event() -> None:
+    """R1B (C4): the reconciler recomputes the same deterministic identity the create
+    action used and proves the event exists via a direct lookup."""
+    from keel_core.connector_contracts import (
+        ConnectorReconciliationOutcome,
+        ConnectorReconciliationRequest,
+    )
+
+    client = FakeCalendarClient(_credential(GOOGLE_CALENDAR_WRITE_SCOPES))
+    store = FakeCredentialStore(_credential(GOOGLE_CALENDAR_WRITE_SCOPES))
+    provider = GoogleCalendarProvider(client_factory=_factory(client))
+    context = await _writable_context(store)
+    actions = provider.build_actions(context)
+    create = next(item for item in actions if item.manifest.name == "google_calendar_event_create")
+    arguments = {
+        "calendar_id": "team-calendar@example.test",
+        "summary": "Approved event",
+        "start": {"date_time": "2026-07-20T10:00:00+08:00"},
+        "end": {"date_time": "2026-07-20T11:00:00+08:00"},
+        "idempotency_key": "request-1",
+    }
+    await create.action(arguments, _tool_context())
+
+    reconciler = provider.build_reconciler(context)
+    assert reconciler is not None
+    outcome = await reconciler.reconcile(
+        ConnectorReconciliationRequest(
+            scope_id="scope:a",
+            connector_id=GOOGLE_CALENDAR_CONNECTOR_ID,
+            action_name="google_calendar_event_create",
+            idempotency_key="request-1",
+            resource_id="team-calendar@example.test",
+            provider_ref="",
+            canonical_args=json.dumps(arguments, sort_keys=True),
+        )
+    )
+    assert outcome.outcome is ConnectorReconciliationOutcome.confirmed
+
+
+async def test_calendar_reconciler_reports_absent_when_event_never_landed() -> None:
+    from keel_core.connector_contracts import (
+        ConnectorReconciliationOutcome,
+        ConnectorReconciliationRequest,
+    )
+
+    client = FakeCalendarClient(_credential(GOOGLE_CALENDAR_WRITE_SCOPES))
+    store = FakeCredentialStore(_credential(GOOGLE_CALENDAR_WRITE_SCOPES))
+    provider = GoogleCalendarProvider(client_factory=_factory(client))
+    context = ConnectorActionContext("scope:a", credential_store=store)
+
+    reconciler = provider.build_reconciler(context)
+    assert reconciler is not None
+    # No create ever happened for this idempotency key: get_event's fake fallback
+    # returns an event with no matching marker, so the reconciler proves absence.
+    outcome = await reconciler.reconcile(
+        ConnectorReconciliationRequest(
+            scope_id="scope:a",
+            connector_id=GOOGLE_CALENDAR_CONNECTOR_ID,
+            action_name="google_calendar_event_create",
+            idempotency_key="never-sent",
+            resource_id="team-calendar@example.test",
+            provider_ref="",
+            canonical_args="{}",
+        )
+    )
+    assert outcome.outcome is ConnectorReconciliationOutcome.absent
+
+
+async def test_calendar_reconciler_confirms_existing_updated_event() -> None:
+    from keel_core.connector_contracts import (
+        ConnectorReconciliationOutcome,
+        ConnectorReconciliationRequest,
+    )
+
+    client = FakeCalendarClient(_credential(GOOGLE_CALENDAR_WRITE_SCOPES))
+    store = FakeCredentialStore(_credential(GOOGLE_CALENDAR_WRITE_SCOPES))
+    provider = GoogleCalendarProvider(client_factory=_factory(client))
+    context = await _writable_context(store)
+    actions = provider.build_actions(context)
+    update = next(item for item in actions if item.manifest.name == "google_calendar_event_update")
+    update_arguments = {
+        "calendar_id": "team-calendar@example.test",
+        "event_id": "event-existing",
+        "summary": "Approved update",
+        "idempotency_key": "request-2",
+    }
+    await update.action(update_arguments, _tool_context())
+
+    reconciler = provider.build_reconciler(context)
+    assert reconciler is not None
+    outcome = await reconciler.reconcile(
+        ConnectorReconciliationRequest(
+            scope_id="scope:a",
+            connector_id=GOOGLE_CALENDAR_CONNECTOR_ID,
+            action_name="google_calendar_event_update",
+            idempotency_key="request-2",
+            resource_id="team-calendar@example.test",
+            provider_ref="",
+            canonical_args=json.dumps(update_arguments, sort_keys=True),
+        )
+    )
+    assert outcome.outcome is ConnectorReconciliationOutcome.confirmed
+
+
+async def test_calendar_reconciler_is_incapable_without_credentials() -> None:
+    from keel_core.connector_contracts import (
+        ConnectorReconciliationOutcome,
+        ConnectorReconciliationRequest,
+    )
+
+    store = FakeCredentialStore(None)
+    provider = GoogleCalendarProvider()
+    context = ConnectorActionContext("scope:a", credential_store=store)
+    reconciler = provider.build_reconciler(context)
+    assert reconciler is not None
+    outcome = await reconciler.reconcile(
+        ConnectorReconciliationRequest(
+            scope_id="scope:a",
+            connector_id=GOOGLE_CALENDAR_CONNECTOR_ID,
+            action_name="google_calendar_event_create",
+            idempotency_key="k",
+            resource_id="team-calendar@example.test",
+            provider_ref="",
+            canonical_args="{}",
+        )
+    )
+    assert outcome.outcome is ConnectorReconciliationOutcome.incapable
 
 
 async def test_refresh_health_and_remote_revoke_errors_are_explicit(

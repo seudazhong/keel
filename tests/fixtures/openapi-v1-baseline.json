@@ -21,6 +21,98 @@
         "title": "AddMemberRequest",
         "type": "object"
       },
+      "AgentAccessLevel": {
+        "description": "Ordered team-Agent access tiers; a higher tier's capabilities include the lower\ntiers' (``manage`` implies ``use`` implies ``discover``).",
+        "enum": [
+          "discover",
+          "use",
+          "manage"
+        ],
+        "title": "AgentAccessLevel",
+        "type": "string"
+      },
+      "AgentAccessPrincipalType": {
+        "description": "What kind of principal an :class:`AgentAccess` edge binds \u2014 a durable user or a\ndurable channel identity (e.g. an IM chat/room), never a bare org membership.",
+        "enum": [
+          "user",
+          "channel"
+        ],
+        "title": "AgentAccessPrincipalType",
+        "type": "string"
+      },
+      "AgentAccessResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "grantor_user_id": {
+            "title": "Grantor User Id",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "level": {
+            "$ref": "#/components/schemas/AgentAccessLevel"
+          },
+          "org_id": {
+            "title": "Org Id",
+            "type": "string"
+          },
+          "principal_id": {
+            "title": "Principal Id",
+            "type": "string"
+          },
+          "principal_type": {
+            "$ref": "#/components/schemas/AgentAccessPrincipalType"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          }
+        },
+        "required": [
+          "id",
+          "org_id",
+          "agent_id",
+          "principal_type",
+          "principal_id",
+          "level",
+          "grantor_user_id",
+          "status",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "AgentAccessResponse",
+        "type": "object"
+      },
       "AgentKind": {
         "enum": [
           "personal",
@@ -575,6 +667,144 @@
         "title": "CreateReviewResponse",
         "type": "object"
       },
+      "EffectResponse": {
+        "description": "An Effect ledger row \u2014 never carries a secret; ``canonical_args`` is either the\ncall's canonical JSON or a ``sha256:<hex>`` safe digest (see\n``keel_core.effects.canonical_args_or_digest``).",
+        "properties": {
+          "action_hash": {
+            "title": "Action Hash",
+            "type": "string"
+          },
+          "action_name": {
+            "title": "Action Name",
+            "type": "string"
+          },
+          "actor_id": {
+            "title": "Actor Id",
+            "type": "string"
+          },
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "attempt": {
+            "title": "Attempt",
+            "type": "integer"
+          },
+          "canonical_args": {
+            "title": "Canonical Args",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "date-time",
+            "title": "Created At",
+            "type": "string"
+          },
+          "error": {
+            "title": "Error",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "org_id": {
+            "title": "Org Id",
+            "type": "string"
+          },
+          "provider": {
+            "title": "Provider",
+            "type": "string"
+          },
+          "provider_ref": {
+            "title": "Provider Ref",
+            "type": "string"
+          },
+          "reconciled_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reconciled At"
+          },
+          "reconciliation_attempts": {
+            "title": "Reconciliation Attempts",
+            "type": "integer"
+          },
+          "resource_id": {
+            "title": "Resource Id",
+            "type": "string"
+          },
+          "result": {
+            "title": "Result",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "tool_name": {
+            "title": "Tool Name",
+            "type": "string"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "org_id",
+          "agent_id",
+          "actor_id",
+          "run_id",
+          "tool_name",
+          "provider",
+          "resource_id",
+          "action_name",
+          "action_hash",
+          "idempotency_key",
+          "canonical_args",
+          "status",
+          "attempt",
+          "provider_ref",
+          "result",
+          "error",
+          "reconciliation_attempts",
+          "reconciled_at",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "EffectResponse",
+        "type": "object"
+      },
+      "EffectStatus": {
+        "description": "The durable lifecycle of one external mutation attempt (C4/C5).",
+        "enum": [
+          "reserved",
+          "executing",
+          "confirmed",
+          "unknown",
+          "reconciled_confirmed",
+          "reconciled_absent",
+          "failed"
+        ],
+        "title": "EffectStatus",
+        "type": "string"
+      },
       "ErasureRequestBody": {
         "description": "Submit an erasure request for a scope, a session, or a coding project.",
         "properties": {
@@ -819,6 +1049,30 @@
         "title": "ErasureTargetKind",
         "type": "string"
       },
+      "GrantAgentAccessRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "level": {
+            "$ref": "#/components/schemas/AgentAccessLevel"
+          },
+          "principal_id": {
+            "maxLength": 300,
+            "minLength": 1,
+            "title": "Principal Id",
+            "type": "string"
+          },
+          "principal_type": {
+            "$ref": "#/components/schemas/AgentAccessPrincipalType"
+          }
+        },
+        "required": [
+          "principal_type",
+          "principal_id",
+          "level"
+        ],
+        "title": "GrantAgentAccessRequest",
+        "type": "object"
+      },
       "GrantProjectRequest": {
         "additionalProperties": false,
         "properties": {
@@ -949,6 +1203,34 @@
         ],
         "title": "HealthResponse",
         "type": "object"
+      },
+      "ImChatKind": {
+        "description": "A mapping targets a single DM peer (personal) or a group/channel (group).",
+        "enum": [
+          "personal",
+          "group"
+        ],
+        "title": "ImChatKind",
+        "type": "string"
+      },
+      "ImMappingStatus": {
+        "description": "Lifecycle of a channel mapping (revoked/disabled fail closed at lookup).",
+        "enum": [
+          "active",
+          "disabled",
+          "revoked"
+        ],
+        "title": "ImMappingStatus",
+        "type": "string"
+      },
+      "ImProvider": {
+        "description": "The IM providers with a durable webhook + reply adapter.",
+        "enum": [
+          "onebot",
+          "telegram"
+        ],
+        "title": "ImProvider",
+        "type": "string"
       },
       "ImportProjectRequest": {
         "additionalProperties": false,
@@ -1923,6 +2205,173 @@
         "title": "LinkInstallationRequest",
         "type": "object"
       },
+      "MappingCreateRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "chat_kind": {
+            "$ref": "#/components/schemas/ImChatKind"
+          },
+          "external_bot_id": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "External Bot Id",
+            "type": "string"
+          },
+          "external_chat_id": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "External Chat Id",
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/PolicyModel"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ImProvider"
+          },
+          "run_as_user_id": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Run As User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "external_bot_id",
+          "external_chat_id",
+          "chat_kind",
+          "agent_id",
+          "run_as_user_id"
+        ],
+        "title": "MappingCreateRequest",
+        "type": "object"
+      },
+      "MappingResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_id": {
+            "title": "Agent Id",
+            "type": "string"
+          },
+          "channel_principal_id": {
+            "title": "Channel Principal Id",
+            "type": "string"
+          },
+          "chat_kind": {
+            "$ref": "#/components/schemas/ImChatKind"
+          },
+          "created_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created At"
+          },
+          "created_by": {
+            "title": "Created By",
+            "type": "string"
+          },
+          "external_bot_id": {
+            "title": "External Bot Id",
+            "type": "string"
+          },
+          "external_chat_id": {
+            "title": "External Chat Id",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "org_id": {
+            "title": "Org Id",
+            "type": "string"
+          },
+          "policy": {
+            "$ref": "#/components/schemas/PolicyModel"
+          },
+          "provider": {
+            "$ref": "#/components/schemas/ImProvider"
+          },
+          "revoked_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Revoked At"
+          },
+          "revoked_by": {
+            "title": "Revoked By",
+            "type": "string"
+          },
+          "run_as_user_id": {
+            "title": "Run As User Id",
+            "type": "string"
+          },
+          "scope_id": {
+            "title": "Scope Id",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ImMappingStatus"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "format": "date-time",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "version": {
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "org_id",
+          "provider",
+          "external_bot_id",
+          "external_chat_id",
+          "chat_kind",
+          "agent_id",
+          "scope_id",
+          "channel_principal_id",
+          "run_as_user_id",
+          "policy",
+          "status",
+          "version",
+          "created_by",
+          "created_at",
+          "updated_at",
+          "revoked_by",
+          "revoked_at"
+        ],
+        "title": "MappingResponse",
+        "type": "object"
+      },
       "MaterializeWorktreeRequest": {
         "additionalProperties": false,
         "properties": {
@@ -2130,6 +2579,36 @@
         "title": "PermissionDecision",
         "type": "string"
       },
+      "PolicyModel": {
+        "additionalProperties": false,
+        "description": "The mapping reply/tool policy (never carries a secret \u2014 capability flags only).",
+        "properties": {
+          "allow_tools": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Allow Tools",
+            "type": "array"
+          },
+          "approvals_enabled": {
+            "default": false,
+            "title": "Approvals Enabled",
+            "type": "boolean"
+          },
+          "partial_replies": {
+            "default": false,
+            "title": "Partial Replies",
+            "type": "boolean"
+          },
+          "reply_enabled": {
+            "default": true,
+            "title": "Reply Enabled",
+            "type": "boolean"
+          }
+        },
+        "title": "PolicyModel",
+        "type": "object"
+      },
       "ProjectGrantResponse": {
         "additionalProperties": false,
         "properties": {
@@ -2324,6 +2803,28 @@
           }
         },
         "title": "ResourceSelectionRequest",
+        "type": "object"
+      },
+      "RetryEligibilityResponse": {
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "effect": {
+            "$ref": "#/components/schemas/EffectResponse"
+          },
+          "retryable": {
+            "title": "Retryable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "effect",
+          "retryable",
+          "detail"
+        ],
+        "title": "RetryEligibilityResponse",
         "type": "object"
       },
       "ReviewSource": {
@@ -2525,6 +3026,16 @@
       "SessionId": {
         "type": "string"
       },
+      "SessionVisibility": {
+        "description": "A session's read-visibility policy, independent of the selected Agent's access.",
+        "enum": [
+          "private",
+          "agent_members",
+          "explicit"
+        ],
+        "title": "SessionVisibility",
+        "type": "string"
+      },
       "SetupRequest": {
         "properties": {
           "values": {
@@ -2536,6 +3047,21 @@
           }
         },
         "title": "SetupRequest",
+        "type": "object"
+      },
+      "ShareSessionRequest": {
+        "properties": {
+          "user_id": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "title": "ShareSessionRequest",
         "type": "object"
       },
       "SyncEntryResponse": {
@@ -2802,6 +3328,18 @@
           "expected_version"
         ],
         "title": "UpdateProjectRequest",
+        "type": "object"
+      },
+      "UpdateSessionVisibilityRequest": {
+        "properties": {
+          "visibility": {
+            "$ref": "#/components/schemas/SessionVisibility"
+          }
+        },
+        "required": [
+          "visibility"
+        ],
+        "title": "UpdateSessionVisibilityRequest",
         "type": "object"
       },
       "UserResponse": {
@@ -4938,6 +5476,326 @@
         ]
       }
     },
+    "/v1/effects": {
+      "get": {
+        "operationId": "list_effects_v1_effects_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/EffectStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/EffectResponse"
+                  },
+                  "title": "Response List Effects V1 Effects Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Effects for the caller's scope",
+        "tags": [
+          "effects"
+        ]
+      }
+    },
+    "/v1/effects/{effect_id}": {
+      "get": {
+        "operationId": "get_effect_v1_effects__effect_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "effect_id",
+            "required": true,
+            "schema": {
+              "title": "Effect Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EffectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get one Effect",
+        "tags": [
+          "effects"
+        ]
+      }
+    },
+    "/v1/effects/{effect_id}/reconcile": {
+      "post": {
+        "operationId": "reconcile_effect_v1_effects__effect_id__reconcile_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "effect_id",
+            "required": true,
+            "schema": {
+              "title": "Effect Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EffectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Request one on-demand provider reconciliation attempt for an unknown Effect",
+        "tags": [
+          "effects"
+        ]
+      }
+    },
+    "/v1/effects/{effect_id}/retry": {
+      "post": {
+        "description": "Report whether ``effect_id`` may be retried now.\n\nThe API never re-executes the original connector action itself (it does not hold the\ncall's arguments or credentials out of band) \u2014 a legitimately eligible Effect is\nretried by invoking the owning tool again with the same ``idempotency_key``; this\nendpoint's role is authorization + a truthful, explicit eligibility signal (never a\nsilent no-op that could be mistaken for an actual resend).",
+        "operationId": "retry_effect_v1_effects__effect_id__retry_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "effect_id",
+            "required": true,
+            "schema": {
+              "title": "Effect Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetryEligibilityResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Confirm retry eligibility for a failed/reconciled-absent Effect",
+        "tags": [
+          "effects"
+        ]
+      }
+    },
     "/v1/erasure/requests": {
       "get": {
         "operationId": "list_erasure_requests_v1_erasure_requests_get",
@@ -5128,7 +5986,7 @@
     },
     "/v1/gateway/onebot": {
       "post": {
-        "description": "Verify the signature + replay, ack, then process the event in the background.",
+        "description": "Verify the signature + replay, ack, then admit the event durably (or via the gateway).\n\nProvider auth (HMAC-SHA1 body signature) + the durable replay check run **before** any\nmapping is resolved. When the durable IM substrate is wired the event is resolved through\nthe global route index and admitted as a durable ``surface=\"im\"`` run (fail-closed on an\nunknown/revoked mapping); otherwise it falls back to the in-process gateway (local preview).",
         "operationId": "onebot_webhook_v1_gateway_onebot_post",
         "requestBody": {
           "content": {
@@ -5176,7 +6034,7 @@
     },
     "/v1/gateway/telegram": {
       "post": {
-        "description": "Verify the secret header + replay, ack, then process the update in the background.",
+        "description": "Verify the secret header + replay, ack, then admit the update durably (or via gateway).",
         "operationId": "telegram_webhook_v1_gateway_telegram_post",
         "requestBody": {
           "content": {
@@ -5451,6 +6309,211 @@
           }
         },
         "summary": "Update Agent",
+        "tags": [
+          "identity"
+        ]
+      }
+    },
+    "/v1/identity/agents/{agent_id}/access": {
+      "delete": {
+        "operationId": "revoke_agent_access_v1_identity_agents__agent_id__access_delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "principal_type",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/AgentAccessPrincipalType"
+            }
+          },
+          {
+            "in": "query",
+            "name": "principal_id",
+            "required": true,
+            "schema": {
+              "maxLength": 300,
+              "minLength": 1,
+              "title": "Principal Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentAccessResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Agent Access",
+        "tags": [
+          "identity"
+        ]
+      },
+      "get": {
+        "description": "List a team Agent's Agent Access edges (requires org admin/owner or manage access).",
+        "operationId": "list_agent_access_v1_identity_agents__agent_id__access_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AgentAccessResponse"
+                  },
+                  "title": "Response List Agent Access V1 Identity Agents  Agent Id  Access Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Agent Access",
+        "tags": [
+          "identity"
+        ]
+      },
+      "post": {
+        "description": "Grant (or update) a user/channel's discover/use/manage edge on a team Agent.",
+        "operationId": "grant_agent_access_v1_identity_agents__agent_id__access_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GrantAgentAccessRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentAccessResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Grant Agent Access",
         "tags": [
           "identity"
         ]
@@ -6132,6 +7195,397 @@
         "summary": "Get Current Organization",
         "tags": [
           "identity"
+        ]
+      }
+    },
+    "/v1/im/mappings": {
+      "get": {
+        "operationId": "list_mappings_v1_im_mappings_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/MappingResponse"
+                  },
+                  "title": "Response List Mappings V1 Im Mappings Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Mappings",
+        "tags": [
+          "im-routing"
+        ]
+      },
+      "post": {
+        "description": "Platform-admin-only: claim a global route + create the org-owned channel mapping.\n\nThe target org (``X-Keel-Org``) and Agent (``agent_id``) are resolved as authoritative\nconfiguration (no membership) and must both be active; the selected **run-as** user\n(``run_as_user_id``) must be an active org member independently authorized to use that Agent\n(a personal Agent's owner, or a team Agent user) \u2014 the platform admin is only the audited\nprovisioner, never the run actor. The mapping row and its global route claim are committed\natomically; a chat already claimed by another org fails closed with an opaque ``409`` (the\nowning org is never disclosed). Reusing a **revoked** chat idempotently reprovisions the same\nrow (no duplicate); an already-live chat is idempotent only for the exact same binding. The\nclaim is audited.",
+        "operationId": "create_mapping_v1_im_mappings_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MappingCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MappingResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Mapping",
+        "tags": [
+          "im-routing"
+        ]
+      }
+    },
+    "/v1/im/mappings/{mapping_id}": {
+      "get": {
+        "operationId": "get_mapping_v1_im_mappings__mapping_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mapping_id",
+            "required": true,
+            "schema": {
+              "title": "Mapping Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MappingResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Mapping",
+        "tags": [
+          "im-routing"
+        ]
+      }
+    },
+    "/v1/im/mappings/{mapping_id}/disable": {
+      "post": {
+        "operationId": "disable_mapping_v1_im_mappings__mapping_id__disable_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mapping_id",
+            "required": true,
+            "schema": {
+              "title": "Mapping Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Expected Version"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MappingResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Disable Mapping",
+        "tags": [
+          "im-routing"
+        ]
+      }
+    },
+    "/v1/im/mappings/{mapping_id}/enable": {
+      "post": {
+        "operationId": "enable_mapping_v1_im_mappings__mapping_id__enable_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mapping_id",
+            "required": true,
+            "schema": {
+              "title": "Mapping Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Expected Version"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MappingResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Enable Mapping",
+        "tags": [
+          "im-routing"
+        ]
+      }
+    },
+    "/v1/im/mappings/{mapping_id}/revoke": {
+      "post": {
+        "operationId": "revoke_mapping_v1_im_mappings__mapping_id__revoke_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "mapping_id",
+            "required": true,
+            "schema": {
+              "title": "Mapping Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "expected_version",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Expected Version"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MappingResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Mapping",
+        "tags": [
+          "im-routing"
         ]
       }
     },
@@ -7244,6 +8698,77 @@
         "summary": "Search",
         "tags": [
           "knowledge"
+        ]
+      }
+    },
+    "/v1/memory/blocks": {
+      "get": {
+        "description": "Return the current block values that interactive memory tools read and update.",
+        "operationId": "list_memory_blocks_v1_memory_blocks_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response List Memory Blocks V1 Memory Blocks Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List the scope's current core-memory blocks",
+        "tags": [
+          "v1"
         ]
       }
     },
@@ -9338,6 +10863,40 @@
     "/v1/schedules": {
       "get": {
         "operationId": "list_schedules_v1_schedules_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -9353,6 +10912,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List the scope's schedules (management view)",
@@ -9372,6 +10941,38 @@
             "schema": {
               "title": "Schedule Id",
               "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
             }
           }
         ],
@@ -9419,6 +11020,38 @@
               "title": "Schedule Id",
               "type": "string"
             }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
           }
         ],
         "requestBody": {
@@ -9465,7 +11098,7 @@
     },
     "/v1/sessions": {
       "get": {
-        "description": "Session summaries for the Sessions list (title preview + message count), scoped.",
+        "description": "Session summaries for the Sessions list (title preview + message count), scoped.\n\nFiltered by R1B session visibility (:mod:`keel_core.session_visibility`) \u2014 using the\nscope's team Agent does not by itself surface another user's private sessions.",
         "operationId": "list_sessions_endpoint_v1_sessions_get",
         "parameters": [
           {
@@ -9706,7 +11339,7 @@
     },
     "/v1/sessions/{session_id}/history": {
       "get": {
-        "description": "The session's durable event log (oldest first) for a read-only replay, scoped.\n\nThe session must belong to the caller's derived scope: a cross-org/Agent session id has no\nevents here and answers 404 (no cross-scope read).",
+        "description": "The session's durable event log (oldest first) for a read-only replay, scoped.\n\nThe session must belong to the caller's derived scope: a cross-org/Agent session id has no\nevents here and answers 404 (no cross-scope read). Session visibility (R1B) is enforced\nindependent of the selected Agent scope \u2014 see :func:`_authorize_session_visibility`.",
         "operationId": "session_history_v1_sessions__session_id__history_get",
         "parameters": [
           {
@@ -9864,6 +11497,415 @@
           }
         },
         "summary": "Admit a user message and schedule a run",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/shares": {
+      "get": {
+        "operationId": "list_session_shares_v1_sessions__session_id__shares_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "title": "Response List Session Shares V1 Sessions  Session Id  Shares Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List a session's explicit shares",
+        "tags": [
+          "v1"
+        ]
+      },
+      "post": {
+        "operationId": "create_session_share_v1_sessions__session_id__shares_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ShareSessionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Create Session Share V1 Sessions  Session Id  Shares Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Grant a user explicit read access to a session",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/shares/{user_id}": {
+      "delete": {
+        "operationId": "revoke_session_share_v1_sessions__session_id__shares__user_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Revoke Session Share V1 Sessions  Session Id  Shares  User Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke a user's explicit session share",
+        "tags": [
+          "v1"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/visibility": {
+      "get": {
+        "operationId": "get_session_visibility_v1_sessions__session_id__visibility_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Session Visibility V1 Sessions  Session Id  Visibility Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Read a session's ownership/visibility",
+        "tags": [
+          "v1"
+        ]
+      },
+      "patch": {
+        "description": "Mutating a session's visibility requires ownership or Agent-manage authority (R1B).",
+        "operationId": "update_session_visibility_v1_sessions__session_id__visibility_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Org",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Org"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Keel-Agent",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Keel-Agent"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateSessionVisibilityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Update Session Visibility V1 Sessions  Session Id  Visibility Patch",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Change a session's visibility policy",
         "tags": [
           "v1"
         ]

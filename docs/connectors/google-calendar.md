@@ -70,13 +70,19 @@ Both actions:
 - require an `idempotency_key`;
 - require a selected calendar grant whose discovered access role is `writer` or `owner`;
 - require the incremental `calendar.events` scope;
-- use the durable connector outbox;
+- execute through the durable Effect ledger (R1B, `keel_core.effects`/`keel_core.effect_store`) —
+  reserved/executed/confirmed exactly once per idempotency key;
 - store a hashed request marker in the external event.
 
 Create derives a stable Google event id from the scope, calendar, and idempotency key, then
 reconciles an existing event or an insert conflict before returning. Update patches a specific
 event and reconciles the external request marker after ambiguous failures. These checks cover the
-crash window between Google's successful write and local outbox finalization.
+crash window between Google's successful write and local Effect confirmation. The same
+deterministic identity backs `GoogleCalendarProvider.build_reconciler` (R1B): if the ConnectorTool
+process itself crashes after a create/update lands but before it confirms the Effect, the worker's
+`keel_worker.effects_reconciliation` cron reaps the expired execution lease to `unknown` and then
+proves `reconciled_confirmed`/`reconciled_absent` via a direct `get_event` lookup + marker check —
+never inferred from a bare retry.
 
 ## Health and revoke
 

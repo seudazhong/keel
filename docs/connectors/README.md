@@ -13,7 +13,8 @@ Provider modules expose a manifest and factory. The shared runtime supplies:
 - selected provider resources and Knowledge/trigger targets;
 - routed authenticated webhooks and replay protection;
 - recurring durable jobs across Agent scopes;
-- connector action schemas, provenance, taint, approval, and idempotency.
+- connector action schemas, provenance, taint, approval, and the durable Effect ledger
+  (idempotent at-most-once execution + ambiguous-outcome reconciliation, see below).
 
 The current schema permits one binding per provider per Agent scope. The target Connection model
 supports multiple accounts and reusable resource grants.
@@ -38,6 +39,33 @@ reconciliation, provenance, health, and UI acceptance.
 
 Gmail and Google Calendar are the initial personal-Agent product candidates. Other providers remain
 available for preview/qualification.
+
+## Effects and reconciliation (R1B, invariants C4/C5)
+
+Every outbound connector action with an idempotency key is reserved, executed, and confirmed
+through the generic durable **Effect** ledger (`keel_core.effects`/`keel_core.effect_store`,
+migration `0026_effect_ledger`) instead of a per-provider ad hoc claim: `reserved -> executing ->
+confirmed`, with `executing` also able to land on `unknown` (a possible provider success followed
+by response loss — never an ordinary failure, never a deleted claim) or `failed` (an ordinary,
+provably pre-send failure). An `unknown` Effect blocks every further retry until provider
+reconciliation proves `reconciled_confirmed` or `reconciled_absent` (which then permits exactly
+one controlled retry).
+
+A provider action signals ambiguity by raising `keel_core.connectors.ProviderAmbiguousError` —
+never inferred from a generic exception — and may optionally implement
+`ConnectorProvider.build_reconciler` to let the worker's reconciliation cron
+(`keel_worker.effects_reconciliation`) prove confirmed/absent for an `unknown` Effect:
+
+| Provider | Reconciliation identity | Capability |
+|---|---|---|
+| Gmail (`email_send`) | A deterministic RFC 5322 `Message-ID` derived from `(scope_id, idempotency_key)`, embedded in every send attempt; reconciled by a bare-value Gmail `rfc822msgid:` search. Search can prove existence, but not-found never proves permanent absence, so it does not unlock retry. | Confirm-only |
+| Google Calendar (create/update) | A deterministic event id / `request_id` marker derived from `(scope_id, calendar_id, idempotency_key)` (or `event_id:idempotency_key` for update), already used by the action itself for idempotent retry; reconciled by a direct `get_event` lookup + marker check. | Implemented |
+| Every other current provider | — | **Not yet implemented** — an `unknown` Effect from these providers stays `unknown` and is surfaced via `/v1/effects` for an operator/user decision; it is never guessed at or silently retried. |
+
+The API (`/v1/effects`, `keel_server.api.effects`) and the typed SDK
+(`KeelClient.list_effects`/`get_effect`/`reconcile_effect`/`check_effect_retry_eligibility`) expose
+this ledger for read and authorized manual reconciliation/retry-eligibility requests. See
+[`docs/INVARIANTS.md`](../INVARIANTS.md) C4/C5 for the acceptance statement.
 
 ## Webhook routing
 

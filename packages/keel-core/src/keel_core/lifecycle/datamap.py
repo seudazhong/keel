@@ -231,6 +231,26 @@ DATA_MAP: tuple[DataMapEntry, ...] = (
         "Outbound at-most-once idempotency claims.",
     ),
     DataMapEntry(
+        "effects",
+        "table",
+        policies.EFFECT,
+        "scope_id",
+        ErasureTreatment.scope_bound,
+        "R1B durable Effect ledger (C4/C5): reserved/executing/confirmed/unknown/"
+        "reconciled_*/failed outbound-mutation records. Purged with its scope "
+        "(keel_core.effect_store.purge_scope); its reconciliation-outbox pointer "
+        "cascades away with it (composite FK).",
+    ),
+    DataMapEntry(
+        "effect_reconciliation_outbox",
+        "table",
+        policies.EFFECT_RECONCILIATION_OUTBOX,
+        "scope_id",
+        ErasureTreatment.scope_bound,
+        "Global (non-RLS) cross-scope reconciliation dispatch pointer; carries no "
+        "action args/result, only routing keys. Cascades from its Effect on erasure.",
+    ),
+    DataMapEntry(
         "connector_active_scopes",
         "table",
         policies.CONNECTOR_STATE,
