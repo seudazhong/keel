@@ -33,7 +33,6 @@ const groups: NavGroup[] = [
   {
     labelKey: "shell.nav.configuration",
     items: [
-      { icon: "🤖", labelKey: "shell.nav.agents", to: "/agents", status: "preview" },
       { icon: "🔌", labelKey: "shell.nav.connectors", to: "/connectors", status: "ready" },
       { icon: "✅", labelKey: "shell.nav.approvals", to: "/approvals", status: "ready" },
       { icon: "🧩", labelKey: "shell.nav.extensions", status: "roadmap" },

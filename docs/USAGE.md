@@ -24,7 +24,6 @@ compatibility scope, not the target product model.
 | Sessions | List, search, inspect, and resume conversations |
 | Memory | Blocks, proposals, and consolidation controls |
 | Knowledge | Knowledge Base/document lifecycle and cited search |
-| Agents | Persisted Agent create/select preview |
 | Connectors | Setup, resources, targets, health, sync, and disconnect |
 | Projects | Create/import/list/detail/delete preview |
 | Approvals | Durable pending/resolved decisions |
@@ -33,6 +32,8 @@ compatibility scope, not the target product model.
 | Observability | Local operational overview |
 
 Review and controlled Patch do not yet have React routes.
+Persisted Agent and Agent Access administration are API-only; the incomplete Agents preview page is
+not shipped, and legacy `/agents` links redirect to Chat.
 
 ## Chat and sessions
 
@@ -89,7 +90,8 @@ Invoke-RestMethod http://localhost:8000/v1/jobs
 Invoke-RestMethod http://localhost:8000/v1/approvals
 ```
 
-Mutations affect durable preview data. Current schedules are a precursor to first-class Routines.
+Mutations affect durable preview data. Current Schedules remain the shipped preview automation
+surface; a Routine redesign is deferred.
 
 ## CLI
 

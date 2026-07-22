@@ -19,7 +19,7 @@ release.
 Implemented foundations include:
 
 - worker-owned durable runs, jobs, schedules, approvals, outboxes, recovery, and replayable events;
-- a React application for Chat, Sessions, Memory, Knowledge, Connectors, Agents, Projects,
+- a React application for Chat, Sessions, Memory, Knowledge, Connectors, Projects,
   Approvals, Schedules, Jobs, and Observability;
 - identity, organization, Agent, grant, IM-routing, retention/erasure, and event-evolution backends;
 - a manifest-driven connector runtime with Gmail, Google Calendar, Google Drive/Docs,

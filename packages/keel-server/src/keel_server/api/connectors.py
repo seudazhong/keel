@@ -17,6 +17,7 @@ from keel_core.connector_contracts import (
     ConnectorIngressRequest,
     ConnectorSetupArtifact,
     ConnectorSetupArtifactKind,
+    ConnectorUnavailableError,
     ConnectorUnsupportedError,
 )
 from keel_core.connector_credentials import ConnectorCredentialStore
@@ -482,8 +483,18 @@ async def connector_resources(
             }
             for item in await _repository(request, auth.scope_id).list_resources(connector_id)
         ]
-    except (LookupError, RuntimeError) as exc:
+    except ConnectorUnsupportedError as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except ConnectorAuthenticationError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except ConnectorUnavailableError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    except ConnectorError as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+    except LookupError as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
 
 @router.put(

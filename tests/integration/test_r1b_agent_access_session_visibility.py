@@ -35,8 +35,12 @@ from keel_core.identity import (
     StaticJWKSProvider,
 )
 from keel_core.loop import admit
-from keel_core.scoping import derive_agent_scope
-from keel_core.session_visibility import SessionVisibility, ensure_session_identity
+from keel_core.scoping import LOCAL_PREVIEW_SCOPE, derive_agent_scope
+from keel_core.session_visibility import (
+    SessionVisibility,
+    ensure_session_identity,
+    get_session_identity,
+)
 from keel_core.state import PostgresEventStore
 from keel_server.app import create_app
 
@@ -144,6 +148,22 @@ async def _create_team_agent(client: httpx.AsyncClient, owner_subject: str, org_
     )
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
+
+
+async def test_local_preview_session_does_not_require_a_persisted_org(
+    client_and_engine: tuple[httpx.AsyncClient, AsyncEngine],
+) -> None:
+    client, engine = client_and_engine
+    session_id = f"local-{uuid.uuid4().hex}"
+    response = await client.post(
+        f"/v1/sessions/{session_id}/messages",
+        json={"content": "local preview"},
+    )
+    assert response.status_code == 202, response.text
+    identity = await get_session_identity(engine, LOCAL_PREVIEW_SCOPE, session_id)
+    assert identity is not None
+    assert identity.org_id is None
+    assert identity.owner_user_id is None
 
 
 async def _grant_access(
@@ -600,7 +620,6 @@ async def test_im_admission_wires_private_and_group_session_identity(
         PostgresImProvisioner,
         PostgresImRouteIndex,
     )
-    from keel_core.session_visibility import get_session_identity
     from keel_server.gateway.durable import DurableImIngress, ImInbound
 
     client, engine = client_and_engine

@@ -51,14 +51,7 @@ List the next few calendar events and cite the connected source. Do not create o
 
 Do not configure secrets or perform outbound effects during a short demo.
 
-## 4. Agents and Projects
-
-### Agents
-
-- show persisted Agent records and selection;
-- explain that complete model/tool/resource/memory/budget configuration is still roadmap work.
-
-### Projects
+## 4. Projects
 
 - show Project list/import;
 - use only a disposable repository when GitHub is already configured;
@@ -87,5 +80,5 @@ Do not claim:
 - review or patch React workflows;
 - full OTel/SLO/DR.
 
-A successful demo shows one coherent trusted-preview Agent journey and names every remaining
+A successful demo shows one coherent trusted-preview assistant journey and names every remaining
 boundary.

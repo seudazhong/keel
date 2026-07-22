@@ -209,8 +209,8 @@ that reconciles before retry.
 
 ### Memory
 
-- Model-learned core/profile changes are proposal-first with provenance; direct mutation tools are
-  disabled for normal product Agents.
+- Durable memory mutations remain permission/approval governed, versioned, and attributable to their
+  source; the product does not silently change learning policy without evidence.
 - Untrusted IM/content cannot write durable memory.
 - Erased source content cannot be resurrected through consolidation or rebuild.
 

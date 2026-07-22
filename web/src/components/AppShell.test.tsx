@@ -25,7 +25,7 @@ function shellAt(path: string) {
   );
 }
 
-test("the shell exposes real navigation including Jobs, Memory, Agents, and Projects", () => {
+test("the shell exposes the shipped R1 navigation", () => {
   renderWithClient(<RouterProvider router={shellAt("/approvals")} />);
   const labels = screen.getAllByRole("link").map((l) => l.textContent ?? "");
   for (const name of [
@@ -38,7 +38,6 @@ test("the shell exposes real navigation including Jobs, Memory, Agents, and Proj
     "Schedules",
     "Approvals",
     "Observability",
-    "Agents",
     "Projects",
   ]) {
     expect(labels.some((l) => l.includes(name))).toBe(true);
@@ -48,7 +47,6 @@ test("the shell exposes real navigation including Jobs, Memory, Agents, and Proj
 test("roadmap nav items remain non-interactive while shipped and preview surfaces are enabled", () => {
   renderWithClient(<RouterProvider router={shellAt("/approvals")} />);
   const disabled = Array.from(document.querySelectorAll("[aria-disabled='true']"));
-  expect(disabled.some((el) => el.textContent?.includes("Agents"))).toBe(false);
   expect(disabled.some((el) => el.textContent?.includes("Projects"))).toBe(false);
   expect(disabled.some((el) => el.textContent?.includes("Knowledge"))).toBe(false);
   expect(disabled.some((el) => el.textContent?.includes("Memory"))).toBe(false);
@@ -58,12 +56,11 @@ test("roadmap nav items remain non-interactive while shipped and preview surface
   expect(disabled.some((el) => el.textContent?.includes("Extensions"))).toBe(true);
 });
 
-test("Agents and Projects links are labeled as preview rather than pretending to be finished", () => {
+test("Agents is not shipped while Projects remains explicitly preview", () => {
   renderWithClient(<RouterProvider router={shellAt("/approvals")} />);
-  const agentsLink = screen.getAllByRole("link").find((l) => l.textContent?.includes("Agents"));
   const projectsLink = screen
     .getAllByRole("link")
     .find((l) => l.textContent?.includes("Projects"));
-  expect(agentsLink?.textContent).toContain("Preview");
+  expect(screen.queryByRole("link", { name: /Agents/i })).not.toBeInTheDocument();
   expect(projectsLink?.textContent).toContain("Preview");
 });

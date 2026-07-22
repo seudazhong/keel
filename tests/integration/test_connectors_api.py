@@ -12,6 +12,11 @@ from fastapi import FastAPI
 from httpx import ASGITransport
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from keel_core.connector_contracts import (
+    ConnectorAuthenticationError,
+    ConnectorUnavailableError,
+    ConnectorUnsupportedError,
+)
 from keel_core.secrets import EnvelopeCipher
 from keel_core.tokens import PostgresTokenStore, list_connected
 from keel_server.api.connectors import router
@@ -49,6 +54,42 @@ async def test_connectors_endpoint_lists_catalog(connectors_client: httpx.AsyncC
     assert gmail["connected"] is False
     assert gmail["scopes"] == ["gmail.readonly", "gmail.send"]
     assert gmail["name"] == "Gmail"
+
+
+async def test_unconfigured_connector_resources_returns_conflict(
+    connectors_client: httpx.AsyncClient,
+) -> None:
+    response = await connectors_client.get("/v1/connectors/github/resources")
+    assert response.status_code == 409
+    assert "configur" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_status"),
+    [
+        (ConnectorAuthenticationError("bad credentials"), 400),
+        (ConnectorUnavailableError("provider unavailable"), 503),
+        (ConnectorUnsupportedError("resources unsupported"), 409),
+    ],
+)
+async def test_connector_resources_preserves_error_taxonomy(
+    connectors_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    expected_status: int,
+) -> None:
+    class FailingConnectorService:
+        async def refresh_resources(self, _connector_id: str) -> list[object]:
+            raise error
+
+    monkeypatch.setattr(
+        "keel_server.api.connectors._service",
+        lambda _request, _scope: FailingConnectorService(),
+    )
+
+    response = await connectors_client.get("/v1/connectors/github/resources")
+    assert response.status_code == expected_status
+    assert response.json()["detail"] == str(error)
 
 
 async def test_revoke_connector_endpoint(migrated_db: AsyncEngine) -> None:

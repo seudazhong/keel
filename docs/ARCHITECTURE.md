@@ -35,15 +35,15 @@ Five commitments drive the architecture:
 |---|---|---|
 | Product profile | Trusted local/single-operator Compose preview. | Single-organization multi-user product, then production profile. |
 | Identity | Users, organizations, memberships, Agents, grants, first-class Agent Access edges (discover/use/manage; R1B), session ownership/visibility (private/agent_members/explicit; R1B), OIDC JWT verification, API keys, local actor. | Browser authorization-code/PKCE login, secure session, complete admin UI for Agent Access/session-visibility/shares. |
-| Agent model | Persisted kind, owner, name, persona, status, version. Runs capture an immutable, schema-versioned `AgentConfigSnapshot` (version/name/persona/model/budget/permission-profile identifier/tool names/memory-policy/grant descriptors) at admission. | Agent-owned versioned tool/resource/memory/autonomy config the snapshot draws from directly (today it is assembled per-surface at admission), and Routine policy in the snapshot. |
+| Agent model | Persisted kind, owner, name, persona, status, version. Runs capture an immutable, schema-versioned `AgentConfigSnapshot` at admission. Agent management is API-only; the incomplete React tab is not shipped. | Agent-owned versioned tool/resource/memory/autonomy config when product requirements justify a management surface. |
 | Scope | `agent:<org>/<agent>` is derived for authenticated runs; `web:local` remains preview compatibility. | Scope remains internal and disappears from normal product UX. |
-| Runs | Postgres-owned worker execution with leases, controls, approvals, dispatch outbox, reconciliation, and an immutable per-run Agent config snapshot bound into the admission fingerprint. | Capability routing and immutable full Agent/Routine snapshots (richer grant/tool/routine fields; today's snapshot is extensible but not the full future model). |
-| Schedules | Persistent rows and compare-and-set cursor advance in worker cron. | First-class Routines and durable accepted-occurrence outbox; no silent loss after acceptance. |
+| Runs | Postgres-owned worker execution with leases, controls, approvals, dispatch outbox, reconciliation, and an immutable per-run Agent config snapshot bound into the admission fingerprint. | Richer admitted authority fields when a concrete product requirement needs them. |
+| Schedules | Persistent rows and compare-and-set cursor advance in worker cron. | Reliability hardening and any Routine redesign are deferred until automation requirements justify them. |
 | Jobs | Postgres lifecycle, at-least-once Redis/arq delivery, leases, retries, cancellation, result injection, dispatch recovery. | Capability-specific worker pools and production SLOs. |
 | Effects | Generic durable Effect ledger (R1B): `reserved -> executing -> {confirmed, unknown, failed}`, with `unknown` leaving only through provider reconciliation (`reconciled_confirmed`/`reconciled_absent`, the latter permitting one controlled retry). Fenced single-winner execution lease; a cross-scope worker cron reaps expired leases and drives reconciliation. Gmail send and Google Calendar create/update have reconciliation capability today; every other connector's `unknown` Effects surface via `/v1/effects` for an operator/user decision. | Reconciliation capability for the remaining connectors (comment/PR effects, etc.), a React history/status surface, and richer per-effect approval-context columns beyond action hash. |
-| Memory | Core blocks/version history, archival memory, search, consolidation proposals, evals. Interactive model tools can currently mutate memory directly. | Agent-owned memory policy and proposal-first learned memory as the product default. |
+| Memory | Core blocks/version history, archival memory, search, consolidation proposals, evals. Interactive model tools can mutate memory directly under the current permission/approval policy. | Any change to learning authority requires comparative product evidence; proposal-first is a deferred option, not an active gate. |
 | Knowledge | Versioned documents, chunking, embeddings, hybrid retrieval, citations, taint, delete lifecycle. | Product qualification and source lifecycle across supported Connections. |
-| Connections | One provider binding per connector per scope plus selected resources/targets. | Multi-account Connection objects reusable through explicit Agent/Routine grants. |
+| Connections | One provider binding per connector per scope plus selected resources/targets. | Multi-account user/organization-owned Connections move to R2. |
 | Keel Mailbox | Not implemented. | One Primary plus optional private Purpose Mailboxes per User, private routing, signed inbound delivery, and approval-gated outbound mail. |
 | ToDos and notifications | Not implemented. | User-owned ToDos with durable reminders and reusable Web/email/IM notification delivery. |
 | Projects | Organization-owned project records, shared Git storage, worktrees, GitHub App sync, grants. | Simpler GitHub setup and complete user journeys. |
@@ -156,9 +156,9 @@ actor membership
 Routine policy only attenuates the Agent's grants. RLS is defense in depth after this authorization
 decision, not a replacement for it.
 
-### 3.6 Routine
+### 3.6 Routine (deferred)
 
-**Target:** a first-class Routine binds:
+If future automation requirements justify it, a first-class Routine would bind:
 
 - trigger;
 - Agent version or selection rule;
@@ -169,8 +169,8 @@ decision, not a replacement for it.
 - delivery target;
 - owner and lifecycle.
 
-The current `schedules` rows and hard-coded digest/consolidation dispatch are an implementation
-precursor, not the final autonomy model.
+R1 retains the current `schedules` rows and hard-coded digest/consolidation dispatch. Neither a
+Routine model nor a Schedule migration is on the active R1 plan.
 
 ### 3.7 Keel Mailbox, ToDo, and Notification
 
@@ -323,13 +323,13 @@ ADR-0010 defines the job contract:
 - terminal result injection in the same durable transaction;
 - dispatch reconciliation.
 
-### 6.3 Schedule and Routine delivery
+### 6.3 Schedule delivery
 
 **Current:** a schedule occurrence advances `next_run_at` before enqueue. This prevents duplicate
 delivery but can lose an occurrence if the process crashes after the cursor update.
 
-**Target:** atomically create a unique accepted occurrence and dispatch outbox row. Delivery may be
-duplicated, but the occurrence is never silently lost after acceptance.
+**Deferred hardening:** atomically create a unique accepted occurrence and dispatch outbox row.
+Current R1 behavior and its narrow crash-loss window remain documented rather than redesigned.
 
 ### 6.4 External effects
 
@@ -396,11 +396,10 @@ These are separate data classes:
    persistent taint.
 5. **Run-local scratch:** temporary state that must not become durable memory implicitly.
 
-Current interactive registration places memory mutation tools in the explicitly allowed extra-tool
-set. The target disables direct model mutation for normal product Agents and uses proposal-first
-learning by default. Current consolidation also reads all non-internal sessions in a scope and
-auto-commits high-confidence archival facts; [Memory](./MEMORY.md) records the required trust and
-proposal correction.
+Current interactive registration places memory mutation tools in the explicitly governed extra-tool
+set. Consolidation can create proposals and can auto-commit high-confidence archival facts. R1 keeps
+this behavior unchanged; [Memory](./MEMORY.md) records proposal-first as a future option that requires
+comparative evidence before adoption.
 
 Knowledge collections pin embedding model and dimension. A model change is an explicit re-embed
 operation, never silent cross-model vector search.
@@ -633,9 +632,9 @@ The active ordering is in [Roadmap](./ROADMAP.md). The remaining load-bearing ga
 
 1. Enforced single-organization policy; an admin-facing UI for Agent Access/session-visibility/
    shares (API-only foundation landed, R1B);
-2. versioned Agent and first-class Routine/Connection models;
-3. direct-memory mutation removal plus proposal-first learning;
-4. durable accepted-occurrence and ambiguous-effect reconciliation;
+2. a complete versioned personal-assistant configuration and first-class Connection model;
+3. deferred Schedule reliability hardening and any future Routine model;
+4. reconciliation capability for providers beyond Gmail/Calendar;
 5. per-user Primary/Purpose Keel Mailboxes, verified delivery endpoint, ToDo, and Notification
    models and product surfaces;
 6. browser OIDC session and team/admin product surfaces;
