@@ -33,8 +33,10 @@ global routing indices and stores removed through foreign-key cascade.
 | `connector_tokens` | table | permanent | `scope_id` | scope-bound (revoke + purge) |
 | `connector_bindings` / `connector_binding_targets` / `connector_resources` / `connector_items` / `connector_cursors` | table | permanent | `scope_id` | typed targets, selected roots, imported-item mappings, and per-resource sync state |
 | `connector_deliveries` | table | short (1d) | `scope_id` | scope-bound replay/processing ledger |
-| `connector_outbox` | table | short (1d) | `scope_id` | scope-bound |
+| `connector_outbox` | table | short (1d) | `scope_id` | scope-bound (superseded by `effects` for new outbound-connector mutations; retained for legacy claims/lifecycle continuity) |
 | `connector_active_scopes` / `connector_webhook_routes` | table | permanent | `scope_id` | global non-content routing indices explicitly removed by connector scope purge |
+| `effects` | table | standard (30d) | `scope_id` | scope-bound — R1B durable Effect ledger (C4/C5): reserved/executing/confirmed/unknown/reconciled_*/failed outbound-mutation records |
+| `effect_reconciliation_outbox` | table | short (1d) | `scope_id` | global (non-RLS) cross-scope reconciliation pointer; carries no action args/result; cascades from its Effect (composite FK) |
 | `oauth_states` | table | transient (1h) | `scope_id` | scope-bound |
 | `webhook_deliveries` | table | short (1d) | *(global)* | **global — preserved** (no personal content) |
 | `schedules` | table | permanent | `scope_id` | scope-bound |

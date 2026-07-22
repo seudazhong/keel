@@ -71,6 +71,21 @@ def is_agent_scope(scope_id: ScopeId) -> bool:
     return scope_id.startswith(_AGENT_SCOPE_PREFIX)
 
 
+def parse_agent_scope(scope_id: ScopeId) -> tuple[str, str] | None:
+    """Best-effort ``(org_id, agent_id)`` recovered from a derived per-Agent scope.
+
+    ``None`` for the local-preview scope or anything malformed — never raises, so a
+    read-only/audit caller (e.g. the R1B Effect ledger's traceability columns,
+    :mod:`keel_core.connectors`) can use it without re-validating the scope itself."""
+    if not is_agent_scope(scope_id):
+        return None
+    remainder = scope_id[len(_AGENT_SCOPE_PREFIX) :]
+    org, sep, agent = remainder.partition("/")
+    if not sep or not org or not agent:
+        return None
+    return org, agent
+
+
 def validate_scope_id(scope_id: ScopeId) -> ScopeId:
     """Re-validate a scope id centrally (the worker revalidates ``record.scope_id``).
 
@@ -111,6 +126,7 @@ __all__ = [
     "derive_agent_scope",
     "is_agent_scope",
     "is_local_preview_scope",
+    "parse_agent_scope",
     "validate_scope_id",
     "workspace_namespace",
 ]

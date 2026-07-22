@@ -19,6 +19,7 @@ from keel_core.approvals import purge_scope as _purge_approvals
 from keel_core.connector_repository import purge_scope as _purge_connector_state
 from keel_core.consolidation.cursor import purge_scope as _purge_cursor
 from keel_core.consolidation.proposals import purge_scope as _purge_proposals
+from keel_core.effect_store import purge_scope as _purge_effects
 from keel_core.im_routing import purge_scope as _purge_im_routing
 from keel_core.jobs import purge_scope as _purge_jobs
 from keel_core.knowledge.store import purge_scope as _purge_knowledge
@@ -101,6 +102,11 @@ class ScopePurgeRepository:
 
     async def connector_outbox(self, scope_id: str) -> int:
         return await _purge_outbox(self._engine, scope_id)
+
+    async def effects(self, scope_id: str) -> int:
+        """R1B: erase the scope's Effect ledger rows; the reconciliation-outbox pointer
+        cascades away with each Effect (composite FK, ``ON DELETE CASCADE``)."""
+        return await _purge_effects(self._engine, scope_id)
 
     async def oauth_states(self, scope_id: str) -> int:
         return await _purge_oauth(self._engine, scope_id)

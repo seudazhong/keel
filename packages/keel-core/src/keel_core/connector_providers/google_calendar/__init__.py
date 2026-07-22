@@ -37,6 +37,10 @@ from keel_core.connector_contracts import (
     ConnectorManifest,
     ConnectorOperationContext,
     ConnectorProvenance,
+    ConnectorReconciler,
+    ConnectorReconciliationOutcome,
+    ConnectorReconciliationRequest,
+    ConnectorReconciliationResult,
     ConnectorResource,
     ConnectorResourceDraft,
     ConnectorResourceRefreshMode,
@@ -58,10 +62,12 @@ from ._client import (
     CalendarClient,
     GoogleCalendarAuthenticationError,
     GoogleCalendarError,
+    GoogleCalendarNotFoundError,
     GoogleCalendarRateLimitError,
     GoogleCalendarRevokeError,
     GoogleCalendarSyncTokenExpired,
     GoogleCalendarWriteAuthorizationRequired,
+    _private_properties,
     build_client,
     merge_authorized_user_values,
     revoke_google_token,
@@ -632,6 +638,20 @@ class GoogleCalendarProvider(BaseConnectorProvider):
             ConnectorAction(EVENT_UPDATE_ACTION, update_event),
         )
 
+    def build_reconciler(self, context: ConnectorActionContext) -> ConnectorReconciler | None:
+        """R1B: prove whether an ``unknown`` create/update Effect reached Google Calendar.
+
+        Recomputes the same deterministic ``request_id``/``event_id`` the action itself
+        used (:func:`_request_id`/:func:`_event_id`) from the Effect's own identity —
+        never trusts a caller-supplied value — and looks the event up directly."""
+        if context.credential_store is None:
+            return None
+        store = cast(
+            CredentialStore,
+            context.envelope_credential_store or context.credential_store,
+        )
+        return GoogleCalendarReconciler(store, self._client_factory)
+
     async def _read_events_action(
         self,
         context: ConnectorActionContext,
@@ -724,6 +744,68 @@ async def _persist_action_credential(
 ) -> None:
     if latest != previous:
         await store.put(GOOGLE_CALENDAR_CONNECTOR_ID, latest)
+
+
+class GoogleCalendarReconciler:
+    """R1B (C4): prove whether an ``unknown`` create/update Effect reached Google
+    Calendar, by recomputing the same deterministic identity the action itself derived
+    and looking the event up directly (never inferred from a bare retry)."""
+
+    def __init__(self, store: CredentialStore, client_factory: ClientFactory) -> None:
+        self._store = store
+        self._client_factory = client_factory
+
+    async def reconcile(
+        self, request: ConnectorReconciliationRequest
+    ) -> ConnectorReconciliationResult:
+        calendar_id = request.resource_id
+        if not calendar_id:
+            return ConnectorReconciliationResult(ConnectorReconciliationOutcome.incapable)
+        credential = await self._store.get(GOOGLE_CALENDAR_CONNECTOR_ID)
+        if credential is None:
+            return ConnectorReconciliationResult(ConnectorReconciliationOutcome.incapable)
+        args: dict[str, Any] = {}
+        if not request.canonical_args.startswith("sha256:"):
+            try:
+                loaded = json.loads(request.canonical_args or "{}")
+            except (TypeError, ValueError):
+                loaded = {}
+            if isinstance(loaded, dict):
+                args = loaded
+        if request.action_name == EVENT_CREATE_ACTION.name:
+            request_id = _request_id(request.scope_id, calendar_id, request.idempotency_key)
+            event_id = _event_id(request_id)
+            marker = "keel_create_request_id"
+        elif request.action_name == EVENT_UPDATE_ACTION.name:
+            event_id = str(args.get("event_id", ""))
+            if not event_id:
+                return ConnectorReconciliationResult(ConnectorReconciliationOutcome.incapable)
+            request_id = _request_id(
+                request.scope_id, calendar_id, f"{event_id}:{request.idempotency_key}"
+            )
+            marker = "keel_update_request_id"
+        else:
+            # No reconciliation identity for a non-write action (should not occur — the
+            # worker only reconciles unknown outbound Effects).
+            return ConnectorReconciliationResult(ConnectorReconciliationOutcome.incapable)
+        try:
+            client = self._client_factory(credential, GOOGLE_CALENDAR_WRITE_SCOPES)
+        except GoogleCalendarAuthenticationError:
+            return ConnectorReconciliationResult(ConnectorReconciliationOutcome.incapable)
+        try:
+            try:
+                event = await asyncio.to_thread(client.get_event, calendar_id, event_id)
+            except GoogleCalendarNotFoundError:
+                return ConnectorReconciliationResult(ConnectorReconciliationOutcome.absent)
+            if _private_properties(event).get(marker) == request_id:
+                return ConnectorReconciliationResult(
+                    ConnectorReconciliationOutcome.confirmed,
+                    provider_ref=event_id,
+                    result=json.dumps({"id": event_id, "calendar_id": calendar_id}),
+                )
+            return ConnectorReconciliationResult(ConnectorReconciliationOutcome.absent)
+        finally:
+            client.close()
 
 
 async def _binding_id(context: ConnectorActionContext) -> str:

@@ -44,13 +44,50 @@ class ToolContext(BaseModel):
     content_taint: ContentTaint = ContentTaint.clean
     # Stable provider tool-call id for durable idempotency. The executor fills this per call.
     tool_call_id: str | None = None
+    # R1B: the exact resolved idempotency key ConnectorTool reserved this Effect under
+    # (set by ConnectorTool itself before invoking an outbound action — never by the
+    # model/caller). Lets an action build a deterministic provider-side reconciliation
+    # identity (e.g. Gmail's Message-ID) from the *same* key regardless of whether the
+    # model supplied one or it was derived from ``tool_call_id`` — without polluting the
+    # action's own ``args`` dict (which many callers compare/record verbatim).
+    idempotency_key: str | None = None
+    # R1B durable Effect ledger (C4/C5) audit columns — best-effort, additive. ``run_id``
+    # is the loop's own run identifier; ``org_id``/``actor_id`` come from the run's
+    # ``ApprovalBinding`` when one was supplied (blank for a legacy/binding-less run — the
+    # Effect ledger still isolates correctly on ``scope_id`` alone). ``agent_id`` is parsed
+    # from the derived per-Agent ``scope_id`` (blank for the local-preview scope).
+    run_id: str | None = None
+    org_id: str = ""
+    actor_id: str = ""
+
+    @property
+    def agent_id(self) -> str:
+        from keel_core.scoping import parse_agent_scope
+
+        parsed = parse_agent_scope(self.scope_id)
+        return parsed[1] if parsed is not None else ""
+
+    @property
+    def resolved_org_id(self) -> str:
+        """``org_id`` when explicitly set (an ``ApprovalBinding``-carrying run), else
+        best-effort parsed from the derived per-Agent ``scope_id`` (R1B audit columns —
+        never used for authorization, only traceability)."""
+        if self.org_id:
+            return self.org_id
+        from keel_core.scoping import parse_agent_scope
+
+        parsed = parse_agent_scope(self.scope_id)
+        return parsed[0] if parsed is not None else ""
 
 
 class ToolResult(BaseModel):
     """Tool output. ``output`` is model-facing (bounded); ``display`` user-facing.
 
     Full output spills to ``spill_path`` (FR-T5). ``taint`` propagates content
-    trust for the confused-deputy guard (G17).
+    trust for the confused-deputy guard (G17). ``effect_id``/``effect_status``/
+    ``provider_ref`` (R1B) surface the durable Effect ledger record an outbound
+    connector action reserved/executed, never a secret — only carried by
+    :class:`~keel_core.connectors.ConnectorTool`'s outbound path.
     """
 
     ok: bool
@@ -59,6 +96,9 @@ class ToolResult(BaseModel):
     spill_path: str | None = None
     taint: ContentTaint = ContentTaint.clean
     citations: list[Citation] = Field(default_factory=list)
+    effect_id: str | None = None
+    effect_status: str | None = None
+    provider_ref: str | None = None
 
 
 class ProviderRequest(BaseModel):

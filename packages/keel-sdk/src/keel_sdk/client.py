@@ -19,6 +19,8 @@ from keel_sdk.models import (
     CreateProjectRequest,
     CreateReviewRequest,
     CreateReviewResponse,
+    EffectRetryEligibility,
+    EffectSummary,
     GrantAgentAccessRequest,
     GrantProjectRequest,
     GrantSummary,
@@ -542,3 +544,48 @@ class KeelClient:
         )
         response.raise_for_status()
         return ImMappingSummary.model_validate(response.json())
+
+    # --- Durable Effect ledger (R1B, C4/C5) — additive methods ------------------------
+    async def list_effects(
+        self,
+        org: str,
+        agent: str,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[EffectSummary]:
+        """List Effects for the caller's derived per-Agent scope."""
+        params: dict[str, str | int] = {"limit": limit}
+        if status is not None:
+            params["status"] = status
+        response = await self._client.get(
+            "/v1/effects", params=params, headers=self._scope_headers(org, agent)
+        )
+        response.raise_for_status()
+        return [EffectSummary.model_validate(item) for item in response.json()]
+
+    async def get_effect(self, org: str, agent: str, effect_id: str) -> EffectSummary:
+        """Fetch one Effect."""
+        response = await self._client.get(
+            f"/v1/effects/{effect_id}", headers=self._scope_headers(org, agent)
+        )
+        response.raise_for_status()
+        return EffectSummary.model_validate(response.json())
+
+    async def reconcile_effect(self, org: str, agent: str, effect_id: str) -> EffectSummary:
+        """Request one on-demand provider reconciliation attempt for an `unknown` Effect."""
+        response = await self._client.post(
+            f"/v1/effects/{effect_id}/reconcile", headers=self._scope_headers(org, agent)
+        )
+        response.raise_for_status()
+        return EffectSummary.model_validate(response.json())
+
+    async def check_effect_retry_eligibility(
+        self, org: str, agent: str, effect_id: str
+    ) -> EffectRetryEligibility:
+        """Confirm whether a `failed`/`reconciled_absent` Effect may be retried now."""
+        response = await self._client.post(
+            f"/v1/effects/{effect_id}/retry", headers=self._scope_headers(org, agent)
+        )
+        response.raise_for_status()
+        return EffectRetryEligibility.model_validate(response.json())

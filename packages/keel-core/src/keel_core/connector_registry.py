@@ -159,6 +159,7 @@ class ConnectorRegistry:
                 actions[action.manifest.name] = ConnectorAction(
                     action.manifest,
                     _scope_bound_action(action.action, context.scope_id),
+                    connector_id=manifest.id,
                 )
         return tuple(actions[name] for name in sorted(actions))
 

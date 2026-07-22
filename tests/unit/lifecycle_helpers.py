@@ -67,6 +67,9 @@ class FakePurge:
     async def connector_outbox(self, scope_id: str) -> int:
         return await self._op("connector_outbox")
 
+    async def effects(self, scope_id: str) -> int:
+        return await self._op("effects")
+
     async def oauth_states(self, scope_id: str) -> int:
         return await self._op("oauth_states")
 

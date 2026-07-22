@@ -48,7 +48,7 @@ from keel_core.connector_registry import (
 from keel_core.connector_repository import InMemoryConnectorRepository
 from keel_core.connector_service import CallbackConnectorChangeSink, ConnectorService
 from keel_core.connectors import ConnectorTool
-from keel_core.outbox import InMemoryOutboundStore
+from keel_core.effect_store import InMemoryEffectStore
 from keel_core.protocols import ToolContext
 from keel_core.secrets import EnvelopeCipher
 from keel_core.tokens import InMemoryTokenStore
@@ -610,7 +610,7 @@ async def test_duplicate_reply_uses_outbox_and_requires_selected_chat() -> None:
         action=action.action,
         outbound=True,
         idempotency_required=True,
-        idempotency_store=InMemoryOutboundStore(),
+        effect_store=InMemoryEffectStore(),
         input_schema=dict(REPLY_ACTION.input_schema),
     )
     arguments = {

@@ -96,6 +96,7 @@ from keel_core.runtime_db import inspect_runtime_principal, verify_runtime_princ
 from keel_core.tools import build_service_execution_environment
 from keel_core.webhooks import InMemoryWebhookReplayStore, PostgresWebhookReplayStore
 from keel_server.api import connectors as connectors_api
+from keel_server.api import effects as effects_api
 from keel_server.api import gateway as gateway_api
 from keel_server.api import identity as identity_api
 from keel_server.api import im_routing as im_routing_api
@@ -1011,6 +1012,7 @@ def create_app() -> FastAPI:
     app.include_router(knowledge_api.router)
     app.include_router(lifecycle_api.router)
     app.include_router(connectors_api.router)
+    app.include_router(effects_api.router)
     app.include_router(im_routing_api.router)
     # Backward-compatible concrete Gmail OAuth routes (published operation ids
     # ``gmail_oauth_connect``/``gmail_oauth_callback``) for old clients. Registered after the

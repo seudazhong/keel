@@ -83,7 +83,16 @@ change, but R2 cannot close until both gates pass.
   (`keel_core.identity.authz`, `keel_core.session_visibility`, migration `0025`). Admin UI for
   granting/revoking access and managing visibility/shares is not built (API-only);
 - introduce first-class Routine and accepted-occurrence/outbox semantics;
-- introduce durable Effect states including `unknown` plus provider reconciliation;
+- introduce durable Effect states including `unknown` plus provider reconciliation — **done**: a
+  generic Effect ledger (`reserved -> executing -> {confirmed, unknown, failed}`, `unknown` leaving
+  only through provider reconciliation) now backs every outbound connector action with an
+  idempotency key (`keel_core.effects`/`keel_core.effect_store`, migration `0026_effect_ledger`),
+  with a fenced single-winner execution lease, a worker-cron cross-scope reconciler
+  (`keel_worker.effects_reconciliation`), and a read/manual-reconcile/retry-eligibility API+SDK
+  surface (`/v1/effects`). Reconciliation capability exists for Gmail send and Google Calendar
+  create/update only; every other connector's `unknown` Effects surface via the API rather than
+  reconciling automatically — that provider-capability gap remains open, as does a React
+  effect-history surface;
 - define user/organization-owned multi-account Connections and resource grants instead of one
   connector binding per Agent scope; Routine policy may only attenuate Agent grants;
 - enumerate and classify every persisted table/index/artifact in lifecycle and erasure policy,
@@ -91,13 +100,17 @@ change, but R2 cannot close until both gates pass.
 
 **Exit gates:**
 
-- crash tests prove no lost accepted Routine occurrence and no blind retry of an unknown effect;
+- crash tests prove no lost accepted Routine occurrence and no blind retry of an unknown effect —
+  **done for the generic Effect ledger** (`tests/unit/test_effect_store.py`,
+  `tests/integration/test_effect_store_postgres.py`: crash-after-provider-success-before-confirm
+  recovers to `unknown`, and `begin_execution` refuses while `unknown`). Routine's own
+  accepted-occurrence-outbox equivalent (C3) remains open;
 - all runtime construction paths are fail-closed;
 - authorization tests cover Agent discovery, session visibility, and resource use separately —
   **done for Agent discovery/use/manage tiers and session ownership/visibility**
   (`tests/integration/test_r1b_agent_access_session_visibility.py`,
-  `tests/unit/test_identity_authz.py`, `tests/unit/test_session_visibility.py`); Routine/Effect
-  coverage remains open.
+  `tests/unit/test_identity_authz.py`, `tests/unit/test_session_visibility.py`); Routine coverage
+  remains open.
 
 ## R2 — Connected personal Agent
 

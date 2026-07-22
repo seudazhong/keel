@@ -54,6 +54,7 @@ from keel_core.state import PostgresEventStore
 from keel_core.tools import build_service_execution_environment
 from keel_scheduler.store import PostgresScheduleStore, ScheduleRow, due_tick
 from keel_worker.connectors import reconcile_connectors_tick, register_connector_jobs
+from keel_worker.effects_reconciliation import build_effect_reconciler, reconcile_effects_tick
 from keel_worker.jobs import dispatch_jobs, reconcile_job_dispatch_tick, run_job
 from keel_worker.knowledge import knowledge_job_registry
 from keel_worker.patch import reconcile_patch_outbox_tick
@@ -100,15 +101,16 @@ def _digest_registry(
     actions: tuple[ConnectorAction, ...] | None = None,
 ) -> ToolRegistry:
     connector_actions = actions or ()
-    idempotency_store = None
+    effect_store = None
     engine = ctx.get("engine")
     if engine is not None:
-        from keel_core.outbox import PostgresOutboundStore
+        from keel_core.effect_outbox import PostgresEffectReconciliationOutbox
+        from keel_core.effect_store import PostgresEffectStore
 
-        idempotency_store = PostgresOutboundStore(engine)
+        effect_store = PostgresEffectStore(engine, PostgresEffectReconciliationOutbox(engine))
     return digest_registry(
         ctx.get("sent"),
-        idempotency_store=idempotency_store,
+        effect_store=effect_store,
         connector_actions=connector_actions,
     )
 
@@ -737,6 +739,30 @@ async def startup(ctx: dict[str, Any]) -> None:
             worker_id=f"patch:{uuid.uuid4().hex[:12]}",
         )
 
+    # R1B durable Effect ledger (C4/C5): the cross-scope reconciliation pointer reaps
+    # expired execution leases to `unknown` (crash recovery — never a silent pending-retry
+    # state) and drives provider reconciliation for `unknown` Effects. Wired unconditionally
+    # (the worker always has a durable `engine`, unlike the optional patch storage root).
+    from keel_core.effect_outbox import PostgresEffectReconciliationOutbox
+    from keel_core.effect_store import PostgresEffectStore
+
+    _effect_outbox = PostgresEffectReconciliationOutbox(engine)
+    ctx["effect_reconciler"] = build_effect_reconciler(
+        engine=engine,
+        outbox=_effect_outbox,
+        effect_store_factory=lambda s: PostgresEffectStore(engine, _effect_outbox),
+        registry=connector_registry,
+        settings=settings,
+        worker_id=f"effects:{uuid.uuid4().hex[:12]}",
+    )
+    try:
+        # Best-effort immediate pass so a restart recovers stranded executing leases
+        # without waiting for the next cron tick; a failure here never blocks startup
+        # (the recurring cron tick is the durable backstop).
+        await ctx["effect_reconciler"].run()
+    except Exception:  # noqa: BLE001 - startup must never crash-loop on a reconcile hiccup
+        logger.warning("initial effect reconciliation pass failed", exc_info=True)
+
     async def enqueue(name: str, *args: object, **options: object) -> None:
         await _enqueue_arq(redis, name, *args, **options)
 
@@ -779,6 +805,7 @@ class WorkerSettings:
         review_artifact_reaper_tick,
         reconcile_stranded_reviews_tick,
         reconcile_patch_outbox_tick,
+        reconcile_effects_tick,
         send_im_replies_tick,
         func(
             run_job,
@@ -796,6 +823,7 @@ class WorkerSettings:
         cron(reconcile_job_dispatch_tick, second={0, 30}),
         cron(reconcile_stranded_reviews_tick, second={0, 30}),
         cron(reconcile_patch_outbox_tick, second={0, 30}),
+        cron(reconcile_effects_tick, second={0, 30}),
         cron(review_artifact_reaper_tick, minute={0}),
         cron(send_im_replies_tick, second={0, 15, 30, 45}),
     ]

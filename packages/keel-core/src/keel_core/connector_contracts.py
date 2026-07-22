@@ -10,7 +10,6 @@ from typing import Any, Protocol, runtime_checkable
 
 from keel_core.connector_credentials import CredentialEnvelope
 from keel_core.connectors import ActionFn
-from keel_core.outbox import OutboundIdempotencyStore
 from keel_core.types import ContentTaint
 
 
@@ -96,6 +95,67 @@ class ConnectorActionIdempotency(StrEnum):
 class ConnectorActionApproval(StrEnum):
     none = "none"
     tainted = "tainted"
+
+
+class ConnectorReconciliationOutcome(StrEnum):
+    """The result of asking a provider whether a possibly-ambiguous mutation landed.
+
+    ``confirmed``/``absent`` are only ever returned when the provider actually proved the
+    answer (a deterministic lookup, not an inference from a retry's own success/failure).
+    ``incapable`` means the provider/action has no reconciliation seam at all — the Effect
+    must stay ``unknown`` and be surfaced for an operator/user decision, never silently
+    retried (R1B requirement 6)."""
+
+    confirmed = "confirmed"
+    absent = "absent"
+    incapable = "incapable"
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorReconciliationResult:
+    """A reconciliation decision plus provider evidence discovered during the lookup."""
+
+    outcome: ConnectorReconciliationOutcome
+    provider_ref: str = ""
+    result: str = ""
+
+
+def reconciliation_result(
+    value: ConnectorReconciliationResult | ConnectorReconciliationOutcome,
+) -> ConnectorReconciliationResult:
+    """Normalize legacy enum-only reconcilers to the evidence-carrying result contract."""
+    if isinstance(value, ConnectorReconciliationResult):
+        return value
+    return ConnectorReconciliationResult(value)
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorReconciliationRequest:
+    """The exact identity of one possibly-ambiguous Effect a reconciler must resolve."""
+
+    scope_id: str
+    connector_id: str
+    action_name: str
+    idempotency_key: str
+    resource_id: str
+    provider_ref: str
+    canonical_args: str
+    unknown_since: datetime | None = None
+
+
+@runtime_checkable
+class ConnectorReconciler(Protocol):
+    """Optional per-provider capability: prove whether an ambiguous mutation landed.
+
+    A provider that cannot deterministically prove existence/absence (no stable identity
+    to look up, no idempotent lookup API) simply does not implement
+    :meth:`ConnectorProvider.build_reconciler` (returns ``None``) — the reconciliation
+    worker then records the Effect as durably ``incapable`` for this tick and leaves it
+    ``unknown`` rather than guessing."""
+
+    async def reconcile(
+        self, request: ConnectorReconciliationRequest
+    ) -> ConnectorReconciliationResult | ConnectorReconciliationOutcome: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -528,6 +588,12 @@ class ConnectorRenewalResult:
 class ConnectorAction:
     manifest: ConnectorActionManifest
     action: ActionFn
+    # The owning connector/provider id (e.g. ``"gmail"``, ``"google_calendar"``) — used as
+    # the Effect ledger's ``provider`` column (R1B) and by the reconciliation worker to
+    # route an ``unknown`` Effect to that provider's :meth:`ConnectorProvider.
+    # build_reconciler`. Blank only for legacy/ad-hoc test doubles that construct a
+    # ``ConnectorAction`` directly without going through the registry.
+    connector_id: str = ""
 
 
 @runtime_checkable
@@ -613,7 +679,11 @@ class ConnectorActionContext:
     scope_id: str
     credential_store: Any | None = None
     envelope_credential_store: Any | None = None
-    idempotency_store: OutboundIdempotencyStore | None = None
+    # R1B: the durable Effect ledger (C4/C5) a provider's own action closures may consult
+    # for a provider-side reconciliation lookup (e.g. Gmail/Calendar building a
+    # :class:`ConnectorReconciler`). Outbound at-most-once execution itself is owned by
+    # :class:`~keel_core.connectors.ConnectorTool`, not by this context.
+    effect_store: Any | None = None
     _state_loader: Callable[[str], Awaitable[ConnectorOperationContext]] | None = field(
         default=None,
         repr=False,
@@ -627,7 +697,7 @@ class ConnectorActionContext:
         *,
         credential_store: Any | None = None,
         envelope_credential_store: Any | None = None,
-        idempotency_store: OutboundIdempotencyStore | None = None,
+        effect_store: Any | None = None,
     ) -> ConnectorActionContext:
         if repository.scope_id != scope_id:
             raise ValueError("connector action repository crosses its scope")
@@ -664,7 +734,7 @@ class ConnectorActionContext:
             scope_id,
             credential_store=credential_store,
             envelope_credential_store=envelope_credential_store,
-            idempotency_store=idempotency_store,
+            effect_store=effect_store,
             _state_loader=load,
         )
 
@@ -865,6 +935,14 @@ class ConnectorProvider(Protocol):
 
     def build_actions(self, context: ConnectorActionContext) -> tuple[ConnectorAction, ...]: ...
 
+    def build_reconciler(self, context: ConnectorActionContext) -> ConnectorReconciler | None:
+        """An optional reconciliation capability for this provider's outbound actions.
+
+        Returns ``None`` when the provider has no way to deterministically prove whether
+        an ambiguous mutation landed (the default, safe posture — see
+        :class:`ConnectorReconciliationOutcome`)."""
+        ...
+
 
 class BaseConnectorProvider:
     """Fail-closed defaults for provider operations a manifest does not advertise."""
@@ -926,6 +1004,11 @@ class BaseConnectorProvider:
             )
         return ()
 
+    def build_reconciler(self, context: ConnectorActionContext) -> ConnectorReconciler | None:
+        """Default: no reconciliation capability (Effects from this provider stay
+        ``unknown`` until a subclass proves otherwise — never silently retried)."""
+        return None
+
 
 @runtime_checkable
 class ConnectorProviderFactory(Protocol):
@@ -971,6 +1054,11 @@ __all__ = [
     "ConnectorProvider",
     "ConnectorProviderFactory",
     "ConnectorProvenance",
+    "ConnectorReconciler",
+    "ConnectorReconciliationOutcome",
+    "ConnectorReconciliationResult",
+    "ConnectorReconciliationRequest",
+    "reconciliation_result",
     "ConnectorResource",
     "ConnectorResourceDraft",
     "ConnectorResourceRefreshMode",

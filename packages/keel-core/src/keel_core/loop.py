@@ -72,13 +72,23 @@ _SET_SCOPE = _sa_text("SELECT set_config('app.scope_id', :scope, true)")
 
 
 def _tool_result_payload(call_id: str, result: ToolResult) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "call_id": call_id,
         "ok": result.ok,
         "output": result.output,
         "taint": str(result.taint),
         "citations": [citation.model_dump() for citation in result.citations],
     }
+    # R1B: surface the durable Effect ledger identity/status/provider reference an
+    # outbound connector action reserved — never a secret, only ids/enum values already
+    # safe to persist on the Effect row itself (keel_core.effects.EffectRecord).
+    if result.effect_id is not None:
+        payload["effect_id"] = result.effect_id
+    if result.effect_status is not None:
+        payload["effect_status"] = result.effect_status
+    if result.provider_ref is not None:
+        payload["provider_ref"] = result.provider_ref
+    return payload
 
 
 # Live-observation seams: an in-process surface (CLI now, IM adapter later) renders
@@ -831,6 +841,9 @@ async def _run_tools(
         session_id=session_id,
         trust=trust,
         content_taint=taint_from_events(prior),
+        run_id=run_id,
+        org_id=binding.org_id if binding is not None else "",
+        actor_id=binding.actor if binding is not None else "",
     )
 
     # Decide suspension BEFORE any write: an ask-gated batch persists its tool.call events,
@@ -1273,6 +1286,9 @@ async def resume(
         session_id=session_id,
         trust=trust,
         content_taint=taint_from_events(prior),
+        run_id=run_id,
+        org_id=binding.org_id if binding is not None else "",
+        actor_id=binding.actor if binding is not None else "",
     )
     # Approval id per call, restricted to THIS run's approval.requested events — never adopt
     # another run's approval decision when a session is shared (M3.6 blocker 2).

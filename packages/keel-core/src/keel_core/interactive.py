@@ -27,10 +27,11 @@ from keel_core.connector_contracts import (
     ConnectorActionSemantics,
 )
 from keel_core.connectors import ConnectorTool
+from keel_core.effect_outbox import PostgresEffectReconciliationOutbox
+from keel_core.effect_store import PostgresEffectStore
 from keel_core.embeddings import Embedder
 from keel_core.knowledge import KnowledgeSearcher, KnowledgeSearchTool
 from keel_core.memory import MemoryAppendTool, MemoryReplaceTool, MemoryRethinkTool
-from keel_core.outbox import PostgresOutboundStore
 from keel_core.permissions import Rule, RuleBasedPermissionEngine
 from keel_core.protocols import Tool
 from keel_core.search import ArchivalInsertTool, ArchivalSearchTool, SessionSearchTool
@@ -181,7 +182,8 @@ def build_interactive_registry(
     if engine is not None:
         extra += build_interactive_memory_tools(engine, embedder, caps)
         extra += build_interactive_knowledge_tools(engine, scope_id, embedder, caps)
-        outbound_store = PostgresOutboundStore(engine)
+        effect_outbox = PostgresEffectReconciliationOutbox(engine)
+        effect_store = PostgresEffectStore(engine, effect_outbox)
         extra += [
             ConnectorTool(
                 name=action.manifest.name,
@@ -191,7 +193,8 @@ def build_interactive_registry(
                 idempotency_required=(
                     action.manifest.idempotency is ConnectorActionIdempotency.required
                 ),
-                idempotency_store=outbound_store,
+                effect_store=effect_store,
+                provider=action.connector_id or action.manifest.name,
                 input_schema=dict(action.manifest.input_schema),
             )
             for action in connector_actions

@@ -3,7 +3,7 @@
 > **Snapshot:** 2026-07-22
 > **Branch:** `main`
 > **Implementation baseline reviewed:** `10f6806`
-> **Migration head:** `0025_agent_access_sessions`
+> **Migration head:** `0026_effect_ledger`
 > **Target:** [Product requirements](./PRD.md)
 > **Next work:** [Roadmap](./ROADMAP.md)
 
@@ -53,6 +53,7 @@ production operations remain incomplete.
 | User ToDos and reminders | no | no | no | no | ADR-0012/0013 define ownership, UI, proposals, and Agent tools; no API, tools, persistence, reminders, or React surface exist. |
 | Event evolution and data lifecycle | yes | yes | yes | partial | Upcasters, rebuild checkpoints/tombstones, retention classes, durable erasure, identity purge, and complete migration-table classification exist. Product administration and external-provider erasure remain partial. |
 | Connector framework | yes | yes | yes | partial | Manifest discovery, encrypted credentials, routed webhooks, recurring sync, provenance, taint, and durable actions exist. Provider maturity and setup UX differ. |
+| Durable Effect ledger (R1B, C4/C5) | yes | yes | yes | partial | Generic `reserved -> executing -> {confirmed, unknown, failed}` state machine with fenced single-winner execution, worker-cron reconciliation, and an API/SDK surface exist (migration `0026_effect_ledger`). Reconciliation capability is implemented for Gmail send and Google Calendar create/update only; every other connector's `unknown` Effects surface via the API for an operator/user decision rather than being reconciled automatically. No React history/status surface yet. |
 | Gmail | yes | yes | yes | partial | Mail read and approval-gated send exist. The connected personal-Agent journey still needs common release qualification. |
 | Google Calendar | yes | yes | yes | partial | Read/sync/create/update exist with incremental OAuth and approval. It has less product history than Gmail and needs its own end-to-end qualification. |
 | Other connector providers | yes | yes | partial | no | Drive/Docs, Microsoft 365, Notion, Feishu, GitHub collaboration, RSS/Atom, and webhook providers exist but are not all product-qualified. |

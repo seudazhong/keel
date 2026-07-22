@@ -151,6 +151,29 @@ re-encryption finish.
 Provider webhooks use provider-specific authentication plus durable replay protection. Cloud
 deployments must use routed connector webhook URLs so the delivery resolves to one Agent scope.
 
+### Effect ledger and reconciliation (R1B)
+
+Every outbound connector mutation with an idempotency key is reserved/executed/confirmed through
+the durable Effect ledger (`effects` + the global `effect_reconciliation_outbox` pointer, migration
+`0026_effect_ledger`). The worker cron `reconcile_effects_tick` (registered unconditionally at
+worker startup, alongside a best-effort immediate pass so a restart recovers stranded execution
+leases without waiting for the next tick) reaps expired execution leases to `unknown` and drives
+provider reconciliation for `unknown` Effects.
+
+Gmail search is eventually consistent and Gmail send is not provider-idempotent. Its reconciler may
+confirm a matching deterministic `Message-ID`, but a not-found search never proves permanent
+absence and therefore never unlocks an automatic retry. Such an Effect remains `unknown`.
+
+An `unknown` Effect **never** auto-retries. Operators can inspect it via `GET /v1/effects` /
+`GET /v1/effects/{id}`, request one on-demand reconciliation attempt via
+`POST /v1/effects/{id}/reconcile` (requires the connected provider to implement
+`ConnectorProvider.build_reconciler` — today Gmail send and Google Calendar create/update only;
+every other provider reports `503` and the Effect stays `unknown`), and check retry eligibility via
+`POST /v1/effects/{id}/retry` (the API never re-executes the mutation itself — an eligible Effect
+is retried by invoking the owning tool again with the same idempotency key). Treat a persistently
+`unknown` Effect from a provider with no reconciler as a manual investigation: check the provider's
+own audit log/sent-mail folder/calendar for the mutation before assuming either outcome.
+
 ## 8. Data lifecycle
 
 Scope/session/project erasure runs as durable background work. User/organization erasure currently
